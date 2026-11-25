@@ -581,7 +581,15 @@ endif()
 
 if (MCPU_POS EQUAL -1)
   if (TUNE_CPU STREQUAL "native")
-    if(ARCHITECTURE_arm64)
+    if(ARCHITECTURE_arm64 AND APPLE)
+      # The Linux probe below reads /proc/cpuinfo, which macOS does not have.
+      # Every Apple silicon Mac supports the M1 feature set, so tune for that
+      # baseline: the result runs on all of them, virtual machines included.
+      check_cxx_compiler_flag("-mcpu=apple-m1" COMPILER_SUPPORTS_CPU_TYPE)
+      if(COMPILER_SUPPORTS_CPU_TYPE)
+        list(APPEND FEX_TUNE_COMPILE_FLAGS "-mcpu=apple-m1")
+      endif()
+    elseif(ARCHITECTURE_arm64)
       if (CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL 999999.0)
         # Clang 12.0 fixed the -mcpu=native bug with mixed big.little implementers
         # Clang can not currently check for native Apple M1 type in hypervisor.
