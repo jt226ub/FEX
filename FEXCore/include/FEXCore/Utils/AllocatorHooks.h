@@ -6,7 +6,11 @@
 
 #ifndef _WIN32
 #include <stdlib.h>
+#ifdef __APPLE__
+#include <malloc/malloc.h>
+#else
 #include <malloc.h>
+#endif
 #include <sys/mman.h>
 #else
 #define NTDDI_VERSION 0x0A000005
@@ -113,12 +117,22 @@ FEX_DEFAULT_VISIBILITY extern void VirtualName(const char* Name, void* Ptr, size
 
 // All commit parameters are ignored here, they are unnecessary as Linux supports overcommit
 
+#ifdef __APPLE__
+// macOS only grants executable anonymous memory to mappings made with MAP_JIT.
+// Writes to such a mapping are then gated per thread by pthread_jit_write_protect_np.
+inline constexpr int ExecutableMapFlags = MAP_JIT;
+#else
+inline constexpr int ExecutableMapFlags = 0;
+#endif
+
 inline void* VirtualAlloc(size_t Size, bool Execute = false, bool Commit = true) {
-  return FEXCore::Allocator::mmap(nullptr, Size, PROT_READ | PROT_WRITE | (Execute ? PROT_EXEC : 0), MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  return FEXCore::Allocator::mmap(nullptr, Size, PROT_READ | PROT_WRITE | (Execute ? PROT_EXEC : 0),
+                                  MAP_PRIVATE | MAP_ANONYMOUS | (Execute ? ExecutableMapFlags : 0), -1, 0);
 }
 
 inline void* VirtualAlloc(void* Base, size_t Size, bool Execute = false, bool Commit = true) {
-  return FEXCore::Allocator::mmap(Base, Size, PROT_READ | PROT_WRITE | (Execute ? PROT_EXEC : 0), MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  return FEXCore::Allocator::mmap(Base, Size, PROT_READ | PROT_WRITE | (Execute ? PROT_EXEC : 0),
+                                  MAP_PRIVATE | MAP_ANONYMOUS | (Execute ? ExecutableMapFlags : 0), -1, 0);
 }
 
 inline void VirtualFree(void* Ptr, size_t Size) {
@@ -143,7 +157,14 @@ inline bool VirtualProtect(void* Ptr, size_t Size, ProtectOptions options) {
 }
 
 inline void VirtualTHPControl(const void* Ptr, size_t Size, THPControl Control) {
+#ifdef __APPLE__
+  // macOS has no transparent huge page hint. This is a performance hint only.
+  (void)Ptr;
+  (void)Size;
+  (void)Control;
+#else
   ::madvise(const_cast<void*>(Ptr), Size, Control == THPControl::Enable ? MADV_HUGEPAGE : MADV_NOHUGEPAGE);
+#endif
 }
 
 #endif

@@ -2,8 +2,18 @@
 #pragma once
 
 #ifndef _WIN32
-
+#ifdef __APPLE__
+// macOS has no prctl(). Every use in FEX is an optional Linux feature (naming
+// mappings, hardening queries, the hardware memory-model switch), so report
+// "not supported" exactly as Linux does for an unknown option.
+#include <cerrno>
+inline int prctl(int, ...) {
+  errno = ENOSYS;
+  return -1;
+}
+#else
 #include <sys/prctl.h>
+#endif
 
 #ifndef PR_SET_VMA
 #define PR_SET_VMA 0x53564d41
