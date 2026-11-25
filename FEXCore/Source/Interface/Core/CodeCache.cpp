@@ -943,7 +943,15 @@ void CodeCache::FinalizeCodePages(MappedCodeCacheFile& Code, std::span<std::byte
 
   FEXCORE_PROFILE_SCOPED("FinalizeCodePages");
 
-#ifndef _WIN32
+#if defined(__APPLE__)
+  // Not implemented on macOS yet. Linux publishes finalized code by remapping a
+  // staging buffer over the code buffer with mremap, which macOS does not have,
+  // and macOS will not remap executable MAP_JIT memory at all. The macOS path
+  // needs its own design, so stop here instead of running unfinalized code.
+  (void)StartOffset;
+  (void)Size;
+  ERROR_AND_DIE_FMT("{}: loading code from the on-disk code cache is not implemented on macOS", __FUNCTION__);
+#elif !defined(_WIN32)
   // Atomicity is critical when making the finalized code data visible.
   // We ensure this by remapping a temporary buffer onto the PROT_NONE
   // placeholder page in CodeBuffer. Some constraints to keep in mind are:

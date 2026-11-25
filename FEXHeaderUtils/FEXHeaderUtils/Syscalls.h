@@ -14,6 +14,7 @@
 #endif
 #ifdef __APPLE__
 #include <pthread.h>
+#include <stdlib.h>
 #endif
 #include <sys/stat.h>
 #include <unistd.h>
@@ -98,6 +99,12 @@ inline int32_t renameat2(int olddirfd, const char* oldpath, int newdirfd, const 
 inline int32_t pidfd_open(pid_t pid, unsigned int flags) {
   ERROR_AND_DIE_FMT("Unsupported");
   return -1;
+}
+
+inline ssize_t getrandom(void* buf, size_t buflen, unsigned int flags) {
+  // macOS's own generator. It needs no seeding and cannot fail.
+  ::arc4random_buf(buf, buflen);
+  return static_cast<ssize_t>(buflen);
 }
 #elif !defined(_WIN32)
 inline int32_t getcpu(uint32_t* cpu, uint32_t* node) {

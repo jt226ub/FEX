@@ -32,6 +32,55 @@ static inline bool unlinkat(int fd, const char* path, bool dir) {
   return true;
 }
 
+#ifdef __APPLE__
+// macOS has no getdents64. Its public directory API is fdopendir and readdir.
+static bool RecursiveRemoveDirectory(int parent_fd, const char* Directory) {
+  // Don't follow symlinks and ensure it closes on exec.
+  constexpr int DIR_FLAGS = O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC;
+  int dir_fd = ::openat(parent_fd, Directory, DIR_FLAGS);
+  if (dir_fd == -1) {
+    // A missing directory means something else removed it first.
+    return errno == ENOENT;
+  }
+
+  // fdopendir takes ownership of dir_fd, and closedir closes it.
+  DIR* dir = ::fdopendir(dir_fd);
+  if (!dir) {
+    close(dir_fd);
+    return false;
+  }
+
+  bool Result = true;
+  while (true) {
+    errno = 0;
+    const struct dirent* entry = ::readdir(dir);
+    if (!entry) {
+      Result = errno == 0;
+      break;
+    }
+
+    std::string_view path_name_view = entry->d_name;
+    if (path_name_view == "." || path_name_view == "..") {
+      continue;
+    }
+
+    const bool is_dir = entry->d_type == DT_DIR;
+    if (is_dir && !RecursiveRemoveDirectory(dir_fd, entry->d_name)) {
+      Result = false;
+      break;
+    }
+
+    if (!unlinkat(dir_fd, entry->d_name, is_dir)) {
+      LogMan::Msg::IFmt("Failed to remove file: {}", path_name_view);
+      Result = false;
+      break;
+    }
+  }
+
+  ::closedir(dir);
+  return Result;
+}
+#else
 static bool RecursiveRemoveDirectory(int parent_fd, const char* Directory) {
   // Don't follow symlinks and ensure it closes on exec.
   constexpr int DIR_FLAGS = O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC;
@@ -124,11 +173,40 @@ end:
   close(dir_fd);
   return Result;
 }
+#endif
 
 FEX_DEFAULT_VISIBILITY bool RecursiveRemoveDirectory(const fextl::string& Directory) {
   return RecursiveRemoveDirectory(AT_FDCWD, Directory.c_str()) && unlinkat(AT_FDCWD, Directory.c_str(), true);
 }
 
+#ifdef __APPLE__
+FEX_DEFAULT_VISIBILITY void WalkDirectory(std::string_view Directory,
+                                          fextl::move_only_function<void(std::string_view name, bool is_dir, const void* user_data)> Callback,
+                                          const void* user_data) {
+  constexpr int DIR_FLAGS = O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC;
+  int dir_fd = ::openat(AT_FDCWD, fextl::string(Directory).c_str(), DIR_FLAGS);
+  if (dir_fd == -1) {
+    return;
+  }
+
+  // fdopendir takes ownership of dir_fd, and closedir closes it.
+  DIR* dir = ::fdopendir(dir_fd);
+  if (!dir) {
+    close(dir_fd);
+    return;
+  }
+
+  while (const struct dirent* entry = ::readdir(dir)) {
+    std::string_view path_name_view = entry->d_name;
+    if (path_name_view == "." || path_name_view == "..") {
+      continue;
+    }
+    Callback(path_name_view, entry->d_type == DT_DIR, user_data);
+  }
+
+  ::closedir(dir);
+}
+#else
 FEX_DEFAULT_VISIBILITY void WalkDirectory(std::string_view Directory,
                                           fextl::move_only_function<void(std::string_view name, bool is_dir, const void* user_data)> Callback,
                                           const void* user_data) {
@@ -200,6 +278,7 @@ end:
 
   close(dir_fd);
 }
+#endif
 
 #else
 static inline std::optional<UNICODE_STRING> PathToNTPath(std::string_view Path) {

@@ -337,10 +337,15 @@ fextl::vector<MemoryRegion> StealMemoryRegion(uintptr_t Begin, uintptr_t End) {
     if (SupportsDontDump) {
       // Mark these regions as don't dump so that coredump doesn't try dumping large unmapped regions.
       // Ideally coredump would be smart enough to only dump resident pages, but here we are.
+#ifdef MADV_DONTDUMP
       auto Result = madvise(RegionIt->Ptr, RegionIt->Size, MADV_DONTDUMP);
       if (Result == -1) {
         SupportsDontDump = false;
       }
+#else
+      // No equivalent on this host (macOS). The hint only affects core dumps.
+      SupportsDontDump = false;
+#endif
     }
 
     LogMan::Throw::AFmt(Alloc != MAP_FAILED, "StealMemoryRegion: mmap({}, {:x}) failed: {}", fmt::ptr(RegionIt->Ptr), RegionIt->Size, errno);
