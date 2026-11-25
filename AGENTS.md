@@ -1,1 +1,4 @@
-AI must not be used to generate code for contributions to this project.
+See [CLAUDE.md](CLAUDE.md). The same rules apply to every agent.
+
+In short: AI-assisted code is allowed here, this is an independent macOS port, and nothing
+from this repository may ever be submitted to FEX-Emu/FEX.
