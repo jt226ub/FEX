@@ -1,0 +1,92 @@
+name: macOS core build
+
+# Builds the translator core on Apple silicon. Until the port is complete this
+# job is expected to fail at compile time: its error list is the work list.
+
+on:
+  push:
+    branches:
+      - 'macos/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-core-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+
+      - name: Fetch the third-party code the core needs
+        run: |
+          git submodule update --init --depth 1 \
+            Source/Common/cpp-optparse \
+            External/fmt \
+            External/xxhash \
+            External/rpmalloc \
+            External/range-v3 \
+            External/unordered_dense
+
+      - name: Host details
+        run: |
+          uname -a
+          sw_vers
+          sysctl -n machdep.cpu.brand_string
+          sysctl -n hw.pagesize
+          clang --version
+          cmake --version
+
+      - name: Install Ninja
+        run: brew install ninja
+
+      - name: Configure
+        run: |
+          cmake -G Ninja -S . -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_TESTING=OFF \
+            -DENABLE_LTO=OFF \
+            -DENABLE_CCACHE=OFF
+
+      - name: Build
+        run: |
+          set -o pipefail
+          ninja -C build -k 0 FEXCore Common CommonTools 2>&1 | tee build.log
+
+      - name: Summarise errors
+        if: always()
+        run: |
+          {
+            echo "## macOS core build"
+            if [ -f build.log ]; then
+              echo
+              echo "Errors: $(grep -c ' error: ' build.log || true)"
+              echo
+              echo "### Files with errors"
+              echo '```'
+              grep ' error: ' build.log | sed -E 's/:[0-9]+:[0-9]+: error:.*//' | sort | uniq -c | sort -rn | head -60
+              echo '```'
+              echo "### Most common messages"
+              echo '```'
+              grep ' error: ' build.log | sed -E 's/^.*: error: //' | sort | uniq -c | sort -rn | head -40
+              echo '```'
+            else
+              echo "No build log: configure failed."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: macos-core-build-log
+          path: |
+            build.log
+            build/CMakeFiles/CMakeConfigureLog.yaml
+          if-no-files-found: ignore
