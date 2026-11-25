@@ -12,8 +12,14 @@ set(SRCS
 
 if (NOT MINGW)
   list(APPEND SRCS
+    FileFormatCheck.cpp)
+endif()
+
+if (NOT MINGW AND NOT APPLE)
+  # Linux only: the FEXServer client, sbrk tracking and kernel version checks.
+  # Nothing in the macOS core-only build uses them.
+  list(APPEND SRCS
     FEXServerClient.cpp
-    FileFormatCheck.cpp
     Linux/SBRKAllocations.cpp
     Linux/LinuxVersion.cpp)
 endif()

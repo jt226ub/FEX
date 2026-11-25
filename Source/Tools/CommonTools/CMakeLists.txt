@@ -1,6 +1,7 @@
 set(SRCS DummyHandlers.cpp)
 
-if (NOT MINGW)
+if (NOT MINGW AND NOT APPLE)
+  # Parses Linux ELF files through <elf.h>, which macOS does not ship.
   list(APPEND SRCS Linux/Utils/ELFContainer.cpp)
 endif()
 

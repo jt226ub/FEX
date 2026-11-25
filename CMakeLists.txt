@@ -10,6 +10,7 @@ option(BUILD_THUNKS "Build thunks" FALSE)
 option(ENABLE_CLANG_THUNKS "Build thunks with clang" TRUE)
 
 option(BUILD_FEXCONFIG "Build FEXConfig" TRUE)
+option(BUILD_FEXCORE_ONLY "Build only FEXCore and the libraries it needs (always on for macOS)" FALSE)
 option(ENABLE_IWYU "Enable the Include What You Use sanitizer" FALSE)
 option(ENABLE_LTO "Enable LTO with compilation" TRUE)
 option(ENABLE_COVERAGE "Enable Code Coverage" FALSE)
@@ -90,10 +91,21 @@ if (NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
   message(FATAL_ERROR "Unsupported pointer size ${CMAKE_SIZEOF_VOID_P}."
     " FEX only supports 64-bit (8-byte pointer) systems."
     " If you believe this is in error, file an issue.")
-elseif (NOT (WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Linux"))
+elseif (NOT (WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Linux" OR CMAKE_SYSTEM_NAME STREQUAL "Darwin"))
   message(FATAL_ERROR "Unsupported system type ${CMAKE_SYSTEM_NAME}."
-    " FEX only supports Linux and Windows."
+    " FEX only supports Linux, Windows and (in this port) macOS."
     " If you believe this is in error, file an issue.")
+endif()
+
+if (APPLE)
+  # macOS port: only the translator core is built. FEX's Linux process loader,
+  # syscall emulation, FEXServer and thunks have no macOS counterpart.
+  if (NOT BUILD_FEXCORE_ONLY)
+    message(STATUS "macOS: forcing BUILD_FEXCORE_ONLY=ON")
+    set(BUILD_FEXCORE_ONLY ON CACHE BOOL "Build only FEXCore and the libraries it needs" FORCE)
+  endif()
+  # This allocator hooks glibc, which macOS does not have.
+  set(ENABLE_JEMALLOC_GLIBC_ALLOC FALSE)
 endif()
 
 ## Compiler Checks ##
@@ -116,7 +128,11 @@ else ()
 endif()
 
 ## Architecture Handling ##
-string(TOLOWER ${CMAKE_SYSTEM_PROCESSOR} processor)
+if (NOT CMAKE_SYSTEM_PROCESSOR AND CMAKE_OSX_ARCHITECTURES)
+  # Xcode-style configures can leave the processor unset.
+  set(CMAKE_SYSTEM_PROCESSOR "${CMAKE_OSX_ARCHITECTURES}")
+endif()
+string(TOLOWER "${CMAKE_SYSTEM_PROCESSOR}" processor)
 if (processor MATCHES "x86|amd64")
   option(ENABLE_X86_HOST_DEBUG "Enables compiling on x86_64 host" FALSE)
   if (NOT ENABLE_X86_HOST_DEBUG)
@@ -710,6 +726,14 @@ add_subdirectory(External/cephes/)
 add_subdirectory(FEXHeaderUtils/)
 add_subdirectory(CodeEmitter/)
 add_subdirectory(FEXCore/)
+
+if (BUILD_FEXCORE_ONLY)
+  # Stop before the Linux front end. Common and CommonTools hold the config and
+  # host-feature code an embedder needs alongside FEXCore.
+  add_subdirectory(Source/Common/)
+  add_subdirectory(Source/Tools/CommonTools/)
+  return()
+endif()
 
 if (ARCHITECTURE_arm64 AND NOT MINGW AND NOT BUILD_STEAM_SUPPORT)
   # Binfmt_misc files must be installed prior to Source/ installs
