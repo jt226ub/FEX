@@ -289,8 +289,10 @@ function(AddLibrary Name Type)
   set_target_properties(${Name} PROPERTIES OUTPUT_NAME FEXCore)
 
   # During generation of the import library (dll.a), MinGW needs some extra
-  # symbols from libraries such as fmt, which are propagated by FEXCore_Base
-  if (MINGW)
+  # symbols from libraries such as fmt, which are propagated by FEXCore_Base.
+  # macOS is the same: a dylib must resolve every symbol when it is linked,
+  # where a Linux shared object may leave them for the final program.
+  if (MINGW OR APPLE)
     target_link_libraries(${Name} PRIVATE FEXCore_Base)
   endif()
   AddDefaultOptionsToTarget(${Name})
