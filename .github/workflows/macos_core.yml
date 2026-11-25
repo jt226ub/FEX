@@ -1,7 +1,7 @@
 name: macOS core build
 
-# Builds the translator core on Apple silicon. Until the port is complete this
-# job is expected to fail at compile time: its error list is the work list.
+# Builds the translator core on Apple silicon, including the shared library so
+# that every symbol the core needs is checked at link time.
 
 on:
   push:
@@ -58,7 +58,16 @@ jobs:
       - name: Build
         run: |
           set -o pipefail
-          ninja -C build -k 0 FEXCore Common CommonTools 2>&1 | tee build.log
+          ninja -C build -k 0 FEXCore FEXCore_shared Common CommonTools 2>&1 | tee build.log
+
+      - name: Inspect what was built
+        run: |
+          find build -name 'libFEXCore*' -o -name 'libCommon*.a' | sort | while read -r f; do
+            ls -l "$f"
+            file "$f" | cut -c1-160
+          done
+          echo "--- shared library dependencies"
+          otool -L "$(find build -name 'libFEXCore*.dylib' | head -1)"
 
       - name: Summarise errors
         if: always()
