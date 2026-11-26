@@ -13,6 +13,7 @@
 #include "Common/Config.h"
 #include "Common/HostFeatures.h"
 #include "Common/X86Features.h"
+#include "CoreThreadSetup.h"
 #include "DummyHandlers.h"
 #include "HarnessHelpers.h"
 #include "MacOSHostFaults.h"
@@ -293,7 +294,12 @@ int main(int argc, char** argv, char** const envp) {
     return ExitFail;
   }
 
-  FEXCore::Core::CPUState::gdt_segment GDT[32] {};
+  if (!FEX::CoreThreadSetup::AllocateCallRetStack(Thread)) {
+    fextl::fmt::print("Could not allocate the call and return stack\n");
+    return ExitFail;
+  }
+
+  auto* GDT = FEX::CoreThreadSetup::FullDescriptorTable();
   {
     auto Frame = Thread->CurrentFrame;
     Frame->State.segment_arrays[FEXCore::Core::CPUState::SEGMENT_ARRAY_INDEX_GDT] = &GDT[0];

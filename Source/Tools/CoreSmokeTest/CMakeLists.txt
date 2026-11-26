@@ -2,5 +2,6 @@
 add_executable(FEXCoreSmokeTest Main.cpp)
 target_include_directories(FEXCoreSmokeTest PRIVATE
   ${CMAKE_BINARY_DIR}/generated
-  ${CMAKE_SOURCE_DIR}/Source)
+  ${CMAKE_SOURCE_DIR}/Source
+  ${CMAKE_SOURCE_DIR}/Source/Tools/CommonTools)
 target_link_libraries(FEXCoreSmokeTest PRIVATE FEXCore Common CommonTools JemallocLibs Threads::Threads)

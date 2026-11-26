@@ -14,6 +14,7 @@
 // core. It exits from inside the system call handler.
 
 #include "Common/HostFeatures.h"
+#include "CoreThreadSetup.h"
 #include "DummyHandlers.h"
 
 #include <FEXCore/Config/Config.h>
@@ -142,7 +143,11 @@ int main() {
 
   auto Thread = CTX->CreateThread();
 
-  FEXCore::Core::CPUState::gdt_segment GDT[32] {};
+  if (!FEX::CoreThreadSetup::AllocateCallRetStack(Thread)) {
+    fprintf(stderr, "FAIL: could not allocate the call and return stack\n");
+    return 1;
+  }
+  auto* GDT = FEX::CoreThreadSetup::FullDescriptorTable();
   {
     auto Frame = Thread->CurrentFrame;
     Frame->State.segment_arrays[FEXCore::Core::CPUState::SEGMENT_ARRAY_INDEX_GDT] = &GDT[0];
