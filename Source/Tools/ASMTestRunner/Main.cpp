@@ -15,6 +15,7 @@
 #include "Common/X86Features.h"
 #include "DummyHandlers.h"
 #include "HarnessHelpers.h"
+#include "MacOSHostFaults.h"
 
 #include <FEXCore/Config/Config.h>
 #include <FEXCore/Core/Context.h>
@@ -308,6 +309,11 @@ int main(int argc, char** argv, char** const envp) {
     Frame->Pointers.SynchronousExceptionHandler = reinterpret_cast<uintptr_t>(&SynchronousExceptionHandler);
     Frame->State.rip = Loader.DefaultRIP();
   }
+
+#if defined(__APPLE__) && defined(__aarch64__)
+  FEX::MacOSHostFaults::Install();
+  FEX::MacOSHostFaults::CurrentThread = Thread;
+#endif
 
   if (!setjmp(LongJump)) {
     CTX->ExecuteThread(Thread);

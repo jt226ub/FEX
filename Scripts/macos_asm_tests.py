@@ -34,7 +34,9 @@ SKIP_CODE = 125
 # moved and is reported as skipped.
 LOW_MEMORY_RELOCATION = 0x10000000000 if sys.platform == "darwin" else 0
 FOUR_GB = 0x100000000
-DEFAULT_LOW_RANGES = [(0xE0000000, 0xE0100000), (0xE7FF0000, 0xE8010000)]
+# The scratch areas the loader always maps, with a margin below each because tests that
+# walk downwards name addresses just under them.
+DEFAULT_LOW_RANGES = [(0xDFF00000, 0xE0100000), (0xE7F00000, 0xE8010000)]
 HEX_LITERAL = re.compile(r"0x[0-9a-fA-F_]+")
 REGION_KEY = re.compile(r'"(0x[0-9a-fA-F_]+)"\s*:\s*"(0x[0-9a-fA-F]+|[0-9]+)"')
 
