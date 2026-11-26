@@ -8,8 +8,9 @@ in the same change that closes or opens a gap.
 - **Builds and links on Apple silicon.** `libFEXCore.a`, `libFEXCore.dylib`, `libCommon.a`
   and `libCommonTools.a` build with no errors or warnings on macOS 26 with Apple clang.
   The dylib is arm64 and depends only on `libSystem` and `libc++`.
-- **Has never been run.** No guest code has been translated or executed on macOS by this
-  port. Building is the only thing verified so far.
+- **Runs a first x86-64 program.** A smoke test translates and runs a short loop on the
+  hosted Apple silicon runner (macOS 26, virtual M1) and gets the right answer. Nothing
+  larger has run, and nothing has run on a physical Mac.
 - **Linux is unaffected.** The core-only Linux build passes with the same changes.
 
 Only the translator core is built on macOS. FEX's Linux process loader, syscall emulation,
@@ -28,24 +29,48 @@ FEXServer and thunks are not part of this port.
 | Linker options | `-dead_strip`, `-x`, `-dead_strip_dylibs` |
 | CPU tuning | `-mcpu=apple-m1` baseline |
 
-## Known gaps before it can run
+## Runtime fixes and what is still unproven
 
-These are expected to fail at run time. They are listed in the order they will be hit.
+Fixed in code on `macos/runtime-fixes`:
 
-1. **Writing translated code.** Mappings are made with `MAP_JIT`, but nothing yet calls
-   `pthread_jit_write_protect_np` around code emission, block linking or self-modifying
-   code invalidation. The first write to code memory will fault.
-2. **Reserved register.** macOS reserves `x18`. The register allocation has not been
-   checked or changed to avoid it.
-3. **Page size.** Host pages are 16K on Apple silicon. Call sites that assume the host
-   page size equals the 4K guest page size have not been audited.
-4. **Fault context.** macOS lays out `ucontext_t` and `mcontext_t` differently from Linux.
-   The signal-handling paths compile but have not been reviewed.
-5. **Instruction cache flush.** Not checked against `sys_icache_invalidate`.
-6. **`VirtualDontNeed`.** `MADV_DONTNEED` does not guarantee zeroed pages on macOS as it
+1. **Writing translated code.** `FEXCore::Allocator::ScopedJITWrite` wraps
+   `pthread_jit_write_protect_np`. It surrounds the dispatcher emit, the copy of compiled
+   blocks into the code buffer, block linking and unlinking, cached-code loading and the
+   fault-time patching of memory accesses.
+2. **Reserved register.** `x18` is removed from the register allocation and from the
+   dynamic save lists on macOS.
+3. **Fault page.** The per-thread interrupt fault page and the thread state are aligned to
+   the 16K host page.
+4. **Code-buffer guard page.** Skipped on macOS, because `mprotect` cannot change a page
+   inside a `MAP_JIT` mapping. Without this the core logs
+   `Failed to mprotect last page of code buffer`.
+5. **Host feature detection.** The Linux kernel version check is kept out of the Mac build.
+
+Checked and found not to need a change:
+
+- **Instruction cache flush.** Already uses `__builtin___clear_cache`, which calls
+  `sys_icache_invalidate` on macOS.
+- **Fault context.** The core does not read `ucontext_t` itself. Whatever embeds the core
+  supplies that, so the macOS layout is the embedder's job.
+
+Still unproven:
+
+1. **The fixes above on real hardware.** The smoke test passes on the hosted Apple silicon
+   runner with and without fixes 1 to 3, in both an ordinary and a hardened-runtime build.
+   So that runner does not show that they are needed. It is a virtual machine and may not
+   enforce per-thread write protection. Both branches need running on a physical Mac.
+2. **`x18` under load.** Corruption would only show after a context switch, which the
+   short smoke test does not provoke.
+3. **Faulting paths.** Nothing that takes a fault has run: memory-access patching,
+   self-modifying code, the interrupt fault page. These need a signal handler in the
+   embedder.
+4. **`dc cvau` from user space.** Used on some paths; not confirmed to be allowed on macOS.
+5. **`VirtualDontNeed`.** `MADV_DONTNEED` does not guarantee zeroed pages on macOS as it
    does on Linux.
-7. **Region reservation in `Allocator.cpp`.** Uses `MAP_FIXED_NOREPLACE`, which macOS does
-   not have; the fallback value defined for it is a Linux number.
+6. **Region reservation in `Allocator.cpp`.** Uses `MAP_FIXED_NOREPLACE`, which macOS does
+   not have; the fallback value defined for it is a Linux number. Not reached by the
+   smoke test.
+7. **More than one thread.** Not tested.
 
 ## Not implemented, by decision or for lack of a macOS method
 
@@ -68,5 +93,17 @@ at upstream and are being ported by hand, macOS only.
 
 ## Tests
 
-None run on macOS yet. The two test programs that proved the earlier port live in the
-Bachata-S4 project and have not been brought over.
+`FEXCoreSmokeTest` (`Source/Tools/CoreSmokeTest`) translates and runs a 23-byte x86-64
+program: a loop that sums 1 to 100, then a system call carrying the sum. It passes when the
+handler sees system call 60, argument 5050, and the address after `syscall` in `rcx`.
+Multiblock is off so the loop branch goes through the block linker.
+
+The Mac workflow builds it and runs it twice: once as built, and once signed for the
+hardened runtime with only `com.apple.security.cs.allow-jit`
+(`Data/macOS/jit.entitlements`).
+
+`macos/core-port-smoke` is `macos/core-port` plus the test, kept only so the two can be
+compared on a physical Mac.
+
+The two test programs that proved the earlier port live in the Bachata-S4 project and have
+not been brought over.
