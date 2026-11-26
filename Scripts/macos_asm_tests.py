@@ -15,6 +15,7 @@ the list can be trimmed.
 import argparse
 import concurrent.futures
 import os
+import re
 import subprocess
 import sys
 
@@ -25,6 +26,45 @@ MODES = {
 }
 COMMON_ENV = {"FEX_SILENTLOG": "0", "FEX_DUMPGPRS": "1", "FEX_TSOENABLED": "0"}
 SKIP_CODE = 125
+
+# macOS on Apple silicon reserves the first 4GB of every 64-bit process, so guest memory
+# cannot live there. The tests use fixed scratch addresses below 4GB. On macOS each test
+# is rewritten so those addresses move up by this amount, matching LowMemoryRelocation in
+# HarnessHelpers.h. A test that uses such an address through a 32-bit operand cannot be
+# moved and is reported as skipped.
+LOW_MEMORY_RELOCATION = 0x1000000000 if sys.platform == "darwin" else 0
+FOUR_GB = 0x100000000
+DEFAULT_LOW_RANGES = [(0xE0000000, 0xE0100000), (0xE7FF0000, 0xE8010000)]
+HEX_LITERAL = re.compile(r"0x[0-9a-fA-F_]+")
+REGION_KEY = re.compile(r'"(0x[0-9a-fA-F_]+)"\s*:\s*"(0x[0-9a-fA-F]+|[0-9]+)"')
+
+
+def relocate_low_memory(text):
+    """Moves every hex constant that names low guest memory up by the relocation."""
+    if not LOW_MEMORY_RELOCATION:
+        return text
+    ranges = list(DEFAULT_LOW_RANGES)
+    header = text.split("%ifdef CONFIG", 1)
+    if len(header) > 1 and '"MemoryRegions"' in header[1]:
+        block = header[1].split('"MemoryRegions"', 1)[1].split("}", 1)[0]
+        for key, size in REGION_KEY.findall(block):
+            start = int(key.replace("_", ""), 16)
+            length = int(size, 0)
+            # Also covers the few gigabytes just above 4GB, where macOS loads the program.
+            if start < LOW_MEMORY_RELOCATION:
+                ranges.append((start, start + max(length, 0x4000)))
+
+    def move(match):
+        literal = match.group(0)
+        try:
+            value = int(literal.replace("_", ""), 16)
+        except ValueError:
+            return literal
+        if any(low <= value < high for low, high in ranges):
+            return hex(value + LOW_MEMORY_RELOCATION)
+        return literal
+
+    return HEX_LITERAL.sub(move, text)
 
 
 def read_list(path):
@@ -46,15 +86,24 @@ def prepare(root, asm_dir, source, out_dir):
     tmp, binary, config = base + "_TMP.asm", base + ".bin", base + ".config.bin"
     with open(source) as handle:
         text = handle.read()
+    relocated = relocate_low_memory(text)
     with open(tmp, "w") as handle:
-        handle.write("BITS 64\n" + text + "\nret\n")
+        handle.write("BITS 64\n" + relocated + "\nret\n")
+    config_source = source
+    if relocated != text:
+        config_source = base + "_RELOCATED.asm"
+        with open(config_source, "w") as handle:
+            handle.write(relocated)
+    # A moved address that no longer fits its operand must stop the build, not be cut short.
     result = subprocess.run(
-        ["nasm", "-i", os.path.join(asm_dir, "Includes") + "/", "-i", os.path.dirname(source) + "/", tmp, "-o", binary],
+        ["nasm", "-w+error=number-overflow", "-i", os.path.join(asm_dir, "Includes") + "/", "-i", os.path.dirname(source) + "/", tmp, "-o", binary],
         capture_output=True, text=True)
     if result.returncode != 0:
-        return "nasm: " + result.stderr.strip().splitlines()[-1][:200] if result.stderr.strip() else "nasm failed"
+        if relocated != text and "overflow" in result.stderr:
+            return "lowmem"
+        return "nasm: " + (result.stderr.strip().splitlines()[-1][:200] if result.stderr.strip() else "nasm failed")
     result = subprocess.run(
-        [sys.executable, os.path.join(root, "Scripts", "json_asm_config_parse.py"), source, config],
+        [sys.executable, os.path.join(root, "Scripts", "json_asm_config_parse.py"), config_source, config],
         capture_output=True, text=True)
     if result.returncode != 0 or not os.path.exists(config):
         return "config: " + (result.stderr.strip().splitlines()[-1][:200] if result.stderr.strip() else "no config written")
@@ -115,6 +164,7 @@ def main():
 
     tests = []
     prepare_errors = []
+    low_memory = []
     for source in sources:
         name = "Test_" + os.path.relpath(source, asm_dir)
         if args.filter and args.filter not in name:
@@ -122,6 +172,9 @@ def main():
         if name in disabled:
             continue
         prepared = prepare(root, asm_dir, source, args.out)
+        if prepared == "lowmem":
+            low_memory.append(name)
+            continue
         if isinstance(prepared, str):
             prepare_errors.append((name, prepared))
             continue
@@ -144,6 +197,9 @@ def main():
 
     print("Tests found: %d   disabled by upstream lists: %d   could not be prepared: %d" %
           (len(sources), len([s for s in sources if "Test_" + os.path.relpath(s, asm_dir) in disabled]), len(prepare_errors)))
+    print("Skipped because they need memory below 4GB through a 32-bit operand: %d" % len(low_memory))
+    with open(os.path.join(args.out, "skipped-low-memory.txt"), "w") as handle:
+        handle.write("\n".join(low_memory) + "\n")
     for name, error in prepare_errors[:20]:
         print("  PREPARE %s: %s" % (name, error))
 

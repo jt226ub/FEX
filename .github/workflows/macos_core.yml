@@ -117,6 +117,18 @@ jobs:
           set -o pipefail
           python3 Scripts/macos_asm_tests.py --runner "$T" --out asm-out 2>&1 | tee asm-tests.log
 
+      - name: Probe the low-memory rule
+        if: always()
+        run: |
+          printf 'int main(void){return 0;}\n' > lowmem.c
+          clang -o lowmem-default lowmem.c
+          clang -o lowmem-pagezero lowmem.c -Wl,-pagezero_size,0x4000
+          clang -o lowmem-imagebase lowmem.c -Wl,-image_base,0x400000000000
+          for t in lowmem-default lowmem-pagezero lowmem-imagebase; do
+            set +e; ./$t; code=$?; set -e
+            echo "$t: exit code $code"
+          done 2>&1 | tee lowmem.log
+
       - name: Probe executable-memory behaviour
         if: always()
         run: |

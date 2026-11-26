@@ -257,10 +257,6 @@ int main(int argc, char** argv, char** const envp) {
   auto DoMmap = [&](uint64_t Address, size_t Size) -> void* {
     return Mapper.Map(Address, Size);
   };
-  // Check the two mappings the loader dereferences without checking, before it does.
-  if (Mapper.Map(0x1'0000, 0x1000) == MAP_FAILED) {
-    return ExitFail;
-  }
   if (!Loader.MapMemory(DoMmap) || Mapper.Failed) {
     fextl::fmt::print("Failed to map the test's memory\n");
     return ExitFail;

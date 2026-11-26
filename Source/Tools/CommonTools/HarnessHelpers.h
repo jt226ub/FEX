@@ -498,14 +498,14 @@ public:
     }
 
     if (LimitedSize) {
-      DoMMap(0xe000'0000, AllocPageSize * 10);
+      DoMMap(0xe000'0000 + LowMemoryRelocation, AllocPageSize * 10);
 
       // SIB8
       // We test [-128, -126] (Bottom)
       // We test [-8, 8] (Middle)
       // We test [120, 127] (Top)
       // Can fit in two pages
-      DoMMap(0xe800'0000 - AllocPageSize, AllocPageSize * 2);
+      DoMMap(0xe800'0000 + LowMemoryRelocation - AllocPageSize, AllocPageSize * 2);
     } else {
       // This is scratch memory location and SIB8 location
       DoMMap(0xe000'0000, 0x1000'0000);
@@ -653,9 +653,18 @@ public:
   }
 
 private:
+#ifdef __APPLE__
+  // macOS on Apple silicon reserves the first 4GB of every 64-bit process and will not
+  // start a program that asks for less. Guest memory therefore cannot be placed below
+  // 4GB. The test loader moves its fixed low addresses up by this amount, and
+  // Scripts/macos_asm_tests.py rewrites the matching constants in each test.
+  constexpr static uint64_t LowMemoryRelocation = 0x10'0000'0000;
+#else
+  constexpr static uint64_t LowMemoryRelocation = 0;
+#endif
   constexpr static uint64_t STACK_OFFSET = 0xc000'0000;
   // Zero is special case to know when we are done
-  uint64_t Code_start_page = 0x1'0000;
+  uint64_t Code_start_page = 0x1'0000 + LowMemoryRelocation;
   uint64_t RIP {};
 
   fextl::vector<char> RawASMFile;
