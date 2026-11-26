@@ -740,6 +740,7 @@ if (BUILD_FEXCORE_ONLY)
   # host-feature code an embedder needs alongside FEXCore.
   add_subdirectory(Source/Common/)
   add_subdirectory(Source/Tools/CommonTools/)
+  add_subdirectory(Source/Tools/CoreSmokeTest/)
   return()
 endif()
 

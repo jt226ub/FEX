@@ -58,7 +58,7 @@ jobs:
       - name: Build
         run: |
           set -o pipefail
-          ninja -C build -k 0 FEXCore FEXCore_shared Common CommonTools 2>&1 | tee build.log
+          ninja -C build -k 0 FEXCore FEXCore_shared Common CommonTools FEXCoreSmokeTest 2>&1 | tee build.log
 
       - name: Inspect what was built
         run: |
@@ -68,6 +68,24 @@ jobs:
           done
           echo "--- shared library dependencies"
           otool -L "$(find build -name 'libFEXCore*.dylib' | head -1)"
+
+      - name: Run the smoke test
+        run: |
+          set -o pipefail
+          T="$(find build -name FEXCoreSmokeTest -type f | head -1)"
+          file "$T"
+          # Allow a core file and print a backtrace if it crashes.
+          ulimit -c unlimited || true
+          set +e
+          "$T" 2>&1 | tee smoke.log
+          code=${PIPESTATUS[0]}
+          set -e
+          echo "smoke test exit code: $code"
+          if [ "$code" -ne 0 ]; then
+            echo "--- lldb backtrace"
+            lldb --batch -o run -o "bt all" -o "register read" -o quit -- "$T" 2>&1 | tail -80 || true
+          fi
+          exit "$code"
 
       - name: Summarise errors
         if: always()
@@ -97,5 +115,6 @@ jobs:
           name: macos-core-build-log
           path: |
             build.log
+            smoke.log
             build/CMakeFiles/CMakeConfigureLog.yaml
           if-no-files-found: ignore
