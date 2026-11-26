@@ -5,12 +5,13 @@ in the same change that closes or opens a gap.
 
 ## Where it stands
 
-- **Builds and links on Apple silicon.** `libFEXCore.a`, `libFEXCore.dylib`, `libCommon.a`
-  and `libCommonTools.a` build with no errors or warnings on macOS 26 with Apple clang.
-  The dylib is arm64 and depends only on `libSystem` and `libc++`.
-- **Runs a first x86-64 program.** A smoke test translates and runs a short loop on the
-  hosted Apple silicon runner (macOS 26, virtual M1) and gets the right answer. Nothing
-  larger has run, and nothing has run on a physical Mac.
+- **Builds and links on Apple silicon.** The core libraries and the test tools build with
+  no errors on macOS 26 with Apple clang. The dylib depends only on `libSystem` and `libc++`.
+- **Passes 2,244 of upstream's 2,291 instruction tests** on GitHub's hosted Apple silicon
+  Mac, in each of upstream's three translator modes. The rest are listed under "Tests".
+- **Runs eight guest threads at once** with correct, separate results.
+- **Nothing has run on a physical Mac.** The hosted Mac is a virtual machine and does not
+  enforce the write protection on translated code that real hardware does.
 - **Linux is unaffected.** The core-only Linux build passes with the same changes.
 
 Only the translator core is built on macOS. FEX's Linux process loader, syscall emulation,
@@ -41,39 +42,54 @@ Fixed in code on `macos/runtime-fixes`:
    dynamic save lists on macOS.
 3. **Fault page.** The per-thread interrupt fault page and the thread state are aligned to
    the 16K host page.
-4. **Code-buffer guard page.** Skipped on macOS, because `mprotect` cannot change a page
-   inside a `MAP_JIT` mapping. Without this the core logs
+4. **Code-buffer guard page.** Skipped on macOS. Without this the core logs
    `Failed to mprotect last page of code buffer`.
 5. **Host feature detection.** The Linux kernel version check is kept out of the Mac build.
+6. **Clearing memory.** `MADV_DONTNEED` does not zero memory on macOS, but the block
+   lookup cache is cleared by relying on that. `VirtualDontNeed` now maps fresh pages
+   over the range on macOS.
+7. **Reserving addresses.** The Linux-only "do not replace" mapping flag is replaced by a
+   hint-and-check, and the address-space size comes from `sysctl`.
+
+Added for embedders (the core expects these from whatever hosts it):
+
+- `Source/Tools/CommonTools/MacOSHostFaults.h`: catches the alignment fault ARM64 raises
+  for a misaligned atomic operation and hands it to the core. 53 instruction tests depend
+  on it.
+- `Source/Tools/CommonTools/CoreThreadSetup.h`: allocates the per-thread call and return
+  stack and a full descriptor table. Every guest `call` and `ret` depends on the first.
+- `docs/macOS-embedding-interface.md` lists every such duty found so far.
 
 Checked and found not to need a change:
 
 - **Instruction cache flush.** Already uses `__builtin___clear_cache`, which calls
   `sys_icache_invalidate` on macOS.
-- **Fault context.** The core does not read `ucontext_t` itself. Whatever embeds the core
-  supplies that, so the macOS layout is the embedder's job.
+- **Fault context.** The core does not read `ucontext_t` itself; the embedder does.
 
-Still unproven:
+Found out about macOS on Apple silicon:
 
-1. **The fixes above on real hardware.** The smoke test passes on the hosted Apple silicon
-   runner with and without fixes 1 to 3, in both an ordinary and a hardened-runtime build.
-   So that runner does not show that they are needed. `JITWriteProbe` confirms why: the
-   runner is a virtual machine, reports `pthread_jit_write_protect_supported_np` as 0, and
-   lets a thread write and run `MAP_JIT` memory in any state. Both branches and the probe
-   need running on a physical Mac.
-2. **`x18` under load.** Corruption would only show after a context switch, which the
-   short smoke test does not provoke.
-3. **Faulting paths.** Nothing that takes a fault has run: memory-access patching,
-   self-modifying code, the interrupt fault page. These need a signal handler in the
-   embedder.
-4. **`dc cvau` from user space.** Allowed on the hosted runner; not yet confirmed on a
-   physical Mac.
-5. **`VirtualDontNeed`.** `MADV_DONTNEED` does not guarantee zeroed pages on macOS as it
-   does on Linux.
-6. **Region reservation in `Allocator.cpp`.** Uses `MAP_FIXED_NOREPLACE`, which macOS does
-   not have; the fallback value defined for it is a Linux number. Not reached by the
-   smoke test.
-7. **More than one thread.** Not tested.
+- **The first 4GB cannot be used.** A 64-bit program that reserves less than 4GB at
+  address zero is killed at launch (`lowmem-pagezero` in the Mac job exits with 137).
+  Guest memory therefore cannot be placed below 4GB.
+- **64GB to 448GB is reserved**, observed as one region on the hosted Mac and believed to
+  be the GPU's.
+- A further region of about 12GB appears at a different address near 32GB in each process.
+  What it is has not been identified.
+
+Still unproven or open:
+
+1. **Write protection on real hardware.** `JITWriteProbe` shows the hosted Mac reports
+   `pthread_jit_write_protect_supported_np` as 0 and lets a thread write and run `MAP_JIT`
+   memory in any state. The smoke test passes there with and without fixes 1 to 3.
+2. **Self-modifying code.** Two instruction tests time out. Detection may rely on a write
+   fault the embedder must catch, which is not done yet.
+3. **The interrupt fault page and guest signals.** Not exercised.
+4. **Code buffer overflow.** One test crashes in multiblock mode, probably because of the
+   skipped guard page (fix 4).
+5. **Two tests not understood**: `Test_TwoByte/0F_02` times out and
+   `Test_VEX/vmovq_vmovd_reg` crashes.
+6. **`dc cvau` from user space.** Allowed on the hosted Mac; not confirmed on hardware.
+7. **Speed.** Nothing has been measured.
 
 ## Not implemented, by decision or for lack of a macOS method
 
@@ -96,17 +112,34 @@ at upstream and are being ported by hand, macOS only.
 
 ## Tests
 
-`FEXCoreSmokeTest` (`Source/Tools/CoreSmokeTest`) translates and runs a 23-byte x86-64
-program: a loop that sums 1 to 100, then a system call carrying the sum. It passes when the
-handler sees system call 60, argument 5050, and the address after `syscall` in `rcx`.
-Multiblock is off so the loop branch goes through the block linker.
+All of these run in the Mac job on every push to a `macos/**` branch.
 
-The Mac workflow builds it and runs it twice: once as built, and once signed for the
-hardened runtime with only `com.apple.security.cs.allow-jit`
-(`Data/macOS/jit.entitlements`).
+| Test | What it does | Hosted Mac result |
+|---|---|---|
+| `FEXCoreSmokeTest` | Translates and runs a 23-byte loop, as built and under the hardened runtime | pass, both |
+| `FEXCoreThreadTest` | Eight host threads share a context, each summing a different count in a long guest loop | pass |
+| `FEXCoreASMTestRunner` with `Scripts/macos_asm_tests.py` | Upstream's 2,291 assembly instruction tests, in three translator modes | 2,244 pass in each mode |
+| `JITWriteProbe` | Reports how the machine treats executable memory | report only |
+| Low-memory probe | Shows that a program with a small page-zero reservation is killed | report only |
 
-`macos/core-port-smoke` is `macos/core-port` plus the test, kept only so the two can be
-compared on a physical Mac.
+The instruction tests, per mode:
 
-The two test programs that proved the earlier port live in the Bachata-S4 project and have
-not been brought over.
+| Outcome | Count |
+|---|---|
+| Pass | 2,244 |
+| Skipped by the runner (host lacks a CPU feature the test needs, or it needs Linux system calls) | 16 |
+| Skipped by upstream's own lists | 6 |
+| Skipped because the test reaches low memory through a 32-bit operand | 5 |
+| Listed in `unittests/ASM/Known_Failures_macOS` | 20 |
+
+`Known_Failures_macOS` separates 15 tests believed to be side effects of moving the tests'
+memory above 4GB from 5 that are not understood and may be faults in the port. The first
+group has not been confirmed test by test.
+
+32-bit guest tests (`unittests/32Bit_ASM`) are not run: they need memory below 4GB.
+
+The instruction tests run with x86 memory-ordering emulation switched off, as upstream
+runs them. That mode is therefore untested here.
+
+`macos/core-port-smoke` is `macos/core-port` plus the smoke test, kept only so the two can
+be compared on a physical Mac.
