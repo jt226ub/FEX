@@ -87,6 +87,29 @@ jobs:
           fi
           exit "$code"
 
+      - name: Run the smoke test under the hardened runtime
+        # A program that ships outside the App Store must use the hardened runtime.
+        # There, code memory must be MAP_JIT and each thread must switch it between
+        # writable and executable, so this run is the one that checks those paths.
+        run: |
+          set -o pipefail
+          T="$(find build -name FEXCoreSmokeTest -type f | head -1)"
+          cp "$T" FEXCoreSmokeTest-hardened
+          codesign --force --sign - --options runtime --entitlements Data/macOS/jit.entitlements FEXCoreSmokeTest-hardened
+          codesign -d --verbose=2 --entitlements - FEXCoreSmokeTest-hardened 2>&1 | grep -E 'flags|allow-jit' || true
+          set +e
+          ./FEXCoreSmokeTest-hardened 2>&1 | tee smoke-hardened.log
+          code=${PIPESTATUS[0]}
+          set -e
+          echo "hardened smoke test exit code: $code"
+          if [ "$code" -ne 0 ]; then
+            ls -t ~/Library/Logs/DiagnosticReports/ 2>/dev/null | head -3 || true
+            sleep 5
+            R="$(ls -t ~/Library/Logs/DiagnosticReports/FEXCoreSmokeTest* 2>/dev/null | head -1)"
+            [ -n "$R" ] && head -c 6000 "$R" || true
+          fi
+          exit "$code"
+
       - name: Summarise errors
         if: always()
         run: |
@@ -116,5 +139,6 @@ jobs:
           path: |
             build.log
             smoke.log
+            smoke-hardened.log
             build/CMakeFiles/CMakeConfigureLog.yaml
           if-no-files-found: ignore
