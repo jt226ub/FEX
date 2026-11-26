@@ -9,4 +9,12 @@ namespace FEXCore::Utils {
 constexpr size_t FEX_PAGE_SIZE = 4096;
 constexpr size_t FEX_PAGE_SHIFT = 12;
 constexpr size_t FEX_PAGE_MASK = ~(FEX_PAGE_SIZE - 1);
+
+// FEX_PAGE_SIZE is the guest's page size. The host's can be larger: Apple silicon
+// uses 16K pages, and memory protection there only works on whole 16K pages.
+#ifdef __APPLE__
+constexpr size_t FEX_HOST_PAGE_SIZE = 16384;
+#else
+constexpr size_t FEX_HOST_PAGE_SIZE = FEX_PAGE_SIZE;
+#endif
 } // namespace FEXCore::Utils

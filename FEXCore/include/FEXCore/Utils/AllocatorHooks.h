@@ -8,6 +8,7 @@
 #include <stdlib.h>
 #ifdef __APPLE__
 #include <malloc/malloc.h>
+#include <pthread.h>
 #else
 #include <malloc.h>
 #endif
@@ -168,6 +169,34 @@ inline void VirtualTHPControl(const void* Ptr, size_t Size, THPControl Control) 
 }
 
 #endif
+
+// Grants the calling thread permission to write to executable memory for the
+// lifetime of the object.
+//
+// macOS keeps MAP_JIT memory either writable or executable for each thread, never
+// both, and pthread_jit_write_protect_np flips between the two. While one of these
+// objects is alive the thread can write translated code but cannot run any, so keep
+// the scope tight around the write and flush the instruction cache after it ends.
+//
+// These must not be nested: the inner object's destructor would end the outer one's
+// write permission. Only a register write is involved, so it is safe in a signal
+// handler. On other hosts code memory is always writable and this does nothing.
+class [[nodiscard]] ScopedJITWrite final {
+public:
+#ifdef __APPLE__
+  ScopedJITWrite() {
+    pthread_jit_write_protect_np(0);
+  }
+  ~ScopedJITWrite() {
+    pthread_jit_write_protect_np(1);
+  }
+#else
+  ScopedJITWrite() {}
+  ~ScopedJITWrite() {}
+#endif
+  ScopedJITWrite(const ScopedJITWrite&) = delete;
+  ScopedJITWrite& operator=(const ScopedJITWrite&) = delete;
+};
 
 // Memory allocation routines to be defined externally.
 // This allows to use jemalloc for emulation while using the normal allocator

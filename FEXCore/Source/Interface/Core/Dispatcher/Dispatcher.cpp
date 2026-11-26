@@ -40,7 +40,16 @@ constexpr size_t MAX_DISPATCHER_CODE_SIZE = FEXCore::Utils::FEX_PAGE_SIZE * 4;
 Dispatcher::Dispatcher(FEXCore::Context::ContextImpl* ctx)
   : Arm64Emitter(ctx, FEXCore::Allocator::VirtualAlloc(MAX_DISPATCHER_CODE_SIZE, true), MAX_DISPATCHER_CODE_SIZE)
   , CTX {ctx} {
-  EmitDispatcher();
+  {
+    // The dispatcher is emitted straight into executable memory.
+    FEXCore::Allocator::ScopedJITWrite JITWrite;
+    EmitDispatcher();
+  }
+#ifdef __APPLE__
+  // EmitDispatcher flushed the instruction cache while this thread still held write
+  // permission. Flush again now that the code is executable.
+  ClearICache(reinterpret_cast<void*>(Start), End - Start);
+#endif
 
   FEXCore::Allocator::VirtualName("FEXMem_Misc", reinterpret_cast<void*>(GetBufferBase()), MAX_DISPATCHER_CODE_SIZE);
 }

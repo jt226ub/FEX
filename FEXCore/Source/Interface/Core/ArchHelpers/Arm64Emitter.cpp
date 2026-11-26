@@ -73,6 +73,22 @@ namespace x64 {
     ARMEmitter::Reg::r8, ARMEmitter::Reg::r16, ARMEmitter::Reg::r17,
   };
 
+#ifdef __APPLE__
+  // Apple reserves x18 as the platform register: the system may overwrite it at
+  // any time, so translated code must never hold a value in it. Leave it out of
+  // every register table on macOS.
+  constexpr std::array<ARMEmitter::Register, 6> RA = {
+    // All these callee saved
+    ARMEmitter::Reg::r20, ARMEmitter::Reg::r21, ARMEmitter::Reg::r22, ARMEmitter::Reg::r23, ARMEmitter::Reg::r24, ARMEmitter::Reg::r30,
+  };
+
+  constexpr unsigned RAPairs = 4;
+
+  // Dynamic GPRs
+  constexpr std::array<ARMEmitter::Register, 1> PreserveAll_Dynamic = {
+    ARMEmitter::Reg::r30,
+  };
+#else
   constexpr std::array<ARMEmitter::Register, 7> RA = {
     // All these callee saved
     ARMEmitter::Reg::r20, ARMEmitter::Reg::r21, ARMEmitter::Reg::r22, ARMEmitter::Reg::r23,
@@ -86,8 +102,9 @@ namespace x64 {
     ARMEmitter::Reg::r18,
     ARMEmitter::Reg::r30,
   };
+#endif
 
-  constexpr std::array<ARMEmitter::Register, 2> NotPreserved_Dynamic = PreserveAll_Dynamic;
+  constexpr auto NotPreserved_Dynamic = PreserveAll_Dynamic;
 
   // All are caller saved
   constexpr std::array<ARMEmitter::VRegister, 16> SRAFPR = {

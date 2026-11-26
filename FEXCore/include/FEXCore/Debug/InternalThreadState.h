@@ -122,7 +122,8 @@ struct alignas(FEXCore::Utils::FEX_PAGE_SIZE) InternalThreadState : public FEXCo
   FEXCore::Core::CpuStateFrame BaseFrameState {};
 
   // Can be reprotected as RO to trigger an interrupt at generated code block entrypoints
-  alignas(FEXCore::Utils::FEX_PAGE_SIZE) uint8_t InterruptFaultPage[FEXCore::Utils::FEX_PAGE_SIZE];
+  // It is reprotected on its own, so it has to be a whole host page, aligned to one.
+  alignas(FEXCore::Utils::FEX_HOST_PAGE_SIZE) uint8_t InterruptFaultPage[FEXCore::Utils::FEX_HOST_PAGE_SIZE];
 };
 static_assert(std::is_standard_layout_v<FEXCore::Core::InternalThreadState>);
 // Maximum unsigned-offset store range for fault page.
