@@ -97,7 +97,10 @@ public:
     ISAR1.SetReg(Get_ISAR1_EL1());
     MMFR0.SetReg(Get_MMFR0_EL1());
     MMFR2.SetReg(Get_MMFR2_EL1());
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(__APPLE__)
+    // Linux kernel version check. macOS never takes this path: it reads features with
+    // sysctl in GetCPUFeaturesFromDarwinSysctl() because these registers cannot be read
+    // from user space there.
     if (FEX::LinuxVersion::CalculateHostKernelVersion() >= FEX::LinuxVersion::KernelVersion(6, 5)) {
       // Only exists in kernel 6.5 and newer.
       MMFR3.SetReg(Get_MMFR3_EL1());
