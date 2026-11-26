@@ -50,10 +50,12 @@ inline void FaultHandler(int Signal, siginfo_t* Info, void* RawContext) {
   const uint64_t PC = State.__pc;
 
   if (Thread && Thread->JITGuardPage) {
-    // The translator counts its inaccessible page in guest pages (4K), but protection is
-    // per host page (16K), so the page that actually faults starts earlier.
-    const uintptr_t GuardEnd = Thread->JITGuardPage + FEXCore::Utils::FEX_PAGE_SIZE;
-    const uintptr_t GuardBegin = GuardEnd - FEXCore::Utils::FEX_HOST_PAGE_SIZE;
+    // JITGuardPage is where the translator stops using the buffer. On macOS the
+    // inaccessible page is a whole host page placed after the buffer, at the next host
+    // page boundary, so the fault can land anywhere from JITGuardPage to the end of it.
+    const uintptr_t HostPage = FEXCore::Utils::FEX_HOST_PAGE_SIZE;
+    const uintptr_t GuardBegin = Thread->JITGuardPage;
+    const uintptr_t GuardEnd = ((Thread->JITGuardPage + FEXCore::Utils::FEX_PAGE_SIZE + HostPage - 1) & ~(HostPage - 1)) + HostPage;
     const auto Address = reinterpret_cast<uintptr_t>(Info->si_addr);
     if (Address >= GuardBegin && Address < GuardEnd) {
       FEXCore::UncheckedLongJump::ManuallyLoadJumpBuf(Thread->RestartJump, Thread->JITGuardOverflowArgument, &State.__x[0],

@@ -25,6 +25,7 @@
 #include <FEXCore/Debug/InternalThreadState.h>
 #include <FEXCore/HLE/SyscallHandler.h>
 #include <FEXCore/Utils/LogManager.h>
+#include <FEXCore/Utils/SignalScopeGuards.h>
 #include <FEXCore/fextl/fmt.h>
 #include <FEXCore/fextl/memory.h>
 #include <FEXCore/fextl/string.h>
@@ -117,6 +118,7 @@ public:
   // changed. Discarding the stale translations is the embedder's job; without it the
   // core finds the same stale block again and never makes progress.
   void InvalidateGuestCodeRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Start, uint64_t Length) override {
+    auto Lock = FEXCore::GuardSignalDeferringSectionWithFallback(Thread->CTX->GetCodeInvalidationMutex(), Thread);
     Thread->CTX->InvalidateCodeBuffersCodeRange(Start, Length);
     Thread->CTX->InvalidateThreadCachedCodeRange(Thread, Start, Length);
   }

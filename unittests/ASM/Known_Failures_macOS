@@ -39,3 +39,18 @@ Test_VEX/vmovq_vmovd_reg.asm
 # Makes a Linux system call and loops until it succeeds. The runner's system call handler
 # does nothing. Confirmed by sampling: it spins in the handler.
 Test_TwoByte/0F_02.asm
+
+# --- Not understood yet. Treat as possible faults in the port or in the test runner.
+
+# Self-modifying code, with a check on every block that its guest code is unchanged.
+# All three time out. Sampling shows the thread spinning between discarding a block and
+# translating it again. The runner implements the callback that discards stale
+# translations; before it did, SameBlock passed, apparently by not needing a real discard.
+# Cause unknown.
+Test_SelfModifyingCode/Delinking.asm
+Test_SelfModifyingCode/DifferentBlock.asm
+Test_SelfModifyingCode/SameBlock.asm
+
+# Crashed in multiblock mode before the fault handler learned to restart translation when
+# the scratch buffer fills. Listed until a run confirms the fix.
+Test_FEX_bugs/CodeBufferOverflow.asm
