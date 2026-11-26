@@ -58,7 +58,7 @@ jobs:
       - name: Build
         run: |
           set -o pipefail
-          ninja -C build -k 0 FEXCore FEXCore_shared Common CommonTools FEXCoreSmokeTest FEXCoreASMTestRunner 2>&1 | tee build.log
+          ninja -C build -k 0 FEXCore FEXCore_shared Common CommonTools FEXCoreSmokeTest FEXCoreASMTestRunner FEXCoreThreadTest 2>&1 | tee build.log
 
       - name: Inspect what was built
         run: |
@@ -109,6 +109,12 @@ jobs:
             [ -n "$R" ] && head -c 6000 "$R" || true
           fi
           exit "$code"
+
+      - name: Run the multi-thread test
+        run: |
+          set -o pipefail
+          T="$(find build -name FEXCoreThreadTest -type f | head -1)"
+          time "$T" 2>&1 | tee thread-test.log
 
       - name: Run the assembly instruction tests
         run: |
@@ -171,6 +177,7 @@ jobs:
             smoke-hardened.log
             probe.log
             asm-tests.log
+            thread-test.log
             asm-out/results.tsv
             probe-hardened.log
             build/CMakeFiles/CMakeConfigureLog.yaml
