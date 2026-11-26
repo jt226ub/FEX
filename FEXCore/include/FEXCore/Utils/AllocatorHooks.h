@@ -8,6 +8,8 @@
 #include <stdlib.h>
 #ifdef __APPLE__
 #include <malloc/malloc.h>
+#include <string.h>
+#include <unistd.h>
 #include <pthread.h>
 #else
 #include <malloc.h>
@@ -140,7 +142,24 @@ inline void VirtualFree(void* Ptr, size_t Size) {
   FEXCore::Allocator::munmap(Ptr, Size);
 }
 inline void VirtualDontNeed(void* Ptr, size_t Size, bool Recommit = true) {
+#ifdef __APPLE__
+  // Callers rely on the range reading as zero afterwards: the block lookup cache and the
+  // call and return stack are cleared this way. On Linux MADV_DONTNEED guarantees that.
+  // On macOS it is only a hint and the old contents stay. Mapping fresh anonymous pages
+  // over the range gives the same result natively: zeroed memory, and the old pages
+  // returned to the system. Every caller on macOS passes private, readable and writable
+  // anonymous memory, which is what the replacement mapping is.
+  const uintptr_t PageMask = static_cast<uintptr_t>(::getpagesize()) - 1;
+  const bool Aligned = (reinterpret_cast<uintptr_t>(Ptr) & PageMask) == 0 && (Size & PageMask) == 0;
+  if (Aligned && ::mmap(Ptr, Size, PROT_READ | PROT_WRITE, MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS, -1, 0) == Ptr) {
+    return;
+  }
+  // A range that does not cover whole host pages cannot be remapped without touching
+  // its neighbours, so clear it in place.
+  ::memset(Ptr, 0, Size);
+#else
   ::madvise(reinterpret_cast<void*>(Ptr), Size, MADV_DONTNEED);
+#endif
 }
 inline bool VirtualProtect(void* Ptr, size_t Size, ProtectOptions options) {
   int prot {PROT_NONE};

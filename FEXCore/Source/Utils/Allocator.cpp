@@ -1,4 +1,7 @@
 // SPDX-License-Identifier: MIT
+#ifdef __APPLE__
+#include <sys/sysctl.h>
+#endif
 #include "Utils/Allocator/HostAllocator.h"
 #include "Utils/Allocator.h"
 #include <FEXCore/Utils/Allocator.h>
@@ -104,12 +107,41 @@ void ClearHooks() {
 }
 #pragma GCC diagnostic pop
 
+// Maps at exactly `Addr`, failing with EEXIST if something is already there.
+static void* MmapNoReplace(void* Addr, size_t Size, int Prot, int Flags) {
+#ifdef __APPLE__
+  // macOS has no flag that refuses to replace an existing mapping. Without MAP_FIXED the
+  // address is a hint, so take what the kernel offers and reject it if it is elsewhere.
+  void* Result = ::mmap(Addr, Size, Prot, Flags, -1, 0);
+  if (Result != MAP_FAILED && Result != Addr) {
+    ::munmap(Result, Size);
+    errno = EEXIST;
+    return MAP_FAILED;
+  }
+  return Result;
+#else
+  return ::mmap(Addr, Size, Prot, Flags | MAP_FIXED_NOREPLACE, -1, 0);
+#endif
+}
+
 FEX_DEFAULT_VISIBILITY size_t GetHostVABits() {
   static uint64_t HostVABits = 0;
 
   if (HostVABits) {
     return HostVABits;
   }
+
+#ifdef __APPLE__
+  // macOS reports the size of the user address space directly.
+  {
+    int Bits = 0;
+    size_t Size = sizeof(Bits);
+    if (::sysctlbyname("machdep.virtual_address_size", &Bits, &Size, nullptr, 0) == 0 && Bits > 0) {
+      HostVABits = static_cast<uint64_t>(Bits);
+      return HostVABits;
+    }
+  }
+#endif
 
   static constexpr std::array<uintptr_t, 7> TLBSizes = {
     57, 52, 48, 47, 42, 39, 36,
@@ -122,7 +154,7 @@ FEX_DEFAULT_VISIBILITY size_t GetHostVABits() {
     // If this succeeds OR the page is reported as already existing,
     // we know we're in valid VA space. Otherwise, we must go lower.
     void* Addr = reinterpret_cast<void*>((1ULL << Bits) - FEXCore::Utils::FEX_PAGE_SIZE);
-    void* Ptr = ::mmap(Addr, FEXCore::Utils::FEX_PAGE_SIZE, PROT_NONE, MAP_FIXED_NOREPLACE | MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    void* Ptr = MmapNoReplace(Addr, FEXCore::Utils::FEX_PAGE_SIZE, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS);
     if (Ptr != (void*)~0ULL) {
       ::munmap(Ptr, FEXCore::Utils::FEX_PAGE_SIZE);
     }
@@ -332,7 +364,7 @@ fextl::vector<MemoryRegion> StealMemoryRegion(uintptr_t Begin, uintptr_t End) {
   // Block remaining memory gaps
   bool SupportsDontDump = true;
   for (auto RegionIt = Regions.begin(); RegionIt != Regions.end(); ++RegionIt) {
-    auto Alloc = ::mmap(RegionIt->Ptr, RegionIt->Size, PROT_NONE, MAP_ANONYMOUS | MAP_NORESERVE | MAP_PRIVATE | MAP_FIXED_NOREPLACE, -1, 0);
+    auto Alloc = MmapNoReplace(RegionIt->Ptr, RegionIt->Size, PROT_NONE, MAP_ANONYMOUS | MAP_NORESERVE | MAP_PRIVATE);
 
     if (SupportsDontDump) {
       // Mark these regions as don't dump so that coredump doesn't try dumping large unmapped regions.
