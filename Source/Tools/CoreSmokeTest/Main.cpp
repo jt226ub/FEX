@@ -36,6 +36,12 @@
 namespace {
 constexpr uint64_t ExpectedSum = 5050;
 
+// Offset of the instruction after `syscall` in GuestProgram. The x86-64 `syscall`
+// instruction stores the address of the next instruction in rcx, so the handler
+// should see this address there.
+constexpr uint64_t OffsetAfterSyscall = 22;
+uint64_t GuestCodeBase {};
+
 // clang-format off
 constexpr uint8_t GuestProgram[] = {
   0x31, 0xC0,                   // xor eax, eax
@@ -66,14 +72,15 @@ public:
   void HandleSyscall(FEXCore::Core::CpuStateFrame* Frame) override {
     const uint64_t Number = Frame->State.gregs[FEXCore::X86State::REG_RAX];
     const uint64_t Argument = Frame->State.gregs[FEXCore::X86State::REG_RDI];
-    const uint64_t Counter = Frame->State.gregs[FEXCore::X86State::REG_RCX];
+    const uint64_t ReturnAddress = Frame->State.gregs[FEXCore::X86State::REG_RCX];
+    const uint64_t ExpectedReturn = GuestCodeBase + OffsetAfterSyscall;
 
-    printf("Guest made system call %llu with argument %llu (loop counter %llu)\n", static_cast<unsigned long long>(Number),
-           static_cast<unsigned long long>(Argument), static_cast<unsigned long long>(Counter));
+    printf("Guest made system call %llu with argument %llu, return address 0x%llx\n", static_cast<unsigned long long>(Number),
+           static_cast<unsigned long long>(Argument), static_cast<unsigned long long>(ReturnAddress));
 
-    const bool Passed = Number == 60 && Argument == ExpectedSum && Counter == 0;
-    printf("%s: expected system call 60 with argument %llu and loop counter 0\n", Passed ? "PASS" : "FAIL",
-           static_cast<unsigned long long>(ExpectedSum));
+    const bool Passed = Number == 60 && Argument == ExpectedSum && ReturnAddress == ExpectedReturn;
+    printf("%s: expected system call 60 with argument %llu, return address 0x%llx\n", Passed ? "PASS" : "FAIL",
+           static_cast<unsigned long long>(ExpectedSum), static_cast<unsigned long long>(ExpectedReturn));
     fflush(stdout);
     _exit(Passed ? 0 : 1);
   }
@@ -109,6 +116,7 @@ int main() {
     return 1;
   }
   memcpy(Code, GuestProgram, sizeof(GuestProgram));
+  GuestCodeBase = reinterpret_cast<uint64_t>(Code);
 
   printf("Host page size: %ld\n", sysconf(_SC_PAGESIZE));
   printf("Creating translator context\n");
