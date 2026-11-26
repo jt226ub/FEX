@@ -30,19 +30,20 @@ Test_FEX_bugs/cmpxchg16b.asm
 Test_FEX_bugs/cmpxchg8b.asm
 Test_FEX_bugs/SIBScaleTranspose.asm
 
-# --- Not understood yet. Treat as possible faults in the port.
-
-# Self-modifying code. Both time out. Detection may depend on a write fault that the
-# embedder must catch and pass to the core, which the macOS fault handler does not do yet.
-Test_SelfModifyingCode/Delinking.asm
-Test_SelfModifyingCode/DifferentBlock.asm
-
-# Times out.
-Test_TwoByte/0F_02.asm
-
-# Crashes with a segmentation fault.
+# Moves an address through a 32-bit vector register move, which cuts it short.
+# Confirmed in a debugger: the faulting access is at the original low address.
 Test_VEX/vmovq_vmovd_reg.asm
 
-# Crashes in the multiblock mode only. The port skips the guard page at the end of the
-# code buffer on macOS, and this test fills the buffer, so the two are probably related.
-Test_FEX_bugs/CodeBufferOverflow.asm
+# --- Needs something the core-only runner does not provide.
+
+# Makes a Linux system call and loops until it succeeds. The runner's system call handler
+# does nothing. Confirmed by sampling: it spins in the handler.
+Test_TwoByte/0F_02.asm
+
+# --- Not understood yet. Treat as possible faults in the port.
+
+# Self-modifying code. Both time out, spinning between removing a block and translating
+# it again (confirmed by sampling), so the check that a block's code is unchanged keeps
+# failing after a fresh translation. Cause unknown.
+Test_SelfModifyingCode/Delinking.asm
+Test_SelfModifyingCode/DifferentBlock.asm

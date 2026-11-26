@@ -12,6 +12,11 @@
 //    address that is not a multiple of the operand size, where x86 allows it. macOS
 //    reports that as SIGBUS with code BUS_ADRALN. The core rewrites the instruction
 //    sequence and execution resumes.
+//  - The translator's scratch buffer filling up. The translator writes each block into a
+//    per-thread scratch buffer that ends in an inaccessible page. Running into that page
+//    is how it learns the buffer was too small: the embedder must resume the thread at
+//    the translator's restart point, which then retries with a larger buffer. macOS
+//    reports the write as SIGBUS (or SIGSEGV for an unmapped address).
 #pragma once
 
 #if defined(__APPLE__) && defined(__aarch64__)
@@ -19,6 +24,8 @@
 #include <FEXCore/Core/Context.h>
 #include <FEXCore/Debug/InternalThreadState.h>
 #include <FEXCore/Utils/ArchHelpers/Arm64.h>
+#include <FEXCore/Utils/LongJump.h>
+#include <FEXCore/Utils/TypeDefines.h>
 
 #include <signal.h>
 #include <sys/ucontext.h>
@@ -27,18 +34,35 @@ namespace FEX::MacOSHostFaults {
 
 inline thread_local FEXCore::Core::InternalThreadState* CurrentThread {};
 inline struct sigaction PreviousBusAction {};
+inline struct sigaction PreviousSegvAction {};
 
-inline void BusHandler(int Signal, siginfo_t* Info, void* RawContext) {
+inline void FaultHandler(int Signal, siginfo_t* Info, void* RawContext) {
   auto* Context = static_cast<ucontext_t*>(RawContext);
   // macOS keeps x0 to x28 in an array followed directly by the frame pointer (x29) and
   // link register (x30), so the array address serves as a pointer to x0 through x30.
   auto& State = Context->uc_mcontext->__ss;
   static_assert(offsetof(__darwin_arm_thread_state64, __fp) == 29 * sizeof(uint64_t));
   static_assert(offsetof(__darwin_arm_thread_state64, __lr) == 30 * sizeof(uint64_t));
+  // The stack pointer follows as entry 31, which the restart below relies on.
+  static_assert(offsetof(__darwin_arm_thread_state64, __sp) == 31 * sizeof(uint64_t));
 
   auto* Thread = CurrentThread;
   const uint64_t PC = State.__pc;
-  if (Thread && Info->si_code == BUS_ADRALN && Thread->CTX->IsAddressInCodeBuffer(Thread, PC)) {
+
+  if (Thread && Thread->JITGuardPage) {
+    // The translator counts its inaccessible page in guest pages (4K), but protection is
+    // per host page (16K), so the page that actually faults starts earlier.
+    const uintptr_t GuardEnd = Thread->JITGuardPage + FEXCore::Utils::FEX_PAGE_SIZE;
+    const uintptr_t GuardBegin = GuardEnd - FEXCore::Utils::FEX_HOST_PAGE_SIZE;
+    const auto Address = reinterpret_cast<uintptr_t>(Info->si_addr);
+    if (Address >= GuardBegin && Address < GuardEnd) {
+      FEXCore::UncheckedLongJump::ManuallyLoadJumpBuf(Thread->RestartJump, Thread->JITGuardOverflowArgument, &State.__x[0],
+                                                      &Context->uc_mcontext->__ns.__v[0], &State.__pc);
+      return;
+    }
+  }
+
+  if (Thread && Signal == SIGBUS && Info->si_code == BUS_ADRALN && Thread->CTX->IsAddressInCodeBuffer(Thread, PC)) {
     const auto Result = FEXCore::ArchHelpers::Arm64::HandleUnalignedAccess(
       Thread, FEXCore::ArchHelpers::Arm64::UnalignedHandlerType::HalfBarrier, PC, &State.__x[0]);
     if (Result.has_value()) {
@@ -49,16 +73,17 @@ inline void BusHandler(int Signal, siginfo_t* Info, void* RawContext) {
 
   // Not ours: put the previous behaviour back and return, so the fault happens again
   // and is reported normally.
-  sigaction(Signal, &PreviousBusAction, nullptr);
+  sigaction(Signal, Signal == SIGBUS ? &PreviousBusAction : &PreviousSegvAction, nullptr);
 }
 
 // Call once per process, and set CurrentThread on each thread that runs guest code.
 inline void Install() {
   struct sigaction Action {};
-  Action.sa_sigaction = BusHandler;
+  Action.sa_sigaction = FaultHandler;
   Action.sa_flags = SA_SIGINFO;
   sigemptyset(&Action.sa_mask);
   sigaction(SIGBUS, &Action, &PreviousBusAction);
+  sigaction(SIGSEGV, &Action, &PreviousSegvAction);
 }
 
 } // namespace FEX::MacOSHostFaults
