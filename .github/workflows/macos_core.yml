@@ -110,6 +110,16 @@ jobs:
           fi
           exit "$code"
 
+      - name: Probe executable-memory behaviour
+        if: always()
+        run: |
+          clang -O1 -o JITWriteProbe Source/Tools/JITWriteProbe/Main.c
+          echo "=== probe: as built"
+          ./JITWriteProbe 2>&1 | tee probe.log
+          codesign --force --sign - --options runtime --entitlements Data/macOS/jit.entitlements JITWriteProbe
+          echo "=== probe: hardened runtime"
+          ./JITWriteProbe 2>&1 | tee probe-hardened.log
+
       - name: Summarise errors
         if: always()
         run: |
@@ -140,5 +150,7 @@ jobs:
             build.log
             smoke.log
             smoke-hardened.log
+            probe.log
+            probe-hardened.log
             build/CMakeFiles/CMakeConfigureLog.yaml
           if-no-files-found: ignore
