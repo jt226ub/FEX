@@ -32,7 +32,7 @@ SKIP_CODE = 125
 # is rewritten so those addresses move up by this amount, matching LowMemoryRelocation in
 # HarnessHelpers.h. A test that uses such an address through a 32-bit operand cannot be
 # moved and is reported as skipped.
-LOW_MEMORY_RELOCATION = 0x800000000 if sys.platform == "darwin" else 0
+LOW_MEMORY_RELOCATION = 0x10000000000 if sys.platform == "darwin" else 0
 FOUR_GB = 0x100000000
 DEFAULT_LOW_RANGES = [(0xE0000000, 0xE0100000), (0xE7FF0000, 0xE8010000)]
 HEX_LITERAL = re.compile(r"0x[0-9a-fA-F_]+")
@@ -51,7 +51,7 @@ def relocate_low_memory(text):
             start = int(key.replace("_", ""), 16)
             length = int(size, 0)
             # Also covers the few gigabytes just above 4GB, where macOS loads the program.
-            if start < LOW_MEMORY_RELOCATION:
+            if start < 0x1000000000:
                 ranges.append((start, start + max(length, 0x4000)))
 
     def move(match):

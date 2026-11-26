@@ -658,9 +658,10 @@ private:
   // start a program that asks for less. Guest memory therefore cannot be placed below
   // 4GB. The test loader moves its fixed low addresses up by this amount, and
   // Scripts/macos_asm_tests.py rewrites the matching constants in each test.
-  // 32GB: clear of the program and system libraries (4GB to about 12GB) and of the
-  // range macOS reserves for the GPU (64GB to 448GB).
-  constexpr static uint64_t LowMemoryRelocation = 0x8'0000'0000;
+  // 1TB: above the program and system libraries (4GB upwards), a large per-process
+  // reservation seen at varying addresses around 32GB, and the range macOS reserves for
+  // the GPU (64GB to 448GB).
+  constexpr static uint64_t LowMemoryRelocation = 0x100'0000'0000;
 #else
   constexpr static uint64_t LowMemoryRelocation = 0;
 #endif
