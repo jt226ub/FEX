@@ -19,12 +19,16 @@ basis for a small, stable C interface, which does not exist yet.
 | Provide descriptor tables (GDT and LDT) and a 64-bit code segment | Segment loads read them | `CoreThreadSetup.h` |
 | Set `SynchronousExceptionHandler` | The core calls it when guest code faults by design, for example at `hlt` | each tool |
 | Catch host alignment faults and pass them to the core | Misaligned atomic operations fault on ARM64 and the core rewrites them | `MacOSHostFaults.h` |
+| Discard stale translations when the core reports changed guest code (`InvalidateGuestCodeRange`) | Self-modifying code loops forever otherwise | `ASMTestRunner` |
+| Resume the translator at its restart point when it runs into the end of its scratch buffer | Large blocks crash otherwise | `MacOSHostFaults.h` |
 | Map guest memory at the addresses the guest expects | The core uses guest addresses as host addresses | each tool |
 | Call the allocator's per-thread initialisation | Required before a thread allocates | `CoreThreadTest` |
 
 ## Duties known but not done yet
 
-- Catch write faults for self-modifying code detection and pass them to the core.
+- Catch write faults for the cheaper kind of self-modifying code detection, which
+  write-protects pages holding translated guest code. Only the check-on-every-block kind
+  is exercised so far.
 - Arm and service the interrupt fault page used to stop a thread from another thread.
 - Guest signals and exceptions that the guest program handles itself.
 - Reconstructing guest state when a fault lands in the middle of translated code.

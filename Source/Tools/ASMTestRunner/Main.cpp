@@ -113,6 +113,14 @@ class RunnerSyscallHandler final : public FEXCore::HLE::SyscallHandler, public F
 public:
   void HandleSyscall(FEXCore::Core::CpuStateFrame*) override {}
 
+  // The core calls this when translated code finds that the guest code it came from has
+  // changed. Discarding the stale translations is the embedder's job; without it the
+  // core finds the same stale block again and never makes progress.
+  void InvalidateGuestCodeRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Start, uint64_t Length) override {
+    Thread->CTX->InvalidateCodeBuffersCodeRange(Start, Length);
+    Thread->CTX->InvalidateThreadCachedCodeRange(Thread, Start, Length);
+  }
+
   std::optional<FEXCore::ExecutableFileSectionInfo> LookupExecutableFileSection(FEXCore::Core::InternalThreadState*, uint64_t) override {
     return std::nullopt;
   }
