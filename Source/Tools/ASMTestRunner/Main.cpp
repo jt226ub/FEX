@@ -36,8 +36,14 @@
 #include <cstring>
 #include <optional>
 #include <set>
+#include <cerrno>
 #include <sys/mman.h>
 #include <unistd.h>
+
+#ifdef __APPLE__
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
+#endif
 
 namespace {
 constexpr int ExitPass = 0;
@@ -149,12 +155,31 @@ public:
       if (Mapped.contains(Page)) {
         continue;
       }
-      void* Result = ::mmap(reinterpret_cast<void*>(Page), PageSize, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+      int Flags = MAP_PRIVATE | MAP_ANONYMOUS;
+#ifdef __APPLE__
+      // macOS treats the address as a loose hint, so ask the kernel whether the page is
+      // free and, only if it is, place the mapping there exactly.
+      mach_vm_address_t RegionAddress = Page;
+      mach_vm_size_t RegionSize = 0;
+      vm_region_basic_info_data_64_t Info {};
+      mach_msg_type_number_t Count = VM_REGION_BASIC_INFO_COUNT_64;
+      mach_port_t Object = MACH_PORT_NULL;
+      const kern_return_t Status = mach_vm_region(mach_task_self(), &RegionAddress, &RegionSize, VM_REGION_BASIC_INFO_64,
+                                                  reinterpret_cast<vm_region_info_t>(&Info), &Count, &Object);
+      if (Status == KERN_SUCCESS && RegionAddress < Page + PageSize) {
+        fextl::fmt::print("Could not map guest memory at 0x{:x}: in use by a region at 0x{:x} of size 0x{:x}\n", Page,
+                          static_cast<uint64_t>(RegionAddress), static_cast<uint64_t>(RegionSize));
+        Failed = true;
+        return MAP_FAILED;
+      }
+      Flags |= MAP_FIXED;
+#endif
+      void* Result = ::mmap(reinterpret_cast<void*>(Page), PageSize, PROT_READ | PROT_WRITE, Flags, -1, 0);
       if (Result != reinterpret_cast<void*>(Page)) {
+        fextl::fmt::print("Could not map guest memory at 0x{:x}: got {} (errno {})\n", Page, fmt::ptr(Result), errno);
         if (Result != MAP_FAILED) {
           ::munmap(Result, PageSize);
         }
-        fextl::fmt::print("Could not map guest memory at 0x{:x}\n", Page);
         Failed = true;
         return MAP_FAILED;
       }
