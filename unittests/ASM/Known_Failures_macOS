@@ -1,0 +1,48 @@
+# Instruction tests that do not pass with the core-only runner on macOS.
+# Used by Scripts/macos_asm_tests.py in addition to upstream's lists.
+#
+# Background: macOS on Apple silicon reserves the first 4GB of every 64-bit process, so
+# the tests' fixed low addresses are moved up by 1TB before assembly. A test whose result
+# depends on an address fitting in 32 or 16 bits cannot survive that move.
+
+# --- Believed to be side effects of the move, not translator faults. Not individually
+# --- confirmed: each should be read before being trusted.
+
+# 32-bit address-size override cuts the moved address back to 32 bits.
+Test_FEX_bugs/a32_lods.asm
+Test_FEX_bugs/a32_rep_lods.asm
+Test_Primary/Primary_A6_REP_addrmod.asm
+Test_Primary/Primary_A6_addrmod.asm
+Test_Primary/Primary_AE_addrmod.asm
+
+# Far and operand-size-limited branches and frame operations: the target or frame
+# address is taken through a 16 or 32-bit operand.
+Test_PrimaryGroup/5_FF_05.asm
+Test_PrimaryGroup/5_FF_05_03_o32.asm
+Test_PrimaryGroup/5_FF_05_03_o32_imm.asm
+Test_PrimaryGroup/5_FF_05_03_o64.asm
+Test_PrimaryGroup/5_FF_05_03_o64_imm.asm
+Test_TwoByte/0F_8B_16.asm
+Test_FEX_bugs/o16_leave.asm
+
+# Expected values are derived from addresses or instruction lengths that the move changes.
+Test_FEX_bugs/cmpxchg16b.asm
+Test_FEX_bugs/cmpxchg8b.asm
+Test_FEX_bugs/SIBScaleTranspose.asm
+
+# --- Not understood yet. Treat as possible faults in the port.
+
+# Self-modifying code. Both time out. Detection may depend on a write fault that the
+# embedder must catch and pass to the core, which the macOS fault handler does not do yet.
+Test_SelfModifyingCode/Delinking.asm
+Test_SelfModifyingCode/DifferentBlock.asm
+
+# Times out.
+Test_TwoByte/0F_02.asm
+
+# Crashes with a segmentation fault.
+Test_VEX/vmovq_vmovd_reg.asm
+
+# Crashes in the multiblock mode only. The port skips the guard page at the end of the
+# code buffer on macOS, and this test fills the buffer, so the two are probably related.
+Test_FEX_bugs/CodeBufferOverflow.asm
