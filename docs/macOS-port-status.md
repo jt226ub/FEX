@@ -57,14 +57,17 @@ Still unproven:
 
 1. **The fixes above on real hardware.** The smoke test passes on the hosted Apple silicon
    runner with and without fixes 1 to 3, in both an ordinary and a hardened-runtime build.
-   So that runner does not show that they are needed. It is a virtual machine and may not
-   enforce per-thread write protection. Both branches need running on a physical Mac.
+   So that runner does not show that they are needed. `JITWriteProbe` confirms why: the
+   runner is a virtual machine, reports `pthread_jit_write_protect_supported_np` as 0, and
+   lets a thread write and run `MAP_JIT` memory in any state. Both branches and the probe
+   need running on a physical Mac.
 2. **`x18` under load.** Corruption would only show after a context switch, which the
    short smoke test does not provoke.
 3. **Faulting paths.** Nothing that takes a fault has run: memory-access patching,
    self-modifying code, the interrupt fault page. These need a signal handler in the
    embedder.
-4. **`dc cvau` from user space.** Used on some paths; not confirmed to be allowed on macOS.
+4. **`dc cvau` from user space.** Allowed on the hosted runner; not yet confirmed on a
+   physical Mac.
 5. **`VirtualDontNeed`.** `MADV_DONTNEED` does not guarantee zeroed pages on macOS as it
    does on Linux.
 6. **Region reservation in `Allocator.cpp`.** Uses `MAP_FIXED_NOREPLACE`, which macOS does
