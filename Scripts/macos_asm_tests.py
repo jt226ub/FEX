@@ -23,6 +23,11 @@ MODES = {
     "jit_1": {"FEX_MAXINST": "1", "FEX_MULTIBLOCK": "0"},
     "jit_500": {"FEX_MAXINST": "500", "FEX_MULTIBLOCK": "0"},
     "jit_500_m": {"FEX_MAXINST": "500", "FEX_MULTIBLOCK": "1"},
+    # Not an upstream mode. Upstream runs these tests with x86 memory-ordering emulation
+    # off; this mode turns it on, including for vector and block-copy operations, so
+    # that the emulation paths are exercised at all.
+    "jit_500_tso": {"FEX_MAXINST": "500", "FEX_MULTIBLOCK": "1", "FEX_TSOENABLED": "1", "FEX_VECTORTSOENABLED": "1",
+                    "FEX_MEMCPYSETTSOENABLED": "1"},
 }
 COMMON_ENV = {"FEX_SILENTLOG": "0", "FEX_DUMPGPRS": "1", "FEX_TSOENABLED": "0"}
 SKIP_CODE = 125
