@@ -87,7 +87,7 @@ struct UnalignedExclusiveStore {
   uint8_t Size;
 };
 
-struct alignas(FEXCore::Utils::FEX_PAGE_SIZE) InternalThreadState : public FEXCore::Allocator::FEXAllocOperators {
+struct alignas(FEXCore::Utils::FEX_HOST_PAGE_SIZE) InternalThreadState : public FEXCore::Allocator::FEXAllocOperators {
   FEXCore::Core::CpuStateFrame* const CurrentFrame = &BaseFrameState;
 
   FEXCore::Context::Context* const CTX;
