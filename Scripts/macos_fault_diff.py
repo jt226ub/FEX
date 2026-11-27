@@ -63,11 +63,7 @@ CASES = [
     ("ystore-cross-ro", "FAULT: vmovdqu [r14-12], ymm1\nhlt", 1),
     ("fstp-ro", "fld1\nFAULT: fstp qword ptr [r15]\nhlt", 1),
     ("fxsave-ro", "FAULT: fxsave [r15]\nhlt", 1),
-    ("rep-stos-cross", "lea rdi, [r15-64]\nmov rcx, 128\nFAULT: rep stosb\nhlt", 1),
-    ("rep-movs-overlap", "lea rsi, [r15-64]\nlea rdi, [r15-63]\nmov rcx, 128\nFAULT: rep movsb\nhlt", 1),
-    ("rep-movs-overlap-down", "lea rdi, [r15-64]\nlea rsi, [r15-32]\nmov rcx, 128\nFAULT: rep movsb\nhlt", 1),
-    ("rep-movsq-nonoverlap", "lea rdi, [r15-64]\nlea rsi, [r15-4096]\nmov rcx, 32\nFAULT: rep movsq\nhlt", 1),
-    ("enter-ro", "lea rsp, [r15+0x100]\nFAULT: enter 16, 0\nhlt", 1),
+                    ("enter-ro", "lea rsp, [r15+0x100]\nFAULT: enter 16, 0\nhlt", 1),
     ("pushf-ro", "lea rsp, [r15+0x100]\nstc\nFAULT: pushfq\nhlt", 1),
     ("ldmxcsr-then-fault", "mov dword ptr [rdi], 0x3f80\nldmxcsr [rdi]\nFAULT: mov rax, [r15]\nhlt", 0),
     ("wrfsbase-then-fault", "mov rax, 0x12345000\nwrfsbase rax\nFAULT: mov rax, [r15]\nhlt", 0),
@@ -83,6 +79,34 @@ CASES = [
         "rcl byte ptr [r15], 1", "inc qword ptr [r15]\nadc rax, 0", "neg qword ptr [r15]", "shl qword ptr [r15], cl\nadc rax,0",
         "btc qword ptr [r15], 3\nadc rax, 0", "xadd [r15], rax\nadc rdx, 0", "cmpxchg [r15], rbx\nadc rdx,0"])
 ]
+
+# rep string instructions report their progress at a fault, as x86 does: the at-fault
+# reference is the same program run with rcx set to the elements that must be done
+# before the fault (their memory effect included), and rcx set to the rest afterwards.
+# (name, setup, instruction, element size, elements done, elements in all, protection)
+def rep_case(name, setup, ins, done, total, prot=1):
+    fault = setup + "\nmov rcx, %d\nFAULT: %s\nhlt" % (total, ins)
+    ref = setup + "\nmov rcx, %d\n%s\nmov rcx, %d\nhlt" % (done, ins, total - done)
+    return (name, fault, prot, True, ref)
+
+REP_CASES = []
+for ins, size in (("rep movsb", 1), ("rep movsw", 2), ("rep movsd", 4), ("rep movsq", 8), ("rep stosb", 1), ("rep stosw", 2),
+                  ("rep stosd", 4), ("rep stosq", 8)):
+    for k in (1, 8, 31, 32, 33, 64, 65):
+        done = k // size
+        # Forward into the read-only test page from below: the elements wholly below it.
+        REP_CASES.append(rep_case("%s-fwd-%d" % (ins.replace(" ", "-"), k), "lea rdi, [r15-%d]\nlea rsi, [rdi-0x2000]" % k, ins, done, 128))
+        # Backward (DF=1) into it from above.
+        REP_CASES.append(rep_case("%s-back-%d" % (ins.replace(" ", "-"), k),
+                                  "std\nlea rdi, [r15+0x4000+%d]\nlea rsi, [rdi+0x2000]" % (k - size), ins, done, 128))
+# Overlapping copies (memmove patterns), forward and backward, element by element.
+for d in (1, 3, 8, 31):
+    REP_CASES.append(rep_case("rep-movsb-overlap-ahead-%d" % d, "lea rdi, [r15-40]\nlea rsi, [rdi-%d]" % d, "rep movsb", 40, 128))
+    REP_CASES.append(rep_case("rep-movsb-overlap-behind-%d" % d, "lea rdi, [r15-40]\nlea rsi, [rdi+%d]" % d, "rep movsb", 40, 128))
+    REP_CASES.append(rep_case("rep-movsb-back-overlap-%d" % d, "std\nlea rdi, [r15+0x4000+39]\nlea rsi, [rdi+%d]" % d, "rep movsb", 40,
+                              128))
+# The source page inaccessible instead.
+REP_CASES.append(rep_case("rep-movsq-src-none", "lea rsi, [r15-64]\nlea rdi, [rsi-0x2000]", "rep movsq", 8, 32, 0))
 
 MODES = [(0, 0), (1, 0), (0, 1), (1, 1)]
 # The guest-fault comparisons run with each way of translating: SMCCHECKS full (the
@@ -138,11 +162,12 @@ def diff(a, b, pa, pb):
             a.get(pa + "." + k) != b.get(pb + "." + k)]
 
 
-def check_case(tool, name, src, prot, clean=True):
+def check_case(tool, name, src, prot, clean=True, ref_src=None):
     fault = assemble(src.replace("FAULT:", ""))
     # The reference replaces the marked instruction (and nothing else on its line, such
-    # as a label) by hlt.
-    ref = assemble("\n".join((l.split("FAULT:")[0] + "hlt" if "FAULT:" in l else l) for l in src.splitlines()))
+    # as a label) by hlt, unless the case gives its own.
+    ref = assemble(ref_src) if ref_src else assemble("\n".join((l.split("FAULT:")[0] + "hlt" if "FAULT:" in l else l)
+                                                               for l in src.splitlines()))
     found = {}
     for mb, tso, smc in [(mb, tso, smc) for mb, tso in MODES for smc in FAULT_SMC + ["smc-path"]]:
         tag = "mb=%d tso=%d smc=%s" % (mb, tso, smc)
@@ -191,7 +216,7 @@ def main():
             words = line.split("#", 1)[0].split()
             if len(words) >= 2:
                 known.add((words[0], words[1]))
-    cases = [c for c in CASES if args.filter in c[0]]
+    cases = [c for c in CASES + REP_CASES if args.filter in c[0]]
     failures = 0
     seen = set()
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as pool:

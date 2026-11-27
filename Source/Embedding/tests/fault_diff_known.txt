@@ -31,15 +31,6 @@ call-stack-ro           resume     # call: see the doc (the return address the r
 call-stack-ro           smc
 ystore-cross-ro         at-fault   # 32-byte store: first 16 bytes written before the fault
 #
-# rep movs / rep stos: one host loop; registers from before the instruction, memory partly
-# written; an overlapping forward copy restarted from the start gives a different result.
-rep-movs-overlap        at-fault
-rep-movs-overlap-down   at-fault
-rep-movs-overlap-down   resume
-rep-movs-overlap-down   smc
-rep-movsq-nonoverlap    at-fault
-rep-stos-cross          at-fault
-#
 # Dead flags: PF and AF (or any flag) that the rest of the block overwrites without reading
 # are not computed and are reported as whatever the frame held. Running again is not
 # affected. With SMCCHECKS full the extra per-instruction block split computes them.

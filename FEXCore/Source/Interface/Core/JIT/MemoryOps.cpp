@@ -1861,6 +1861,206 @@ DEF_OP(StoreMemTSO) {
   }
 }
 
+#ifdef __APPLE__
+// rep movs / rep stos with exact x86 progress (macOS). The guest's rcx, rsi and rdi live
+// in static registers; when the IR hands those registers to MemCpy/MemSet unchanged (no
+// segment base added), the loops below use them as the induction variables themselves,
+// so that at any fault or stop they say exactly which elements are done:
+//  - one element is loaded and stored, then rsi/rdi move and rcx drops: a fault on the
+//    load or the store leaves the registers before that element and nothing of it
+//    written (a single store of up to 8 bytes does not write partly on this hardware;
+//    the differential test checks a store across a page);
+//  - 32-byte chunks (ldp/stp of two q registers) only while the destination chunk is
+//    32-byte aligned, so it cannot cross a page and a faulting stp writes nothing, and
+//    only when source and destination are at least 32 bytes apart, so a chunk never
+//    reads bytes it writes (overlapping copies go element by element, which is x86's
+//    order); a load that faults has written nothing of the chunk;
+//  - the interrupt fault page is written every chunk and every 64 elements, so a stop
+//    request lands inside a long rep with the registers exact; running again continues.
+// NZCV is not touched (no flag-setting instruction). Direction comes from DF.
+// Returns false (and emits nothing) when the registers are not the guest's.
+bool Arm64JITCore::EmitRepStringInPlace(bool Copy, bool IsAtomic, size_t Size, ARMEmitter::Register Length, ARMEmitter::Register DestIn,
+                                        ARMEmitter::Register SrcIn, ARMEmitter::Register Value, bool DirectionIsInline,
+                                        uint64_t DirectionConstant, ARMEmitter::Register DirectionReg, ARMEmitter::Register OutDst,
+                                        ARMEmitter::Register OutSrc) {
+  const auto RCX = StaticRegisters[X86State::REG_RCX];
+  const auto RDI = StaticRegisters[X86State::REG_RDI];
+  const auto RSI = StaticRegisters[X86State::REG_RSI];
+  if (Length.Idx() != RCX.Idx() || DestIn.Idx() != RDI.Idx() || (Copy && SrcIn.Idx() != RSI.Idx())) {
+    return false;
+  }
+  if (Size != 1 && Size != 2 && Size != 4 && Size != 8) {
+    return false;
+  }
+  const auto R = RCX.X();
+  const auto D = RDI.X();
+  const auto S = RSI.X();
+  const uint32_t Log2 = FEXCore::ilog2(Size);
+  const uint32_t ChunkElements = 32 / Size;
+
+  auto LoadElement = [&](ARMEmitter::XRegister Base) {
+    if (IsAtomic) {
+      switch (Size) {
+      case 1: CTX->HostFeatures.SupportsRCPC ? ldaprb(TMP4.W(), Base) : ldarb(TMP4.W(), Base); break;
+      case 2: CTX->HostFeatures.SupportsRCPC ? ldaprh(TMP4.W(), Base) : ldarh(TMP4.W(), Base); break;
+      case 4: CTX->HostFeatures.SupportsRCPC ? ldapr(TMP4.W(), Base) : ldar(TMP4.W(), Base); break;
+      case 8: CTX->HostFeatures.SupportsRCPC ? ldapr(TMP4, Base) : ldar(TMP4, Base); break;
+      }
+      if (Size != 1) {
+        // Placeholders for backpatching barriers (one per load/store), as the copy below.
+        nop();
+        nop();
+      }
+    } else {
+      switch (Size) {
+      case 1: ldrb(TMP4.W(), Base, 0); break;
+      case 2: ldrh(TMP4.W(), Base, 0); break;
+      case 4: ldr(TMP4.W(), Base, 0); break;
+      case 8: ldr(TMP4, Base, 0); break;
+      }
+    }
+  };
+  auto StoreElement = [&](ARMEmitter::Register Data) {
+    if (IsAtomic) {
+      switch (Size) {
+      case 1: stlrb(Data.W(), D); break;
+      case 2: stlrh(Data.W(), D); break;
+      case 4: stlr(Data.W(), D); break;
+      case 8: stlr(Data.X(), D); break;
+      }
+    } else {
+      switch (Size) {
+      case 1: strb(Data.W(), D, 0); break;
+      case 2: strh(Data.W(), D, 0); break;
+      case 4: str(Data.W(), D, 0); break;
+      case 8: str(Data.X(), D, 0); break;
+      }
+    }
+  };
+
+  auto Emit = [&](int32_t Direction) {
+    ARMEmitter::BackwardLabel ElementLoop;
+    ARMEmitter::BackwardLabel ChunkLoop;
+    ARMEmitter::ForwardLabel ElementStep;
+    ARMEmitter::ForwardLabel SkipCheck;
+    ARMEmitter::ForwardLabel Finished;
+    const bool Back = Direction < 0;
+
+    (void)cbz(ARMEmitter::Size::i64Bit, R, &Finished);
+    if (Value != ARMEmitter::Reg::zr && !Copy && !IsAtomic) {
+      dup(Size == 1 ? ARMEmitter::SubRegSize::i8Bit : Size == 2 ? ARMEmitter::SubRegSize::i16Bit :
+          Size == 4 ? ARMEmitter::SubRegSize::i32Bit : ARMEmitter::SubRegSize::i64Bit, VTMP2.Q(), Value);
+    } else if (!Copy && !IsAtomic) {
+      movi(ARMEmitter::SubRegSize::i64Bit, VTMP2.Q(), 0);
+    }
+
+    (void)Bind(&ElementLoop);
+    if (!IsAtomic) {
+      // Chunk when at least one chunk is left, the destination chunk is 32-byte aligned
+      // and (copies) source and destination are 32 bytes apart or more.
+      ARMEmitter::ForwardLabel NoChunk;
+      sub(ARMEmitter::Size::i64Bit, TMP1, R, ChunkElements);
+      (void)tbnz(TMP1, 63, &NoChunk);
+      if (Back) {
+        add(ARMEmitter::Size::i64Bit, TMP1, D, Size);
+      } else {
+        mov(TMP1, D);
+      }
+      and_(ARMEmitter::Size::i64Bit, TMP1, TMP1, 31);
+      (void)cbnz(ARMEmitter::Size::i64Bit, TMP1, &NoChunk);
+      if (Copy) {
+        ARMEmitter::ForwardLabel Positive;
+        sub(ARMEmitter::Size::i64Bit, TMP1, D, S);
+        (void)tbz(TMP1, 63, &Positive);
+        neg(ARMEmitter::Size::i64Bit, TMP1, TMP1);
+        (void)Bind(&Positive);
+        sub(ARMEmitter::Size::i64Bit, TMP1, TMP1, 32);
+        (void)tbnz(TMP1, 63, &NoChunk);
+      }
+      (void)Bind(&ChunkLoop);
+      if (Back) {
+        sub(ARMEmitter::Size::i64Bit, TMP2, D, 32 - Size);
+        if (Copy) {
+          sub(ARMEmitter::Size::i64Bit, TMP3, S, 32 - Size);
+          ldp<ARMEmitter::IndexType::OFFSET>(VTMP1.Q(), VTMP2.Q(), TMP3, 0);
+        }
+        stp<ARMEmitter::IndexType::OFFSET>(Copy ? VTMP1.Q() : VTMP2.Q(), VTMP2.Q(), TMP2, 0);
+        sub(ARMEmitter::Size::i64Bit, D, D, 32);
+        if (Copy) {
+          sub(ARMEmitter::Size::i64Bit, S, S, 32);
+        }
+      } else {
+        if (Copy) {
+          ldp<ARMEmitter::IndexType::OFFSET>(VTMP1.Q(), VTMP2.Q(), S, 0);
+        }
+        stp<ARMEmitter::IndexType::OFFSET>(Copy ? VTMP1.Q() : VTMP2.Q(), VTMP2.Q(), D, 0);
+        add(ARMEmitter::Size::i64Bit, D, D, 32);
+        if (Copy) {
+          add(ARMEmitter::Size::i64Bit, S, S, 32);
+        }
+      }
+      sub(ARMEmitter::Size::i64Bit, R, R, ChunkElements);
+      EmitSuspendInterruptCheck();
+      sub(ARMEmitter::Size::i64Bit, TMP1, R, ChunkElements);
+      (void)tbz(TMP1, 63, &ChunkLoop);
+      (void)cbz(ARMEmitter::Size::i64Bit, R, &Finished);
+      if (!Copy) {
+        // The pattern register was clobbered only for copies; nothing to restore.
+      } else if (false) {
+      }
+      (void)Bind(&NoChunk);
+      if (Copy) {
+        // VTMP2 held copy data; a memset never reaches here with it changed.
+      }
+    }
+    // One element.
+    if (Copy) {
+      LoadElement(S);
+      StoreElement(TMP4);
+    } else {
+      StoreElement(Value);
+    }
+    if (Back) {
+      sub(ARMEmitter::Size::i64Bit, D, D, Size);
+      if (Copy) {
+        sub(ARMEmitter::Size::i64Bit, S, S, Size);
+      }
+    } else {
+      add(ARMEmitter::Size::i64Bit, D, D, Size);
+      if (Copy) {
+        add(ARMEmitter::Size::i64Bit, S, S, Size);
+      }
+    }
+    sub(ARMEmitter::Size::i64Bit, R, R, 1);
+    and_(ARMEmitter::Size::i64Bit, TMP1, R, 63);
+    (void)cbnz(ARMEmitter::Size::i64Bit, TMP1, &SkipCheck);
+    EmitSuspendInterruptCheck();
+    (void)Bind(&SkipCheck);
+    (void)cbnz(ARMEmitter::Size::i64Bit, R, &ElementLoop);
+    (void)Bind(&Finished);
+    (void)Log2;
+  };
+
+  ARMEmitter::ForwardLabel Backward;
+  ARMEmitter::ForwardLabel Done;
+  if (DirectionIsInline) {
+    Emit(DirectionConstant == 1 ? 1 : -1);
+  } else {
+    (void)tbnz(DirectionReg, 1, &Backward);
+    Emit(1);
+    (void)b(&Done);
+    (void)Bind(&Backward);
+    Emit(-1);
+  }
+  (void)Bind(&Done);
+  mov(OutDst.X(), D);
+  if (Copy && OutSrc != ARMEmitter::Reg::zr) {
+    mov(OutSrc.X(), S);
+  }
+  return true;
+}
+#endif
+
 DEF_OP(MemSet) {
   const auto Op = IROp->C<IR::IROp_MemSet>();
 
@@ -1877,6 +2077,14 @@ DEF_OP(MemSet) {
   if (!DirectionIsInline) {
     DirectionReg = GetReg(Op->Direction);
   }
+
+#ifdef __APPLE__
+  if (Op->Prefix.IsInvalid() &&
+      EmitRepStringInPlace(false, IsAtomic, Size, Length, MemReg, ARMEmitter::Reg::zr, Value, DirectionIsInline, DirectionConstant,
+                           DirectionReg, Dst, ARMEmitter::Reg::zr)) {
+    return;
+  }
+#endif
 
   // If Direction > 0 then:
   //   MemReg is incremented (by size)
@@ -2114,6 +2322,12 @@ DEF_OP(MemCpy) {
 
   auto Dst0 = GetReg(Op->OutDstAddress);
   auto Dst1 = GetReg(Op->OutSrcAddress);
+#ifdef __APPLE__
+  if (EmitRepStringInPlace(true, IsAtomic, Size, Length, MemRegDest, MemRegSrc, ARMEmitter::Reg::zr, DirectionIsInline, DirectionConstant,
+                           DirectionReg, Dst0, Dst1)) {
+    return;
+  }
+#endif
   // If Direction > 0 then:
   //   MemRegDest is incremented (by size)
   //   MemRegSrc is incremented (by size)

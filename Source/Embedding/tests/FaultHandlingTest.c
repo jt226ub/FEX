@@ -1652,6 +1652,110 @@ static void TestSMCDefaultPolicy(void) {
   }
 }
 
+/* Stop requests during long rep movs/stos: every stop is at the rep instruction with
+ * rcx, rsi and rdi describing exactly the elements done; running again continues; the
+ * final memory is what x86 gives, including a forward overlapping byte copy (the pattern
+ * replicates) and a backward one. */
+struct RepRun {
+  const char* Name;
+  uint8_t Program[4];
+  size_t ProgramSize;
+  size_t Element;
+  int Backward;
+  int Copy;
+  long Overlap; /* rdi - rsi for copies */
+};
+
+static void* RequestEvery100us(void* Argument) {
+  fexmac_thread* T = Argument;
+  while (!atomic_load(&StormDone)) {
+    usleep(100);
+    fexmac_thread_request_stop(T);
+  }
+  return NULL;
+}
+
+static void TestStopRepMovs(void) {
+  fexmac_install_fault_handlers();
+  static const struct RepRun Runs[] = {
+    {"rep movsb, 32MB apart", {0xF3, 0xA4, 0xF4}, 3, 1, 0, 1, 32 << 20},
+    {"rep movsq, 32MB apart", {0xF3, 0x48, 0xA5, 0xF4}, 4, 8, 0, 1, 32 << 20},
+    {"rep stosq", {0xF3, 0x48, 0xAB, 0xF4}, 4, 8, 0, 0, 0},
+    {"rep movsb overlapping forward by 1 (replicates)", {0xF3, 0xA4, 0xF4}, 3, 1, 0, 1, 1},
+    {"rep movsb overlapping forward by 24", {0xF3, 0xA4, 0xF4}, 3, 1, 0, 1, 24},
+    {"std; rep movsb overlapping backward by 3", {0xF3, 0xA4, 0xF4}, 3, 1, 1, 1, -3},
+  };
+  const size_t Bytes = 32 << 20;
+  uint8_t* Area = MapGuestMemory(Bytes * 3);
+  uint8_t* Expect = malloc(Bytes * 3);
+  for (size_t r = 0; r < sizeof(Runs) / sizeof(Runs[0]); ++r) {
+    const struct RepRun* Run_ = &Runs[r];
+    fexmac_context* Context = MakeContext(1, (int)(r & 1), "none", NULL, NULL);
+    uint8_t* Code = MapCode(Context, Run_->Program, Run_->ProgramSize, 0);
+    for (size_t i = 0; i < Bytes * 3; ++i) {
+      Area[i] = (uint8_t)(i * 131 + 7);
+    }
+    memcpy(Expect, Area, Bytes * 3);
+    const size_t Count = Bytes / Run_->Element;
+    uint8_t* Dst = Area + Bytes;
+    uint8_t* Src = Dst - Run_->Overlap;
+    if (Run_->Backward) {
+      /* rdi and rsi name the last element; the copy runs down. */
+      Dst = Area + 2 * Bytes - Run_->Element;
+      Src = Dst - Run_->Overlap;
+    }
+    /* The x86 result, element by element in order. */
+    for (size_t i = 0; i < Count; ++i) {
+      const ptrdiff_t Step = Run_->Backward ? -(ptrdiff_t)(i * Run_->Element) : (ptrdiff_t)(i * Run_->Element);
+      uint8_t* E = Expect + (Dst - Area) + Step;
+      if (Run_->Copy) {
+        memmove(E, Expect + (Src - Area) + Step, Run_->Element);
+      } else {
+        memset(E, 0x5A, Run_->Element);
+      }
+    }
+    fexmac_thread* Thread = CreateThreadAt(Context, Addr(Code), 0);
+    fexmac_x86_state State = GetState(Thread);
+    State.gpr[RCX] = Count;
+    State.gpr[RDI] = Addr(Dst);
+    State.gpr[RSI] = Addr(Src);
+    State.gpr[RAX] = 0x5A5A5A5A5A5A5A5AULL;
+    State.rflags = Run_->Backward ? 0x602 : 0x202;
+    SetState(Thread, &State);
+    atomic_store(&StormDone, 0);
+    pthread_t Requester;
+    pthread_create(&Requester, NULL, RequestEvery100us, Thread);
+    int Stops = 0, Bad = 0;
+    for (;;) {
+      const fexmac_stop Stop = Run(Thread);
+      State = GetState(Thread);
+      if (Stop.reason == FEXMAC_STOP_HALT) {
+        break;
+      }
+      if (Stop.reason != FEXMAC_STOP_REQUESTED) {
+        ++Bad;
+        break;
+      }
+      const uint64_t Done = Count - State.gpr[RCX];
+      const int64_t Moved = Run_->Backward ? -(int64_t)(Done * Run_->Element) : (int64_t)(Done * Run_->Element);
+      if ((State.rip != Addr(Code) && !(State.gpr[RCX] == Count && State.rip == Addr(Code))) || State.gpr[RDI] != Addr(Dst) + Moved ||
+          (Run_->Copy && State.gpr[RSI] != Addr(Src) + Moved)) {
+        ++Bad;
+      }
+      ++Stops;
+    }
+    atomic_store(&StormDone, 1);
+    pthread_join(Requester, NULL);
+    printf("  %s: %d stops part-way\n", Run_->Name, Stops);
+    Check(Bad == 0, "%s: every stop at the rep instruction with rcx, rsi, rdi exact (%d bad)", Run_->Name, Bad);
+    Check(Stops > 3, "%s: stopped part-way (%d times)", Run_->Name, Stops);
+    Check(State.gpr[RCX] == 0 && memcmp(Area, Expect, Bytes * 3) == 0, "%s: after all the resumes, memory is x86's result", Run_->Name);
+    fexmac_thread_destroy(Thread);
+    fexmac_context_destroy(Context);
+  }
+  free(Expect);
+}
+
 const struct Subtest FaultSubtests[] = {
   {"fault-mid-block", TestFaultMidBlock, 0, NULL, "fexmac:", 0},
   {"fault-flags", TestFaultFlags, 0, NULL, "fexmac:", 0},
@@ -1663,6 +1767,7 @@ const struct Subtest FaultSubtests[] = {
   {"fault-fetch", TestFaultFetch, 0, NULL, "fexmac:", 0},
   {"memory-arguments", TestMemoryArguments, 0, NULL, NULL, 0},
   {"stop-latency", TestStopLatency, 0, NULL, "fexmac:", 0},
+  {"stop-rep-movs", TestStopRepMovs, 0, NULL, "fexmac:", 0},
   {"stop-rep", TestStopRep, 0, NULL, "fexmac:", 0},
   {"stop-not-running", TestStopNotRunning, 0, NULL, "fexmac:", 0},
   {"stop-during-callback", TestStopDuringCallback, 0, NULL, "fexmac:", 0},
