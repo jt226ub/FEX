@@ -496,6 +496,13 @@ fexmac_result fexmac_context_create(const fexmac_config* config, fexmac_context*
   // Library defaults first, so the embedder's options override them.
   ParsedOptions Parsed {
     {FEXCore::Config::CONFIG_DISABLETELEMETRY, "1"},
+    // Always on, whatever the core's built-in default; the option is not one an embedder
+    // can set. Without it, a locked operation on a word crossing 16 bytes is emulated by
+    // two compare-and-swaps that tear under contention and lose the update. The fault
+    // handler then takes the core's process-wide split-lock spin lock around each such
+    // emulation; why that is safe is in docs/macOS-embedding-interface.md (fault handler
+    // locks).
+    {FEXCore::Config::CONFIG_STRICTINPROCESSSPLITLOCKS, "1"},
   };
   if (const auto Result = ParseOptions(*config, &Parsed); Result != FEXMAC_OK) {
     return Fail(Result, false);

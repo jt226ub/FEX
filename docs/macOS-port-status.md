@@ -108,8 +108,8 @@ Added for embedders (the core expects these from whatever hosts it):
   hung until package E's reader-writer lock fix; `fexmac_c_test invalidate-concurrent`
   now passes.
 - `Source/Tools/CommonTools/MacOSHostFaults.h` and `CoreThreadSetup.h`, the previous
-  per-tool versions, are used only by `FEXCoreOrderingTest` (package E) and kept until it
-  is ported; `MacOSHostFaults.h` got the same fault-status check.
+  per-tool versions, are gone: `FEXCoreOrderingTest`, the last tool using them, now uses
+  `fexmac.h` only.
 
 Checked and found not to need a change:
 
@@ -143,8 +143,8 @@ with `JITWriteProbe`:
   because the signal is blocked while its handler runs. A hang in a test can be a crash
   in a fault handler.
 - **Returning from a signal handler does not restore the thread's write setting.** A
-  handler that switches leaves the setting it last chose. `MacOSHostFaults.h` handles two
-  kinds of fault. Misaligned accesses in translated code are patched with the setting
+  handler that switches leaves the setting it last chose. The library's fault handler (and
+  before it `MacOSHostFaults.h`) handles these kinds of fault. Misaligned accesses in translated code are patched with the setting
   switched, and translated code only runs executable, so the handler ends in the state
   it found. Scratch-buffer guard faults in the translator's own emitter code are
   resumed without touching the setting at all. Neither path leaves a wrong setting.
@@ -225,9 +225,18 @@ crosses a 16K page almost never completes out of order, has not been established
 plausible but unverified explanation is that the cores do not let a store become visible
 before an older load has its value, and perform a page-crossing load late, in order.
 
-With emulation on, the misaligned tests take 9 to 10 alignment faults per run where 4
-instructions are patched, so several threads fault on the same instruction at once and
-the back-patching under the block's spin lock runs concurrently.
+With emulation on, the misaligned tests take more alignment faults per run than the 4
+instructions they patch, so in some runs several threads fault on the same instruction at
+once and the back-patching under the block's spin lock runs concurrently: 9 to 10 per run
+when the tool set up its threads itself, 4.0 to 4.4 per run (403 to 436 over 100) since
+it runs on `fexmac`, so concurrent faults on one instruction are now the exception rather
+than the rule.
+
+The tool now uses only `fexmac.h` (it owns SIGBUS and SIGSEGV and hands each fault to
+`fexmac_handle_fault`, counting the alignment faults the library claims). The three
+soaks were repeated on it, hardened: all pass, with no forbidden outcome with emulation
+on, every required one with it off and in the scalar mode, and exact counting totals
+(MP-split16K showed 19 with emulation off, LB none).
 
 **What each sub-setting protects.** With only the general setting on, scalar loads
 become acquire loads (`ldapr`/`ldapur`) and scalar stores release stores
@@ -272,22 +281,36 @@ Found by it and fixed:
   spurious wake moves the writer behind the reader (read-to-write hand-off); the other
   four pass with either header. 20,000 eight-thread starts ran clean after the fix.
 - **Lost updates from locked operations on a word that crosses 16 bytes.** ARM64 atomics
-  fault there and the core emulates them with two compare-and-swaps. By default
-  (`StrictInProcessSplitLocks` off) concurrent emulations interleave and tear, and the
-  increment is dropped: LOCK-xadd-split* lost between 1 in 4,000 and 1 in 900 increments in every run.
-  On macOS that setting now defaults to on (`FEXCore/Source/CMakeLists.txt`), which
-  serialises the emulated operations within the process; they already cost a fault each
-  and the counting tests show no measurable slowdown from the lock.
-- **A locked operation could report an old value it never wrote.** Even serialised, the
-  emulation wrote the upper half first; if a plain store (such as a spin lock's release)
-  changed the lower half before the second compare-and-swap, the operation gave up as
-  "torn" and returned a mix of old values. For an `xchg` lock that meant two threads held
-  the lock: LOCK-xchg-split16 lost an increment in 3 of 10 long runs (and in 1 to 3 of 100
-  soak runs). On macOS the half that the operation does not change is now compared first,
-  so a failure of the second is retried instead (`SplitCAS` in
+  fault there and the core emulates them with two compare-and-swaps. With
+  `StrictInProcessSplitLocks` off (upstream's default) concurrent emulations interleave
+  and tear, and the update is lost: before the next fix, LOCK-xadd-split* lost between 1
+  in 4,000 and 1 in 900 increments in every run. On macOS the setting now defaults to on
+  (`FEXCore/Source/CMakeLists.txt`) and `fexmac` always sets it (it is not an option an
+  embedder can change; see "Fault handler locks" in `docs/macOS-embedding-interface.md`
+  for why taking that lock in the fault handler is safe). It serialises the emulated
+  operations within the process; they already cost a fault each and the counting tests
+  show no measurable slowdown. The ordering test's counting tests and `fexmac_c_test
+  split-locks-concurrent` add 0x100000001 per operation, which changes both halves of the
+  word: with the lock switched off in a scratch build, the C subtest's three `lock xadd`
+  totals came out short in 3 of 3 runs; with it on they are exact.
+- **A locked operation could report an old value it never wrote.** The emulation wrote
+  the upper half first; if anything (another emulation, or a plain store such as a spin
+  lock's release) changed the lower half before the second compare-and-swap, the
+  operation gave up as "torn" and returned a mix of old values without completing. For
+  an `xchg` lock that meant two threads held the lock: LOCK-xchg-split16 lost an
+  increment in 3 of 10 long runs (and in 1 to 3 of 100 soak runs). On macOS the half that
+  the operation does not change is now compared first, so a failure of the second has
+  written nothing and is retried (`SplitCAS` in
   `FEXCore/Source/Utils/ArchHelpers/Arm64.cpp`); 10 long runs and the soaks are clean.
-  When both halves change, a tear is still possible; x86 promises a locked operation is
-  atomic even against plain stores, which two compare-and-swaps cannot give.
+
+Remaining limits of split locked operations: the split-lock lock makes emulations atomic
+with each other, and `SplitCAS` keeps an operation that changes only one half from
+completing with a stale result when a plain store intervenes (it retries instead). An operation that changes both halves can still tear if a plain store
+from another thread (one that is not a locked operation, so not under the lock) lands
+between its two compare-and-swaps: the upper half is then written and the lower is not,
+and the guest gets a mixed result. x86 promises a locked operation is atomic even against
+plain stores, which two compare-and-swaps cannot give. Not observed (the tests' plain
+stores only touch the lower half of their lock word).
 
 Known gap, not fixed: **the misaligned back-patch is cross-modifying code that the
 architecture does not guarantee.** When a misaligned acquire load or release store
@@ -345,7 +368,7 @@ All of these run in the Mac job on every push to a `macos/**` branch.
 | `FEXCoreASMTestRunner` with `Scripts/macos_asm_tests.py` | Upstream's 2,292 assembly instruction tests plus the port's four in `unittests/macOS/ASM`, in four modes | 2,253 pass in each mode (before the upstream sync added one test) | 2,265 of 2,296 pass in each mode, both |
 | `FEXCoreOrderingTest` | Multi-thread x86 memory-ordering litmus tests and misaligned locked-operation counts, in three emulation modes; see above | not yet run | pass, both, in each mode |
 | `FEXCoreMutexWakeTest` | The core's reader-writer lock never loses a wake-up, in six queueing orders | not yet run | pass, both; with the bug restored, two orders hang |
-| `fexmac_c_test` | A C program using only `fexmac.h`, linked as an outside project would be: 34 subtests covering system calls (prefixed, restarted), stops, state, guest faults, invalidation (also from 8 threads at once), misaligned atomics with each signal-handler arrangement, call/return stack overflow and underflow, guest accesses to protected pages, chained handlers (one that leaves with siglongjmp, over 306 stack layouts; one that faults itself, which must end the process quickly; one that returns without fixing the fault) and sent signals, garbage struct sizes, lifetime races and error paths | not yet run | pass, both |
+| `fexmac_c_test` | A C program using only `fexmac.h`, linked as an outside project would be: 35 subtests covering system calls (prefixed, restarted), stops, state, guest faults, invalidation (also from 8 threads at once), misaligned atomics with each signal-handler arrangement, call/return stack overflow and underflow, guest accesses to protected pages, chained handlers (one that leaves with siglongjmp, over 306 stack layouts; one that faults itself, which must end the process quickly; one that returns without fixing the fault) and sent signals, garbage struct sizes, lifetime races, split locked operations from 8 threads (exact totals) and error paths | not yet run | pass, both |
 | `fexmac_hook_test` | The same library built with test hooks, 9 subtests: guest and callback accesses to guard pages are not claimed, the scratch-buffer guard is disarmed after each translation, a log callback cannot re-enter the library, a fault inside the handler crashes with a message instead of hanging, the log callback is never called from a signal handler, a failed create leaves no log hook, invalidation leaves fault signals unblocked | not yet run | pass, both |
 | `JITWriteProbe` | Reports how the machine treats executable memory, including writes and switches from a fault handler and instruction-cache flushing | report only | see the facts above |
 | `JITWriteProbe --expect-enforced` | The same, but exits 1 unless every asserted case gives the result the port relies on with write protection enforced, or if a fault-handler case's handler never ran | not run: the hosted Mac does not enforce, so it would fail | pass, as built and hardened |

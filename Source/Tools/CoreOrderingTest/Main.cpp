@@ -9,6 +9,9 @@
 // (FEX_TSOENABLED, FEX_VECTORTSOENABLED, FEX_MEMCPYSETTSOENABLED). The instruction tests
 // run with it on but are single-threaded; this tool checks ordering between threads.
 //
+// The tool uses only the fexmac interface (fexmac.h): contexts, threads, guest state, runs
+// that stop at `hlt`, and fexmac_handle_fault from its own fault handler.
+//
 // Each test is a classic litmus test: two guest threads run a few memory accesses on
 // shared variables, many times over, and the tool counts the outcomes. Some outcomes are
 // forbidden under TSO but allowed (and produced) by Apple silicon when the accesses are
@@ -61,33 +64,17 @@
 // finish, or if a counting test's total is wrong. --only takes exact test names (an
 // unknown one is an error). --soak runs far more iterations (minutes instead of seconds).
 
-#include "Common/HostFeatures.h"
-#include "CoreThreadSetup.h"
-#include "DummyHandlers.h"
-#include "MacOSHostFaults.h"
-
-#include <FEXCore/Config/Config.h>
-#include <FEXCore/Core/Context.h>
-#include <FEXCore/Core/CoreState.h>
-#include <FEXCore/Core/X86Enums.h>
-#include <FEXCore/Debug/InternalThreadState.h>
-#include <FEXCore/HLE/SyscallHandler.h>
-#include <FEXCore/Utils/AllocatorHooks.h>
-#include <FEXCore/Utils/LogManager.h>
-#include <FEXCore/Utils/TypeDefines.h>
-#include <FEXCore/fextl/memory.h>
+#include <fexmac.h>
 
 #include <algorithm>
 #include <atomic>
 #include <chrono>
-#include <csetjmp>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <mutex>
-#include <optional>
 #include <string>
 #include <sys/mman.h>
 #include <thread>
@@ -97,10 +84,8 @@
 #include <signal.h>
 #include <vector>
 
-#ifdef __APPLE__
 #include <pthread/qos.h>
-#include <sys/sysctl.h>
-#endif
+#include <sys/ucontext.h>
 
 namespace {
 
@@ -318,6 +303,10 @@ constexpr int CasSplit16 = 0x1000 + 0x400 + 12;
 constexpr int XchgLock = 0x1000 + 0x800 + 12;
 constexpr int XchgCounter = 0x1000 + 0xC00;
 constexpr int Increments = 4; // locked operations per thread per iteration
+// Added by each locked increment. It changes both halves of a word that crosses 16 bytes
+// at its middle, so that two emulations' compare-and-swaps can interleave: without the
+// core's split-lock serialisation the totals come out short.
+constexpr uint64_t SplitIncrement = 0x1'0000'0001ULL;
 
 struct Layout {
   uint32_t Stride = 512;
@@ -953,7 +942,7 @@ std::vector<LitmusTest> MakeTests() {
     auto& t = Counting(Name, Desc);
     t.Body = [Ctr](Asm& A, int) {
       for (int i = 0; i < Increments; ++i) {
-        A.MovImm(RAX, 1);
+        A.MovImm(RAX, SplitIncrement);
         A.LockXadd(R8, Ctr, RAX);
         if (i == 0) {
           A.Store(R12, 0, RAX);
@@ -962,12 +951,12 @@ std::vector<LitmusTest> MakeTests() {
       A.Store(R12, 8, RAX);
     };
     t.Classify = [](const uint64_t* R0, const uint64_t* R1) {
-      return int(R0[1] - R0[0] != Increments - 1 || R1[1] - R1[0] != Increments - 1);
+      return int(R0[1] - R0[0] != (Increments - 1) * SplitIncrement || R1[1] - R1[0] != (Increments - 1) * SplitIncrement);
     };
     t.FinalCheck = [Ctr](const uint8_t* Shared, uint64_t ThreadIterations) {
       uint64_t V;
       memcpy(&V, Shared + Ctr, 8);
-      const uint64_t Want = ThreadIterations * Increments;
+      const uint64_t Want = ThreadIterations * Increments * SplitIncrement;
       return V == Want ? std::string() : "counter " + std::to_string(V) + ", expected " + std::to_string(Want);
     };
   };
@@ -982,7 +971,8 @@ std::vector<LitmusTest> MakeTests() {
         const size_t Retry = A.Here();
         A.Load(RAX, R8, CasSplit16);
         A.Mov(RDX, RAX);
-        A.Inc(RDX);
+        A.MovImm(RDI, SplitIncrement);
+        A.Add(RDX, RDI);
         A.LockCmpxchg(R8, CasSplit16, RDX);
         const size_t Done = A.JccFwd(CC_Z);
         A.Inc(RSI);
@@ -997,7 +987,7 @@ std::vector<LitmusTest> MakeTests() {
     t.FinalCheck = [](const uint8_t* Shared, uint64_t ThreadIterations) {
       uint64_t V;
       memcpy(&V, Shared + CasSplit16, 8);
-      const uint64_t Want = ThreadIterations * Increments;
+      const uint64_t Want = ThreadIterations * Increments * SplitIncrement;
       return V == Want ? std::string() : "counter " + std::to_string(V) + ", expected " + std::to_string(Want);
     };
   }
@@ -1121,59 +1111,36 @@ std::vector<uint8_t> BuildProgram(const LitmusTest& T, int Role, int NumThreads)
 
 // ---------------------------------------------------------------------------------------
 
-void MsgHandler(LogMan::DebugLevels Level, const char* Message) {
-  fprintf(stderr, "[%s] %s\n", LogMan::DebugLevelStr(Level), Message);
-}
-void AssertHandler(const char* Message) {
-  fprintf(stderr, "[ASSERT] %s\n", Message);
-}
-
-class NullSyscallHandler final : public FEXCore::HLE::SyscallHandler, public FEXCore::Allocator::FEXAllocOperators {
-public:
-  void HandleSyscall(FEXCore::Core::CpuStateFrame*) override {}
-  std::optional<FEXCore::ExecutableFileSectionInfo> LookupExecutableFileSection(FEXCore::Core::InternalThreadState*, uint64_t) override {
-    return std::nullopt;
-  }
-  FEXCore::HLE::ExecutableRangeInfo QueryGuestExecutableRange(FEXCore::Core::InternalThreadState*, uint64_t) override {
-    return {0, UINT64_MAX, true};
-  }
-};
-
-thread_local jmp_buf LongJump {};
-
-// Counts the alignment faults the core handles, to show that the misaligned tests reach the
-// fault-time back-patching (and how often several threads fault on the same code).
+// Counts the alignment faults the library handles, to show that the misaligned tests reach
+// the fault-time back-patching (and how often several threads fault on the same code).
 std::atomic<uint64_t> AlignmentFaults {};
 
 // Prints where a stalled thread is. Not async-signal-safe; it only runs when the tool is
 // about to give up anyway.
 void WhereHandler(int, siginfo_t*, void* RawContext) {
   char Line[160];
-#if defined(__APPLE__) && defined(__aarch64__)
   auto& SS = static_cast<ucontext_t*>(RawContext)->uc_mcontext->__ss;
   snprintf(Line, sizeof(Line), "--- thread %p: pc 0x%llx lr 0x%llx\n", (void*)pthread_self(), (unsigned long long)SS.__pc, (unsigned long long)SS.__lr);
-#else
-  (void)RawContext;
-  snprintf(Line, sizeof(Line), "--- thread %p\n", (void*)pthread_self());
-#endif
   write(STDOUT_FILENO, Line, strlen(Line));
   void* Frames[48];
   const int N = backtrace(Frames, 48);
   backtrace_symbols_fd(Frames, N, STDOUT_FILENO);
 }
 
-#if defined(__APPLE__) && defined(__aarch64__)
-void CountingFaultHandler(int Signal, siginfo_t* Info, void* Context) {
-  if (Signal == SIGBUS && Info->si_code == BUS_ADRALN) {
-    AlignmentFaults.fetch_add(1, std::memory_order_relaxed);
+// The tool owns SIGBUS and SIGSEGV and hands every fault to the library first (the second
+// way in fexmac.h), so that it can count the alignment faults the library handled; the
+// library tells faults apart by the syndrome's fault status code, and so does this count
+// (0x21 is an alignment fault). A fault the library does not claim is a real crash: the
+// default action is restored and the fault happens again.
+void FaultHandler(int Signal, siginfo_t* Info, void* RawContext) {
+  const uint32_t ESR = static_cast<ucontext_t*>(RawContext)->uc_mcontext->__es.__esr;
+  if (fexmac_handle_fault(Signal, Info, RawContext)) {
+    if ((ESR & 0x3F) == 0x21) {
+      AlignmentFaults.fetch_add(1, std::memory_order_relaxed);
+    }
+    return;
   }
-  FEX::MacOSHostFaults::FaultHandler(Signal, Info, Context);
-}
-#endif
-
-[[noreturn]]
-void SynchronousExceptionHandler(FEXCore::Context::Context*, FEXCore::Core::CpuStateFrame*) {
-  longjmp(LongJump, 1);
+  signal(Signal, SIG_DFL);
 }
 
 struct GuestThread {
@@ -1186,8 +1153,6 @@ struct GuestThread {
   pthread_t Handle {};
 };
 
-std::mutex CreateMutex;
-
 // What the stall watchdog reports.
 struct {
   std::mutex M;
@@ -1198,74 +1163,50 @@ struct {
   std::vector<const GuestThread*> Threads;
 } Progress;
 
-void RunGuest(FEXCore::Context::Context* CTX, GuestThread* Self) {
-#ifdef __APPLE__
+void RunGuest(fexmac_context* Context, GuestThread* Self) {
   // macOS has no way to pin a thread to a core. Ask for the highest quality of service so
   // the scheduler prefers performance cores and does not park the thread.
   pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
-#endif
   Self->Handle = pthread_self();
-  FEXCore::Allocator::InitializeThread();
 
-  FEXCore::Core::InternalThreadState* Thread {};
-  {
-    std::lock_guard Lock {CreateMutex};
-    Thread = CTX->CreateThread();
-  }
-  Self->Stage = 1;
-  if (!Thread || !FEX::CoreThreadSetup::AllocateCallRetStack(Thread)) {
+  fexmac_thread* Thread {};
+  if (fexmac_thread_create(Context, &Thread) != FEXMAC_OK) {
     return;
   }
-  auto Frame = Thread->CurrentFrame;
-  auto* GDT = FEX::CoreThreadSetup::FullDescriptorTable();
-  Frame->State.segment_arrays[FEXCore::Core::CPUState::SEGMENT_ARRAY_INDEX_GDT] = GDT;
-  Frame->State.segment_arrays[FEXCore::Core::CPUState::SEGMENT_ARRAY_INDEX_LDT] = GDT;
-  Frame->State.cs_idx = FEXCore::Core::CPUState::DEFAULT_USER_CS << 3;
-  auto CodeSegment = FEXCore::Core::CPUState::GetSegmentFromIndex(Frame->State, Frame->State.cs_idx);
-  {
-    std::lock_guard Lock {CreateMutex};
-    FEXCore::Core::CPUState::SetGDTBase(CodeSegment, 0);
-    FEXCore::Core::CPUState::SetGDTLimit(CodeSegment, 0xF'FFFFU);
-    CodeSegment->L = 1;
-    CodeSegment->D = 0;
-  }
-  Frame->State.cs_cached = FEXCore::Core::CPUState::CalculateGDTBase(*CodeSegment);
-  Frame->Pointers.SynchronousExceptionHandler = reinterpret_cast<uintptr_t>(&SynchronousExceptionHandler);
-  Frame->State.rip = Self->RIP;
+  Self->Stage = 1;
+  fexmac_x86_state State;
+  fexmac_x86_state_init(&State);
+  fexmac_thread_get_state(Thread, &State);
+  State.rip = Self->RIP;
   for (int i = 0; i < 16; ++i) {
-    Frame->State.gregs[i] = Self->Regs[i];
+    State.gpr[i] = Self->Regs[i];
   }
+  fexmac_thread_set_state(Thread, &State);
 
-#if defined(__APPLE__) && defined(__aarch64__)
-  FEX::MacOSHostFaults::CurrentThread = Thread;
-#endif
   Self->Stage = 2;
-  if (!setjmp(LongJump)) {
-    CTX->ExecuteThread(Thread);
-  }
+  fexmac_stop Stop;
+  fexmac_stop_init(&Stop);
+  const fexmac_result Result = fexmac_thread_run(Thread, &Stop);
   Self->Stage = 3;
-#if defined(__APPLE__) && defined(__aarch64__)
-  FEX::MacOSHostFaults::CurrentThread = nullptr;
-#endif
 
-  Self->FinalIteration = Thread->CurrentFrame->State.gregs[FEXCore::X86State::REG_R15];
-  Self->Done = true;
-
-  void* CallRet = Thread->CallRetStackBase;
-  CTX->DestroyThread(Thread);
-  if (CallRet) {
-    constexpr size_t Guard = FEXCore::Utils::FEX_HOST_PAGE_SIZE;
-    ::munmap(static_cast<uint8_t*>(CallRet) - Guard, FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE + 2 * Guard);
+  // Each guest loop ends at its hlt.
+  if (Result == FEXMAC_OK && Stop.reason == FEXMAC_STOP_HALT && fexmac_thread_get_state(Thread, &State) == FEXMAC_OK) {
+    Self->FinalIteration = State.gpr[R15];
+    Self->Done = true;
+  } else {
+    fprintf(stderr, "guest thread stopped unexpectedly: %s, stop reason %d at 0x%llx\n", fexmac_result_string(Result), Stop.reason,
+            static_cast<unsigned long long>(Stop.instruction_address));
   }
+  fexmac_thread_destroy(Thread);
   Self->Stage = 4;
 }
 
 uint32_t RandomBelow(uint32_t N) {
-#ifdef __APPLE__
   return arc4random_uniform(N);
-#else
-  return static_cast<uint32_t>(random()) % N;
-#endif
+}
+
+size_t HostPageSize() {
+  return static_cast<size_t>(getpagesize());
 }
 
 void* MapZeroed(size_t Size) {
@@ -1370,8 +1311,6 @@ unsigned HostCPUs() {
 } // namespace
 
 int main(int argc, char** argv) {
-  LogMan::Throw::InstallHandler(AssertHandler);
-  LogMan::Msg::InstallHandler(MsgHandler);
   setvbuf(stdout, nullptr, _IOLBF, 0);
 
   const Options Opt = Parse(argc, argv);
@@ -1389,40 +1328,36 @@ int main(int argc, char** argv) {
   // Every test has two threads; the result arrays and the stall report assume it.
   constexpr int NumThreads = 2;
 
-  FEXCore::Config::Initialize();
-  FEXCore::Config::Load();
-  FEXCore::Config::ReloadMetaLayer();
-  FEXCore::Config::Set(FEXCore::Config::CONFIG_IS64BIT_MODE, "1");
-  FEXCore::Config::Set(FEXCore::Config::CONFIG_DISABLETELEMETRY, "1");
-  const bool ScalarTSO = Opt.Mode != Options::TSO::Off;
-  const bool OtherTSO = Opt.Mode == Options::TSO::On;
-  FEXCore::Config::Set(FEXCore::Config::CONFIG_TSOENABLED, ScalarTSO ? "1" : "0");
-  FEXCore::Config::Set(FEXCore::Config::CONFIG_VECTORTSOENABLED, OtherTSO ? "1" : "0");
-  FEXCore::Config::Set(FEXCore::Config::CONFIG_MEMCPYSETTSOENABLED, OtherTSO ? "1" : "0");
-
-  fextl::unique_ptr<FEXCore::Context::Context> CTX;
-  {
-    auto HostFeatures = FEX::FetchHostFeatures(true);
-    CTX = FEXCore::Context::Context::CreateNewContext(HostFeatures);
-  }
-  auto SignalDelegation = FEX::DummyHandlers::CreateSignalDelegator();
-  auto SyscallHandler = fextl::make_unique<NullSyscallHandler>();
-  CTX->SetSignalDelegator(SignalDelegation.get());
-  CTX->SetSyscallHandler(SyscallHandler.get());
-  if (!CTX->InitCore()) {
-    fprintf(stderr, "FAIL: InitCore returned false\n");
+  if ((fexmac_version() >> 16) != FEXMAC_VERSION_MAJOR) {
+    fprintf(stderr, "FAIL: fexmac version %x, built against %x\n", fexmac_version(), FEXMAC_VERSION);
     return 1;
   }
-#if defined(__APPLE__) && defined(__aarch64__)
-  FEX::MacOSHostFaults::Install();
+  const bool ScalarTSO = Opt.Mode != Options::TSO::Off;
+  const bool OtherTSO = Opt.Mode == Options::TSO::On;
+  const fexmac_option TSOOptions[] = {
+    {"TSOENABLED", ScalarTSO ? "1" : "0"},
+    {"VECTORTSOENABLED", OtherTSO ? "1" : "0"},
+    {"MEMCPYSETTSOENABLED", OtherTSO ? "1" : "0"},
+  };
+  fexmac_config Config;
+  fexmac_config_init(&Config);
+  Config.options = TSOOptions;
+  Config.option_count = sizeof(TSOOptions) / sizeof(TSOOptions[0]);
+  fexmac_context* Context {};
+  if (const auto Result = fexmac_context_create(&Config, &Context); Result != FEXMAC_OK) {
+    fprintf(stderr, "FAIL: could not create the context: %s\n", fexmac_result_string(Result));
+    return 1;
+  }
   {
+    // SA_NODEFER, as fexmac.h asks of a host that owns the fault signals: on macOS a fault
+    // while its signal is blocked hangs the thread.
     struct sigaction Action {};
-    Action.sa_sigaction = CountingFaultHandler;
-    Action.sa_flags = SA_SIGINFO;
+    Action.sa_sigaction = FaultHandler;
+    Action.sa_flags = SA_SIGINFO | SA_NODEFER;
     sigemptyset(&Action.sa_mask);
     sigaction(SIGBUS, &Action, nullptr);
+    sigaction(SIGSEGV, &Action, nullptr);
   }
-#endif
 
   const char* ModeName = Opt.Mode == Options::TSO::On ? "on" : (Opt.Mode == Options::TSO::Off ? "off" : "scalar only");
   printf("memory-ordering emulation: %s; expecting %s; %u groups x %u runs x %llu iterations per test\n", ModeName,
@@ -1552,7 +1487,7 @@ int main(int argc, char** argv) {
 
       std::vector<GroupMemory> Mem(Groups);
       std::vector<GuestThread> Threads(Groups * NumThreads);
-      const size_t Page = FEXCore::Utils::FEX_HOST_PAGE_SIZE;
+      const size_t Page = HostPageSize();
       const size_t SlotBytes = AlignUp(size_t(T.L.Stride) * T.L.Slots, Page);
       const size_t ResultBytes = AlignUp(Iterations << RESULT_SHIFT, Page);
       for (unsigned G = 0; G < Groups; ++G) {
@@ -1582,12 +1517,12 @@ int main(int argc, char** argv) {
         for (int R = 0; R < NumThreads; ++R) {
           auto& GT = Threads[G * NumThreads + R];
           GT.RIP = reinterpret_cast<uint64_t>(Code + R * RoleCodeSize);
-          GT.Regs[FEXCore::X86State::REG_R14] = Iterations;
-          GT.Regs[FEXCore::X86State::REG_R13] = reinterpret_cast<uint64_t>(M.Results[R]);
-          GT.Regs[FEXCore::X86State::REG_R11] = reinterpret_cast<uint64_t>(M.Slots);
-          GT.Regs[FEXCore::X86State::REG_R10] = reinterpret_cast<uint64_t>(M.Counter);
-          GT.Regs[FEXCore::X86State::REG_R9] = reinterpret_cast<uint64_t>(M.Delays[R]);
-          GT.Regs[FEXCore::X86State::REG_R8] = reinterpret_cast<uint64_t>(Shared);
+          GT.Regs[R14] = Iterations;
+          GT.Regs[R13] = reinterpret_cast<uint64_t>(M.Results[R]);
+          GT.Regs[R11] = reinterpret_cast<uint64_t>(M.Slots);
+          GT.Regs[R10] = reinterpret_cast<uint64_t>(M.Counter);
+          GT.Regs[R9] = reinterpret_cast<uint64_t>(M.Delays[R]);
+          GT.Regs[R8] = reinterpret_cast<uint64_t>(Shared);
         }
       }
 
@@ -1607,7 +1542,7 @@ int main(int argc, char** argv) {
       }
       std::vector<std::thread> Host;
       for (auto& GT : Threads) {
-        Host.emplace_back(RunGuest, CTX.get(), &GT);
+        Host.emplace_back(RunGuest, Context, &GT);
       }
       for (auto& H : Host) {
         H.join();

@@ -1,7 +1,4 @@
-# Multi-thread x86 memory-ordering litmus tests. See Main.cpp.
+# Multi-thread x86 memory-ordering litmus tests, through the fexmac interface. See
+# Main.cpp. The fexmac library is macOS-only, so this tool is too.
 add_executable(FEXCoreOrderingTest Main.cpp)
-target_include_directories(FEXCoreOrderingTest PRIVATE
-  ${CMAKE_BINARY_DIR}/generated
-  ${CMAKE_SOURCE_DIR}/Source
-  ${CMAKE_SOURCE_DIR}/Source/Tools/CommonTools)
-target_link_libraries(FEXCoreOrderingTest PRIVATE FEXCore Common CommonTools JemallocLibs Threads::Threads)
+target_link_libraries(FEXCoreOrderingTest PRIVATE fexmac Threads::Threads)
