@@ -275,7 +275,10 @@ data; for SB: both loads seeing both stores), or it fails as NOT RACING in every
 no test can pass because its threads stopped overlapping. A test that shows none gets up
 to two more sets of runs first (reported; their outcomes count too), and with fewer than
 four groups every run has proportionally more iterations, because on a machine with few
-processors (the hosted virtual Mac) two threads sometimes share a core for a whole run.
+processors (the hosted virtual Mac) two threads sometimes share a core for a whole run. With
+one group and emulation on (or scalar), SB's relaxed outcome is reported but not
+required: two threads alone sometimes show none over 24 runs of 400,000 tries on a loaded
+M4, since it needs a load-acquire to pass a store-release; they must still overlap.
 Counting tests instead run one of the locked operations the core emulates from every
 thread of every group on one misaligned operand and check the exact result; each thread
 takes a native ticket before and after its operations, and a gap between the two is the
@@ -327,12 +330,16 @@ established; a plausible but unverified explanation is that the cores do not let
 become visible before an older load has its value, and perform a page-crossing load
 late.
 
-With emulation on, the misaligned tests must take more alignment faults over the run than
-the 4 instructions they patch per run, when there are at least two groups: some
-instruction must then have faulted on several threads at once, so the core's
-back-patching under the block's spin lock runs concurrently (otherwise the test fails as
-NOT CONCURRENT). They take 10 to 12 per run (1,025 to 1,208 over 100). The start barrier
-is what makes that happen: the guest barrier lines up only the two threads of one group,
+With emulation on and at least two groups, a misaligned test must see some instruction
+(host address in translated code) fault on two or more distinct threads over the run, so
+that the core's back-patching under the block's spin lock runs concurrently; otherwise it
+fails as NOT CONCURRENT. The tool's fault handler records which threads faulted at each
+address, so a thread faulting again on its own copy does not count. With the start
+barrier up to 3 or 4 distinct threads fault on one instruction; with the barrier removed
+every default run failed NOT CONCURRENT (in 5 of 5 runs, three or four of the four
+misaligned tests each time). (Translations are not all shared: the misaligned tests fault
+at about 9 instruction addresses per run for 4 instructions, so some threads have their
+own copy of a block.) The start barrier is what makes the concurrency happen: the guest barrier lines up only the two threads of one group,
 which run different code, so the threads that run the same code (the same role in
 different groups) used to reach its first, faulting execution at different times; after
 the move to `fexmac` that skew left 4.0 to 4.4 faults per run, almost never more than one
@@ -418,8 +425,18 @@ Found by it and fixed:
   then interrupt the core while it held the split-lock lock or the patch lock (and the
   thread was switched to writing code), and a handler that left by a jump or stopped the
   thread would have left them so. `fexmac_handle_fault` now blocks asynchronous signals
-  itself around the core's handling of misaligned accesses. `fexmac_c_test
-  split-locks-signal-storm` stalls in 3 of 3 runs without that and never with it.
+  itself around the core's handling of misaligned accesses. `fexmac_hook_test
+  misaligned-blocks-async-signals` checks it deterministically: a test hook sends the
+  thread a signal where the core is about to take its locks, and the signal's handler must
+  not run before the handling ends; without the blocking it runs inside in 1000 of 1000
+  accesses, in 10 of 10 runs. `fexmac_c_test split-locks-signal-storm` is the stress
+  version (a real signal storm until 3,000 signals have landed inside fault handling,
+  exact totals, no stall), but it rarely catches the missing blocking (the reviewer saw 1
+  failure in 7 runs; I saw none in 6): a signal sent to a thread that is running is
+  delivered when it next enters the kernel, which for a thread taking faults is mostly at
+  the fault, before the core's handling starts, and forcing interrupts (protection
+  changes on a spare page, which make the kernel interrupt the process's other running
+  threads) did not change that.
 
 Remaining limits of split locked operations, none of them seen in the tests:
 
@@ -437,6 +454,9 @@ Remaining limits of split locked operations, none of them seen in the tests:
    it read. It is not applied again.
 4. The lock is per process (one context per process). Memory shared with another process
    is not covered.
+5. When both halves change and neighbouring bytes of the lower word keep changing, the
+   completion (rewriting the lower half with the new neighbouring bytes) gives up after
+   16 attempts: the operation is then torn as in 3, upper half new, lower half old.
 
 Inaccuracies in the previous write-up, corrected: the tests' spin-lock release is a plain
 store of a whole qword, across both halves (it changes only the lower one, since the
@@ -724,7 +744,7 @@ All of these run in the Mac job on every push to a `macos/**` branch.
 | `FEXCoreOrderingTest` | Multi-thread x86 memory-ordering litmus tests and misaligned locked-operation counts, in three emulation modes; see above | not yet run | pass, both, in each mode |
 | `FEXCoreMutexWakeTest` | The core's reader-writer lock never loses a wake-up, in six queueing orders | not yet run | pass, both; with the bug restored, two orders hang |
 | `fexmac_c_test` | A C program using only `fexmac.h`, linked as an outside project would be: 48 subtests covering large blocks (every size across the first scratch-buffer overflow, 8 threads translating large blocks at once), system calls (prefixed, restarted), stops, state, guest faults, invalidation (also from 8 threads at once), misaligned atomics with each signal-handler arrangement, call/return stack overflow and underflow, guest accesses to protected pages, chained handlers (one that leaves with siglongjmp, over 306 stack layouts; one that faults itself, which must end the process quickly; one that returns without fixing the fault) and sent signals, garbage struct sizes, lifetime races, cached translations and code ranges, split locked operations from 8 threads in every emulated form, also with plain stores to neighbouring bytes and under a signal storm (exact results), and error paths | not yet run | pass, both |
-| `fexmac_hook_test` | The same library built with test hooks, 21 subtests: translations overflowing the scratch buffer 0 to 5 times run correctly, translations moving through three code buffers (also from the code cache), a block ending exactly on a code buffer's last byte, 5,014 random-size blocks across six buffers, a first code buffer that cannot be made fails thread creation cleanly and a later one ends the process with an accurate message, a guest store into a code buffer's guard page is a guest fault, a block that never fits stops cleanly at its start and the thread stays usable, each code buffer ends in an inaccessible page, a write past the end of a code buffer dies with a message (also with a host handler chained), guest and callback accesses to guard pages are not claimed, the scratch-buffer guard is disarmed after each translation, a log callback cannot re-enter the library, a fault inside the handler crashes with a message instead of hanging, the log callback is never called from a signal handler, a failed create leaves no log hook, invalidation leaves fault signals unblocked | not yet run | pass, both |
+| `fexmac_hook_test` | The same library built with test hooks, 22 subtests: asynchronous signals held off while the core handles a misaligned access, translations overflowing the scratch buffer 0 to 5 times run correctly, translations moving through three code buffers (also from the code cache), a block ending exactly on a code buffer's last byte, 5,014 random-size blocks across six buffers, a first code buffer that cannot be made fails thread creation cleanly and a later one ends the process with an accurate message, a guest store into a code buffer's guard page is a guest fault, a block that never fits stops cleanly at its start and the thread stays usable, each code buffer ends in an inaccessible page, a write past the end of a code buffer dies with a message (also with a host handler chained), guest and callback accesses to guard pages are not claimed, the scratch-buffer guard is disarmed after each translation, a log callback cannot re-enter the library, a fault inside the handler crashes with a message instead of hanging, the log callback is never called from a signal handler, a failed create leaves no log hook, invalidation leaves fault signals unblocked | not yet run | pass, both |
 | `FEXCoreBench` with `Scripts/macos_bench.py --quick` | The freestanding x86-64 benchmark, as built and hardened: the literal mode (no system call but exit) natively and under FEX; the loader's contract (9 cases of a guest breaking it); the timed mode (18 kernels, 4 guest threads) in four translator configurations, every checksum matching the recorded value and the native arm64 build (and Rosetta 2's where present), with the stated exceptions for ordering off and reduced x87 precision | not yet run (added after the last hosted run) | pass, both |
 | `Scripts/macos_bench_mutations.py` | 58 mutations of the benchmark kernels, each of which must change its kernel's checksum (native arm64; x86-64-only ones under Rosetta 2) | not yet run | pass |
 | `JITWriteProbe` | Reports how the machine treats executable memory, including writes and switches from a fault handler, instruction-cache flushing and the ways of placing a guard page after `MAP_JIT` memory | report only | see the facts above |

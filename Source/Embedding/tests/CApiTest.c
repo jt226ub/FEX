@@ -1880,55 +1880,100 @@ static void TestSplitLockForms(void) {
 /* ---- split locked operations while asynchronous signals keep arriving ---- */
 
 /* The host owns the fault signals (way 2) with an empty mask, and a signal handler of its
- * own keeps interrupting one guest thread. That handler waits until another thread's
- * split locked operation has changed the shared word. If the signal arrived while the
- * interrupted thread held the core's split-lock lock, nothing could change it and the
- * wait times out: fexmac_handle_fault must keep asynchronous signals blocked while the
- * core can hold its locks. The storm starts once every thread has translated its code
- * (the word has moved well past its start), since a thread interrupted while it holds a
- * lock of the translator would stall the others too, and stops at the first stall so
- * that a failure ends quickly. */
+ * own keeps interrupting one guest thread (worker 0) while 8 threads run split lock xadd
+ * and a host thread writes the neighbouring bytes (which makes the core's attempts under
+ * the split-lock lock longer). When a signal lands while worker 0 is inside its fault
+ * handler, the signal handler waits until another thread's operation has changed the
+ * shared word. If the interrupted thread held the core's split-lock lock, nothing can
+ * change it and the wait times out: fexmac_handle_fault must keep asynchronous signals
+ * blocked while the core can hold its locks.
+ *
+ * The workload runs until a minimum number of signals has landed inside fault handling
+ * (or a stall ends it early), not for a fixed number of operations, so a fast or a small
+ * machine checks as many landings as a large one. The storm starts once every thread has
+ * translated its code, since a thread interrupted while it holds a lock of the translator
+ * would stall the others too. */
+enum { StormMinimumInside = 3000, StormBudgetSeconds = 90 };
 static volatile uint64_t* StormWord;
-static atomic_int StormFinished;
-static atomic_long StormSignals, StormStalls;
+static volatile uint64_t StormStopFlag; /* read by the guest loop */
+static atomic_int StormStopped;
+static atomic_long StormSignals, StormInside, StormStalls;
+static pthread_t StormTarget;
+static volatile sig_atomic_t StormTargetInFault;
+static uint64_t StormOperations[SplitThreads];
+
+/* lock xadd [rdi], r8 until [rsi] is set, counting in rcx. */
+/* clang-format off */
+static const uint8_t StormProgram[] = {
+  0x4C, 0x89, 0xC0,             /*  0: mov rax, r8 */
+  0xF0, 0x48, 0x0F, 0xC1, 0x07, /*  3: lock xadd [rdi], rax */
+  0x48, 0xFF, 0xC1,             /*  8: inc rcx */
+  0x48, 0x83, 0x3E, 0x00,       /* 11: cmp qword [rsi], 0 */
+  0x74, 0xEF,                   /* 15: je 0 */
+  0xF4,                         /* 17: hlt */
+};
+/* clang-format on */
+
+static void StormFaultHandler(int Signal, siginfo_t* Info, void* Context) {
+  const int Target = pthread_equal(pthread_self(), StormTarget);
+  if (Target) {
+    StormTargetInFault = 1;
+  }
+  const int Handled = fexmac_handle_fault(Signal, Info, Context);
+  if (Target) {
+    StormTargetInFault = 0;
+  }
+  if (!Handled) {
+    signal(Signal, SIG_DFL);
+  }
+}
 
 static void StormHandler(int Signal) {
   (void)Signal;
-  if (atomic_load(&StormFinished)) {
+  if (atomic_load(&StormStopped)) {
     return;
   }
   atomic_fetch_add(&StormSignals, 1);
+  if (!StormTargetInFault) {
+    return;
+  }
+  atomic_fetch_add(&StormInside, 1);
   const uint64_t Before = *StormWord;
-  for (int Spin = 0; Spin < 20000; ++Spin) { /* about 20 ms */
-    if (*StormWord != Before || atomic_load(&StormFinished)) {
+  for (int Spin = 0; Spin < 20000; ++Spin) { /* at least 20 ms */
+    if (*StormWord != Before || atomic_load(&StormStopped)) {
       return;
     }
     usleep(1);
   }
   atomic_fetch_add(&StormStalls, 1);
-  atomic_store(&StormFinished, 1);
+  atomic_store(&StormStopped, 1);
 }
 
 static void* StormWorker(void* Arg) {
-  pthread_t* Self = Arg;
-  *Self = pthread_self();
+  const int Index = (int)(intptr_t)Arg;
   fexmac_thread* Thread = CreateThreadAt(SplitContext, SplitCode, 0);
   fexmac_x86_state State = GetState(Thread);
   State.gpr[RDI] = SplitRdi;
-  State.gpr[RCX] = SplitIterations;
+  State.gpr[RSI] = (uint64_t)(uintptr_t)&StormStopFlag;
+  State.gpr[RCX] = 0;
   State.gpr[8] = SplitIncrement;
   SetState(Thread, &State);
   const fexmac_stop Stop = Run(Thread);
   if (Stop.reason != FEXMAC_STOP_HALT) {
     Shared[2] = 1;
   }
-  atomic_store(&StormFinished, 1);
+  StormOperations[Index] = GetState(Thread).gpr[RCX];
   fexmac_thread_destroy(Thread);
   return NULL;
 }
 
+static void* StormTargetWorker(void* Arg) {
+  StormTarget = pthread_self();
+  return StormWorker(Arg);
+}
+
 static void TestSplitLockSignalStorm(void) {
-  InstallHostHandler(HostForwardingHandler, SA_NODEFER);
+  InstallHostHandler(StormFaultHandler, SA_NODEFER);
   struct sigaction Action;
   memset(&Action, 0, sizeof(Action));
   Action.sa_handler = StormHandler;
@@ -1937,34 +1982,59 @@ static void TestSplitLockSignalStorm(void) {
 
   SplitContext = CreateContext(NULL, NULL);
   uint8_t* Code = MapGuestMemory(0x10000);
-  memcpy(Code, SplitXaddProgram, sizeof(SplitXaddProgram));
+  memcpy(Code, StormProgram, sizeof(StormProgram));
   uint8_t* Data = MapGuestMemory(0x8000);
   SplitCode = (uint64_t)(uintptr_t)Code;
   SplitRdi = (uint64_t)(uintptr_t)(Data + 0x100 + 12);
-  StormWord = (volatile uint64_t*)(Data + 0x100 + 8); /* aligned, covers the low half */
-  pthread_t Handles[SplitThreads];
-  pthread_t Workers[SplitThreads];
-  memset(Handles, 0, sizeof(Handles));
-  for (int i = 0; i < SplitThreads; ++i) {
-    pthread_create(&Workers[i], NULL, StormWorker, &Handles[i]);
+  StormWord = (volatile uint64_t*)(Data + 0x100 + 8); /* aligned, covers the operand's low half */
+  /* The neighbouring bytes of the operand's two compare-and-swap units. */
+  NeighbourCount = 0;
+  for (int b = 8; b < 12; ++b) {
+    NeighbourBytes[NeighbourCount++] = Data + 0x100 + b;
   }
-  while (!Handles[0] || *(volatile uint64_t*)SplitRdi < 4000 * SplitIncrement) {
+  for (int b = 20; b < 24; ++b) {
+    NeighbourBytes[NeighbourCount++] = Data + 0x100 + b;
+  }
+
+  pthread_t Workers[SplitThreads];
+  pthread_create(&Workers[0], NULL, StormTargetWorker, (void*)(intptr_t)0);
+  for (int i = 1; i < SplitThreads; ++i) {
+    pthread_create(&Workers[i], NULL, StormWorker, (void*)(intptr_t)i);
+  }
+  /* The operand's low half counts the operations (the increment adds 1 to it). */
+  while (!StormTarget || (*(volatile uint64_t*)SplitRdi & 0xFFFFFFFFULL) < 4000) {
     usleep(100);
   }
-  while (!atomic_load(&StormFinished)) {
-    pthread_kill(Handles[0], SIGUSR1);
-    usleep(300);
+  atomic_store(&NeighbourStop, 0);
+  pthread_t Writer;
+  pthread_create(&Writer, NULL, NeighbourWriter, NULL);
+  const time_t Start = time(NULL);
+  while (!atomic_load(&StormStopped) && atomic_load(&StormInside) < StormMinimumInside && time(NULL) - Start < StormBudgetSeconds) {
+    pthread_kill(StormTarget, SIGUSR1);
+    usleep(50);
   }
+  atomic_store(&StormStopped, 1);
+  StormStopFlag = 1;
   for (int i = 0; i < SplitThreads; ++i) {
     pthread_join(Workers[i], NULL);
   }
+  atomic_store(&NeighbourStop, 1);
+  pthread_join(Writer, NULL);
+
+  uint64_t Operations = 0;
+  for (int i = 0; i < SplitThreads; ++i) {
+    Operations += StormOperations[i];
+  }
   uint64_t Got;
   memcpy(&Got, Data + 0x100 + 12, 8);
-  const uint64_t Want = (uint64_t)SplitThreads * SplitIterations * SplitIncrement;
-  Check(Got == Want, "lock xadd across 16 bytes from %d threads under a signal storm: %" PRIu64 " of %" PRIu64, SplitThreads, Got, Want);
-  Check(atomic_load(&StormStalls) == 0, "no signal interrupted a thread holding the split-lock lock (%ld signals, %ld stalls)",
-        atomic_load(&StormSignals), atomic_load(&StormStalls));
-  Check(atomic_load(&StormSignals) > 20, "the storm reached the guest thread (%ld signals)", atomic_load(&StormSignals));
+  const uint64_t Want = Operations * SplitIncrement;
+  Check(Got == Want, "lock xadd across 16 bytes from %d threads under a signal storm: 0x%" PRIx64 ", expected 0x%" PRIx64 " (%" PRIu64
+        " operations)", SplitThreads, Got, Want, Operations);
+  Check(atomic_load(&StormStalls) == 0, "no signal interrupted a thread holding the split-lock lock (%ld signals, %ld inside fault handling, %ld stalls)",
+        atomic_load(&StormSignals), atomic_load(&StormInside), atomic_load(&StormStalls));
+  Check(atomic_load(&StormStalls) != 0 || atomic_load(&StormInside) >= StormMinimumInside,
+        "at least %d signals landed inside fault handling within %d seconds (%ld)", StormMinimumInside, StormBudgetSeconds,
+        atomic_load(&StormInside));
   Check(Shared[2] == 0, "every thread ran to its halt");
   CheckResult(fexmac_context_destroy(SplitContext), FEXMAC_OK, "context destroy");
 }

@@ -23,6 +23,11 @@ FEXMAC_EXPORT void fexmac_testing_fault_inside_handler(int enable, volatile uint
  * log callback. */
 FEXMAC_EXPORT void fexmac_testing_log_from_fault_handler(int enable);
 
+/* Called (NULL to stop) in fexmac_handle_fault just before the core handles a
+ * misaligned access (and may take its patch or split-lock lock), with the signal mask that
+ * handling runs with. */
+FEXMAC_EXPORT void fexmac_testing_set_misaligned_hook(void (*hook)(void));
+
 /* Called inside fexmac_invalidate while the core's invalidation lock is held (NULL to
  * stop), to observe the signal mask there. */
 FEXMAC_EXPORT void fexmac_testing_set_invalidation_hook(void (*hook)(void));
