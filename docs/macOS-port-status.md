@@ -85,7 +85,9 @@ Added for embedders (the core expects these from whatever hosts it):
 Checked and found not to need a change:
 
 - **Instruction cache flush.** Already uses `__builtin___clear_cache`, which calls
-  `sys_icache_invalidate` on macOS.
+  `sys_icache_invalidate` on macOS. The dispatcher flushes a second time after switching
+  back to executable; the probe shows that is not needed on an M4, but it is kept, as
+  not proven unneeded elsewhere.
 - **Fault context.** The core does not read `ucontext_t` itself; the embedder does.
 
 Found out about macOS on Apple silicon:
@@ -112,11 +114,19 @@ with `JITWriteProbe`:
   because the signal is blocked while its handler runs. A hang in a test can be a crash
   in a fault handler.
 - **Returning from a signal handler does not restore the thread's write setting.** A
-  handler that switches leaves the setting it last chose. The core's handler only runs
-  for faults in translated code, which is always executable, and ends executable.
-- **Reading `ctr_el0` from user space faults** (SIGILL), as do `midr_el1` and the ID
-  registers; the port uses `sysctl` for all of them. **`dc cvau` is allowed.**
-- Misaligned atomic accesses fault only when they cross a 16-byte boundary.
+  handler that switches leaves the setting it last chose. `MacOSHostFaults.h` handles two
+  kinds of fault. Misaligned accesses in translated code are patched with the setting
+  switched, and translated code only runs executable, so the handler ends in the state
+  it found. Scratch-buffer guard faults in the translator's own emitter code are
+  resumed without touching the setting at all. Neither path leaves a wrong setting.
+- **Flushing the instruction cache while still writable is enough.** Rewriting the same
+  code 50,000 times with a different result each time, flushing before switching back,
+  always ran the new code; flushing after switching back did too; never flushing ran
+  stale code, which shows the test can detect it. Single thread, one address.
+- **Reading `ctr_el0`, `midr_el1` or `id_aa64isar0_el1` from user space faults**
+  (SIGILL); the port uses `sysctl` for all of them. **`dc cvau` is allowed.**
+- Misaligned atomic loads fault only when they cross a 16-byte boundary: an 8-byte
+  `ldar` at offset 4 of a 16-byte-aligned buffer runs, at offset 12 it raises SIGBUS.
 - GitHub's hosted Mac reports `pthread_jit_write_protect_supported_np` as 0 and lets a
   thread write and run `MAP_JIT` memory in any state, so it cannot test any of this.
 
@@ -158,8 +168,9 @@ All of these run in the Mac job on every push to a `macos/**` branch.
 | `FEXCoreSmokeTest` | Translates and runs a 23-byte loop, as built and under the hardened runtime | pass, both | pass, both |
 | `FEXCoreThreadTest` | Eight host threads share a context, each summing a different count in a long guest loop | pass | pass, both |
 | `FEXCoreASMTestRunner` with `Scripts/macos_asm_tests.py` | Upstream's 2,291 assembly instruction tests, in four modes | 2,253 pass in each mode | 2,254 pass in each mode, both |
-| `JITWriteProbe` | Reports how the machine treats executable memory, including writes from a fault handler | report only | see the facts above |
-| Linkage check | Fails if the core or a test tool links anything but `libSystem` and `libc++` (Homebrew's `fmt` is installed first) | | pass |
+| `JITWriteProbe` | Reports how the machine treats executable memory, including writes and switches from a fault handler and instruction-cache flushing | report only | see the facts above |
+| `JITWriteProbe --expect-enforced` | The same, but exits 1 unless every asserted case gives the result the port relies on with write protection enforced, or if a fault-handler case's handler never ran | not run: the hosted Mac does not enforce, so it would fail | pass, as built and hardened |
+| `Scripts/macos_check_linkage.sh` | Fails if the core or a test tool links anything but `libSystem` and `libc++`, if one of them is missing, or if the bundled `fmt` was not compiled. Homebrew's `fmt` is installed first. `otool` shows only that no fmt dylib is linked; the `build.ninja` check covers a static one | not yet run (added after the last hosted run) | pass, both toolchains |
 | Low-memory probe | Shows that a program with a small page-zero reservation is killed | report only | same as hosted |
 
 The instruction tests, per mode, on the most recent physical-Mac run (as built and
@@ -176,6 +187,15 @@ hardened, with either toolchain, the same):
 The skip count depends on the CPU: the hosted Mac skips one more test than the M4, and an
 earlier hosted run on a different virtual CPU skipped 16 and passed 2,244 with the same
 code paths.
+
+**Regression test for the fault-time patching fix.** The 24 instruction tests that hung
+in `jit_500_tso` (listed in the round 1 report; for example `Test_TwoByte/0F_B0_3.asm`
+and `Test_FEX_bugs/UnalignedLoadStoreSIGBUS.asm`), run on a physical Mac, together with
+`JITWriteProbe --expect-enforced` there, which checks that an atomic operation on
+protected code memory faults, that a fault inside a fault handler hangs, and that
+switching inside a handler works. **GitHub's hosted Mac cannot detect a regression
+here:** it does not enforce write protection, so those tests passed there even before
+the fix. Only the physical-Mac run counts.
 
 The fourth mode, `jit_500_tso`, is this port's addition. Upstream runs these tests with
 x86 memory-ordering emulation off; this mode turns it on.
