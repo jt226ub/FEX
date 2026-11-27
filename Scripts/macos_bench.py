@@ -48,11 +48,14 @@ Exit status: 0 all correct, 1 a correctness problem, 2 --final refused because o
 """
 
 import argparse
+import ctypes
 import datetime
 import json
 import os
 import platform
 import queue
+import re
+import resource
 import shutil
 import signal
 import statistics
@@ -64,8 +67,13 @@ import time
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SRC = os.path.join(ROOT, "unittests", "macOS", "Bench")
 DOC = os.path.join(ROOT, "docs", "macOS-benchmarks.md")
+STATUS_DOC = os.path.join(ROOT, "docs", "macOS-port-status.md")
 DOC_BEGIN = "<!-- bench-results:begin -->"
 DOC_END = "<!-- bench-results:end -->"
+SUM_BEGIN = "<!-- bench-summary:begin -->"
+SUM_END = "<!-- bench-summary:end -->"
+# The results the committed documents were generated from (written by --write-docs).
+DOC_JSON = os.path.join(ROOT, "docs", "macOS-benchmarks-results.json")
 
 # Identical for every build. -ffreestanding (which implies -fno-builtin) is used for the
 # kernels in all three builds so the compiler makes the same choices in each.
@@ -172,6 +180,7 @@ def execute(cmd, timeout):
     whether it timed out, and whether it could not be killed."""
     start = time.monotonic()
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
+    CURRENT_CHILD[0] = proc.pid
     lines_q = queue.Queue()
 
     def reader(stream, tag):
@@ -223,6 +232,7 @@ def execute(cmd, timeout):
             # For example a process stuck in Rosetta's launch: report it and go on.
             code, unkillable = None, True
             timed_out = True
+    CURRENT_CHILD[0] = None
     return {"exit": code, "lines": lines, "stderr": errors, "start_s": marks["start"], "first_result_s": marks["first"],
             "timed_out": timed_out, "unkillable": unkillable, "seconds": time.monotonic() - start}
 
@@ -245,46 +255,86 @@ def parse(lines):
     return times, sums, verdicts, errors, end
 
 
+class HostCPU:
+    """Whole-machine CPU time and this script's own, from the kernel's counters (not ps,
+    whose %cpu is a decaying average that barely sees short-lived processes)."""
+
+    TICKS_PER_SECOND = 100  # host_processor_info's CPU_STATE ticks (checked: 100 per s per CPU)
+
+    class _RUsageV0(ctypes.Structure):
+        _fields_ = [("uuid", ctypes.c_uint8 * 16), ("user", ctypes.c_uint64), ("system", ctypes.c_uint64),
+                    ("rest", ctypes.c_uint64 * 8)]
+
+    class _Timebase(ctypes.Structure):
+        _fields_ = [("numer", ctypes.c_uint32), ("denom", ctypes.c_uint32)]
+
+    def __init__(self):
+        self.lib = ctypes.CDLL("/usr/lib/libSystem.B.dylib")
+        self.lib.mach_host_self.restype = ctypes.c_uint
+        self.task = ctypes.c_uint.in_dll(self.lib, "mach_task_self_")
+        tb = HostCPU._Timebase()
+        self.lib.mach_timebase_info(ctypes.byref(tb))
+        self.abs_to_s = tb.numer / tb.denom / 1e9
+
+    def busy_seconds(self):
+        """CPU seconds spent busy (user, system, nice) on all processors since boot."""
+        count, n = ctypes.c_uint(), ctypes.c_uint()
+        info = ctypes.POINTER(ctypes.c_int)()
+        if self.lib.host_processor_info(self.lib.mach_host_self(), 2, ctypes.byref(count), ctypes.byref(info),
+                                        ctypes.byref(n)) != 0:
+            raise OSError("host_processor_info failed")
+        busy = 0
+        for c in range(count.value):
+            user, system, _idle, nice = (info[c * 4 + k] & 0xFFFFFFFF for k in range(4))
+            busy += user + system + nice
+        self.lib.vm_deallocate(self.task, ctypes.cast(info, ctypes.c_void_p), ctypes.c_size_t(n.value * 4))
+        return busy / HostCPU.TICKS_PER_SECOND
+
+    def process_seconds(self, pid):
+        """CPU seconds of a running (or not yet reaped) process; 0 if it is gone."""
+        ru = HostCPU._RUsageV0()
+        if self.lib.proc_pid_rusage(ctypes.c_int(pid), 0, ctypes.byref(ru)) != 0:
+            return 0.0
+        return (ru.user + ru.system) * self.abs_to_s
+
+
+# The benchmark process now running, if any, so its CPU time is not counted as other load.
+CURRENT_CHILD = [None]
+
+
 class LoadSampler:
-    """Samples other processes' CPU use and the load average every interval seconds."""
+    """Samples, every interval seconds, how many cores processes other than this script
+    and the programs it runs kept busy, from whole-machine CPU ticks minus this script's
+    own CPU time (itself, its reaped children, and the child now running); and the load
+    average."""
 
     def __init__(self, interval=2.0):
         self.interval = interval
         self.samples = []
+        self.cpu = HostCPU()
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._loop, daemon=True)
 
-    def _other_cpu(self):
-        out = subprocess.run(["ps", "-Ao", "pid=,ppid=,pcpu="], capture_output=True, text=True).stdout
-        rows = []
-        for line in out.splitlines():
-            f = line.split()
-            if len(f) == 3:
-                try:
-                    rows.append((int(f[0]), int(f[1]), float(f[2])))
-                except ValueError:
-                    pass
-        parent = {p: pp for p, pp, _ in rows}
-        mine = os.getpid()
-
-        def ours(p):
-            seen = 0
-            while p and p != 1 and seen < 64:
-                if p == mine:
-                    return True
-                p = parent.get(p, 0)
-                seen += 1
-            return False
-
-        return sum(c for p, _, c in rows if not ours(p)) / 100.0
+    def _own_seconds(self):
+        me = resource.getrusage(resource.RUSAGE_SELF)
+        ch = resource.getrusage(resource.RUSAGE_CHILDREN)
+        total = me.ru_utime + me.ru_stime + ch.ru_utime + ch.ru_stime
+        pid = CURRENT_CHILD[0]
+        if pid:
+            total += self.cpu.process_seconds(pid)
+        return total
 
     def _loop(self):
-        while not self._stop.is_set():
-            try:
-                self.samples.append({"t": time.time(), "other_cores": round(self._other_cpu(), 2), "loadavg": os.getloadavg()[0]})
-            except OSError:
-                pass
-            self._stop.wait(self.interval)
+        prev = (time.monotonic(), self.cpu.busy_seconds(), self._own_seconds())
+        while not self._stop.wait(self.interval):
+            now = (time.monotonic(), self.cpu.busy_seconds(), self._own_seconds())
+            wall = now[0] - prev[0]
+            if wall > 0:
+                other = max(0.0, (now[1] - prev[1]) - (now[2] - prev[2])) / wall
+                own = max(0.0, now[2] - prev[2]) / wall
+                self.samples.append({"t": time.time(), "other_cores": round(other, 2), "own_cores": round(own, 2),
+                                     "loadavg": os.getloadavg()[0]})
+            prev = now
 
     def start(self):
         self._thread.start()
@@ -299,7 +349,9 @@ class LoadSampler:
         if not c:
             return {"samples": 0}
         return {"samples": len(c), "other_cores_mean": round(statistics.mean(c), 2), "other_cores_max": round(max(c), 2),
-                "loadavg_mean": round(statistics.mean(la), 2), "loadavg_max": round(max(la), 2)}
+                "own_cores_mean": round(statistics.mean(s["own_cores"] for s in self.samples), 2),
+                "loadavg_mean": round(statistics.mean(la), 2), "loadavg_max": round(max(la), 2),
+                "method": "host_processor_info CPU ticks minus this script's own CPU time (getrusage, proc_pid_rusage)"}
 
 
 # (case, extra loader arguments, expected exit status: a negative number is death by that
@@ -341,6 +393,15 @@ def check_run(label, r, want, allowed, size, problems, literal=False):
         problems.append(f"{label}: timed out after {r['seconds']:.0f} s" + (" and could not be killed" if r["unkillable"] else ""))
         return ok
     if literal:
+        report = [l for l in r["stderr"] if "kernel(s) run" in l]
+        n = None
+        for l in report:
+            f = l.replace(",", " ").split()
+            for i, w in enumerate(f):
+                if w == "kernel(s)" and i > 0 and f[i - 1].isdigit():
+                    n = int(f[i - 1])
+        if n != len(LITERAL_KERNELS):
+            problems.append(f"{label}: literal mode ran {n} kernel(s), expected {len(LITERAL_KERNELS)}")
         if r["exit"] != 0:
             problems.append(f"{label}: literal mode exit status {r['exit']} (expected 0): {' / '.join(r['stderr'][-3:])}")
         if r["lines"]:
@@ -348,6 +409,10 @@ def check_run(label, r, want, allowed, size, problems, literal=False):
         return ok
     times, sums, verdicts, errors, end = parse(r["lines"])
     r.update({"times": times, "sums": sums, "verdicts": verdicts})
+    for line in r["lines"]:
+        f = line.split()
+        if len(f) == 3 and f[0] == "CLOCK" and f[2].isdigit():
+            r["clock_ns"] = int(f[2])
     for e in errors:
         problems.append(f"{label}: {e}")
     if end is None:
@@ -384,7 +449,10 @@ def launch_median(r, k):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--loader", required=True, help="FEXCoreBench")
+    ap.add_argument("--loader", help="FEXCoreBench (required except with --check-docs and --measure-load)")
+    ap.add_argument("--check-docs", nargs="?", const=DOC_JSON, metavar="JSON",
+                    help="check that the documents' generated blocks match this results file (default: the committed "
+                    "one) and that no measured figure appears outside them")
     ap.add_argument("--out", default="bench-out")
     ap.add_argument("--quick", action="store_true", help="correctness only: small sizes, one launch, no timing report")
     ap.add_argument("--launches", type=int, default=5)
@@ -397,8 +465,18 @@ def main():
     ap.add_argument("--final", action="store_true", help="label the run FINAL if the machine was quiet enough")
     ap.add_argument("--max-mean-cores", type=float, default=0.5)
     ap.add_argument("--max-peak-cores", type=float, default=1.5)
+    ap.add_argument("--measure-load", type=float, default=0, metavar="SECONDS",
+                    help="only sample the machine's load for this long and say whether --final would accept it")
+    ap.add_argument("--measure-load-own", default="", metavar="COMMAND",
+                    help="with --measure-load: run this command as the script's own child meanwhile (it must not count)")
     ap.add_argument("--write-docs", action="store_true", help=f"replace the generated block in {os.path.relpath(DOC, ROOT)}")
     args = ap.parse_args()
+    if args.measure_load:
+        return measure_load(args)
+    if args.check_docs:
+        return check_docs(args.check_docs)
+    if not args.loader:
+        ap.error("--loader is required")
 
     only = [k for k in args.only.split(",") if k] if args.only else []
     unknown = [k for k in only if k not in ALL_KERNELS]
@@ -533,9 +611,11 @@ def main():
 
     sampler.stop()
     load = sampler.summary()
-    quiet = load.get("samples", 0) > 0 and load["other_cores_mean"] <= args.max_mean_cores and \
-        load["other_cores_max"] <= args.max_peak_cores
-    final = args.final and quiet and not args.quick
+    quiet = quiet_enough(load, args)
+    describe = subprocess.run(["git", "-C", ROOT, "describe", "--always", "--dirty"], capture_output=True,
+                              text=True).stdout.strip()
+    dirty = describe.endswith("-dirty") or not describe
+    final = args.final and quiet and not args.quick and not dirty
     status = "FINAL" if final else "PROVISIONAL"
 
     summary = None if args.quick else summarise(results, labels, startup, want)
@@ -546,7 +626,7 @@ def main():
         "machine": machine_name(),
         "macos": platform.mac_ver()[0],
         "clang": subprocess.run(["clang", "--version"], capture_output=True, text=True).stdout.splitlines()[0],
-        "git": subprocess.run(["git", "-C", ROOT, "rev-parse", "--short", "HEAD"], capture_output=True, text=True).stdout.strip(),
+        "git": describe,
         "quick": args.quick,
         "launches": launches,
         "reps": reps,
@@ -558,18 +638,20 @@ def main():
         "load_samples": sampler.samples,
     }
     slim = {l: [{k: r.get(k) for k in ("launch", "exit", "times", "sums", "verdicts", "ok", "counters", "first_result_s",
-                                        "stderr", "timed_out", "seconds")}
+                                        "clock_ns", "stderr", "timed_out", "seconds")}
                 for r in results[l]] for l in labels}
     name = "results-quick" if args.quick else "results"
     with open(os.path.join(out, name + ".json"), "w") as f:
         json.dump({"meta": meta, "literal": literal_runs, "startup": startup, "summary": summary, "results": slim}, f, indent=1)
     if summary:
         md = markdown(meta, summary, labels)
+        sm = summary_markdown(meta, summary, labels)
         with open(os.path.join(out, name + ".md"), "w") as f:
-            f.write(md)
-        print("\n" + md)
+            f.write(sm + "\n" + md)
+        print("\n" + sm + "\n" + md)
         if args.write_docs:
-            write_docs(md)
+            shutil.copy2(os.path.join(out, name + ".json"), DOC_JSON)
+            write_docs(md, sm)
     print(f"load during the run: {load}")
     if problems:
         print("PROBLEMS:")
@@ -577,12 +659,38 @@ def main():
             print("  " + p)
         return 1
     print("PASS: every checksum as expected")
+    if args.final and dirty:
+        print(f"NOT FINAL: the source tree is not a clean commit ({describe or 'unknown'}); commit first")
+        return 2
     if args.final and not final:
         print(f"NOT FINAL: other processes used {load.get('other_cores_mean')} cores on average and "
               f"{load.get('other_cores_max')} at most (limits {args.max_mean_cores} and {args.max_peak_cores}); "
               "the results are labelled PROVISIONAL")
         return 2
     return 0
+
+
+def quiet_enough(load, args):
+    return load.get("samples", 0) > 0 and load["other_cores_mean"] <= args.max_mean_cores and \
+        load["other_cores_max"] <= args.max_peak_cores
+
+
+def measure_load(args):
+    """Samples the load for --measure-load seconds (running --measure-load-own as this
+    script's child meanwhile, if given) and prints what --final would decide."""
+    sampler = LoadSampler()
+    sampler.start()
+    if args.measure_load_own:
+        r = execute(["/bin/sh", "-c", args.measure_load_own], args.measure_load)
+        print(f"own child: exit {r['exit']}, {r['seconds']:.1f} s")
+    else:
+        time.sleep(args.measure_load)
+    sampler.stop()
+    load = sampler.summary()
+    print(json.dumps(load))
+    ok = quiet_enough(load, args)
+    print("quiet enough for --final" if ok else "too busy for --final")
+    return 0 if ok else 2
 
 
 def machine_name():
@@ -645,7 +753,12 @@ def summarise(results, labels, startup, want):
         later = v["later"]
         st[l] = {"first_launch": v["first_launch"], "later_median": statistics.median(later) if later else None,
                  "later_min": min(later) if later else None, "later_max": max(later) if later else None}
-    return {"per_kernel": per, "means": means, "startup": st, "translation": translation}
+    clock = {}
+    for label in labels:
+        vals = [r.get("clock_ns") for r in results[label] if r.get("clock_ns") is not None]
+        if vals:
+            clock[label] = statistics.median(vals)
+    return {"per_kernel": per, "means": means, "startup": st, "translation": translation, "clock_ns": clock}
 
 
 def markdown(meta, s, labels):
@@ -759,17 +872,209 @@ def markdown(meta, s, labels):
     return "\n".join(o) + "\n"
 
 
-def write_docs(md):
+def replace_block(text, begin, end, content):
+    if begin not in text or end not in text:
+        return None
+    a = text.index(begin)
+    b = text.index(end) + len(end) + 1
+    return text[:a] + content + text[b:]
+
+
+def write_docs(md, sm):
+    """Replaces the generated blocks: results and summary in the benchmarks document,
+    the summary in the status document."""
+    for path, blocks in ((DOC, ((DOC_BEGIN, DOC_END, md), (SUM_BEGIN, SUM_END, sm))), (STATUS_DOC, ((SUM_BEGIN, SUM_END, sm),))):
+        with open(path) as f:
+            text = f.read()
+        for begin, end, content in blocks:
+            new = replace_block(text, begin, end, content)
+            if new is None:
+                print(f"{path} has no {begin} ... {end} block; not changed")
+                return
+            text = new
+        with open(path, "w") as f:
+            f.write(text)
+        print(f"updated {path}")
+
+
+def fmt_ratio(x):
+    return "-" if x is None else f"{x:.2f}"
+
+
+def summary_markdown(meta, s, labels):
+    """The figures the documents' prose may rely on, all from the results."""
+    per, means, tr = s["per_kernel"], s["means"], s.get("translation", {})
+    load = meta["load"]
+
+    def kmed(label, k):
+        p = per.get(label, {}).get(k)
+        return p["median"] if p and p["median"] else None
+
+    def ratio(label, k):
+        a, b = kmed(label, k), kmed("rosetta", k)
+        return a / b if a and b else None
+
+    have = lambda c: f"fex:{c}" in per  # noqa: E731
+    o = [SUM_BEGIN, "<!-- Generated by Scripts/macos_bench.py from docs/macOS-benchmarks-results.json; "
+         "do not edit by hand. -->", ""]
+    status = "**FINAL**" if meta["status"] == "FINAL" else "**PROVISIONAL**"
+    o.append(f"{status} measurement of `{meta['git']}`, {meta['started']}: other processes kept "
+             f"{load.get('other_cores_mean')} cores busy on average (at most {load.get('other_cores_max')}) of the "
+             f"machine's 10; load average {load.get('loadavg_mean')}." +
+             ("" if meta["status"] == "FINAL" else " Provisional numbers show the shape, not final values."))
+    o.append("")
+    names = [("tso_on", "all ordering on (`tso_on`), like for like with Rosetta 2's hardware TSO"),
+             ("tso_scalar", "scalar ordering only (`tso_scalar`, FEX's defaults)"),
+             ("tso_vector", "scalar and vector ordering (`tso_vector`)"),
+             ("tso_memcpy", "scalar and string-instruction ordering (`tso_memcpy`)"),
+             ("tso_on_nomb", "all on, multiblock off"), ("tso_on_x87rp", "all on, reduced x87 precision"),
+             ("tso_on_cache_cold", "all on, code cache cold"), ("tso_on_cache_warm", "all on, code cache warm")]
+    parts = [f"{what} **{fmt_ratio(means.get('fex:' + c, {}).get('headline'))}**" for c, what in names if have(c)]
+    if "native-arm64" in means:
+        parts.append(f"native arm64 {fmt_ratio(means['native-arm64'].get('headline'))}")
+    if have("tso_off"):
+        parts.append(f"ordering off {fmt_ratio(means['fex:tso_off'].get('headline'))} (an upper bound only: not correct "
+                     "for multi-threaded guests)")
+    n = len(means.get("fex:tso_on", {}).get("headline_kernels", []))
+    o.append(f"- **Headline** ({n} single-threaded integer, memory and floating-point kernels), geometric mean of the "
+             "time relative to Rosetta 2: " + "; ".join(parts) + ".")
+    head = [k for k in HEADLINE_KERNELS if k in per.get("fex:tso_on", {})]
+    if have("tso_on") and "rosetta" in per:
+        worst = sorted((k for k in head if ratio("fex:tso_on", k)), key=lambda k: -ratio("fex:tso_on", k))[:6]
+        items = []
+        for k in worst:
+            extra = []
+            for c in ("tso_scalar", "tso_off"):
+                if have(c):
+                    extra.append(f"{c} {fmt_ratio(ratio('fex:' + c, k))}")
+            items.append(f"`{k}` {fmt_ratio(ratio('fex:tso_on', k))} ({', '.join(extra)})")
+        o.append("- **Slowest against Rosetta 2 with all ordering on** (ratio; in brackets the same kernel with scalar "
+                 "ordering only and with ordering off): " + "; ".join(items) + ".")
+    if have("tso_vector") and have("tso_scalar"):
+        v = [(k, ratio("fex:tso_vector", k), ratio("fex:tso_scalar", k)) for k in head]
+        v = [x for x in v if x[1] and x[2] and x[1] / x[2] >= 1.5]
+        o.append("- **Vector ordering** (`tso_vector` against `tso_scalar`, ratios to Rosetta 2), kernels it slows by "
+                 "half or more: " + ("; ".join(f"`{k}` {fmt_ratio(a)} against {fmt_ratio(b)}" for k, a, b in v) or "none") +
+                 ".")
+    if have("tso_memcpy") and have("tso_scalar"):
+        v = [(k, ratio("fex:tso_memcpy", k), ratio("fex:tso_scalar", k)) for k in head]
+        v = [x for x in v if x[1] and x[2] and x[1] / x[2] >= 1.5]
+        o.append("- **String-instruction ordering** (`tso_memcpy` against `tso_scalar`), kernels it slows by half or more: " +
+                 ("; ".join(f"`{k}` {fmt_ratio(a)} against {fmt_ratio(b)}" for k, a, b in v) or "none") + ".")
+    if have("tso_on_nomb") and have("tso_on"):
+        v = [(k, ratio("fex:tso_on_nomb", k), ratio("fex:tso_on", k)) for k in head]
+        v = [x for x in v if x[1] and x[2] and x[1] / x[2] >= 1.5]
+        o.append("- **Multiblock off** (`tso_on_nomb` against `tso_on`), kernels it slows by half or more: " +
+                 ("; ".join(f"`{k}` {fmt_ratio(a)} against {fmt_ratio(b)}" for k, a, b in v) or "none") + ".")
+    if "rosetta" in per and "x87" in per["rosetta"]:
+        xs = [f"Rosetta 2 {kmed('rosetta', 'x87'):.0f} ms"]
+        for c in ("tso_on", "tso_on_x87rp"):
+            if have(c):
+                xs.append(f"`{c}` {fmt_ratio(ratio('fex:' + c, 'x87'))} of Rosetta 2's time")
+        o.append("- **x87** (x86-64 builds only): " + "; ".join(xs) + ".")
+    thr = [k for k in THREAD_KERNELS if k in per.get("fex:tso_on", {})]
+    if thr and "rosetta" in per:
+        items = []
+        for k in thr:
+            p = per["fex:tso_on"][k]
+            items.append(f"`{k}` {fmt_ratio(ratio('fex:tso_on', k))} (launch medians {p['min']:.1f} to {p['max']:.1f} ms; "
+                         f"Rosetta 2 {per['rosetta'][k]['min']:.1f} to {per['rosetta'][k]['max']:.1f} ms)")
+        o.append("- **Thread kernels**, all ordering on against Rosetta 2 (in no mean): " + "; ".join(items) + ".")
+    if tr:
+        def m(c, key, f=".0f"):
+            x = tr.get("fex:" + c, {}).get(key)
+            return "-" if not x else f"{x['median']:{f}}"
+        items = [f"`tso_on` compiles {m('tso_on', 'compiled')} blocks per launch"]
+        if have("tso_on_nomb"):
+            items.append(f"{m('tso_on_nomb', 'compiled')} with multiblock off")
+        if have("tso_on_cache_cold"):
+            items.append(f"a cold-cache launch compiles {m('tso_on_cache_cold', 'compiled')} and loads "
+                         f"{m('tso_on_cache_cold', 'loaded')}")
+        if have("tso_on_cache_warm"):
+            items.append(f"a warm-cache launch compiles {m('tso_on_cache_warm', 'compiled')} and loads "
+                         f"{m('tso_on_cache_warm', 'loaded')}")
+        firsts = [f"`{c}` {m(c, 'first_result_s', '.3f')} s" for c in ("tso_on", "tso_on_cache_cold", "tso_on_cache_warm")
+                  if have(c)]
+        launches = [f"`{c}` {m(c, 'launch_s', '.2f')} s" for c in ("tso_on", "tso_on_cache_cold", "tso_on_cache_warm")
+                    if have(c)]
+        o.append("- **Translation and the code cache**: " + "; ".join(items) + ". Launch to first kernel result: " +
+                 ", ".join(firsts) + "; whole launch: " + ", ".join(launches) + ".")
+    clock = s.get("clock_ns", {})
+    if clock:
+        o.append("- **Clock read** (calibrated by the program, subtracted from the times): " +
+                 ", ".join(f"{l.replace('fex:', '')} {v:.0f} ns" for l, v in clock.items() if l in ("native-arm64", "rosetta",
+                                                                                                    "fex:tso_on")) + ".")
+    o.append(SUM_END)
+    return "\n".join(o) + "\n"
+
+
+# Figures that only a measurement can give: ratios ("2.1x", "3 times"), times with a
+# unit, percentages and bare decimals (not dotted versions such as 27.0.1).
+FIGURE_PATTERNS = [
+    re.compile(r"(?<![\w.])\d+(?:\.\d+)?(?:x|×)(?![0-9A-Za-z_])"),
+    re.compile(r"(?<![\w.])\d+(?:\.\d+)? times\b"),
+    re.compile(r"(?<![\w.])\d+(?:\.\d+)?\s?(?:ms|µs|us|ns)\b"),
+    re.compile(r"(?<![\w.])\d+\.\d+\s?s\b"),
+    re.compile(r"(?<![\w.])\d+(?:\.\d+)?\s?%"),
+    re.compile(r"(?<![\w.])\d+\.\d+(?![\w.])"),
+]
+
+
+def unblocked(text, blocks):
+    for begin, end in blocks:
+        while begin in text and end in text:
+            a = text.index(begin)
+            b = text.index(end) + len(end)
+            text = text[:a] + text[b:]
+    return text
+
+
+def check_docs(json_path):
+    """Fails if a generated block differs from what this results file gives, or if a
+    measured figure appears outside the generated blocks (anywhere in the benchmarks
+    document; in the status document's benchmark section and its summary bullet)."""
+    with open(json_path) as f:
+        data = json.load(f)
+    meta, summary = data["meta"], data["summary"]
+    labels = list(data["results"])
+    md, sm = markdown(meta, summary, labels), summary_markdown(meta, summary, labels)
+    bad = []
     with open(DOC) as f:
-        text = f.read()
-    if DOC_BEGIN not in text or DOC_END not in text:
-        print(f"{DOC} has no {DOC_BEGIN} ... {DOC_END} block; not changed")
-        return
-    a = text.index(DOC_BEGIN)
-    b = text.index(DOC_END) + len(DOC_END) + 1
-    with open(DOC, "w") as f:
-        f.write(text[:a] + md + text[b:])
-    print(f"updated {DOC}")
+        doc = f.read()
+    with open(STATUS_DOC) as f:
+        status = f.read()
+    for path, text, want in ((DOC, doc, ((DOC_BEGIN, DOC_END, md), (SUM_BEGIN, SUM_END, sm))),
+                             (STATUS_DOC, status, ((SUM_BEGIN, SUM_END, sm),))):
+        for begin, end, content in want:
+            if begin not in text or end not in text:
+                bad.append(f"{os.path.relpath(path, ROOT)}: no {begin} block")
+                continue
+            got = text[text.index(begin):text.index(end) + len(end) + 1]
+            if got != content:
+                bad.append(f"{os.path.relpath(path, ROOT)}: the {begin} block is not what {json_path} gives "
+                           "(run the measurement with --write-docs)")
+    regions = [(DOC, unblocked(doc, [(DOC_BEGIN, DOC_END), (SUM_BEGIN, SUM_END)]))]
+    st = unblocked(status, [(SUM_BEGIN, SUM_END)])
+    section = st[st.index("## Guest program and benchmark"):] if "## Guest program and benchmark" in st else ""
+    section = section[:section.find("\n## ", 3)] if "\n## " in section[3:] else section
+    bullet = st[st.index("- **Runs a real guest program"):] if "- **Runs a real guest program" in st else ""
+    bullet = bullet[:bullet.find("\n- **", 3)]
+    regions += [(STATUS_DOC, section), (STATUS_DOC, bullet)]
+    for path, text in regions:
+        in_code = False
+        for line in text.splitlines():
+            if line.startswith("```"):
+                in_code = not in_code
+            if in_code:
+                continue
+            for pat in FIGURE_PATTERNS:
+                for mt in pat.finditer(line):
+                    bad.append(f"{os.path.relpath(path, ROOT)}: figure outside the generated blocks: '{mt.group(0)}' in: "
+                               f"{line.strip()[:100]}")
+    for b in bad:
+        print(b)
+    print("docs check: " + ("FAIL" if bad else "PASS"))
+    return 1 if bad else 0
 
 
 if __name__ == "__main__":

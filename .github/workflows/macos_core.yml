@@ -195,6 +195,8 @@ jobs:
         run: |
           set -o pipefail
           python3 Scripts/macos_bench_mutations.py --out bench-mutations 2>&1 | tee bench-mutations.log
+          # Every speed figure in the documents must come from the committed results file.
+          python3 Scripts/macos_bench.py --check-docs 2>&1 | tee bench-docs-check.log
           python3 Scripts/macos_bench.py --loader build/Bin/FEXCoreBench --out bench-quick --quick 2>&1 | tee bench-quick.log
           python3 Scripts/macos_bench.py --loader build/Bin/FEXCoreBench --out bench-quick-hardened --quick --hardened 2>&1 | tee bench-quick-hardened.log
 
