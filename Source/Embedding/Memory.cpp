@@ -303,6 +303,9 @@ FEXCore::HLE::ExecutableRangeInfo SyscallHandler::QueryGuestExecutableRange(FEXC
 }
 
 void SyscallHandler::MarkGuestExecutableRange(FEXCore::Core::InternalThreadState*, uint64_t Start, uint64_t Length) {
+#ifdef FEXMAC_TESTING
+  CallTestMarkHook(Start, Length);
+#endif
   auto& Memory = Context->Memory;
   if (!Context->WriteProtectCode || !Memory.Tracking() || Length == 0) {
     return;

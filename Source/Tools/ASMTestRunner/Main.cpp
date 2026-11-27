@@ -147,10 +147,7 @@ public:
   }
 
   // Tells fexmac about every page mapped for the test (readable, writable and executable,
-  // as the tests use them), so that it tracks guest memory: SMCCHECKS mtrack then
-  // write-protects translated code. Only with FEXMAC_RUNNER_REGISTER_MEMORY=1: registered
-  // memory also turns a jump to an unmapped address into a guest fault stop instead of a
-  // crash, which would change the outcome some expected failures are matched by.
+  // as the tests use them).
   bool Register(fexmac_context* Context) const {
     for (uint64_t Page : Mapped) {
       if (fexmac_memory_map(Context, Page, PageSize, FEXMAC_PROT_READ | FEXMAC_PROT_WRITE | FEXMAC_PROT_EXEC) != FEXMAC_OK) {
@@ -389,8 +386,19 @@ int main(int argc, char** argv, char** const envp) {
   }
   const auto OptionArray = Options.Get();
 
+  // The code cache, switched on by the environment the way the core's own option names
+  // would (Scripts/macos_asm_tests.py --cache-dir): FEX_DISKCACHE=1 and
+  // FEX_DISKCACHEPATH=<dir>, turned into fexmac's config fields.
+  const char* CacheEnv = getenv("FEX_DISKCACHE");
+  const char* CachePath = getenv("FEX_DISKCACHEPATH");
+  const bool UseCache = CacheEnv && std::string_view {CacheEnv} == "1";
+
   fexmac_config Config;
   fexmac_config_init(&Config);
+  if (UseCache) {
+    Config.code_cache_enabled = 1;
+    Config.code_cache_directory = CachePath && *CachePath ? CachePath : nullptr;
+  }
   Config.options = OptionArray.data();
   Config.option_count = OptionArray.size();
   Config.log = LogHandler;
@@ -480,8 +488,13 @@ int main(int argc, char** argv, char** const envp) {
     fextl::fmt::print("Failed to map the test's memory\n");
     return ExitFail;
   }
-  if (const char* Register = getenv("FEXMAC_RUNNER_REGISTER_MEMORY"); Register && strcmp(Register, "1") == 0 && !Mapper.Register(Context)) {
-    fextl::fmt::print("Failed to register the test's memory with fexmac\n");
+  // Everything this runner mapped may hold code, and tests write to it. Registering it
+  // (readable, writable, executable) makes the core treat only that memory as code (a
+  // jump elsewhere stops with a guest fault), the code cache hashes and patches guest
+  // bytes only inside it, and SMCCHECKS mtrack write-protects pages translated from it.
+  if (!Mapper.Register(Context)) {
+    fextl::fmt::print("Failed to register the test's memory with fexmac
+");
     return ExitFail;
   }
 
@@ -566,6 +579,17 @@ int main(int argc, char** argv, char** const envp) {
   }
 
   const bool Passed = !DidFault && Loader.CompareStates(&State, nullptr, SupportsAVX);
+
+  if (UseCache) {
+    // Wait for this run's translations to be written; the process skips teardown below.
+    // The counters line is what Scripts/macos_asm_tests.py --cache-dir checks.
+    fexmac_context_flush_cache(Context);
+    fexmac_translation_counters Counters;
+    fexmac_translation_counters_init(&Counters);
+    fexmac_context_get_counters(Context, &Counters);
+    fextl::fmt::print("Code cache: compiled {} loaded {} rejected {} queued {}\n", Counters.blocks_compiled, Counters.blocks_loaded,
+                      Counters.cache_entries_rejected, Counters.cache_entries_queued);
+  }
   fextl::fmt::print("Faulted? {}\nPassed? {}\n", DidFault ? "Yes" : "No", Passed ? "Yes" : "No");
   fflush(nullptr);
   // Skip teardown: the result is known and the process is about to exit.

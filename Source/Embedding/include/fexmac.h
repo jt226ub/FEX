@@ -76,8 +76,8 @@ typedef enum fexmac_result {
   /* The core could not be initialised. */
   FEXMAC_ERROR_INIT_FAILED = 5,
   FEXMAC_ERROR_OUT_OF_MEMORY = 6,
-  /* The request needs something this library version does not provide (for example the
-   * reserved cached-translation fields of fexmac_config). */
+  /* The request needs something this library version or this context does not provide
+   * (for example flushing the code cache of a context that has none). */
   FEXMAC_ERROR_UNSUPPORTED = 7,
   /* The core returned without a recorded stop reason. Indicates a bug in the library. */
   FEXMAC_ERROR_INTERNAL = 8,
@@ -157,20 +157,28 @@ typedef struct fexmac_config {
   fexmac_log_fn log;
   void* log_user_data;
 
-  /* Reserved for cached translations (package F; not available yet). Loading and saving
-   * translations to a directory will be switched on here. Must be NULL and 0: anything
-   * else is refused with FEXMAC_ERROR_UNSUPPORTED. The core's own options for this
-   * (DISKCACHE, DISKCACHEPATH) are refused too. */
+  /* Cached translations (the on-disk code cache; docs/macOS-code-cache-design.md).
+   * code_cache_enabled 1: translations are looked up in, and saved to, the directory
+   * code_cache_directory (NULL: ~/Library/Caches/fex-emu/DiskCache). 0: no cache, and
+   * code_cache_directory must be NULL. Other values are refused (FEXMAC_ERROR_BAD_CONFIG).
+   *
+   * The directory must be owned by this user and writable by nobody else (no group or
+   * other write bit, no ACL entry granting write); the library creates it 0700 if it is
+   * missing and never changes an existing one. If it, or the cache files in it, may not
+   * be trusted, the context is still created, without a cache, and
+   * fexmac_context_get_counters reports FEXMAC_CACHE_REFUSED. A cache file is code that
+   * will run: anything running as this user can write it, and the library's integrity
+   * checks do not stop that.
+   *
+   * With the cache on, register the guest's memory with fexmac_memory_map: cached code
+   * is matched against the guest bytes of executable registered pages only.
+   *
+   * The core's own options for this (DISKCACHE, DISKCACHEPATH) are refused; these fields
+   * are the interface. DISKCACHEMAXFILESIZE and DISKCACHEVALIDATION are accepted options. */
   const char* code_cache_directory;
   uint32_t code_cache_enabled;
   uint32_t reserved2;
 } fexmac_config;
-
-/* Planned with cached translations (package F), not declared until they exist:
- *   fexmac_context_flush_cache(fexmac_context*)  writes pending translations to the
- *     cache directory;
- *   a query for translation counters (blocks compiled, loaded from the cache, rejected);
- *   (the guest memory map it needs is fexmac_memory_map, below). */
 
 /* Fills a config with defaults: no options, no callbacks. */
 FEXMAC_EXPORT void fexmac_config_init(fexmac_config* config);
@@ -201,6 +209,60 @@ FEXMAC_EXPORT fexmac_result fexmac_cpuid(fexmac_context* context, uint32_t funct
  * thread that is not running guest code, asynchronous signals are blocked while the lock
  * is held; SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGTRAP and SIGSYS are never blocked. */
 FEXMAC_EXPORT fexmac_result fexmac_invalidate(fexmac_context* context, uint64_t address, uint64_t size);
+
+/* ---------------------------------------------------------------------------------
+ * The code cache
+ *
+ * Which guest memory is code comes from the guest memory map (fexmac_memory_map with
+ * FEXMAC_PROT_EXEC, below): with the cache on, cached code is matched against the guest
+ * bytes of executable registered pages only. (The 2.x development branch had
+ * fexmac_add_code_range / fexmac_remove_code_range for this; they are replaced by the
+ * memory map, which is the one registry of guest memory.)
+ * --------------------------------------------------------------------------------- */
+
+typedef enum fexmac_cache_state {
+  /* code_cache_enabled was 0. */
+  FEXMAC_CACHE_OFF = 0,
+  /* Translations are loaded from and saved to the directory. */
+  FEXMAC_CACHE_ACTIVE = 1,
+  /* Loaded but not saved: the child of a fork (see fexmac_before_fork). */
+  FEXMAC_CACHE_READ_ONLY = 2,
+  /* Requested, but the directory or its files may not be trusted, or the core's build
+   * cannot be identified; the context runs without a cache. The reason is logged. */
+  FEXMAC_CACHE_REFUSED = 3,
+} fexmac_cache_state;
+
+typedef struct fexmac_translation_counters {
+  /* sizeof(fexmac_translation_counters). Set by fexmac_translation_counters_init. */
+  uint32_t struct_size;
+  fexmac_cache_state cache_state;
+  /* Since the context was created: */
+  uint64_t blocks_compiled;        /* blocks the translator compiled */
+  uint64_t blocks_loaded;          /* blocks copied from the code cache instead */
+  uint64_t cache_entries_rejected; /* cache entries that failed a check and were ignored */
+  uint64_t cache_entries_queued;   /* compiled blocks handed to the cache writer */
+} fexmac_translation_counters;
+
+/* Sets struct_size and zeroes the rest. */
+FEXMAC_EXPORT void fexmac_translation_counters_init(fexmac_translation_counters* counters);
+
+FEXMAC_EXPORT fexmac_result fexmac_context_get_counters(fexmac_context* context, fexmac_translation_counters* counters);
+
+/* Waits until every translation queued for the code cache is written, then flushes the
+ * cache files to stable storage. Call it before the process exits: translations still
+ * queued then are lost (never half-written). FEXMAC_ERROR_UNSUPPORTED if the context
+ * does not save translations (cache off, refused or read-only). */
+FEXMAC_EXPORT fexmac_result fexmac_context_flush_cache(fexmac_context* context);
+
+/* fork() with a context: call fexmac_before_fork just before fork() and
+ * fexmac_after_fork in both processes just after it (child = 1 in the child). No other
+ * fexmac call may run meanwhile on another host thread, and no guest thread may be
+ * running. In the child only the forking host thread exists: threads created before the
+ * fork must not be run there (destroy them or leave them), new ones may be created and
+ * run. The child keeps loading from the code cache but saves nothing (it shares the
+ * parent's open cache files); its cache state is FEXMAC_CACHE_READ_ONLY. */
+FEXMAC_EXPORT fexmac_result fexmac_before_fork(fexmac_context* context);
+FEXMAC_EXPORT fexmac_result fexmac_after_fork(fexmac_context* context, int child);
 
 /* ---------------------------------------------------------------------------------
  * Threads

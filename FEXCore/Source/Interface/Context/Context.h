@@ -207,6 +207,11 @@ public:
 
   virtual void InitDiskCache() override {}
 
+  TranslationCounters GetTranslationCounters() const override;
+  bool FlushDiskCache() override;
+  std::atomic<uint64_t> BlocksCompiledCount {};
+  std::atomic<uint64_t> BlocksLoadedFromCacheCount {};
+
   CodeCache& GetCodeCache() override {
     return CodeCache;
   }
@@ -467,6 +472,22 @@ public:
   }
 
   bool RequiresRelocatableConstants() const;
+
+#ifdef __APPLE__
+  // For the disk cache: code at these addresses is not generated from the guest bytes
+  // alone, so it must never be served from or stored to the cache. Callers hold
+  // CodeInvalidationMutex (shared), as CompileBlock does.
+  bool HasCustomIRHandlerAt(uint64_t Address) {
+    if (!HasCustomIRHandlers.load(std::memory_order_relaxed)) {
+      return false;
+    }
+    std::shared_lock lk(CustomIRMutex);
+    return CustomIRHandlers.contains(Address);
+  }
+  bool ForceTSOIntersects(uint64_t Begin, uint64_t End) const {
+    return !ForceTSOValidRanges.Empty() && ForceTSOValidRanges.Intersect({Begin, End});
+  }
+#endif
 
 protected:
   void UpdateAtomicTSOEmulationConfig() {

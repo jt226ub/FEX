@@ -20,6 +20,8 @@
 #include <FEXCore/Utils/LogManager.h>
 #include <FEXCore/Utils/SignalScopeGuards.h>
 #include <FEXCore/Utils/TypeDefines.h>
+#include <FEXCore/Utils/IntervalList.h>
+#include <FEXCore/fextl/set.h>
 
 #include <algorithm>
 #include <atomic>
@@ -360,6 +362,10 @@ namespace {
 
 #ifdef FEXMAC_TESTING
   std::atomic<void (*)()> TestInvalidationHook {};
+  // Called where the core reports guest code it starts executing: in CompileBlock after
+  // compiling and before storing to the code cache.
+  std::atomic<void (*)(uint64_t, uint64_t, void*)> TestMarkHook {};
+  std::atomic<void*> TestMarkHookData {};
 #endif
 
   void Invalidate(fexmac_context* Context, FEXCore::Core::InternalThreadState* CallingThread, uint64_t Start, uint64_t Length) {
@@ -441,6 +447,14 @@ void SyscallHandler::HandleSyscall(FEXCore::Core::CpuStateFrame* Frame) {
 void SyscallHandler::InvalidateGuestCodeRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Start, uint64_t Length) {
   Invalidate(Context, Thread, Start, Length);
 }
+
+#ifdef FEXMAC_TESTING
+void CallTestMarkHook(uint64_t Start, uint64_t Length) {
+  if (auto Hook = TestMarkHook.load()) {
+    Hook(Start, Length, TestMarkHookData.load());
+  }
+}
+#endif
 } // namespace fexmac
 
 using namespace fexmac;
@@ -498,9 +512,12 @@ fexmac_result fexmac_context_create(const fexmac_config* config, fexmac_context*
     return FEXMAC_ERROR_INVALID_ARGUMENT;
   }
   *out_context = nullptr;
-  // Package F: cached translations. Refused until they are implemented.
-  if (config->code_cache_directory || config->code_cache_enabled || config->reserved || config->reserved2) {
+  if (config->reserved || config->reserved2) {
     return FEXMAC_ERROR_UNSUPPORTED;
+  }
+  if (config->code_cache_enabled > 1 || (!config->code_cache_enabled && config->code_cache_directory) ||
+      (config->code_cache_directory && !config->code_cache_directory[0])) {
+    return FEXMAC_ERROR_BAD_CONFIG;
   }
 
   {
@@ -539,8 +556,14 @@ fexmac_result fexmac_context_create(const fexmac_config* config, fexmac_context*
     return Fail(Result, false);
   }
 
-  // Package F: cached-code loading will add its options (cache directory, keying) to the
-  // supported list and set them up here, before the context is created.
+  // The code cache: the core reads these when the context is created. Its own options
+  // for them are refused in ParseOptions; the config fields are the interface.
+  if (config->code_cache_enabled) {
+    Parsed.emplace_back(FEXCore::Config::CONFIG_DISKCACHE, "1");
+    if (config->code_cache_directory) {
+      Parsed.emplace_back(FEXCore::Config::CONFIG_DISKCACHEPATH, config->code_cache_directory);
+    }
+  }
   FEXCore::Config::Initialize();
   FEXCore::Config::AddLayer(CreateOptionsLayer(std::move(Parsed)));
   FEXCore::Config::Load();
@@ -558,6 +581,7 @@ fexmac_result fexmac_context_create(const fexmac_config* config, fexmac_context*
   Context->WriteProtectCode = FEXCore::Config::Get_SMCCHECKS() == FEXCore::Config::CONFIG_SMC_MTRACK;
   Context->SyscallFn = config->syscall;
   Context->SyscallUserData = config->syscall_user_data;
+  Context->CacheRequested = config->code_cache_enabled != 0;
 
   {
     auto HostFeatures = FEX::FetchHostFeatures(true);
@@ -660,6 +684,102 @@ fexmac_result fexmac_invalidate(fexmac_context* context, uint64_t address, uint6
   auto* Current = GetCurrentThread();
   auto* Calling = Current && Current->Context == context ? Current->Thread : nullptr;
   Invalidate(context, Calling, address, size);
+  return FEXMAC_OK;
+}
+
+void fexmac_translation_counters_init(fexmac_translation_counters* counters) {
+  if (counters) {
+    memset(counters, 0, sizeof(*counters));
+    counters->struct_size = sizeof(*counters);
+  }
+}
+
+fexmac_result fexmac_context_get_counters(fexmac_context* context, fexmac_translation_counters* counters) {
+  if (InLogCallback) {
+    return FEXMAC_ERROR_BUSY;
+  }
+  if (!counters || !KnownSize(counters)) {
+    return FEXMAC_ERROR_INVALID_ARGUMENT;
+  }
+  ContextUse Use {context};
+  if (!Use) {
+    return FEXMAC_ERROR_INVALID_HANDLE;
+  }
+  const auto Counters = context->CTX->GetTranslationCounters();
+  counters->blocks_compiled = Counters.BlocksCompiled;
+  counters->blocks_loaded = Counters.BlocksLoadedFromCache;
+  counters->cache_entries_rejected = Counters.CacheEntriesRejected;
+  counters->cache_entries_queued = Counters.CacheEntriesQueued;
+  if (!context->CacheRequested) {
+    counters->cache_state = FEXMAC_CACHE_OFF;
+  } else if (Counters.CacheWriting) {
+    counters->cache_state = FEXMAC_CACHE_ACTIVE;
+  } else if (Counters.CacheReading) {
+    counters->cache_state = FEXMAC_CACHE_READ_ONLY;
+  } else {
+    counters->cache_state = FEXMAC_CACHE_REFUSED;
+  }
+  return FEXMAC_OK;
+}
+
+fexmac_result fexmac_context_flush_cache(fexmac_context* context) {
+  if (InLogCallback) {
+    return FEXMAC_ERROR_BUSY;
+  }
+  ContextUse Use {context};
+  if (!Use) {
+    return FEXMAC_ERROR_INVALID_HANDLE;
+  }
+  if (!context->CTX->GetTranslationCounters().CacheWriting) {
+    return FEXMAC_ERROR_UNSUPPORTED;
+  }
+  return context->CTX->FlushDiskCache() ? FEXMAC_OK : FEXMAC_ERROR_INTERNAL;
+}
+
+namespace {
+  // The context whose locks fexmac_before_fork holds, until fexmac_after_fork. Checked
+  // before taking the registry lock: the caller of a second fexmac_before_fork may be the
+  // thread that holds it.
+  std::atomic<fexmac_context*> ForkingContext {};
+} // namespace
+
+fexmac_result fexmac_before_fork(fexmac_context* context) {
+  if (InLogCallback) {
+    return FEXMAC_ERROR_BUSY;
+  }
+  if (ForkingContext.load()) {
+    return FEXMAC_ERROR_BUSY;
+  }
+  RegistryMutex.lock();
+  if (!context || !LiveContexts.contains(context)) {
+    RegistryMutex.unlock();
+    return FEXMAC_ERROR_INVALID_HANDLE;
+  }
+  for (auto* Thread : context->Threads) {
+    if (Thread->Running) {
+      RegistryMutex.unlock();
+      return FEXMAC_ERROR_BUSY;
+    }
+  }
+  // Every lock the library and the core might hold on another host thread, so the child
+  // does not inherit one held by a thread it does not have. The registry lock stays held
+  // until fexmac_after_fork.
+  ForkingContext = context;
+  context->ThreadsMutex.lock();
+  context->Memory.Mutex.lock();
+  context->CTX->LockBeforeFork(nullptr);
+  return FEXMAC_OK;
+}
+
+fexmac_result fexmac_after_fork(fexmac_context* context, int child) {
+  if (!context || context != ForkingContext.load()) {
+    return FEXMAC_ERROR_INVALID_HANDLE;
+  }
+  context->CTX->UnlockAfterFork(nullptr, child != 0);
+  context->Memory.Mutex.unlock();
+  context->ThreadsMutex.unlock();
+  ForkingContext = nullptr;
+  RegistryMutex.unlock();
   return FEXMAC_OK;
 }
 
@@ -984,6 +1104,43 @@ void fexmac_testing_guard_pages(fexmac_thread* thread, uint64_t* callret_low, ui
 
 void fexmac_testing_set_invalidation_hook(void (*hook)(void)) {
   TestInvalidationHook.store(hook);
+}
+
+// Code generation state outside the configuration, for the code cache tests.
+fexmac_result fexmac_testing_add_thunk_trampoline(fexmac_context* context, uint64_t entry, uint64_t target) {
+  ContextUse Use {context};
+  if (!Use) {
+    return FEXMAC_ERROR_INVALID_HANDLE;
+  }
+  context->CTX->AddThunkTrampolineIRHandler(entry, target);
+  return FEXMAC_OK;
+}
+
+fexmac_result fexmac_testing_set_hardware_tso(fexmac_context* context, int supported) {
+  ContextUse Use {context};
+  if (!Use) {
+    return FEXMAC_ERROR_INVALID_HANDLE;
+  }
+  context->CTX->SetHardwareTSOSupport(supported != 0);
+  return FEXMAC_OK;
+}
+
+fexmac_result fexmac_testing_force_tso(fexmac_context* context, uint64_t begin, uint64_t end, uint64_t instruction) {
+  ContextUse Use {context};
+  if (!Use) {
+    return FEXMAC_ERROR_INVALID_HANDLE;
+  }
+  std::unique_lock Lock {context->CTX->GetCodeInvalidationMutex()};
+  FEXCore::IntervalList<uint64_t> Ranges;
+  Ranges.Insert({begin, end});
+  fextl::set<uint64_t> Instructions {instruction};
+  context->CTX->AddForceTSOInformation(Ranges, std::move(Instructions));
+  return FEXMAC_OK;
+}
+
+void fexmac_testing_set_mark_executable_hook(void (*hook)(uint64_t start, uint64_t length, void* user_data), void* user_data) {
+  TestMarkHookData.store(user_data);
+  TestMarkHook.store(hook);
 }
 #endif
 

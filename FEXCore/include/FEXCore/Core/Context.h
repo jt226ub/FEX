@@ -46,6 +46,29 @@ using CustomIREntrypointHandler = std::function<void(uintptr_t Entrypoint, IR::I
 
 using ExitHandler = std::function<void(Core::InternalThreadState* Thread)>;
 
+/**
+ * @brief Counts of how translations were produced, for the context's whole lifetime.
+ *
+ * Added by the macOS port so that an embedder (and the tests) can tell whether the
+ * on-disk code cache was used: a second run of the same guest code with a warm cache
+ * should report BlocksCompiled == 0.
+ */
+struct TranslationCounters {
+  // Blocks the translator compiled from guest code.
+  uint64_t BlocksCompiled;
+  // Blocks copied from the on-disk code cache instead of being compiled.
+  uint64_t BlocksLoadedFromCache;
+  // Cache entries whose key matched but that failed an integrity or sanity check and were
+  // ignored. Non-zero means a cache file is damaged; translation fell back to compiling.
+  uint64_t CacheEntriesRejected;
+  // Compiled blocks handed to the cache writer to be saved.
+  uint64_t CacheEntriesQueued;
+  // Whether the disk cache is being read and written by this context (it may be off,
+  // refused, or read-only in a forked child).
+  bool CacheReading;
+  bool CacheWriting;
+};
+
 class Context {
 public:
   virtual ~Context() = default;
@@ -134,6 +157,18 @@ public:
   FEX_DEFAULT_VISIBILITY virtual FEXCore::CPUID::FunctionResults RunCPUIDFunctionName(uint32_t Function, uint32_t Leaf, uint32_t CPU) = 0;
 
   virtual void InitDiskCache() = 0;
+
+  /**
+   * @brief Returns how many blocks were compiled and how many were loaded from the disk cache.
+   */
+  FEX_DEFAULT_VISIBILITY virtual TranslationCounters GetTranslationCounters() const = 0;
+
+  /**
+   * @brief Waits until every translation queued for the on-disk code cache is written, then
+   * flushes the cache files to stable storage. Call before the process exits; queued
+   * entries are otherwise lost (never half-written). Returns false if the cache is off.
+   */
+  FEX_DEFAULT_VISIBILITY virtual bool FlushDiskCache() = 0;
 
   virtual AbstractCodeCache& GetCodeCache() = 0;
   virtual void SetCodeMapWriter(fextl::unique_ptr<CodeMapWriter>) = 0;

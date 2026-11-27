@@ -20,6 +20,7 @@
 #include <map>
 #include <mutex>
 #include <optional>
+#include <shared_mutex>
 #include <utility>
 
 namespace fexmac {
@@ -48,7 +49,8 @@ public:
   // mtrack and registered memory, the library write-protects the page. Memory.cpp.
   void MarkGuestExecutableRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Start, uint64_t Length) override;
 
-  // Package F (cached code loading) answers this from the embedder's file mappings.
+  // File-backed cache keys (by file and offset) would come from the embedder's file
+  // mappings; fexmac has none, so the cache keys guest code by its bytes.
   std::optional<FEXCore::ExecutableFileSectionInfo> LookupExecutableFileSection(FEXCore::Core::InternalThreadState*, uint64_t) override {
     return std::nullopt;
   }
@@ -175,6 +177,9 @@ struct fexmac_context {
   fexmac::GuestMemory Memory;
   // SMCCHECKS is mtrack: translated pages are write-protected once memory is registered.
   bool WriteProtectCode {};
+
+  // Whether the embedder asked for the code cache.
+  bool CacheRequested {};
 };
 
 struct fexmac_thread {
@@ -232,6 +237,11 @@ uint64_t InvalidationSignalMask();
 // store has run (or the run ended first).
 void ResolveCodeWrite(fexmac_thread* Thread, uint64_t Address);
 void FinishCodeWrite(fexmac_thread* Thread);
+
+#ifdef FEXMAC_TESTING
+// fexmac_testing_set_mark_executable_hook's hook, called from MarkGuestExecutableRange.
+void CallTestMarkHook(uint64_t Start, uint64_t Length);
+#endif
 
 // The process's one context, for the fault handler's message about host writes to
 // write-protected code from any host thread. Set while the context exists.

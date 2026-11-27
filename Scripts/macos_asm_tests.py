@@ -10,14 +10,23 @@ same with the core-only runner so the tests can run on macOS.
 Each test runs in every mode upstream uses for the translator. A test fails the run only
 if it is not listed in an expected-failure file. A listed test that passes is reported so
 the list can be trimmed.
+
+With --cache-dir the on-disk code cache is switched on. --cache-passes 2 empties the
+directory, runs everything once to fill it (cold) and again to load from it (warm). The
+run then also fails if any test's warm result differs from its cold one, if a warm run
+that finished compiled any block instead of loading it, or if any cache entry was
+rejected. --cache-validate makes the warm pass compile as well and compare its code with
+the cached code byte for byte.
 """
 
 import argparse
 import concurrent.futures
 import os
 import re
+import shutil
 import subprocess
 import sys
+import time
 
 MODES = {
     "jit_1": {"FEX_MAXINST": "1", "FEX_MULTIBLOCK": "0"},
@@ -36,6 +45,8 @@ if sys.platform == "darwin":
     # through FEX's software generator. Turn it on so their tests run that path.
     COMMON_ENV["FEX_SOFTWARERNG"] = "1"
 SKIP_CODE = 125
+CACHE_LINE = re.compile(r"^Code cache: compiled (\d+) loaded (\d+) rejected (\d+) queued (\d+)$", re.M)
+VALIDATE_MISMATCH = re.compile(r"DiskCache: validate host (code|size) mismatch")
 
 # macOS on Apple silicon reserves the first 4GB of every 64-bit process, so guest memory
 # cannot live there. The tests use fixed scratch addresses below 4GB. On macOS each test
@@ -306,26 +317,35 @@ def prepare(root, asm_dir, source, out_dir):
     return binary, config
 
 
-def run_one(runner, name, mode, binary, config, timeout, smc="full"):
+def run_one(runner, name, mode, binary, config, timeout, cache_env=None, smc="full"):
+    """Returns (status, detail, cache) where cache is None or a dict of the runner's counters."""
     env = dict(os.environ)
     env.update(COMMON_ENV)
     env.update(MODES[mode])
     if "SelfModifyingCode" in name:
-        # full: the translator checks the code before every instruction. mtrack: the
-        # runner registers the test's memory with fexmac, which write-protects pages it
-        # has translated code from and discards that code when the guest writes them.
+        # full: the translator checks the code before every instruction. mtrack: fexmac
+        # write-protects pages it has translated code from (the runner registers the
+        # test's memory) and discards that code when the guest writes them.
         env["FEX_SMCCHECKS"] = smc
-        if smc == "mtrack":
-            env["FEXMAC_RUNNER_REGISTER_MEMORY"] = "1"
+    if cache_env:
+        env.update(cache_env)
     try:
         result = subprocess.run([runner, binary, config], capture_output=True, text=True, errors="replace", env=env, timeout=timeout)
     except subprocess.TimeoutExpired:
-        return "timeout", "no exit within %d seconds" % timeout
+        return "timeout", "no exit within %d seconds" % timeout, None
+    cache = None
+    match = CACHE_LINE.search(result.stdout)
+    if match:
+        cache = dict(zip(("compiled", "loaded", "rejected", "queued"), map(int, match.groups())))
+        cache["mismatches"] = len(VALIDATE_MISMATCH.findall(result.stdout + result.stderr))
+        # The cache's own messages (a database that could not be opened, an entry that
+        # could not be written), to explain a warm run that had to compile.
+        cache["log"] = [line[:200] for line in (result.stdout + result.stderr).splitlines() if "DiskCache:" in line and "features" not in line][:3]
     if result.returncode == 0:
-        return "pass", ""
+        return "pass", "", cache
     if result.returncode == SKIP_CODE:
-        return "skip", result.stdout.strip().splitlines()[-1][:160] if result.stdout.strip() else ""
-    lines = (result.stdout + result.stderr).strip().splitlines()
+        return "skip", result.stdout.strip().splitlines()[-1][:160] if result.stdout.strip() else "", cache
+    lines = [line for line in (result.stdout + result.stderr).strip().splitlines() if not line.startswith("Code cache:")]
     tail = lines[-6:]
     status = "crash(signal %d)" % -result.returncode if result.returncode < 0 else "fail"
     # Lead with the lines that say what happened: the fault report (from the runner, or
@@ -333,7 +353,30 @@ def run_one(runner, name, mode, binary, config, timeout, smc="full"):
     # line. The expected-outcome check reads them, and results.tsv keeps them.
     key = [line for line in lines if FAULT_LINE.match(line) or STOP_LINE.match(line)][-2:]
     tail = key + [line for line in tail if line not in key]
-    return status, " | ".join(line[:200] for line in tail)
+    return status, " | ".join(line[:200] for line in tail), cache
+
+
+def directory_bytes(path):
+    total = 0
+    for folder, _, files in os.walk(path):
+        for file in files:
+            try:
+                total += os.path.getsize(os.path.join(folder, file))
+            except OSError:
+                pass
+    return total
+
+
+def run_pass(runner, tests, modes, jobs, timeout, cache_env, smc="full"):
+    results = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=jobs) as pool:
+        futures = {}
+        for mode in modes:
+            for name, binary, config in tests:
+                futures[pool.submit(run_one, runner, name, mode, binary, config, timeout, cache_env, smc)] = (mode, name)
+        for future in concurrent.futures.as_completed(futures):
+            results[futures[future]] = future.result()
+    return results
 
 
 def main():
@@ -343,7 +386,12 @@ def main():
     parser.add_argument("--jobs", type=int, default=os.cpu_count() or 2)
     parser.add_argument("--timeout", type=int, default=60)
     parser.add_argument("--modes", default=",".join(MODES))
-    parser.add_argument("--filter", default="", help="only run tests whose name contains this text")
+    parser.add_argument("--filter", default="", help="only run tests whose name contains this text (several: separate with commas)")
+    parser.add_argument("--cache-dir", default="", help="switch the on-disk code cache on, kept in this directory")
+    parser.add_argument("--cache-passes", type=int, default=1, choices=(1, 2),
+                        help="2: empty the cache directory, run cold, then run warm and compare")
+    parser.add_argument("--cache-validate", action="store_true",
+                        help="in the warm pass, also compile every block and compare it with the cached code")
     parser.add_argument("--smc", choices=["full", "mtrack"], default="full",
                         help="how the SelfModifyingCode tests detect changed code: checks in every block (full) "
                              "or write protection of translated pages (mtrack)")
@@ -389,7 +437,7 @@ def main():
     not_run = []
     for source, top, prefix in sources:
         name = "Test_" + prefix + os.path.relpath(source, top)
-        if args.filter and args.filter not in name:
+        if args.filter and not any(part in name for part in args.filter.split(",") if part):
             continue
         if name in disabled:
             not_run.append((name, "skip(upstream-list)", disabled[name]))
@@ -405,14 +453,30 @@ def main():
         tests.append((name, prepared[0], prepared[1]))
 
     modes = [mode for mode in args.modes.split(",") if mode in MODES]
-    results = {}
-    with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as pool:
-        futures = {}
-        for mode in modes:
-            for name, binary, config in tests:
-                futures[pool.submit(run_one, runner, name, mode, binary, config, args.timeout, args.smc)] = (mode, name)
-        for future in concurrent.futures.as_completed(futures):
-            results[futures[future]] = future.result()
+    cache_env = None
+    if args.cache_dir:
+        cache_dir = os.path.abspath(args.cache_dir)
+        if args.cache_passes == 2 and os.path.isdir(cache_dir):
+            shutil.rmtree(cache_dir)
+        os.makedirs(cache_dir, exist_ok=True)
+        # The runner turns these into fexmac's code_cache_enabled / code_cache_directory.
+        cache_env = {"FEX_DISKCACHE": "1", "FEX_DISKCACHEPATH": cache_dir}
+
+    started = time.monotonic()
+    results = run_pass(runner, tests, modes, args.jobs, args.timeout, cache_env, args.smc)
+    first_seconds = time.monotonic() - started
+    cold = None
+    if cache_env and args.cache_passes == 2:
+        cold = results
+        cold_bytes = directory_bytes(cache_dir)
+        warm_env = dict(cache_env)
+        if args.cache_validate:
+            warm_env["FEX_DISKCACHEVALIDATION"] = "1"
+        started = time.monotonic()
+        results = run_pass(runner, tests, modes, args.jobs, args.timeout, warm_env, args.smc)
+        warm_seconds = time.monotonic() - started
+    full_results = results
+    results = {key: value[:2] for key, value in full_results.items()}
 
     exit_code = 0
     # Every test appears in every mode, including the ones that were not run, each with
@@ -473,6 +537,73 @@ def main():
             print("   NOW PASSES %s" % name)
         if unexpected:
             exit_code = 1
+
+    if cold is not None:
+        exit_code |= report_cache(cold, full_results, modes, tests, cache_dir, first_seconds, warm_seconds, cold_bytes,
+                                  args.cache_validate, os.path.join(args.out, "cache.tsv"))
+    elif cache_env:
+        print("\nCode cache in %s: %d bytes after %.1f s" % (cache_dir, directory_bytes(cache_dir), first_seconds))
+    return exit_code
+
+
+
+def report_cache(cold, warm, modes, tests, cache_dir, cold_seconds, warm_seconds, cold_bytes, validated, tsv_path):
+    """Compares a cold and a warm pass. Returns 1 if the cache changed a result or was not used."""
+    exit_code = 0
+    print("\n== code cache: cold %.1f s, warm %.1f s, %d bytes on disk after the cold pass, %d after the warm pass" %
+          (cold_seconds, warm_seconds, cold_bytes, directory_bytes(cache_dir)))
+    with open(tsv_path, "w") as handle:
+        handle.write("mode\ttest\tcold\twarm\tcold_compiled\tcold_loaded\tcold_queued\twarm_compiled\twarm_loaded\twarm_rejected\t"
+                     "mismatches\n")
+        for mode in modes:
+            changed, compiled, rejected, mismatched, unfinished = [], [], [], [], []
+            total_cold = total_compiled = total_loaded = 0
+            for name, _, _ in tests:
+                cold_status, cold_detail, cold_cache = cold[(mode, name)]
+                warm_status, warm_detail, warm_cache = warm[(mode, name)]
+                cc = cold_cache or {}
+                wc = warm_cache or {}
+                handle.write("%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" %
+                             (mode, name, cold_status, warm_status, cc.get("compiled", ""), cc.get("loaded", ""), cc.get("queued", ""),
+                              wc.get("compiled", ""),
+                              wc.get("loaded", ""), wc.get("rejected", ""), wc.get("mismatches", "")))
+                if cold_status != warm_status:
+                    changed.append((name, cold_status, warm_status, warm_detail))
+                if cold_status == "skip":
+                    continue
+                if cold_cache is None or warm_cache is None:
+                    # The runner did not reach its end (crash or timeout), so it never
+                    # saved its translations. Such a test is an expected failure.
+                    unfinished.append(name)
+                    continue
+                total_cold += cc["compiled"]
+                total_compiled += wc["compiled"]
+                total_loaded += wc["loaded"]
+                if wc["rejected"]:
+                    rejected.append(name)
+                if validated:
+                    if wc["mismatches"]:
+                        mismatched.append((name, wc["mismatches"]))
+                elif wc["compiled"] and cold_status == "pass":
+                    # A test that stops at code the translator cannot translate (an
+                    # expected failure) compiles that block every time: it cannot be cached.
+                    compiled.append((name, wc["compiled"], wc["loaded"], cc.get("log", []) + wc.get("log", [])))
+            print("   %s: cold compiled %d blocks; warm compiled %d, loaded %d; results changed %d; warm runs that compiled %d; "
+                  "rejected entries in %d; not finished %d" % (mode, total_cold, total_compiled, total_loaded, len(changed), len(compiled),
+                                                             len(rejected), len(unfinished)))
+            for name, before, after, detail in changed[:50]:
+                print("   CHANGED %s: cold %s, warm %s %s" % (name, before, after, detail[:200]))
+            for name, count, loaded, log in compiled[:50]:
+                print("   COMPILED %s: %d blocks compiled, %d loaded %s" % (name, count, loaded, " | ".join(log)))
+            for name in rejected[:50]:
+                print("   REJECTED %s" % name)
+            for name, count in mismatched[:50]:
+                print("   MISMATCH %s: %d blocks differ from a fresh compile" % (name, count))
+            # Byte differences against a fresh compile are reported, not failed: upstream's
+            # relocation of patchable immediates can legitimately encode the same low bits
+            # differently (see docs/macOS-code-cache-design.md).
+            if changed or compiled or rejected:
+                exit_code = 1
     return exit_code
 
 

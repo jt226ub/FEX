@@ -460,6 +460,9 @@ void ContextImpl::DestroyThread(FEXCore::Core::InternalThreadState* Thread) {
 #ifndef _WIN32
 void ContextImpl::UnlockAfterFork(FEXCore::Core::InternalThreadState* LiveThread, bool Child) {
   Allocator::UnlockAfterFork(LiveThread, Child);
+#ifdef __APPLE__
+  DiskCache.UnlockAfterFork(Child);
+#endif
 
   Profiler::PostForkAction(Child);
   if (Child) {
@@ -481,6 +484,10 @@ void ContextImpl::UnlockAfterFork(FEXCore::Core::InternalThreadState* LiveThread
 
 void ContextImpl::LockBeforeFork(FEXCore::Core::InternalThreadState* Thread) {
   CodeInvalidationMutex.lock();
+#ifdef __APPLE__
+  // After the invalidation lock, so no thread is compiling (and so storing) any more.
+  DiskCache.LockBeforeFork();
+#endif
   Allocator::LockBeforeFork(Thread);
   if (Config.StrictInProcessSplitLocks) {
     FEXCore::Utils::SpinWaitLock::lock(&StrictSplitLockMutex);
@@ -497,6 +504,21 @@ void ContextImpl::OnCodeBufferAllocated(const fextl::shared_ptr<CPU::CodeBuffer>
     std::scoped_lock lk {CodeBufferListLock};
     CodeBufferList.emplace_back(Buffer);
   }
+}
+
+TranslationCounters ContextImpl::GetTranslationCounters() const {
+  return {
+    .BlocksCompiled = BlocksCompiledCount.load(std::memory_order_relaxed),
+    .BlocksLoadedFromCache = BlocksLoadedFromCacheCount.load(std::memory_order_relaxed),
+    .CacheEntriesRejected = DiskCache.GetRejectedCount(),
+    .CacheEntriesQueued = DiskCache.GetQueuedCount(),
+    .CacheReading = DiskCache.IsReadingDiskCache(),
+    .CacheWriting = DiskCache.IsWritingDiskCache(),
+  };
+}
+
+bool ContextImpl::FlushDiskCache() {
+  return DiskCache.Flush();
 }
 
 void ContextImpl::ClearCodeCache(FEXCore::Core::InternalThreadState* Thread, bool NewCodeBuffer) {
@@ -553,6 +575,13 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
     const auto* GuestCode = reinterpret_cast<const uint8_t*>(GuestRIP);
 
     Thread->FrontendDecoder->DecodeLoop(GuestCode);
+#ifdef __APPLE__
+    if (DiskCache.IsWritingDiskCache()) {
+      const auto Min = Thread->FrontendDecoder->DecodedMinAddress;
+      const auto Max = Thread->FrontendDecoder->DecodedMaxAddress;
+      Thread->FrontendDecoder->DecodedBytesHash = XXH3_64bits(reinterpret_cast<const void*>(Min), Max - Min);
+    }
+#endif
 
     const auto* BlockInfo = Thread->FrontendDecoder->GetDecodedBlockInfo();
     const auto& CodeBlocks = BlockInfo->Blocks;
@@ -982,6 +1011,7 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
         LOGMAN_THROW_A_FMT(CachedHostCode != 0, "Couldn't find GuestRIP in Disk Cache entrypoints!");
 
         FEXCORE_PROFILE_INSTANT_INCREMENT(Thread, AccumulatedDiskCacheHitCount, 1);
+        BlocksLoadedFromCacheCount.fetch_add(1, std::memory_order_relaxed);
         Thread->FrontendDecoder->DelayedDisownBuffer();
 
         Thread->FrontendDecoder->ValidateDisownedOrFree();
@@ -994,6 +1024,7 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
 
   // Accumulate a JIT count now, as even if another thread raced us, it should count as a compile.
   FEXCORE_PROFILE_INSTANT_INCREMENT(Thread, AccumulatedJITCount, 1);
+  BlocksCompiledCount.fetch_add(1, std::memory_order_relaxed);
 
   auto [CompiledCode, DebugData, StartAddr, Length, NeedsAddGuestCodeRanges] = CompileCode(Thread, GuestRIP, MaxInst);
   auto CodePtr = CompiledCode.EntryPoints[GuestRIP];
@@ -1109,6 +1140,7 @@ uintptr_t ContextImpl::CompileSingleStep(FEXCore::Core::CpuStateFrame* Frame, ui
   auto lk = GuardSignalDeferringSection<std::shared_lock>(CodeInvalidationMutex, Thread);
 
   Thread->FrontendDecoder->SetupDecodeInstructionsAtEntry(Thread, GuestRIP, 1);
+  BlocksCompiledCount.fetch_add(1, std::memory_order_relaxed);
   auto [CompiledCode, DebugData, StartAddr, Length, _] = CompileCode(Thread, GuestRIP, 1);
   auto CodePtr = CompiledCode.EntryPoints[GuestRIP];
   if (CodePtr == nullptr) {
