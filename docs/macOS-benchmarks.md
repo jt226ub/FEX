@@ -1,5 +1,13 @@
 # macOS benchmarks: a guest program under this port, Rosetta 2 and native
 
+> **Provisional, under review (27 November 2026).** An independent review found the summary
+> figures in this document inflated and not reproducible (the native mean is skewed by the
+> x87 kernel, the TSO-off mean includes a kernel that gives the wrong answer in that mode,
+> and results vary between launches). Re-runs gave about 0.8 times Rosetta 2's time with
+> ordering emulation off and 2.1 to 2.2 times with it fully on. The method and numbers are
+> being redone; do not quote the figures below.
+
+
 This is the evidence for exit criteria 7 ("a real guest program runs") and 8 ("speed is
 measured") of `docs/macOS-v1.0-plan.md`, and the method behind it.
 

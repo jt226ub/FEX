@@ -38,7 +38,8 @@ Related documents:
 - **Runs a real guest program to the right answer** (criterion 7): a freestanding x86-64
   benchmark of 18 kernels, run through `fexmac` by `FEXCoreBench`, gives bit-identical
   checksums to the same C source under Rosetta 2 and natively on arm64. Speed is
-  recorded (criterion 8): with x86 memory-ordering emulation off, 0.74 times Rosetta 2's
+  recorded provisionally (criterion 8; the figures are under review and being re-measured,
+  see `docs/macOS-benchmarks.md`): with x86 memory-ordering emulation off, 0.74 times Rosetta 2's
   time (geometric mean); with all of it on, 1.9 times, almost all of it barriers on vector
   accesses. See "Guest program and benchmark" below.
 - **Linux is unaffected.** The core-only Linux build passes with the same changes.
@@ -370,7 +371,7 @@ Evidence, Mac mini M4, macOS 27.0.1, 27 November 2026, other workers using about
   seen: with TSO off the message-passing kernel reads stale data (wrong and varying
   checksum), and with `X87REDUCEDPRECISION=1` the x87 checksum changes. No translator
   bug was found.
-- **Criterion 8.** Median time relative to Rosetta 2, geometric mean over the kernels:
+- **Criterion 8 (provisional, under review; do not quote).** Median time relative to Rosetta 2, geometric mean over the kernels:
   native arm64 0.61; this port with TSO off 0.74, scalar TSO only 0.89, all three TSO
   switches on 1.91, all on with multiblock off 2.19. Worst with TSO on: the SSE copy loop
   98x Rosetta (a `dmb` around every vector access: the M4 has no `FEAT_LRCPC3`), SSE
