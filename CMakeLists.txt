@@ -753,6 +753,10 @@ if (BUILD_FEXCORE_ONLY)
   # host-feature code an embedder needs alongside FEXCore.
   add_subdirectory(Source/Common/)
   add_subdirectory(Source/Tools/CommonTools/)
+  if (APPLE)
+    # The C embedding interface (fexmac). The test tools below are built on it.
+    add_subdirectory(Source/Embedding/)
+  endif()
   add_subdirectory(Source/Tools/CoreSmokeTest/)
   add_subdirectory(Source/Tools/ASMTestRunner/)
   add_subdirectory(Source/Tools/CoreThreadTest/)

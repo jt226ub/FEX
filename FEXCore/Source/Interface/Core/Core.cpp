@@ -854,6 +854,55 @@ ContextImpl::CompileCodeResult ContextImpl::CompileCode(FEXCore::Core::InternalT
   };
 }
 
+#ifdef __APPLE__
+// The frontend could translate no instruction at GuestRIP: a valid x86 instruction FEX does
+// not implement (`int 0x80` in a 64-bit process, `mov fs, r` in 64-bit mode, `o16 iret`,
+// some address-size-override string forms, a missing LOCK handler), or bytes it cannot
+// decode at all. CompileBlock and CompileSingleStep return 0 for that, and every caller
+// that branches to the result would jump to host address 0. The three that do are the
+// dispatcher's compile path, its single-step (TF) path, and ExitFunctionLink when linking
+// a block exit (which, with TF set, returns to the loop top and so reaches the single-step
+// path). Instead report it to the embedder as an invalid-opcode guest fault at that
+// instruction, marked Untranslatable and with si_code 0 (a real #UD from translated code
+// carries ILL_ILLOPN), through the dispatcher entry translated code uses for a faultless
+// synchronous fault. That entry expects the static registers filled, as all three callers
+// leave them.
+//
+// Unlike DEF_OP(Break), which reaches the same entry from translated code, nothing here
+// resets the host stack: ExitFunctionLink is entered from a block exit, so entries the
+// guest call/return optimisation pushed stay on the host stack. That is harmless while the
+// synchronous exception handler never returns (fexmac leaves the dispatcher); guest fault
+// delivery that resumes from it (package D) must reset the stack first.
+static uintptr_t UntranslatableFault(FEXCore::Core::CpuStateFrame* Frame, uint64_t GuestRIP) {
+  Frame->State.rip = GuestRIP;
+  Frame->SynchronousFaultData = {
+    .FaultToTopAndGeneratedException = true,
+    .Signal = SIGILL,
+    .TrapNo = X86State::X86_TRAPNO_UD,
+    .si_code = 0,
+    .err_code = 0,
+    .Untranslatable = 1,
+    ._pad = 0,
+    .FaultAddress = GuestRIP,
+  };
+  return Frame->Pointers.GuestSignal_SynchronousFault;
+}
+
+uintptr_t ContextImpl::CompileBlockOrFault(FEXCore::Core::CpuStateFrame* Frame, uint64_t GuestRIP, uint64_t MaxInst) {
+  if (const auto HostCode = CompileBlock(Frame, GuestRIP, MaxInst)) {
+    return HostCode;
+  }
+  return UntranslatableFault(Frame, GuestRIP);
+}
+
+uintptr_t ContextImpl::CompileSingleStepOrFault(FEXCore::Core::CpuStateFrame* Frame, uint64_t GuestRIP) {
+  if (const auto HostCode = CompileSingleStep(Frame, GuestRIP)) {
+    return HostCode;
+  }
+  return UntranslatableFault(Frame, GuestRIP);
+}
+#endif
+
 uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_t GuestRIP, uint64_t MaxInst) {
   if constexpr (BLOCK_DEBUGGING) {
     // Block debugging logic is hand-written and needs to be handled with care.

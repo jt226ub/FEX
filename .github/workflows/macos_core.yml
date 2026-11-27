@@ -60,7 +60,7 @@ jobs:
       - name: Build
         run: |
           set -o pipefail
-          ninja -C build -k 0 FEXCore FEXCore_shared Common CommonTools FEXCoreSmokeTest FEXCoreASMTestRunner FEXCoreThreadTest FEXCoreOrderingTest FEXCoreMutexWakeTest 2>&1 | tee build.log
+          ninja -C build -k 0 FEXCore FEXCore_shared Common CommonTools FEXCoreSmokeTest FEXCoreASMTestRunner FEXCoreThreadTest FEXCoreOrderingTest FEXCoreMutexWakeTest fexmac fexmac_shared fexmac_bundle fexmac_c_test fexmac_hook_test 2>&1 | tee build.log
 
       - name: Inspect what was built
         run: |
@@ -116,6 +116,21 @@ jobs:
             [ -n "$R" ] && head -c 6000 "$R" || true
           fi
           exit "$code"
+
+      - name: Run the embedding interface tests
+        # A C program using only fexmac.h, linked against the standalone archive as an
+        # outside project would be.
+        run: |
+          set -o pipefail
+          T=build/Bin/fexmac_c_test
+          echo "=== as built"
+          "$T" 2>&1 | tee fexmac-c-test.log
+          cp "$T" fexmac_c_test-hardened
+          codesign --force --sign - --options runtime --entitlements Data/macOS/jit.entitlements fexmac_c_test-hardened
+          echo "=== hardened runtime"
+          ./fexmac_c_test-hardened 2>&1 | tee fexmac-c-test-hardened.log
+          # Behaviour that needs the library's test hooks (fexmac_testing build only).
+          build/Bin/fexmac_hook_test 2>&1 | tee fexmac-hook-test.log
 
       - name: Run the multi-thread test
         run: |
@@ -181,15 +196,12 @@ jobs:
         run: |
           T="$(find build -name FEXCoreASMTestRunner -type f | head -1)"
           export FEX_MAXINST=500 FEX_MULTIBLOCK=0 FEX_TSOENABLED=0
-          # Crashes: a debugger backtrace.
-          for t in VEX/vmovq_vmovd_reg; do
-            echo "=== crash: $t"
-            lldb --batch -o run -o "bt 25" -o "register read pc x0 x1 x2 x3 x4 x5 x28" -o "disassemble -c 6 -s \$pc-12" -o quit -- "$T" asm-out/$t.asm.bin asm-out/$t.asm.config.bin 2>&1 | tail -60 || true
-          done
+          # Expected crashes need no debugger: the runner prints the faulting address, and
+          # asm-out/results.tsv carries it with the reason from the expected-failure list.
           echo "=== crash: FEX_bugs/CodeBufferOverflow (multiblock)"
           FEX_MULTIBLOCK=1 lldb --batch -o run -o "bt 25" -o quit -- "$T" asm-out/FEX_bugs/CodeBufferOverflow.asm.bin asm-out/FEX_bugs/CodeBufferOverflow.asm.config.bin 2>&1 | tail -45 || true
           # Timeouts: sample where the process is spinning.
-          for t in TwoByte/0F_02 SelfModifyingCode/DifferentBlock SelfModifyingCode/Delinking; do
+          for t in SelfModifyingCode/DifferentBlock SelfModifyingCode/Delinking; do
             echo "=== timeout: $t"
             extra=""; case "$t" in SelfModifyingCode/*) extra="full";; esac
             FEX_SMCCHECKS="$extra" "$T" asm-out/$t.asm.bin asm-out/$t.asm.config.bin > /dev/null 2>&1 &
@@ -270,6 +282,9 @@ jobs:
             probe.log
             asm-tests.log
             thread-test.log
+            fexmac-c-test.log
+            fexmac-c-test-hardened.log
+            fexmac-hook-test.log
             ordering-on.log
             ordering-on-hardened.log
             ordering-off.log
