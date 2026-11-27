@@ -481,12 +481,11 @@ int main(int argc, char** argv, char** const envp) {
     fextl::fmt::print("Failed to map the test's memory\n");
     return ExitFail;
   }
-  if (UseCache) {
-    // The code cache hashes and patches guest bytes only inside registered ranges.
-    // Everything this runner mapped may hold code, and tests write to it.
-    for (const auto& [Begin, End] : Mapper.Ranges()) {
-      fexmac_add_code_range(Context, Begin, End - Begin, 1);
-    }
+  // Everything this runner mapped may hold code, and tests write to it. Registering it
+  // makes the core treat only that memory as code (a jump elsewhere stops with a guest
+  // fault), and the code cache hashes and patches guest bytes only inside it.
+  for (const auto& [Begin, End] : Mapper.Ranges()) {
+    fexmac_add_code_range(Context, Begin, End - Begin, 1);
   }
 
   fexmac_thread* Thread {};
