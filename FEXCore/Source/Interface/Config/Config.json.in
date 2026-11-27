@@ -639,7 +639,7 @@
       },
       "StrictInProcessSplitLocks": {
         "Type": "bool",
-        "Default": "false",
+        "Default": "@FEX_STRICT_SPLIT_LOCKS_DEFAULT@",
         "AffectsCodeGen": "false",
         "Desc": [
           "Strict global lock when handling an unaligned atomic that crosses a 16-byte or cacheline granularity",
