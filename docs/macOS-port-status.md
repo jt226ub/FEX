@@ -806,6 +806,12 @@ JIT and Linux's signal handler use to recognise a full scratch buffer; a full bu
 crashed instead of restarting the translation. Upstream's layout is now kept on Linux,
 macOS's unchanged.
 
+**Second Linux break, found the same way.** After package D landed (`9c9ea7ecc`), FEXCore
+no longer compiled on Linux: `DEF_OP(MemCpySrcBase)` in `JIT/MemoryOps.cpp` called
+`EmitRepStringInPlace`, which is declared and defined for macOS only (the Linux job on
+`macos/v1` went red, run 46076606725). The op is emitted on macOS only; on other hosts its
+handler body is now a stop with a message. Linux green again with the fix.
+
 Upstream's own workflows (`ccpp.yml`, `glibc_fault.yml`, `hostrunner.yml`,
 `instcountci.yml`, `mingw_build.yml`, `steamrt4.yml`, `vixl_simulator.yml`,
 `wine_dll_artifacts.yml`, `pr-code-format.yml`) trigger only on pushes to `main` or pull
