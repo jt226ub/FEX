@@ -2101,6 +2101,15 @@ std::optional<int32_t> HandleUnalignedAccess(FEXCore::Core::InternalThreadState*
     }
   }
 
+  // The lock word lives in the block's tail, inside the code buffer, so taking and
+  // releasing the lock writes to code memory just as the patch does. On macOS this whole
+  // region therefore runs with the thread switched to writable; it is declared before
+  // the lock so it ends after the lock is released. Without it the lock's first write
+  // faults, and because that happens inside the SIGBUS handler with SIGBUS blocked, the
+  // thread hangs rather than crashing. Only host code runs in this region, and the
+  // instruction cache flushes below need no execute permission.
+  FEXCore::Allocator::ScopedJITWrite JITWrite;
+
   // Lock code mutex during any SIGBUS handling that potentially changes code.
   // Due to code buffer sharing between threads, code must be carefully backpatched from last to first.
   // Multiple threads can be attempting to handle the SIGBUS or even be executing the code being backpatched.
@@ -2113,7 +2122,6 @@ std::optional<int32_t> HandleUnalignedAccess(FEXCore::Core::InternalThreadState*
     LDR |= AddrReg << 5;
     LDR |= DataReg;
     {
-      FEXCore::Allocator::ScopedJITWrite JITWrite;
       if (HandleType != UnalignedHandlerType::NonAtomic) {
         // Ordering matters with cross-thread visibility!
         std::atomic_ref<uint32_t>(PC[1]).store(DMB_LD, std::memory_order_release); // Back-patch the half-barrier.
@@ -2129,7 +2137,6 @@ std::optional<int32_t> HandleUnalignedAccess(FEXCore::Core::InternalThreadState*
     STR |= AddrReg << 5;
     STR |= DataReg;
     {
-      FEXCore::Allocator::ScopedJITWrite JITWrite;
       if (HandleType != UnalignedHandlerType::NonAtomic) {
         std::atomic_ref<uint32_t>(PC[-1]).store(DMB, std::memory_order_release); // Back-patch the half-barrier.
       }
@@ -2146,7 +2153,6 @@ std::optional<int32_t> HandleUnalignedAccess(FEXCore::Core::InternalThreadState*
     LDUR |= DataReg;
     LDUR |= Instr & (0b1'1111'1111 << 12);
     {
-      FEXCore::Allocator::ScopedJITWrite JITWrite;
       if (HandleType != UnalignedHandlerType::NonAtomic) {
         // Ordering matters with cross-thread visibility!
         std::atomic_ref<uint32_t>(PC[1]).store(DMB_LD, std::memory_order_release); // Back-patch the half-barrier.
@@ -2163,7 +2169,6 @@ std::optional<int32_t> HandleUnalignedAccess(FEXCore::Core::InternalThreadState*
     STUR |= DataReg;
     STUR |= Instr & (0b1'1111'1111 << 12);
     {
-      FEXCore::Allocator::ScopedJITWrite JITWrite;
       if (HandleType != UnalignedHandlerType::NonAtomic) {
         std::atomic_ref<uint32_t>(PC[-1]).store(DMB, std::memory_order_release); // Back-patch the half-barrier.
       }
