@@ -275,7 +275,7 @@ limits listed in the last row, where running again still gives x86's result.
 | Scratch-buffer restart | `scratch-guard-disarmed-after-translation`, `scratch-overflow-*`; `CodeBufferOverflow` | pass |
 | Self-modifying code by page protection | `smc-*`, `split-lock-on-code-page`, `SelfModifyingCode/*` with `--smc mtrack`, the harness's write-protection path | pass; **the default once memory is registered** (no memory registered: nothing detected, as on `macos/v1`); writes through aliases and to non-writable guest pages sharing a host page with writable ones are not seen |
 | Stopping a thread from another thread | `stop-*`, `stop-rep-movs` | pass; median 4 to 6 us request to return; also inside a long `rep movs`/`stos` (32 MB, thousands of stops, registers exact at each, final memory x86's) |
-| Guest fault with correct guest state | `fault-*`, `guest-*`, `Scripts/macos_fault_diff.py` (319 programs x 4 modes x 3 ways) | **exact, and running again gives x86's result, for loads, stores, push/pop/call/ret, `pop [m]`, `leave`, `enter`, every read-modify-write form on memory, `xadd`/`cmpxchg`, vector and x87 accesses, 16- and 32-byte stores across a page, lock operations and every `rep` string form part-way**; 4 at-fault-only differences remain in `fault_diff_known.txt`: dead flags (2 programs), a 32-byte store whose lower page faults, `fxsave` across a page; also not exact: `rep movs`/`stos` with a segment-override prefix |
+| Guest fault with correct guest state | `fault-*`, `guest-*`, `Scripts/macos_fault_diff.py` (368 programs x 4 modes x 3 ways) | **exact, and running again gives x86's result, for loads, stores, push/pop/call/ret, `pop [m]`, `leave`, `enter`, every read-modify-write form on memory (also locked and misaligned), `xadd`/`cmpxchg`, vector and x87 accesses, 16- and 32-byte stores across a page, and every `rep` string form part-way (also with fs:/gs:), with x86's fault address**; 4 at-fault-only differences remain in `fault_diff_known.txt`: dead flags (2 programs), a 32-byte store whose lower page faults, `fxsave` across a page; the incoming flags an instruction overwrites unread are dead flags too |
 | 4K protections within a 16K host page | `memory-arguments` | refused unless `FEXMAC_PROT_ALLOW_UNENFORCED`; accepted ones are counted and NOT enforced (guard pages, read-only next to writable, SMC protection of the non-writable page): the 1.0 limit, stated in `fexmac.h` and the embedding document with the sound scheme as future work |
 
 How (all macOS-only, `__APPLE__`): a full register-cache flush and x87 stack sync before
@@ -291,39 +291,45 @@ shared with other builds, so differences under about 5% are noise). Base: `macos
 "before": this package before the second rework (no undo record, the core's rep loops);
 after: the tip.
 
-| Loop | Multiblock | Base | Before | After |
+| Loop | Multiblock | Base (`macos/v1`) | Previous tip `995572564` | Tip |
 |---|---|---|---|---|
-| counted `jnz` | off / on | 0.149 / 0.149 s | -1% / -1% | -1% / -1% |
-| memory mixed (ld/st/adc) | off / on | 0.096 / 0.096 s | +2% / +2% | +2% / +2% |
-| memory with carry | off / on | 0.123 / 0.123 s | +0% / +0% | +0% / +0% |
-| flags live across memory | off / on | 0.063 / 0.064 s | -0% / -0% | -0% / -0% |
-| `memjmp` (two linked blocks) | off / on | 0.050 / 0.035 s | +50% / +18% | +50% / +18% |
-| `add [m]; adc [m]; inc [m]` | off / on | 0.178 / 0.177 s | +1% / +1% | +3% / +2% |
-| `add [m]; sub [m]; inc [m]; or [m]` | off / on | 0.178 / 0.178 s | -0% / -0% | -0% / +0% |
-| `push; pop [m]` | off / on | 0.050 / 0.050 s | +10% / +10% | +11% / +10% |
-| `push rbp; mov rbp,rsp; store; leave` | off / on | 0.081 / 0.067 s | +0% / +21% | +14% / -25% |
-| `rep movsb` 4K | off / on | 0.033 / 0.032 s | +8% / +6% | +17% / +18% |
-| `rep movsq` 4K | off / on | 0.032 / 0.032 s | +6% / +8% | +17% / +19% |
-| `rep stosq` 4K | off / on | 0.032 / 0.031 s | +1% / +2% | +18% / +19% |
-| `rep movsb` 64 bytes | off / on | 0.025 / 0.025 s | +2% / +2% | +26% / +26% |
-| `rep movsb` 4K overlapping by 1 | off / on | 0.20 to 0.47 s | 0.20 s | 0.013 s |
+| counted `jnz` | off / on | 0.153 / 0.150 s | +3% / -1% | +3% / -1% |
+| memory mixed (ld/st/adc) | off / on | 0.099 / 0.099 s | +2% / +2% | +2% / +2% |
+| memory with carry | off / on | 0.127 / 0.127 s | +0% / -0% | -0% / -0% |
+| `memjmp` (two linked blocks) | off / on | 0.051 / 0.036 s | +50% / +21% | +50% / +20% |
+| `add [m]; adc [m]; inc [m]` | off / on | 0.185 / 0.174 s | +118% / +123% | -5% / +0% |
+| `add/sub/inc/or [m]` | off / on | 0.178 / 0.177 s | +131% / +132% | -0% / +1% |
+| `lock add [m]; lock xadd [m]` | off / on | 0.182 / 0.183 s | +70% / +60% | +0% / -2% |
+| `adc/sbb/add [m]` | off / on | 0.178 / 0.178 s | +122% / +132% | +2% / +1% |
+| `shl [m],1; ror [m],3; bts [m],5` | off / on | 0.176 / 0.183 s | +130% / +130% | +4% / -0% |
+| `rol [m],cl; rcl [m],1; sar [m],3` (undo record) | off / on | 0.205 / 0.204 s | +78% / +78% | +16% / +15% |
+| `push; pop [m]` | off / on | 0.055 / 0.051 s | +19% / +11% | +16% / +11% |
+| `rep movsb` / `movsq` 4K | off / on | 0.034 / 0.035 s | +12 to 16% | +12 to 19% |
+| `rep stosq` 4K | off / on | 0.033 / 0.033 s | +23% / +18% | +25% / +32% |
+| `rep movsb` 64 bytes | off / on | 0.025 / 0.025 s | +27% / +27% | +27% / +27% |
+| `rep movsb` 4K, rdi = rsi + 1 | off / on | 0.21 / 0.24 s | +159% / +131% | -94% / -95% |
+| `rep movsb` 4K, rdi = rsi + 8 | off / on | 0.21 / 0.22 s | +128% / +135% | +129% / +131% |
+| `rep movsb` 4K, rsi = rdi + 8 | off / on | 0.21 / 0.21 s | +127% / +129% | -95% / -95% |
 
 `Scripts/macos_bench.py` `rep_movs` kernel (median of 3 launches x 5 runs, ms): `tso_on`
 331 before, 381 after (+15%); `tso_off` 17.8 before, 21.4 after (+20%); native 16.3.
 `copy_loop` unchanged (655 / 651 `tso_on`). The rep cost is the exactness: registers move
 after every 32-byte chunk and every element, the page-bounded run setup, and an element
 loop that counts elements for the interrupt check. A forward byte copy overlapping by
-one (`rdi == rsi + 1`, run-length fills in LZ decoders) is a fill with the first byte:
-0.013 s, 16 times faster than `macos/v1`. Other overlaps closer than 32 bytes still go
-element by element, bound by store-to-load forwarding (about 4 cycles a byte); chunks
-smaller than the distance would keep x86's result and progress but are not done. A
+one (`rdi == rsi + 1`, run-length fills in LZ decoders) is a fill with the first byte,
+and an overlap with the source ahead in the direction of the copy uses whole chunks:
+both about 16 times faster than `macos/v1`. A destination 2 to 32 bytes ahead of the
+source still goes element by element, bound by store-to-load forwarding (about 4 cycles
+a byte); chunks narrower than the distance would keep x86's result and progress but are
+not done. A
 cheaper setup for short counts (one page test for the whole copy instead of the
 per-pointer page room) was measured and gave nothing, so it is not in.
 
-`add`/`or`/`and`/`sub`/`xor`/`inc`/`dec`/`neg` on memory store first and compute the flags
-after, at no measured cost; the undo record is kept for `adc`, `sbb`, rotates, shifts,
-`shld`/`shrd`, bit tests, `xadd` and `cmpxchg` (+2 to 3% on the loop above, which has one
-`adc`). With a record on every read-modify-write the same loop took +121 to 125%. The `memjmp` cost is the interrupt check at each
+Read-modify-writes: `add`/`or`/`and`/`sub`/`xor`/`inc`/`dec`/`neg`/`adc`/`sbb` and
+`shl`/`shr` by a constant store first and compute the flags after; lock forms, `xadd`,
+`cmpxchg` and bit tests need nothing; only rotates, `sar`, shifts by `cl` and
+`shld`/`shrd` keep the undo record (NZCV only for rotates). The record's cost was mostly
+in reading PF and AF, which makes them live. The `memjmp` cost is the interrupt check at each
 block entry: the check is one store (`str xzr, [x28, #off]`), and a load or even a `nop`
 in its place costs the same, so there is no cheaper form; it is the extra instruction in a
 two-block loop. A prototype that checks only on exits to a lower or equal guest address
