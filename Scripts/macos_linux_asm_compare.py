@@ -120,7 +120,8 @@ def main():
             parts = line.rstrip("\n").split("\t")
             if len(parts) >= 3:
                 mac[(parts[0], parts[1])] = parts[2]
-    mac_known = read_list(os.path.join(ROOT, "unittests/ASM/Known_Failures_macOS"))
+    # Known_Failures_macOS lines are "<test> <outcome...>".
+    mac_known = {line.split()[0] for line in read_list(os.path.join(ROOT, "unittests/ASM/Known_Failures_macOS"))}
     linux = {(r[0], r[1]): r[2] for r in rows}
     differences = 0
     for mode in COMMON_MODES:
