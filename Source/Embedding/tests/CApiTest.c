@@ -811,6 +811,27 @@ static void TestChainedMask(void) {
   Check(!sigismember(&Current, SIGUSR1), "the mask is restored afterwards");
 }
 
+/* A previous handler that returns without fixing the cause gets the same fault again,
+ * every time, as with only it installed: here it fixes the page on its 1,000th entry, and
+ * every one of those entries must have reached it. */
+static void RetryingHandler(int Signal, siginfo_t* Info, void* Context) {
+  (void)Signal;
+  (void)Context;
+  if ((uint8_t*)Info->si_addr >= HostPage && (uint8_t*)Info->si_addr < HostPage + PageSize && ++Shared[0] == 1000) {
+    mprotect(HostPage, (size_t)PageSize, PROT_READ | PROT_WRITE);
+  }
+}
+
+static void TestChainedRetry(void) {
+  InstallHostHandler(RetryingHandler, SA_NODEFER);
+  fexmac_install_fault_handlers();
+  HostPage = MapGuestMemory((size_t)PageSize);
+  mprotect(HostPage, (size_t)PageSize, PROT_NONE);
+  ((volatile uint8_t*)HostPage)[16] = 42;
+  Check(Shared[0] == 1000 && HostPage[16] == 42, "a previous handler that returns sees every retry until it fixes the page (%u entries)",
+        Shared[0]);
+}
+
 /* SA_RESETHAND: the first fault goes to the host's handler, the second gets the default. */
 static void TestChainedResetHand(void) {
   InstallHostHandler(HostOwnHandler, SA_RESETHAND);
@@ -1277,6 +1298,7 @@ static const struct Subtest Subtests[] = {
   {"errors", TestErrors, 0, NULL, NULL, 0},
   {"chained-mask", TestChainedMask, 0, NULL, NULL, 0},
   {"chained-resethand-dies", TestChainedResetHand, SIGBUS, NULL, "fexmac:", 1},
+  {"chained-retry", TestChainedRetry, 0, NULL, "fexmac:", 1000},
   {"chained-handler-faults-dies", TestChainedHandlerFaults, -1, NULL, "fault inside the fault handler", 1},
   {"chained-handler-faults-deferring-dies", TestChainedHandlerFaultsDeferring, -1, NULL, "fault inside the fault handler", 1},
   {"chained-handler-faults-no-frame-pointer-dies", TestChainedHandlerFaultsNoFramePointer, -1, NULL, "fault inside the fault handler", 1},

@@ -260,6 +260,15 @@ inaccessible page, the guest memory fault message), restores the default action 
 returns; the fault repeats and kills the process. The same depth diverts log messages to
 `write(2)`.
 
+A previous handler that returns gets the faulting instruction run again, and if it did
+not fix the cause, the same fault again, every time. That is what macOS does with only
+that handler installed (a small program whose handler returns without fixing the page
+faulted 893,300 times in 2 seconds on the M4), and the library cannot know whether a
+handler fixed the cause; mapping the page and returning is the common, legitimate
+pattern. So the library adds no retry limit; resolving the fault or leaving is the
+previous handler's responsibility, as it is without the library (`chained-retry` checks
+that every retry reaches the handler).
+
 The library does not police handlers it chains to. While a previous handler runs the
 depth is zero, so a fault inside it re-enters, is not the library's, and goes to the
 previous handler again, exactly as if the library were not installed. A previous handler
@@ -351,6 +360,7 @@ alarm kills it.
 | `guest-fault-hosted` | with the host owning the signals, the host receives the guest's fault at the guest's address |
 | `callbacks` | from a callback: create a thread, destroy another stopped thread, invalidate; running another thread is `BUSY` |
 | `errors` | missing arguments; unsupported options (`DISKCACHE`, `DISKCACHEPATH`, `JITFEATURES`, `GDBSERVER`, `SINGLESTEP`, `ENABLECODECACHINGWIP`, `FORCESVEWIDTH`, `STRICTINPROCESSSPLITLOCKS`); bad values (`010`, `-5`, `0`, out of range, `true`, unknown names); a second context; destroy with threads; double destroy and use after destroy; a context created again |
+| `chained-retry` | a previous handler that returns without fixing the fault sees every retry (1,000) until it fixes the page |
 | `chained-mask`, `chained-resethand-dies` | the previous handler's mask (with SIGSEGV/SIGBUS not blocked) and `SA_RESETHAND` |
 | `chained-handler-faults-dies`, `chained-handler-faults-deferring-dies`, `chained-handler-faults-no-frame-pointer-dies` | a previous handler that faults, with and without `SA_NODEFER` and with and without frame pointers: the process dies (stack exhausted) within the subtest's time limit, and is not reported as a fault inside the library's handler |
 | `chained-siglongjmp` | a previous handler that leaves with `siglongjmp`, three times in a row (`ljmp.c`): no fault is taken for nested, a misaligned atomic is still handled, the log callback is still called |

@@ -339,7 +339,14 @@ FEXMAC_EXPORT fexmac_result fexmac_thread_run(fexmac_thread* thread, fexmac_stop
  *     honoured; SIGSEGV, SIGBUS and the other synchronous fault signals are never
  *     blocked around it (even without SA_NODEFER), because on macOS a fault while its
  *     signal is blocked hangs the thread. The previous handler may leave with
- *     siglongjmp. If the previous action was the default: a fault is let
+ *     siglongjmp. If it returns, the faulting instruction runs again, every time, as it
+ *     would with only that handler installed: the library cannot know whether the
+ *     handler fixed the cause (a handler that maps the page and returns is the common
+ *     case), so a handler that returns without fixing it makes the instruction fault
+ *     forever, exactly as it does without the library (macOS re-delivers a fault on
+ *     return; checked on the M4). Resolving the fault or leaving is that handler's
+ *     responsibility; the library adds no retry limit. If the previous action was the
+ *     default: a fault is let
  *     happen again with the default action restored, so the process dies with the usual
  *     signal; a signal sent with kill() is re-sent with the default action, so it does
  *     the same. If the previous action was "ignore": a sent signal is ignored; a fault,
