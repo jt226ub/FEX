@@ -45,7 +45,7 @@ jobs:
           cmake --version
 
       - name: Install Ninja
-        # fmt is installed only so the linkage check below proves the build ignores it:
+        # fmt is installed only so the linkage check below runs with a system fmt present:
         # a Homebrew dylib cannot be loaded under the hardened runtime.
         run: brew install ninja fmt
 
@@ -72,19 +72,9 @@ jobs:
           otool -L "$(find build -name 'libFEXCore*.dylib' | head -1)"
 
       - name: Check that only system libraries are linked
-        # The hardened runtime refuses libraries signed by anyone else, so the core and
-        # the test tools may depend on libSystem and libc++ only.
-        run: |
-          bad=0
-          for f in $(find build -name 'libFEXCore*.dylib') build/Bin/FEXCoreSmokeTest build/Bin/FEXCoreThreadTest build/Bin/FEXCoreASMTestRunner build/Bin/FEXCoreOrderingTest build/Bin/FEXCoreMutexWakeTest; do
-            echo "--- $f"
-            otool -L "$f" | tail -n +2
-            if otool -L "$f" | tail -n +2 | grep -v -E '^[[:space:]]*(/usr/lib/libSystem\.B\.dylib|/usr/lib/libc\+\+\.1\.dylib|@rpath/libFEXCore\.dylib) '; then
-              echo "unexpected dependency in $f"
-              bad=1
-            fi
-          done
-          exit "$bad"
+        # Fails if the core or a test tool links anything but libSystem and libc++, if
+        # any of them is missing, or if the bundled fmt was not compiled.
+        run: bash Scripts/macos_check_linkage.sh build
 
       - name: Run the smoke test
         run: |
@@ -221,6 +211,18 @@ jobs:
           codesign --force --sign - --options runtime --entitlements Data/macOS/jit.entitlements JITWriteProbe
           echo "=== probe: hardened runtime"
           ./JITWriteProbe 2>&1 | tee probe-hardened.log
+
+      - name: Check the upstream sync script
+        if: always()
+        # Offline: throwaway repositories in a temporary directory with spaces in its
+        # path, a local stand-in for upstream, and macOS's own bash 3.2. Checks the
+        # never-push hardening for every remote address form, each refusal by its exit
+        # status and message, that the dry run changes nothing, and that a clean merge,
+        # a conflict and a merge that does not start are told apart.
+        run: |
+          /bin/bash -n Scripts/macos_sync_upstream.sh
+          Scripts/macos_sync_upstream.sh --help | grep -q 'default macos/v1'
+          /bin/bash Scripts/macos_sync_upstream_test.sh
 
       - name: Summarise errors
         if: always()

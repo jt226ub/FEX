@@ -8,7 +8,9 @@ Related documents:
 - `docs/macOS-v1.0-plan.md`: what "1.0" means for this port and the work left to get there.
 - `docs/macOS-embedding-interface.md`: what a program hosting the core must provide.
 - `docs/macOS-code-cache-design.md`: design for loading cached translations on macOS.
-- `Scripts/macos_sync_upstream.sh`: brings a new upstream FEX release into the port.
+- `Scripts/macos_sync_upstream.sh` and `docs/macOS-upstream-sync.md`: bring new upstream FEX
+  commits into the port. Upstream merged so far: FEX-Emu/FEX `main` at `a92baf073`
+  (27 November 2026).
 - `Scripts/macos_asm_tests.py`: runs the instruction tests.
 
 ## Where it stands
@@ -20,7 +22,7 @@ Related documents:
   Homebrew has its own.
 - **Passes on a physical Mac.** On a Mac mini (Apple M4, macOS 27.0.1, 16K pages), as
   built and signed for the hardened runtime with only the JIT entitlement: the smoke and
-  multi-thread tests pass, and 2,254 of upstream's 2,291 instruction tests pass in each
+  multi-thread tests pass, and 2,255 of upstream's 2,292 instruction tests pass in each
   of upstream's three translator modes and in a fourth with x86 memory-ordering emulation
   switched on, with no unexpected failures. The rest are listed under "Tests".
 - **Write protection is enforced on real hardware and respected.** `JITWriteProbe` shows
@@ -88,7 +90,9 @@ Added for embedders (the core expects these from whatever hosts it):
 Checked and found not to need a change:
 
 - **Instruction cache flush.** Already uses `__builtin___clear_cache`, which calls
-  `sys_icache_invalidate` on macOS.
+  `sys_icache_invalidate` on macOS. The dispatcher flushes a second time after switching
+  back to executable; the probe shows that is not needed on an M4, but it is kept, as
+  not proven unneeded elsewhere.
 - **Fault context.** The core does not read `ucontext_t` itself; the embedder does.
 
 Found out about macOS on Apple silicon:
@@ -115,11 +119,19 @@ with `JITWriteProbe`:
   because the signal is blocked while its handler runs. A hang in a test can be a crash
   in a fault handler.
 - **Returning from a signal handler does not restore the thread's write setting.** A
-  handler that switches leaves the setting it last chose. The core's handler only runs
-  for faults in translated code, which is always executable, and ends executable.
-- **Reading `ctr_el0` from user space faults** (SIGILL), as do `midr_el1` and the ID
-  registers; the port uses `sysctl` for all of them. **`dc cvau` is allowed.**
-- Misaligned atomic accesses fault only when they cross a 16-byte boundary.
+  handler that switches leaves the setting it last chose. `MacOSHostFaults.h` handles two
+  kinds of fault. Misaligned accesses in translated code are patched with the setting
+  switched, and translated code only runs executable, so the handler ends in the state
+  it found. Scratch-buffer guard faults in the translator's own emitter code are
+  resumed without touching the setting at all. Neither path leaves a wrong setting.
+- **Flushing the instruction cache while still writable is enough.** Rewriting the same
+  code 50,000 times with a different result each time, flushing before switching back,
+  always ran the new code; flushing after switching back did too; never flushing ran
+  stale code, which shows the test can detect it. Single thread, one address.
+- **Reading `ctr_el0`, `midr_el1` or `id_aa64isar0_el1` from user space faults**
+  (SIGILL); the port uses `sysctl` for all of them. **`dc cvau` is allowed.**
+- Misaligned atomic loads fault only when they cross a 16-byte boundary: an 8-byte
+  `ldar` at offset 4 of a 16-byte-aligned buffer runs, at offset 12 it raises SIGBUS.
 - GitHub's hosted Mac reports `pthread_jit_write_protect_supported_np` as 0 and lets a
   thread write and run `MAP_JIT` memory in any state, so it cannot test any of this.
 
@@ -220,11 +232,12 @@ All of these run in the Mac job on every push to a `macos/**` branch.
 |---|---|---|---|
 | `FEXCoreSmokeTest` | Translates and runs a 23-byte loop, as built and under the hardened runtime | pass, both | pass, both |
 | `FEXCoreThreadTest` | Eight host threads share a context, each summing a different count in a long guest loop | pass | pass, both |
-| `FEXCoreASMTestRunner` with `Scripts/macos_asm_tests.py` | Upstream's 2,291 assembly instruction tests, in four modes | 2,253 pass in each mode | 2,254 pass in each mode, both |
+| `FEXCoreASMTestRunner` with `Scripts/macos_asm_tests.py` | Upstream's 2,292 assembly instruction tests, in four modes | 2,253 pass in each mode (before the upstream sync added one test) | 2,255 pass in each mode, both |
 | `FEXCoreOrderingTest` | Multi-thread x86 memory-ordering litmus tests, emulation on (must hold) and off (must break); see above | not yet run | pass, both; off: all required weak outcomes seen |
 | `FEXCoreMutexWakeTest` | The core's reader-writer lock never loses a wake-up | not yet run | pass |
-| `JITWriteProbe` | Reports how the machine treats executable memory, including writes from a fault handler | report only | see the facts above |
-| Linkage check | Fails if the core or a test tool links anything but `libSystem` and `libc++` (Homebrew's `fmt` is installed first) | | pass |
+| `JITWriteProbe` | Reports how the machine treats executable memory, including writes and switches from a fault handler and instruction-cache flushing | report only | see the facts above |
+| `JITWriteProbe --expect-enforced` | The same, but exits 1 unless every asserted case gives the result the port relies on with write protection enforced, or if a fault-handler case's handler never ran | not run: the hosted Mac does not enforce, so it would fail | pass, as built and hardened |
+| `Scripts/macos_check_linkage.sh` | Fails if the core or a test tool links anything but `libSystem` and `libc++`, if one of them is missing, or if the bundled `fmt` was not compiled. Homebrew's `fmt` is installed first. `otool` shows only that no fmt dylib is linked; the `build.ninja` check covers a static one | not yet run (added after the last hosted run) | pass, both toolchains |
 | Low-memory probe | Shows that a program with a small page-zero reservation is killed | report only | same as hosted |
 
 The instruction tests, per mode, on the most recent physical-Mac run (as built and
@@ -232,7 +245,7 @@ hardened, with either toolchain, the same):
 
 | Outcome | Count |
 |---|---|
-| Pass | 2,254 |
+| Pass (2,254 before the upstream sync at `a92baf073` added `FEX_bugs/shufps_single_source`) | 2,255 |
 | Skipped by the runner (host lacks a CPU feature the test needs, or it needs Linux system calls) | 8 |
 | Skipped by upstream's own lists | 6 |
 | Skipped because the test reaches low memory through a 32-bit operand | 5 |
@@ -241,6 +254,15 @@ hardened, with either toolchain, the same):
 The skip count depends on the CPU: the hosted Mac skips one more test than the M4, and an
 earlier hosted run on a different virtual CPU skipped 16 and passed 2,244 with the same
 code paths.
+
+**Regression test for the fault-time patching fix.** The 24 instruction tests that hung
+in `jit_500_tso` (listed in the round 1 report; for example `Test_TwoByte/0F_B0_3.asm`
+and `Test_FEX_bugs/UnalignedLoadStoreSIGBUS.asm`), run on a physical Mac, together with
+`JITWriteProbe --expect-enforced` there, which checks that an atomic operation on
+protected code memory faults, that a fault inside a fault handler hangs, and that
+switching inside a handler works. **GitHub's hosted Mac cannot detect a regression
+here:** it does not enforce write protection, so those tests passed there even before
+the fix. Only the physical-Mac run counts.
 
 The fourth mode, `jit_500_tso`, is this port's addition. Upstream runs these tests with
 x86 memory-ordering emulation off; this mode turns it on.
