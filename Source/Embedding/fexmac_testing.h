@@ -48,6 +48,12 @@ FEXMAC_EXPORT void fexmac_testing_set_scratch_start(fexmac_thread* thread, uint3
  * buffer's end. Call it on the thread's own host thread while it runs (from a system
  * call callback), as the core would; it does not return. */
 FEXMAC_EXPORT uint64_t fexmac_testing_code_buffer_guard(fexmac_thread* thread);
+/* Bytes used and usable in the code buffer the thread writes to; setting the bytes used
+ * (a multiple of 16, at most the usable size), as if that much code were there. */
+FEXMAC_EXPORT void fexmac_testing_code_buffer_use(fexmac_thread* thread, uint64_t* used, uint64_t* usable);
+FEXMAC_EXPORT void fexmac_testing_set_code_buffer_used(fexmac_thread* thread, uint64_t used);
+/* The next `count` code buffers the context tries to make fail, as if mmap had. */
+FEXMAC_EXPORT fexmac_result fexmac_testing_fail_code_buffers(fexmac_context* context, int count);
 FEXMAC_EXPORT void fexmac_testing_overrun_code_buffer(fexmac_thread* thread);
 
 /* Logs a core message at info level, outside any fault handler. */

@@ -872,6 +872,15 @@ CodeBuffer::CodeBufferAllocation Arm64JITCore::AllocateCodeBufferInSharedCache(s
     ThreadState->LookupCache->ChangeGuestToHostMapping(*Prev, *CurrentCodeBuffer->LookupCache, lk);
   }
 
+#ifdef __APPLE__
+  // More than any code buffer can take would replace buffers for ever (and hold the
+  // invalidation lock while doing it). The caller treats a null result as "not stored".
+  if (Size > MaxBlockHostSize) {
+    LogMan::Msg::EFmt("{} bytes of code for one block is more than a code buffer takes ({}); not storing it", Size, MaxBlockHostSize);
+    return {};
+  }
+#endif
+
   // Attempt to allocate a buffer from the SharedCodeBuffers.
   while (AllocatedInfo.BufferAllocationOffset == nullptr) {
     AllocatedInfo = CurrentCodeBuffer->AtomicAllocateBuffer(Size);
@@ -949,7 +958,7 @@ CPUBackend::CompiledCode Arm64JITCore::EmitJITCode(uint64_t Entry, uint64_t Size
   // SharedCodeBufferManager.cpp), so anything that did fit can always be stored. Real
   // blocks need a small fraction of that; reaching it means an emitter bug.
   {
-    constexpr uint64_t DefaultScratchBufferLimit = 64 * 1024 * 1024;
+    constexpr uint64_t DefaultScratchBufferLimit = MaxBlockHostSize;
     const uint64_t Limit = ThreadState->JITScratchBufferLimit ? ThreadState->JITScratchBufferLimit : DefaultScratchBufferLimit;
     const uint64_t Wanted = FEXCore::Utils::FEX_PAGE_SIZE * 2 + uint64_t {SSACount} * SSANodeMultiplier;
     if (Wanted > Limit) {
@@ -1213,6 +1222,15 @@ CPUBackend::CompiledCode Arm64JITCore::EmitJITCode(uint64_t Entry, uint64_t Size
     LOGMAN_THROW_A_FMT(CodeData.Size % 16 == 0, "Needs to be 16B aligned!");
 
     auto AllocatedInfo = AllocateCodeBufferInSharedCache(CodeData.Size);
+#ifdef __APPLE__
+    if (!AllocatedInfo.BufferAllocationOffset) {
+      TempCodeBufferAllocator.DelayedDisownBuffer();
+      Relocations.resize(PrevNumAllocations, FEXCore::CPU::Relocation::Default());
+      CodeData.EntryPoints.clear();
+      this->IR = nullptr;
+      return {};
+    }
+#endif
     // NOTE: 16-byte alignment of the new cursor offset must be preserved for block linking records
     LOGMAN_THROW_A_FMT((reinterpret_cast<uintptr_t>(AllocatedInfo.BufferAllocationOffset) % 16) == 0, "Allocated buffer wasn't 16B "
                                                                                                       "aligned?");
@@ -1275,6 +1293,12 @@ CPUBackend::CompiledCode Arm64JITCore::LoadCachedCode(std::span<const uint8_t> H
   auto AllocatedInfo = AllocateCodeBufferInSharedCache(HostBytes.size());
 
   uint8_t* Dest = AllocatedInfo.BufferAllocationOffset;
+#ifdef __APPLE__
+  if (!Dest) {
+    // Too large for any code buffer: the caller compiles the block instead.
+    return {};
+  }
+#endif
   {
     FEXCore::Allocator::ScopedJITWrite JITWrite;
     memcpy(Dest, HostBytes.data(), HostBytes.size());

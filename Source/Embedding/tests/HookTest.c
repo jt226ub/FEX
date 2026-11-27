@@ -480,7 +480,222 @@ static void TestCodeBufferOverrunChained(void) {
   OverrunCodeBuffer();
 }
 
+/* ---- code buffers: switching, filling to the last byte, allocation failure ---- */
+
+static void QuietLog(fexmac_log_level Level, const char* Message, void* UserData) {
+  (void)Level;
+  (void)Message;
+  (void)UserData;
+}
+
+static char CacheDir[64];
+
+static fexmac_context* CreateBigBlockContext(int Cache) {
+  fexmac_config Config;
+  fexmac_config_init(&Config);
+  Config.options = BigBlockOptions;
+  Config.option_count = 2;
+  if (Cache) {
+    strcpy(CacheDir, "/tmp/fexmac-hook-cache-XXXXXX");
+    if (!mkdtemp(CacheDir)) {
+      exit(2);
+    }
+    Config.code_cache_enabled = 1;
+    Config.code_cache_directory = CacheDir;
+    Config.log = QuietLog;
+  }
+  fexmac_context* Context = NULL;
+  if (fexmac_context_create(&Config, &Context) != FEXMAC_OK) {
+    exit(2);
+  }
+  return Context;
+}
+
+/* The same large block translated again and again (invalidated in between) until the
+ * thread has written to three code buffers: each copy that does not fit in what is left
+ * moves translation to a new, larger buffer. With the code cache on, the copies after
+ * the first come from the cache by copy (LoadCachedCode) instead. */
+static void CodeBufferSwitch(int Cache) {
+  fexmac_install_fault_handlers();
+  fexmac_context* Context = CreateBigBlockContext(Cache);
+  uint8_t* Code = MapGuestMemory(0x4000);
+  uint64_t Expected = 0;
+  const size_t Length = WriteBigBlock(Code, 1024, 8, &Expected);
+  if (Cache) {
+    CheckResult(fexmac_add_code_range(Context, (uint64_t)(uintptr_t)Code, 0x4000, 0), FEXMAC_OK, "registering the guest code");
+  }
+  uint8_t* Data = MapGuestMemory(0x10000);
+  fexmac_thread* Thread = CreateThreadAt(Context, 0, (uint64_t)(uintptr_t)Data + 0x8000);
+  int Wrong = 0, Copies = 0, Buffers = 0;
+  uint64_t Guard = 0;
+  for (; Copies < 1000 && Buffers < 3; ++Copies) {
+    if (!RunBigBlock(Thread, Code, Length, Expected, Data)) {
+      ++Wrong;
+    }
+    const uint64_t Now = fexmac_testing_code_buffer_guard(Thread);
+    if (Now != Guard) {
+      Guard = Now;
+      ++Buffers;
+    }
+    fexmac_invalidate(Context, (uint64_t)(uintptr_t)Code, Length);
+  }
+  fexmac_translation_counters C;
+  fexmac_translation_counters_init(&C);
+  fexmac_context_get_counters(Context, &C);
+  Check(Wrong == 0 && Buffers == 3, "%d translations of a large block ran correctly and moved through %d code buffers (%" PRIu64
+        " compiled, %" PRIu64 " loaded)", Copies, Buffers, C.blocks_compiled, C.blocks_loaded);
+  if (Cache) {
+    Check(C.blocks_loaded >= (uint64_t)Copies - 1, "every copy after the first was loaded from the code cache");
+  }
+  fexmac_thread_destroy(Thread);
+  fexmac_context_destroy(Context);
+  if (Cache) {
+    char Command[128];
+    snprintf(Command, sizeof(Command), "rm -rf %s", CacheDir);
+    (void)!system(Command);
+  }
+}
+
+static void TestCodeBufferSwitch(void) {
+  CodeBufferSwitch(0);
+}
+
+static void TestCodeBufferSwitchCached(void) {
+  CodeBufferSwitch(1);
+}
+
+/* A block that fits exactly in what is left of the code buffer ends on its last usable
+ * byte, right before the guard page, and runs; one 16 bytes too large moves to a new
+ * buffer. The block's size is measured by translating it once first. */
+static void TestCodeBufferFillExact(void) {
+  fexmac_install_fault_handlers();
+  fexmac_context* Context = CreateBigBlockContext(0);
+  uint8_t* Data = MapGuestMemory(0x10000);
+  fexmac_thread* Thread = CreateThreadAt(Context, 0, (uint64_t)(uintptr_t)Data + 0x8000);
+  uint8_t* Code = MapGuestMemory(0x4000);
+  uint64_t Expected = 0;
+  const size_t Length = WriteBigBlock(Code, 300, 3, &Expected);
+  uint64_t Before = 0, After = 0, Usable = 0;
+  fexmac_testing_code_buffer_use(Thread, &Before, &Usable);
+  Check(RunBigBlock(Thread, Code, Length, Expected, Data), "the block ran once");
+  fexmac_testing_code_buffer_use(Thread, &After, &Usable);
+  const uint64_t Size = After - Before;
+  const uint64_t Guard = fexmac_testing_code_buffer_guard(Thread);
+
+  fexmac_invalidate(Context, (uint64_t)(uintptr_t)Code, Length);
+  fexmac_testing_set_code_buffer_used(Thread, Usable - Size);
+  Check(RunBigBlock(Thread, Code, Length, Expected, Data), "translated again into exactly the %" PRIu64 " bytes left, it ran", Size);
+  fexmac_testing_code_buffer_use(Thread, &After, &Usable);
+  Check(After == Usable && fexmac_testing_code_buffer_guard(Thread) == Guard,
+        "it ended on the buffer's last usable byte (%" PRIu64 " of %" PRIu64 "), in the same buffer", After, Usable);
+
+  fexmac_invalidate(Context, (uint64_t)(uintptr_t)Code, Length);
+  fexmac_testing_set_code_buffer_used(Thread, Usable - Size + 16);
+  Check(RunBigBlock(Thread, Code, Length, Expected, Data), "with 16 bytes too few left, it ran");
+  Check(fexmac_testing_code_buffer_guard(Thread) != Guard, "from a new code buffer");
+  fexmac_thread_destroy(Thread);
+  fexmac_context_destroy(Context);
+}
+
+/* Random block sizes, mostly small with some large, until six code buffers have been
+ * used (after the reviewer's FillTest.c): every block runs correctly. Code stays mapped,
+ * so no address is reused for different code. */
+static void TestCodeBufferFillRandom(void) {
+  fexmac_install_fault_handlers();
+  uint8_t* Data = MapGuestMemory(0x10000);
+  fexmac_context* Context = CreateBigBlockContext(0);
+  fexmac_thread* Thread = CreateThreadAt(Context, 0, (uint64_t)(uintptr_t)Data + 0x8000);
+  uint64_t Guard = 0;
+  int Buffers = 0, Wrong = 0, Blocks = 0;
+  unsigned Seed = 12345;
+  while (Buffers < 6 && Blocks < 20000) {
+    Seed = Seed * 1103515245u + 12345u;
+    const size_t Count = (Seed >> 8) % 7 == 0 ? 1 + (Seed >> 4) % 3000 : 1 + (Seed >> 4) % 40;
+    const size_t Every = 1 + (Seed >> 12) % 50;
+    uint8_t* Code = MapGuestMemory(0x8000);
+    uint64_t Expected = 0;
+    const size_t Length = WriteBigBlock(Code, Count, Every, &Expected);
+    if (!RunBigBlock(Thread, Code, Length, Expected, Data)) {
+      ++Wrong;
+    }
+    ++Blocks;
+    const uint64_t Now = fexmac_testing_code_buffer_guard(Thread);
+    if (Now != Guard) {
+      Guard = Now;
+      ++Buffers;
+    }
+  }
+  Check(Wrong == 0 && Buffers == 6, "%d blocks of random sizes ran correctly across %d code buffers", Blocks, Buffers);
+  fexmac_thread_destroy(Thread);
+  fexmac_context_destroy(Context);
+}
+
+/* The context's first code buffer cannot be made: creating the thread fails with an
+ * error instead of stopping the process, and works once memory is available again. */
+static void TestCodeBufferFirstFails(void) {
+  fexmac_install_fault_handlers();
+  fexmac_context* Context = CreateBigBlockContext(0);
+  CheckResult(fexmac_testing_fail_code_buffers(Context, 1), FEXMAC_OK, "forcing the next code buffer to fail");
+  fexmac_thread* Thread = NULL;
+  CheckResult(fexmac_thread_create(Context, &Thread), FEXMAC_ERROR_OUT_OF_MEMORY, "creating the first thread");
+  Check(Thread == NULL, "no thread was returned");
+  uint8_t* Code = MapGuestMemory(0x4000);
+  uint8_t* Data = MapGuestMemory(0x10000);
+  uint64_t Expected = 0;
+  const size_t Length = WriteBigBlock(Code, 10, 1, &Expected);
+  Thread = CreateThreadAt(Context, 0, (uint64_t)(uintptr_t)Data + 0x8000);
+  Check(RunBigBlock(Thread, Code, Length, Expected, Data), "the next attempt creates a thread that runs");
+  Shared[0] = 1;
+  fexmac_thread_destroy(Thread);
+  fexmac_context_destroy(Context);
+}
+
+/* A later code buffer cannot be made while translating: there is no way back to the
+ * embedder there, so the process stops with a message saying why. */
+static void TestCodeBufferLaterFailsDies(void) {
+  fexmac_install_fault_handlers();
+  fexmac_context* Context = CreateBigBlockContext(0);
+  uint8_t* Data = MapGuestMemory(0x10000);
+  fexmac_thread* Thread = CreateThreadAt(Context, 0, (uint64_t)(uintptr_t)Data + 0x8000);
+  uint8_t* Code = MapGuestMemory(0x4000);
+  uint64_t Expected = 0;
+  const size_t Length = WriteBigBlock(Code, 100, 1, &Expected);
+  Check(RunBigBlock(Thread, Code, Length, Expected, Data), "the block ran once");
+  uint64_t Used = 0, Usable = 0;
+  fexmac_testing_code_buffer_use(Thread, &Used, &Usable);
+  fexmac_invalidate(Context, (uint64_t)(uintptr_t)Code, Length);
+  fexmac_testing_set_code_buffer_used(Thread, Usable - 16);
+  fexmac_testing_fail_code_buffers(Context, 1);
+  Shared[0] = 1;
+  RunBigBlock(Thread, Code, Length, Expected, Data);
+  printf("  FAIL: survived a failed code buffer allocation while translating\n");
+  exit(1);
+}
+
+/* A guest access from translated code that happens to hit a code buffer's guard page
+ * (guest addresses are host addresses) is the guest's memory fault, not reported as an
+ * overrun of the code buffer. */
+static void TestGuestTouchesCodeBufferGuard(void) {
+  fexmac_install_fault_handlers();
+  GuardCode = MapGuestMemory(0x10000);
+  const uint8_t Warm[] = {0xB8, 0x01, 0, 0, 0, 0xF4};
+  memcpy(GuardCode, Warm, sizeof(Warm));
+  memcpy(GuardCode + 0x100, GuardStore, sizeof(GuardStore));
+  fexmac_context* Context = CreateContext(NULL, NULL);
+  GuardThread = CreateThreadAt(Context, (uint64_t)(uintptr_t)GuardCode, 0);
+  Run(GuardThread);
+  fexmac_x86_state State = GetState(GuardThread);
+  State.rip = (uint64_t)(uintptr_t)GuardCode + 0x100;
+  State.gpr[RDI] = fexmac_testing_code_buffer_guard(GuardThread) + 64;
+  SetState(GuardThread, &State);
+  Shared[0] = 1;
+  fexmac_thread_run(GuardThread, NULL);
+  printf("  FAIL: survived a guest store to a code buffer's guard page\n");
+  exit(1);
+}
+
 #define GUARD_TEXT "guest memory access fault in translated code at address 0x"
+#define MAP_FAILED_TEXT(MiB) "Couldn't make a " MiB " MiB code buffer: couldn't allocate the executable (MAP_JIT) memory (errno 12)"
 #define OVERRUN_TEXT "fexmac: SIGBUS: write past the end of a code buffer, at address 0x"
 
 static const struct Subtest Subtests[] = {
@@ -499,6 +714,13 @@ static const struct Subtest Subtests[] = {
   {"code-buffer-guard-pages", TestCodeBufferGuardPages, 0, NULL, NULL, 0},
   {"code-buffer-overrun-dies", TestCodeBufferOverrunDies, SIGBUS, OVERRUN_TEXT, "fault inside", 1},
   {"code-buffer-overrun-chained", TestCodeBufferOverrunChained, 0, OVERRUN_TEXT, "fault inside", 2},
+  {"guest-store-code-buffer-guard-dies", TestGuestTouchesCodeBufferGuard, SIGBUS, GUARD_TEXT, "past the end of a code buffer", 1},
+  {"code-buffer-switch", TestCodeBufferSwitch, 0, NULL, NULL, 0},
+  {"code-buffer-switch-cached", TestCodeBufferSwitchCached, 0, NULL, NULL, 0},
+  {"code-buffer-fill-exact", TestCodeBufferFillExact, 0, NULL, NULL, 0},
+  {"code-buffer-fill-random", TestCodeBufferFillRandom, 0, NULL, NULL, 0},
+  {"code-buffer-first-fails", TestCodeBufferFirstFails, 0, MAP_FAILED_TEXT("16"), "guard page", 1},
+  {"code-buffer-later-fails-dies", TestCodeBufferLaterFailsDies, SIGILL, MAP_FAILED_TEXT("32"), "guard page", 1},
 };
 
 int main(int argc, char** argv) {

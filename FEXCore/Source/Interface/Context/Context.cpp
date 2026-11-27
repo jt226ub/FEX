@@ -64,6 +64,14 @@ bool FEXCore::Context::ContextImpl::IsAddressInCodeBufferGuard(FEXCore::Core::In
 uintptr_t FEXCore::Context::ContextImpl::GetCodeBufferGuard(FEXCore::Core::InternalThreadState* Thread) const {
   return Thread->CPUBackend->GetCodeBufferGuard();
 }
+
+void FEXCore::Context::ContextImpl::GetCodeBufferUse(FEXCore::Core::InternalThreadState* Thread, uint64_t* Used, uint64_t* Usable) const {
+  Thread->CPUBackend->GetCodeBufferUse(Used, Usable);
+}
+
+void FEXCore::Context::ContextImpl::SetCodeBufferUsedForTesting(FEXCore::Core::InternalThreadState* Thread, uint64_t Used) {
+  Thread->CPUBackend->SetCodeBufferUsedForTesting(Used);
+}
 #endif
 
 bool FEXCore::Context::ContextImpl::RequiresRelocatableConstants() const {

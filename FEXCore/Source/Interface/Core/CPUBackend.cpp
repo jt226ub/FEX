@@ -372,6 +372,17 @@ namespace CPU {
   uintptr_t CPUBackend::GetCodeBufferGuard() const {
     return CurrentCodeBuffer ? reinterpret_cast<uintptr_t>(CurrentCodeBuffer->GetBufferBase()) + CurrentCodeBuffer->UsableSize() : 0;
   }
+
+  void CPUBackend::GetCodeBufferUse(uint64_t* Used, uint64_t* Usable) const {
+    *Used = CurrentCodeBuffer ? CurrentCodeBuffer->AllocatedSpaceUsed() : 0;
+    *Usable = CurrentCodeBuffer ? CurrentCodeBuffer->UsableSize() : 0;
+  }
+
+  void CPUBackend::SetCodeBufferUsedForTesting(uint64_t Used) {
+    if (CurrentCodeBuffer && Used % 16 == 0 && Used <= CurrentCodeBuffer->UsableSize()) {
+      CurrentCodeBuffer->SetUsedForTesting(Used);
+    }
+  }
 #endif
 
 } // namespace CPU

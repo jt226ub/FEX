@@ -116,6 +116,18 @@ The header documents every function. The design decisions:
   handlers are process-wide, so a second `fexmac_context_create` returns `BUSY` until the
   first context is destroyed. A context can be destroyed and created again. A failed
   create leaves nothing process-wide changed, log hooks included.
+- **Code buffers.** Translated code goes into the context's code buffers (16MB first,
+  each next one twice the last, up to 128MB, each ending in an inaccessible 16K page).
+  The first is made with the context's first `fexmac_thread_create`; if it cannot be
+  made (`mmap` of `MAP_JIT` memory fails, or the guard page cannot be placed), that call
+  returns `FEXMAC_ERROR_OUT_OF_MEMORY` with the reason logged (`Couldn't make a 16 MiB
+  code buffer: couldn't ... (errno ...)`) and a later call can try again. Later buffers
+  are made while translating, where there is no way back to the embedder: a failure then
+  ends the process with that message at assert level. One block may have at most 64MB
+  of host code (half the largest buffer, so it always fits a fresh one): the translator
+  gives up on larger blocks, a code-cache entry claiming more is rejected (and the
+  block compiled instead), and the core never retries buffers for a size that cannot
+  fit.
 - **Locking.** One registry lock guards the tables of live handles, every thread's
   running and in-callback flags and every context's count of calls in progress, so a
   handle check and the state change that follows it are one step: a destroy that races
@@ -228,12 +240,16 @@ translated code at address ...` to standard error and the process dies with the 
 with a host handler (installed before, or owning the signals) the host receives it.
 Delivering it to the guest with reconstructed state is package D.
 
-A fault in the inaccessible page after one of the thread's code buffers is a write (or
-read) running past the end of the buffer: a core bug, never the guest's doing, since
-every write into a code buffer is bounds-checked first. It is not claimed either, but
-the library always writes `fexmac: SIGBUS: write past the end of a code buffer, at
-address ... (its guard page) from host pc ...` to standard error first, also when a
-host handler receives it next.
+A fault in the inaccessible page after one of the thread's code buffers, from the core's
+own code (not translated code or the dispatcher), is a write (or read) running past the
+end of the buffer: a core bug, since every write into a code buffer is bounds-checked
+first. It is not claimed either. With the library's handlers installed, the library
+writes `fexmac: SIGBUS: write past the end of a code buffer, at address ... (its guard
+page) from host pc ...` to standard error first, also when a handler installed before
+the library's receives it next. A host that owns the signals and calls
+`fexmac_handle_fault` gets no such line. A guest access from translated code that
+happens to hit the page (guest addresses are host addresses) is the guest's fault and
+is reported as any other guest memory fault.
 
 `fexmac_handle_fault` allocates nothing, takes no lock that code outside a fault handler
 holds and never calls the log callback. If the core meets an atomic instruction it cannot
@@ -480,7 +496,6 @@ alarm kills it.
 | `unclaimed-fault-dies` | a host fault outside guest code dies silently with SIGBUS |
 | `scratch-overflow-sizes` | blocks of 96 to 416 `rep movsq`, one instruction longer each time, each in a fresh context (a fresh, exactly sized scratch buffer), across the size where the first translation starts to overflow, then blocks of 2,048 to 8,192; every result exact |
 | `scratch-overflow-threads` | 8 threads translating and running 12 large blocks each at the same time, sharing the code buffer |
-| `code-buffer-switch`, `code-buffer-switch-cached` | one large block translated 160 times (invalidated in between), well past the first 16MB code buffer, so blocks that do not fit in what is left move to new, larger buffers; the second with the code cache on, so the copies are loaded from the cache by copy |
 | `invalidate-concurrent` | 8 guest threads invalidating in every one of 20,000 system calls each while the main thread invalidates in a loop, at least 12 runs; a progress watchdog fails it within 5 seconds of a hang. It hung in each of 3 runs before package E's reader-writer lock fix and passed 6 of 6 after it |
 | `split-locks-concurrent` | 8 threads at once run 30,000 `lock xadd` each on one qword crossing 16 bytes, a 128-byte line and the 16K page, a `lock cmpxchg` increment loop across 16 bytes (each adding 0x100000001, which changes both halves), and a spin lock taken with `xchg` across 16 bytes and released by a plain store; every total must be exact. With the split-lock lock switched off in a scratch build, the three `lock xadd` totals came out short in 3 of 3 runs |
 | `split-locks-every-form` | every form the core emulates across 16 bytes, from 8 threads at once, 10,000 operations each: `lock xadd` of 16, 32 and 64 bits, `lock add`, `sub`, `xor`, `inc`, `dec`, `not`, `neg`, `or` then `and`, a `cmpxchg8b` increment loop, a `cmpxchg8b` spin lock with a plain release and an `xchg` spin lock whose value spans both halves; operands change both halves where the operation allows it; a host thread meanwhile writes the neighbouring bytes that share the operand's compare-and-swap units with plain stores. Every result exact. Before the split-lock fixes of package E's third round, 7 of the 13 forms came out wrong in each of 2 runs |
@@ -498,7 +513,8 @@ alarm kills it.
 
 `fexmac_hook_test` (linked against `fexmac_testing`, whose hooks also report a thread's
 guard-page addresses and scratch-buffer overflows, set the scratch buffer's first size
-and limit, and overrun a code buffer on purpose):
+and limit, overrun a code buffer on purpose, read and set how much of the current code
+buffer is used, and make the next code buffer allocations fail):
 
 | Subtest | Checks |
 |---|---|
@@ -508,6 +524,12 @@ and limit, and overrun a code buffer on purpose):
 | `scratch-limit-stops` | with a 64K limit a block that does not fit stops with `UNSUPPORTED_INSTRUCTION` at its start after several overflows, with the core's message; the guard is disarmed; with the limit lifted the same thread translates and runs it |
 | `code-buffer-guard-pages` | three code buffers in turn (filled by one large block translated again and again) each end in an inaccessible page with executable code before it |
 | `code-buffer-overrun-dies`, `code-buffer-overrun-chained` | a write running past the end of the code buffer with the thread switched to writable (from the system call callback) faults on the guard page; the process dies with the library's message, or, with a host handler installed before the library, the message is written and the host receives the fault at the guard address |
+| `guest-store-code-buffer-guard-dies` | a guest store from translated code into a code buffer's guard page dies as a guest memory fault, not reported as an overrun of the code buffer |
+| `code-buffer-switch`, `code-buffer-switch-cached` | one large block translated again and again (invalidated in between) until the thread has written to three code buffers (checked with the buffer-guard hook), every copy correct; the second with the code cache on and the same block options, every copy after the first loaded from the cache by copy |
+| `code-buffer-fill-exact` | with the buffer's used size set by a hook, a block that fits exactly in what is left ends on the buffer's last usable byte, in the same buffer, and runs; with 16 bytes fewer left it moves to a new buffer and runs |
+| `code-buffer-fill-random` | the reviewer's fill test: blocks of random sizes (5,014 of them) until six code buffers have been used, every result exact; at most 20,000 blocks |
+| `code-buffer-first-fails` | the first code buffer forced to fail as if `mmap` had (ENOMEM): `fexmac_thread_create` returns `OUT_OF_MEMORY` and logs `couldn't allocate the executable (MAP_JIT) memory (errno 12)`, not a guard-page failure; the next create works and the thread runs |
+| `code-buffer-later-fails-dies` | a later code buffer forced to fail while translating: the process ends (SIGILL) with the same accurate message for the 32 MiB buffer |
 | `callback-callret-guard-passed-on` | the system call callback reading a call/return guard page: the host's handler receives the fault at that address |
 | `log-callback-reentry` | fexmac calls from inside the log callback return `BUSY`; afterwards they work |
 | `fault-inside-handler-dies` | the hook fired exactly once, the process died with SIGBUS, the message was written |

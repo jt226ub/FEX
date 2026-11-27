@@ -240,6 +240,14 @@ public:
 #ifdef __APPLE__
   bool IsAddressInCodeBufferGuard(FEXCore::Core::InternalThreadState* Thread, uintptr_t Address) const override;
   uintptr_t GetCodeBufferGuard(FEXCore::Core::InternalThreadState* Thread) const override;
+  bool PrepareCodeBuffer() override {
+    return TryAllocateFirst();
+  }
+  void FailCodeBufferAllocationsForTesting(int Count) override {
+    FailuresForTesting = Count;
+  }
+  void GetCodeBufferUse(FEXCore::Core::InternalThreadState* Thread, uint64_t* Used, uint64_t* Usable) const override;
+  void SetCodeBufferUsedForTesting(FEXCore::Core::InternalThreadState* Thread, uint64_t Used) override;
 #endif
 
   // returns false if a handler was already registered

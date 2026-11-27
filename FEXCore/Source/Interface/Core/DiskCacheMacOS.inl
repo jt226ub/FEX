@@ -1265,6 +1265,10 @@ bool DiskCache::ValidateHit(const BlobFixedHeader& Header, std::span<const uint8
   }
 
   // 2. Shape: code size, block header and tail.
+  // No larger block can be stored in a code buffer (or produced by the translator).
+  if (Header.HostSize > CPU::MaxBlockHostSize) {
+    return Reject(11);
+  }
   if (Header.HostSize < sizeof(CPU::CPUBackend::JITCodeHeader) + sizeof(CPU::CPUBackend::JITCodeTail) || Header.HostSize % 16 != 0 ||
       Header.EntryPointCount == 0 || Header.GuestSize == 0 || Header.GuestSize > GuestSizeAvailable) {
     return Reject(10);

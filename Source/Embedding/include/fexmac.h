@@ -301,7 +301,11 @@ FEXMAC_EXPORT fexmac_result fexmac_after_fork(fexmac_context* context, int child
 
 /* Creates a guest thread with the default x86-64 user state (64-bit code segment, all
  * registers zero, rip and rsp zero: set them before running). Allocates its call and
- * return stack and points it at the context's descriptor tables. */
+ * return stack and points it at the context's descriptor tables. The context's first
+ * code buffer (where translated code goes) is made with its first thread: if that or the
+ * call and return stack cannot be allocated, FEXMAC_ERROR_OUT_OF_MEMORY, with the reason
+ * logged. Later code buffers are made while translating; failing to make one then stops
+ * the process with a core message. */
 FEXMAC_EXPORT fexmac_result fexmac_thread_create(fexmac_context* context, fexmac_thread** out_thread);
 
 /* Destroys a thread that is not running. */
@@ -421,10 +425,10 @@ FEXMAC_EXPORT fexmac_result fexmac_thread_run(fexmac_thread* thread, fexmac_stop
  * an alignment fault alike as SIGBUS with si_code 1. The library claims only faults from
  * a host thread that is running guest code, and among those only the cases above. Every
  * other fault, including a guest load or store to an unmapped or protected page in
- * translated code, is not the library's. One of them is always a core bug: an access
- * past the end of a code buffer, which ends in the inaccessible page after it; with the
- * library's handlers installed it writes a "fexmac:" line naming it before passing the
- * fault on.
+ * translated code, is not the library's. One of them is a core bug: the core's own code
+ * running past the end of a code buffer into the inaccessible page after it; with the
+ * library's handlers installed (fexmac_install_fault_handlers) the library writes a
+ * "fexmac:" line naming it before passing the fault on.
  *
  * Two ways to connect it, pick one per process:
  *

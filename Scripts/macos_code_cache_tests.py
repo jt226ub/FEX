@@ -165,8 +165,19 @@ XXH_HELPER_SOURCE = r"""
 #include <stdlib.h>
 int main(int argc, char** argv) {
   unsigned long long seed = strtoull(argv[1], 0, 16);
-  static unsigned char buf[1 << 24];
-  size_t n = fread(buf, 1, sizeof buf, stdin);
+  /* All of standard input: crafted entries can be larger than any fixed buffer. */
+  size_t cap = 1 << 20, n = 0, got;
+  unsigned char* buf = malloc(cap);
+  while (buf && (got = fread(buf + n, 1, cap - n, stdin)) > 0) {
+    n += got;
+    if (n == cap) {
+      cap *= 2;
+      buf = realloc(buf, cap);
+    }
+  }
+  if (!buf) {
+    return 1;
+  }
   XXH128_hash_t h = XXH3_128bits_withSeed(buf, n, seed);
   fwrite(&h, 1, 16, stdout);
   return 0;
@@ -248,7 +259,7 @@ def craft_tests(work, cache_test, base):
     cold = run(cmd, pristine)
     warm = run(cmd, pristine)
 
-    def craft(name, change, expect_reject):
+    def craft(name, change, expect_reject, expect_text=None):
         target = fresh_copy(pristine, work, "craft-" + re.sub(r"\W+", "-", name))
         bucket = [os.path.join(target, d) for d in os.listdir(target) if os.path.isdir(os.path.join(target, d))][0]
         db = CraftDB(bucket, xxh)
@@ -260,7 +271,7 @@ def craft_tests(work, cache_test, base):
             # changed extents) or a rejection; the block is compiled.
             ok = info["rc"] == 0 and info.get("compiled", 0) > 0 and "PASS" in info["out"]
         elif expect_reject:
-            ok = info["rc"] == 0 and info.get("rejected", 0) >= 1 and "PASS" in info["out"]
+            ok = info["rc"] == 0 and info.get("rejected", 0) >= 1 and "PASS" in info["out"] and (not expect_text or expect_text in info["out"])
         else:
             ok = info["rc"] == 0 and info.get("rejected") == 0 and info.get("loaded") == warm.get("loaded") and info.get("compiled") == 0
         check(name, ok, summary(info) + " " + info["out"][-200:])
@@ -288,6 +299,23 @@ def craft_tests(work, cache_test, base):
         struct.pack_into("<Q", b["code"], tail, len(b["code"]) + 16)
         db.write(e, b)
 
+    def oversized(size):
+        # One entry only: code larger than the translator's 64MB cap (MaxBlockHostSize),
+        # consistent otherwise (block tail size matching, re-sealed). Above 128MB-16K such
+        # an entry could never be stored in a code buffer and loading it looped for ever,
+        # holding the invalidation lock.
+        done = []
+
+        def change(db, e, b):
+            if done:
+                return
+            done.append(True)
+            b["code"] += b"\0" * (size - len(b["code"]))
+            tail = struct.unpack_from("<I", b["code"], 0)[0]
+            struct.pack_into("<Q", b["code"], tail, len(b["code"]))
+            db.write(e, b)
+        return change
+
     def extents_unsealed(db, e, b):
         # Change the index's extents without re-sealing: the hash covers them.
         with open(db.index, "r+b") as handle:
@@ -301,6 +329,10 @@ def craft_tests(work, cache_test, base):
     craft("a host entry point on the block header is rejected", host_offset(lambda b: 0), True)
     craft("a block tail whose size disagrees is rejected", tail_size, True)
     craft("guest extents changed in the index (not re-sealed) are not used", extents_unsealed, "fallback")
+    craft("an entry with more code than one block may have (64MB + 16) is rejected", oversized(64 * 1024 * 1024 + 16), True,
+          "entry check 11 failed")
+    craft("an entry larger than the largest code buffer (128MB) is rejected, not loaded for ever", oversized(128 * 1024 * 1024), True,
+          "entry check 11 failed")
 
     # A process that died while appending leaves a partial index record. The next process
     # to store must cut it off first, or the records it appends after it are lost.

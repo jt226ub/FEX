@@ -877,6 +877,12 @@ fexmac_result fexmac_thread_create(fexmac_context* context, fexmac_thread** out_
 
   {
     std::lock_guard Lock {context->ThreadsMutex};
+    // The context's first code buffer is made with its first thread; making it here
+    // first turns a failure into an error instead of a stop inside the core.
+    if (!context->CTX->PrepareCodeBuffer()) {
+      delete Thread;
+      return FEXMAC_ERROR_OUT_OF_MEMORY;
+    }
     Thread->Thread = context->CTX->CreateThread();
     if (!Thread->Thread) {
       delete Thread;
@@ -1075,6 +1081,23 @@ void fexmac_testing_set_scratch_start(fexmac_thread* thread, uint32_t bytes_per_
   if (thread) {
     thread->Thread->JITScratchStartMultiplier = bytes_per_node;
   }
+}
+
+fexmac_result fexmac_testing_fail_code_buffers(fexmac_context* context, int count) {
+  ContextUse Use {context};
+  if (!Use) {
+    return FEXMAC_ERROR_INVALID_HANDLE;
+  }
+  context->CTX->FailCodeBufferAllocationsForTesting(count);
+  return FEXMAC_OK;
+}
+
+void fexmac_testing_code_buffer_use(fexmac_thread* thread, uint64_t* used, uint64_t* usable) {
+  thread->Thread->CTX->GetCodeBufferUse(thread->Thread, used, usable);
+}
+
+void fexmac_testing_set_code_buffer_used(fexmac_thread* thread, uint64_t used) {
+  thread->Thread->CTX->SetCodeBufferUsedForTesting(thread->Thread, used);
 }
 
 uint64_t fexmac_testing_code_buffer_guard(fexmac_thread* thread) {
