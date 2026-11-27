@@ -63,7 +63,8 @@ Order: A first and alone. Then B, C, E, F, H, I, J can run side by side. D and G
 
 ## Rules for every package
 
-- Branch from `macos/runtime-fixes` as `macos/wp-<id>-<short-name>`. One package, one
+- Work is integrated on `macos/v1`, created from `macos/runtime-fixes` when this plan
+  starts. Branch each package from it as `macos/wp-<id>-<short-name>`. One package, one
   branch. Do not commit to `main`.
 - Use the method macOS provides. Keep a workaround only when none exists, with the reason
   in a comment.
