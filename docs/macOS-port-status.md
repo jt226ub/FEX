@@ -42,7 +42,11 @@ Related documents:
   under Rosetta 2 and natively on arm64. Speed is measured (criterion 8): the generated
   summary in "Guest program and benchmark" below gives the figures and says whether they
   are provisional or final.
-- **Linux is unaffected.** The core-only Linux build passes with the same changes.
+- **Linux is unaffected, and this is now checked on every push.** A hosted arm64 Ubuntu
+  job builds the core-only configuration and the whole ordinary Linux build, and runs
+  upstream's 64-bit instruction tests and unit tests there, on the port and on the
+  upstream commit it is based on: identical results (see "Test jobs" below). It found
+  one Linux regression, now fixed (the scratch-buffer guard page).
 
 Only the translator core is built on macOS. FEX's Linux process loader, syscall emulation,
 FEXServer and thunks are not part of this port.
@@ -609,6 +613,84 @@ The earlier macOS port this work draws on (`alamshafil/fexcore-darwin`, itself b
 Bachata-S4 and AetherPS4) also carried iOS and Android handling: a double-mapped code
 buffer, a buffer-reuse generation counter, and related diagnostics. Those files were left
 at upstream and the macOS parts were written by hand.
+
+## Test jobs (exit criterion 10)
+
+Three jobs run the tests automatically. Each shows something the others cannot.
+
+| Job | Where | Trigger | What it can show | What it cannot |
+|---|---|---|---|---|
+| `macos_core.yml` (this repository) | GitHub's hosted Mac (a virtual machine, Apple silicon) | push to `macos/**` | the build with the default toolchain, linkage, every test tool, the instruction tests in four modes, the code cache, the benchmark checksums, the sync script | write protection (the VM does not enforce it), the forbidden memory-ordering outcomes with emulation off (warn only), the Metal tiers; tests needing CPU features the VM lacks are skipped (14 instead of 6) |
+| `physical_mac.yml` (the private umbrella repository, `jt226ub/Apple-Silicon-Translation-Runtime`) | the physical Mac mini (M4), self-hosted runner `m4-mini` registered to that private repository only | push to `physical-mac/**`, manual (FEX ref, quick/full/soak), nightly | everything above as built **and** hardened, with write protection enforced (`JITWriteProbe --expect-enforced`), the ordering test's off/scalar modes as hard requirements, the 1,000-start stress, all four modes of the two-pass cache run, the Xcode 26.5 toolchain, and the umbrella's MetalFX tests (all six, under Metal validation) | Linux; another Mac model |
+| `linux_core_arm64.yml` (this repository) | GitHub's hosted `ubuntu-24.04-arm` (Azure Cobalt 100, 4K pages) | push to `macos/**` | that the port's changes do not break Linux: the `BUILD_FEXCORE_ONLY` build, the whole Linux build, upstream's 64-bit instruction tests through `TestHarnessRunner` and CTest (modes jit_1, jit_500, jit_500_m), upstream's FEXCore, API and emitter unit tests; all also on the upstream base commit, compared test by test | the port's own tools and `fexmac` (Apple-only by design), the TSO mode the Mac runs, anything Mac-specific |
+
+No runner is registered on this public repository, and none may be: a self-hosted runner
+on a public repository can be made to run a stranger's code. The physical-Mac workflow
+lives in the private repository for that reason and checks this repository out read-only.
+
+**Physical Mac, quick level, `macos/v1` at `e513ada49`**: every step PASS (machine
+record, probe enforced, build, linkage, smoke, thread, `fexmac_c_test` 46 subtests,
+`fexmac_hook_test` 9, mutex wake, ordering on/off/scalar, 1,000 starts, instruction tests
+2,265 pass / 15 expected failures / 6 skips in all four modes both ways, code cache tests,
+two-pass cache run, benchmark quick both ways, 58 benchmark mutations caught, sync script
+tests, MetalFX 6 of 6 in all three runs); the write-protection SMC run is ABSENT on that
+ref (package D adds it; the step runs it once `macos_asm_tests.py` has `--smc`). 13
+minutes with the machine at load 20. Run URLs and the full level are in the umbrella's
+`docs/testing/physical-mac-job-report.md`.
+
+**Physical Mac, full level** (adds the Xcode 26.5 leg and the two-pass cache run in all
+four modes): the Xcode leg passes every step with the same counts. The default leg finds
+two code cache faults, both reproduced by hand outside the job, open for package F:
+
+1. `macos_code_cache_tests.py`, "six processes rotating one database, 72 runs": every
+   answer right, but four generations left on disk where at most three may be (for
+   example `-1`, `-2`, `-45`, `-46`): old generations survive when six processes rotate
+   at once. 2 of 8 runs by hand on `e513ada49`, as built and hardened.
+2. `--cache-passes 2` in all four modes: `FEX_bugs/XeSS_quadratic` in jit_1 times out
+   (60 s) in the cold pass and passes warm. Alone it takes 1.0 s cold (65,538 blocks);
+   with the four-mode cold pass sharing one cache directory it hit the limit in 4 of 5
+   tries, on `9018cb0c1` too. Without the cache the same four-mode run passes. The hosted
+   Mac's two-pass run (two modes, jit_1 on a subset) does not reach it.
+
+**Hosted Mac job changes (this package).** The instruction-test steps now also fail on
+an expected failure that now passes (the script itself exits 0 for that); the old
+diagnosis step, which ran `lldb` and `sample` on three tests that pass since the
+scratch-buffer restart, is replaced by printing the unexpected rows of `results.tsv` when
+a step failed. No step uses `continue-on-error`; the memory-ordering off/scalar runs still
+only warn on the virtual machine when a forbidden outcome is not seen (documented in the
+step), and fail on anything else. Run time about 12 minutes.
+
+**Linux arm64.** On the port (with the fix below) and on its upstream base
+(`a92baf073`): instruction tests 2,285 raw passes, 1 known failure
+(`FEX_bugs/32bit_syscall`), 6 disabled by upstream's lists, in each of the three modes,
+CTest 6,876 of 6,876 as upstream's lists expect; unit tests 355 of 355 (the three
+`FutexSpin-Timed` tests are left out: they time wall-clock waits and failed on the
+upstream base too on these shared machines). Port against base: 0 tests differ. The
+core-only build and the full build have no warnings.
+
+Linux against the Mac (`Scripts/macos_linux_asm_compare.py`, modes jit_1, jit_500,
+jit_500_m): no test passes on one and fails on the other, apart from the 11 tests in
+`Known_Failures_macOS` (fixed low addresses) and tests the Mac runner skips: 4 that need
+memory below 4GB, `SecondaryModRM/Reg_7_1` (Linux system calls), and 5 for CPU features
+the guest CPUID does not report (`VEX/sha512`, `avx_vnni_int8`, `avx_vnni_int16`,
+`vpmadd52huq`, `vpmadd52luq`). Those 5 pass on Linux, where upstream's runner does not
+check CPUID; the Mac runner could run them too (not changed here).
+
+**Linux regression found and fixed.** `FEX_bugs/CodeBufferOverflow` failed in the
+multiblock mode on Linux and passed on the upstream base. The macOS change to
+`PooledAllocatorVirtualWithGuard` (`ThreadPoolAllocator.h`: a host-page guard placed
+after the requested size, because 16K pages could swallow the whole buffer) was not
+guarded, so on Linux the guard page moved one page past `JITGuardPage`, the address the
+JIT and Linux's signal handler use to recognise a full scratch buffer; a full buffer then
+crashed instead of restarting the translation. Upstream's layout is now kept on Linux,
+macOS's unchanged.
+
+Upstream's own workflows (`ccpp.yml`, `glibc_fault.yml`, `hostrunner.yml`,
+`instcountci.yml`, `mingw_build.yml`, `steamrt4.yml`, `vixl_simulator.yml`,
+`wine_dll_artifacts.yml`, `pr-code-format.yml`) trigger only on pushes to `main` or pull
+requests to `main` and target upstream's self-hosted runners. They never run on `macos/**`
+pushes, and none has run on this fork (only `macOS core build` is registered), so they are
+left unchanged to keep upstream syncs clean.
 
 ## Tests
 
