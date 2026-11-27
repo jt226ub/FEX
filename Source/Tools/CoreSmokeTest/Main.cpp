@@ -4,33 +4,20 @@
 // program, run it, and confirm the result it hands back.
 //
 // The guest program sums 1 to 100 in a loop and then makes a system call with the
-// sum as its first argument. Reaching the system call handler with 5050 proves that
-// the dispatcher was emitted and runs, that blocks are compiled and copied into
+// sum as its first argument. Reaching the system call with 5050 proves that the
+// dispatcher was emitted and runs, that blocks are compiled and copied into
 // executable memory, and that guest state reaches the host intact. Multiblock is
 // turned off so the loop's backward branch goes through the block linker, which
 // patches code that has already been made executable.
 //
-// The program never faults and needs no signal handling, so it only depends on the
-// core. It exits from inside the system call handler.
+// Uses only the fexmac interface (fexmac.h). The program never faults, so it installs
+// no fault handlers.
 
-#include "Common/HostFeatures.h"
-#include "CoreThreadSetup.h"
-#include "DummyHandlers.h"
-
-#include <FEXCore/Config/Config.h>
-#include <FEXCore/Core/Context.h>
-#include <FEXCore/Core/CoreState.h>
-#include <FEXCore/Core/X86Enums.h>
-#include <FEXCore/Debug/InternalThreadState.h>
-#include <FEXCore/HLE/SyscallHandler.h>
-#include <FEXCore/Utils/AllocatorHooks.h>
-#include <FEXCore/Utils/LogManager.h>
-#include <FEXCore/fextl/memory.h>
+#include <fexmac.h>
 
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
-#include <optional>
 #include <sys/mman.h>
 #include <unistd.h>
 
@@ -38,10 +25,8 @@ namespace {
 constexpr uint64_t ExpectedSum = 5050;
 
 // Offset of the instruction after `syscall` in GuestProgram. The x86-64 `syscall`
-// instruction stores the address of the next instruction in rcx, so the handler
-// should see this address there.
+// instruction stores the address of the next instruction in rcx.
 constexpr uint64_t OffsetAfterSyscall = 22;
-uint64_t GuestCodeBase {};
 
 // clang-format off
 constexpr uint8_t GuestProgram[] = {
@@ -58,55 +43,13 @@ constexpr uint8_t GuestProgram[] = {
 };
 // clang-format on
 
-void MsgHandler(LogMan::DebugLevels Level, const char* Message) {
-  fprintf(stderr, "[%s] %s\n", LogMan::DebugLevelStr(Level), Message);
-  fflush(stderr);
+int Fail(const char* What, fexmac_result Result) {
+  fprintf(stderr, "FAIL: %s: %s\n", What, fexmac_result_string(Result));
+  return 1;
 }
-
-void AssertHandler(const char* Message) {
-  fprintf(stderr, "[ASSERT] %s\n", Message);
-  fflush(stderr);
-}
-
-class SmokeSyscallHandler final : public FEXCore::HLE::SyscallHandler, public FEXCore::Allocator::FEXAllocOperators {
-public:
-  void HandleSyscall(FEXCore::Core::CpuStateFrame* Frame) override {
-    const uint64_t Number = Frame->State.gregs[FEXCore::X86State::REG_RAX];
-    const uint64_t Argument = Frame->State.gregs[FEXCore::X86State::REG_RDI];
-    const uint64_t ReturnAddress = Frame->State.gregs[FEXCore::X86State::REG_RCX];
-    const uint64_t ExpectedReturn = GuestCodeBase + OffsetAfterSyscall;
-
-    printf("Guest made system call %llu with argument %llu, return address 0x%llx\n", static_cast<unsigned long long>(Number),
-           static_cast<unsigned long long>(Argument), static_cast<unsigned long long>(ReturnAddress));
-
-    const bool Passed = Number == 60 && Argument == ExpectedSum && ReturnAddress == ExpectedReturn;
-    printf("%s: expected system call 60 with argument %llu, return address 0x%llx\n", Passed ? "PASS" : "FAIL",
-           static_cast<unsigned long long>(ExpectedSum), static_cast<unsigned long long>(ExpectedReturn));
-    fflush(stdout);
-    _exit(Passed ? 0 : 1);
-  }
-
-  std::optional<FEXCore::ExecutableFileSectionInfo> LookupExecutableFileSection(FEXCore::Core::InternalThreadState*, uint64_t) override {
-    return std::nullopt;
-  }
-
-  FEXCore::HLE::ExecutableRangeInfo QueryGuestExecutableRange(FEXCore::Core::InternalThreadState*, uint64_t) override {
-    return {0, UINT64_MAX, true};
-  }
-};
 } // namespace
 
 int main() {
-  LogMan::Throw::InstallHandler(AssertHandler);
-  LogMan::Msg::InstallHandler(MsgHandler);
-
-  FEXCore::Config::Initialize();
-  FEXCore::Config::Load();
-  FEXCore::Config::ReloadMetaLayer();
-  FEXCore::Config::Set(FEXCore::Config::CONFIG_IS64BIT_MODE, "1");
-  FEXCore::Config::Set(FEXCore::Config::CONFIG_MULTIBLOCK, "0");
-  FEXCore::Config::Set(FEXCore::Config::CONFIG_DISABLETELEMETRY, "1");
-
   // Guest memory is ordinary host memory: the guest's addresses are the host's.
   constexpr size_t CodeSize = 0x10000;
   constexpr size_t StackSize = 0x10000;
@@ -117,62 +60,65 @@ int main() {
     return 1;
   }
   memcpy(Code, GuestProgram, sizeof(GuestProgram));
-  GuestCodeBase = reinterpret_cast<uint64_t>(Code);
+  const auto GuestCodeBase = reinterpret_cast<uint64_t>(Code);
 
   printf("Host page size: %ld\n", sysconf(_SC_PAGESIZE));
   printf("Creating translator context\n");
   fflush(stdout);
 
-  fextl::unique_ptr<FEXCore::Context::Context> CTX;
-  {
-    auto HostFeatures = FEX::FetchHostFeatures(true);
-    CTX = FEXCore::Context::Context::CreateNewContext(HostFeatures);
-  }
+  const fexmac_option Options[] = {{"MULTIBLOCK", "0"}};
+  fexmac_config Config;
+  fexmac_config_init(&Config);
+  Config.options = Options;
+  Config.option_count = 1;
+  // No system call callback: the system call stops the run and is handled below.
 
-  auto SignalDelegation = FEX::DummyHandlers::CreateSignalDelegator();
-  auto SyscallHandler = fextl::make_unique<SmokeSyscallHandler>();
-  CTX->SetSignalDelegator(SignalDelegation.get());
-  CTX->SetSyscallHandler(SyscallHandler.get());
-
-  if (!CTX->InitCore()) {
-    fprintf(stderr, "FAIL: InitCore returned false\n");
-    return 1;
+  fexmac_context* Context {};
+  if (auto Result = fexmac_context_create(&Config, &Context); Result != FEXMAC_OK) {
+    return Fail("could not create the context", Result);
   }
   printf("Core initialised, dispatcher emitted\n");
   fflush(stdout);
 
-  auto Thread = CTX->CreateThread();
-
-  if (!FEX::CoreThreadSetup::AllocateCallRetStack(Thread)) {
-    fprintf(stderr, "FAIL: could not allocate the call and return stack\n");
-    return 1;
+  fexmac_thread* Thread {};
+  if (auto Result = fexmac_thread_create(Context, &Thread); Result != FEXMAC_OK) {
+    return Fail("could not create the thread", Result);
   }
-  auto* GDT = FEX::CoreThreadSetup::FullDescriptorTable();
-  {
-    auto Frame = Thread->CurrentFrame;
-    Frame->State.segment_arrays[FEXCore::Core::CPUState::SEGMENT_ARRAY_INDEX_GDT] = &GDT[0];
-    Frame->State.segment_arrays[FEXCore::Core::CPUState::SEGMENT_ARRAY_INDEX_LDT] = &GDT[0];
-
-    // A 64-bit code segment, as a 64-bit Linux process would have.
-    Frame->State.cs_idx = FEXCore::Core::CPUState::DEFAULT_USER_CS << 3;
-    auto CodeSegment = FEXCore::Core::CPUState::GetSegmentFromIndex(Frame->State, Frame->State.cs_idx);
-    FEXCore::Core::CPUState::SetGDTBase(CodeSegment, 0);
-    FEXCore::Core::CPUState::SetGDTLimit(CodeSegment, 0xF'FFFFU);
-    CodeSegment->L = 1;
-    CodeSegment->D = 0;
-    Frame->State.cs_cached = FEXCore::Core::CPUState::CalculateGDTBase(*CodeSegment);
-
-    Frame->State.rip = reinterpret_cast<uint64_t>(Code);
-    Frame->State.gregs[FEXCore::X86State::REG_RSP] = reinterpret_cast<uint64_t>(Stack) + StackSize - 64;
-  }
+  fexmac_x86_state State;
+  fexmac_x86_state_init(&State);
+  fexmac_thread_get_state(Thread, &State);
+  State.rip = GuestCodeBase;
+  State.gpr[4] = reinterpret_cast<uint64_t>(Stack) + StackSize - 64; // rsp
+  fexmac_thread_set_state(Thread, &State);
 
   printf("Running guest code at %p\n", static_cast<void*>(Code));
   fflush(stdout);
 
-  CTX->ExecuteThread(Thread);
+  fexmac_stop Stop;
+  fexmac_stop_init(&Stop);
+  if (auto Result = fexmac_thread_run(Thread, &Stop); Result != FEXMAC_OK) {
+    return Fail("run failed", Result);
+  }
+  if (Stop.reason != FEXMAC_STOP_SYSCALL) {
+    fprintf(stderr, "FAIL: guest stopped (reason %d) without reaching the system call\n", Stop.reason);
+    return 1;
+  }
 
-  // The system call handler exits the process, so getting here means the guest ran
-  // off the end of its program without making the call.
-  fprintf(stderr, "FAIL: guest execution returned without reaching the system call\n");
-  return 1;
+  fexmac_thread_get_state(Thread, &State);
+  const uint64_t Number = State.gpr[0];        // rax
+  const uint64_t Argument = State.gpr[7];      // rdi
+  const uint64_t ReturnAddress = State.gpr[1]; // rcx
+  const uint64_t ExpectedReturn = GuestCodeBase + OffsetAfterSyscall;
+
+  printf("Guest made system call %llu with argument %llu, return address 0x%llx\n", static_cast<unsigned long long>(Number),
+         static_cast<unsigned long long>(Argument), static_cast<unsigned long long>(ReturnAddress));
+
+  const bool Passed = Number == 60 && Argument == ExpectedSum && ReturnAddress == ExpectedReturn && State.rip == ExpectedReturn;
+  printf("%s: expected system call 60 with argument %llu, return address 0x%llx\n", Passed ? "PASS" : "FAIL",
+         static_cast<unsigned long long>(ExpectedSum), static_cast<unsigned long long>(ExpectedReturn));
+  fflush(stdout);
+
+  fexmac_thread_destroy(Thread);
+  fexmac_context_destroy(Context);
+  return Passed ? 0 : 1;
 }

@@ -274,20 +274,15 @@ public:
 private:
 
 #if defined(__APPLE__)
-  // Darwin's os_sync_wait_on_address family is explicitly documented by Apple as "Darwin's
-  // futex style APIs" -- compare-and-wait / wake-by-address, the same fundamental primitive.
-  // One real gap versus Linux's FUTEX_WAIT_BITSET/FUTEX_WAKE_BITSET: there's no bitset filter
-  // to selectively wake only the writer-waiters or only the reader-waiters sharing this one
-  // Futex word. Waking the unfiltered set is still *correct* (never a hang or a lost wakeup) --
-  // every wait loop in this class already re-checks the atomic state and tolerates spurious
-  // wakeups by design (see the "Can get some spurious wake-ups" comment in lock_shared()) --
-  // just occasionally less efficient than Linux's selective wake.
-  //
-  // That only holds if every waiter is woken. Waking a single waiter is not enough: readers
-  // and writers sleep on the same word, so os_sync_wake_by_address_any could pick a reader,
-  // which sees the writer still waiting and sleeps again, and the writer is never woken.
-  // FEXCoreCacheTest (eight threads linking 200 blocks) hung that way about one run in
-  // thirty, in ExitFunctionLink. So writer wake-ups wake all waiters too.
+  // Darwin's os_sync_wait_on_address family is Apple's futex-style API: compare-and-wait and
+  // wake-by-address on one word. Unlike Linux's FUTEX_WAIT_BITSET/FUTEX_WAKE_BITSET it has
+  // no filter to wake only the writers or only the readers waiting on this word, and unlike
+  // the Windows path it cannot wait on half of the word (sizes are 4 or 8 bytes). Waking
+  // one unfiltered waiter is therefore NOT safe: a reader can take the wake meant for a
+  // writer, see the writer still queued, and sleep again, leaving the writer asleep for
+  // good (FEXCoreMutexWakeTest shows it; FEXCoreOrderingTest hung on the code invalidation
+  // mutex this way). So a writer wake wakes every waiter. Each wait loop re-checks the
+  // state and goes back to sleep if it cannot proceed, so the extra wake-ups cost only time.
   void FutexWaitForWriteAvailable(uint32_t Expected) {
     os_sync_wait_on_address(&Futex, Expected, sizeof(Futex), OS_SYNC_WAIT_ON_ADDRESS_NONE);
   }
