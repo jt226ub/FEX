@@ -204,6 +204,9 @@ jobs:
           T="$(find build -name FEXCoreASMTestRunner -type f | head -1)"
           set -o pipefail
           python3 Scripts/macos_asm_tests.py --runner "$T" --out asm-out 2>&1 | tee asm-tests.log
+          # The script fails on an unexpected failure; an expected failure that now passes
+          # must be looked at too (its entry in Known_Failures_macOS is stale).
+          if grep -E 'expected failures that now pass: [1-9]' asm-tests.log; then exit 1; fi
 
       - name: Run the code cache tests
         # Damaged and mismatched cache files, moving guest code, eight threads loading the
@@ -230,29 +233,17 @@ jobs:
           python3 Scripts/macos_asm_tests.py --runner "$T" --out asm-cache-jit1 --modes jit_1 \
             --filter 3DNow/,TwoByte/,SelfModifyingCode/,FEX_bugs/ \
             --cache-dir asm-code-cache-jit1 --cache-passes 2 2>&1 | tee -a asm-cache-tests.log
+          if grep -E 'expected failures that now pass: [1-9]' asm-cache-tests.log; then exit 1; fi
 
-      - name: Diagnose the tests that are not understood
-        if: always()
+      - name: Show instruction tests that did not behave as listed
+        # No debugger here: the runner prints the faulting address of a crash, and
+        # results.tsv carries it with the reason from the expected-failure list.
+        if: failure()
         run: |
-          T="$(find build -name FEXCoreASMTestRunner -type f | head -1)"
-          export FEX_MAXINST=500 FEX_MULTIBLOCK=0 FEX_TSOENABLED=0
-          # Expected crashes need no debugger: the runner prints the faulting address, and
-          # asm-out/results.tsv carries it with the reason from the expected-failure list.
-          echo "=== crash: FEX_bugs/CodeBufferOverflow (multiblock)"
-          FEX_MULTIBLOCK=1 lldb --batch -o run -o "bt 25" -o quit -- "$T" asm-out/FEX_bugs/CodeBufferOverflow.asm.bin asm-out/FEX_bugs/CodeBufferOverflow.asm.config.bin 2>&1 | tail -45 || true
-          # Timeouts: sample where the process is spinning.
-          for t in SelfModifyingCode/DifferentBlock SelfModifyingCode/Delinking; do
-            echo "=== timeout: $t"
-            extra=""; case "$t" in SelfModifyingCode/*) extra="full";; esac
-            FEX_SMCCHECKS="$extra" "$T" asm-out/$t.asm.bin asm-out/$t.asm.config.bin > /dev/null 2>&1 &
-            pid=$!
-            sleep 4
-            if kill -0 $pid 2>/dev/null; then
-              sample $pid 1 -mayDie 2>/dev/null | sed -n '/Call graph/,/Total number/p' | head -45 || true
-              kill -9 $pid 2>/dev/null || true
-            else
-              wait $pid; echo "finished by itself with exit code $?"
-            fi
+          for f in asm-out/results.tsv asm-cache/results.tsv asm-cache-jit1/results.tsv; do
+            [ -f "$f" ] || continue
+            echo "=== $f"
+            awk -F'\t' '$3 ~ /^unexpected-/' "$f" | head -60
           done
 
       - name: Probe the low-memory rule
