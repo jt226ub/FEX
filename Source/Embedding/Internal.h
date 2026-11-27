@@ -35,9 +35,11 @@ public:
   void HandleSyscall(FEXCore::Core::CpuStateFrame* Frame) override;
   void InvalidateGuestCodeRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Start, uint64_t Length) override;
 
-  // Every guest address is treated as executable and writable code. Package D's
-  // page-protection self-modifying-code detection replaces this with the embedder's
-  // view of guest memory (MarkGuestExecutableRange is where it learns about ranges).
+  // EXTENSION POINT (packages D and F): every guest address is treated as executable
+  // and writable code. Once the embedder can register its mapped guest ranges (see the
+  // planned functions in fexmac.h), this reports the real range and its writability;
+  // page-protection self-modifying-code detection (D) and cached-code keying (F) need it.
+  // MarkGuestExecutableRange is where the core reports ranges it starts executing.
   FEXCore::HLE::ExecutableRangeInfo QueryGuestExecutableRange(FEXCore::Core::InternalThreadState*, uint64_t) override {
     return {0, UINT64_MAX, true};
   }

@@ -43,6 +43,9 @@ enum Outcome {
   SETTING_RESTORED,
   SETTING_NOT_RESTORED,
   STALE_CODE_RAN,
+  ALIGNMENT_FAULT,
+  ACCESS_FAULT,
+  OTHER_FAULT_STATUS,
   FAULT,   // SIGBUS or SIGSEGV
   ILLEGAL, // SIGILL
   OTHER_SIGNAL,
@@ -62,6 +65,9 @@ static const char* OutcomeName(enum Outcome O) {
   case SETTING_RESTORED: return "restored (thread executable again)";
   case SETTING_NOT_RESTORED: return "not restored (handler's setting kept)";
   case STALE_CODE_RAN: return "stale code ran";
+  case ALIGNMENT_FAULT: return "alignment fault (DFSC 0x21)";
+  case ACCESS_FAULT: return "translation or permission fault (DFSC 0x04-0x0F)";
+  case OTHER_FAULT_STATUS: return "other fault status";
   case FAULT: return "FAULT";
   case ILLEGAL: return "FAULT";
   case OTHER_SIGNAL: return "FAULT";
@@ -336,6 +342,70 @@ static int DCCVAU(void) {
   return OK;
 }
 
+// ---- Fault status: what the kernel reports for each kind of data abort ----
+//
+// fexmac tells a misaligned atomic from a protection fault by the data abort's fault
+// status code in ESR_EL1, which macOS passes in the signal context: both arrive as
+// SIGBUS with si_code 1 (BUS_ADRALN), so si_code cannot tell them apart. Each case faults
+// once; the handler prints what the kernel reported and ends the child with the kind.
+
+static void ReportFaultStatus(int Signal, siginfo_t* Info, void* RawContext) {
+  const ucontext_t* Context = (const ucontext_t*)RawContext;
+  const uint32_t ESR = Context->uc_mcontext->__es.__esr;
+  const uint32_t Class = ESR >> 26;
+  const uint32_t DFSC = ESR & 0x3F;
+  char Line[160];
+  const int Length = snprintf(Line, sizeof(Line), "  [signal %d si_code %d ESR 0x%08x DFSC 0x%02x WnR %u] ", Signal, Info->si_code, ESR, DFSC,
+                              (ESR >> 6) & 1);
+  (void)!write(STDOUT_FILENO, Line, (size_t)Length);
+  if (Class != 0x24 && Class != 0x25) {
+    _exit(OTHER_FAULT_STATUS);
+  }
+  _exit(DFSC == 0x21 ? ALIGNMENT_FAULT : (DFSC >= 0x04 && DFSC <= 0x0F) ? ACCESS_FAULT : OTHER_FAULT_STATUS);
+}
+
+static void* FaultStatusSetup(int Protection) {
+  InstallHandler(SIGBUS, ReportFaultStatus);
+  InstallHandler(SIGSEGV, ReportFaultStatus);
+  void* P = mmap(NULL, MAP_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  (void)*(volatile char*)P;
+  mprotect(P, MAP_SIZE, Protection);
+  return P;
+}
+
+static int StatusLoadProtNone(void) {
+  volatile char* P = FaultStatusSetup(PROT_NONE);
+  (void)*P;
+  return OK;
+}
+static int StatusStoreReadOnly(void) {
+  volatile char* P = FaultStatusSetup(PROT_READ);
+  *P = 1;
+  return OK;
+}
+static int StatusAtomicProtNone(void) {
+  uint64_t* P = FaultStatusSetup(PROT_NONE);
+  __atomic_fetch_add(P, 1, __ATOMIC_SEQ_CST);
+  return OK;
+}
+static int StatusMisalignedAtomic(void) {
+  char* P = FaultStatusSetup(PROT_READ | PROT_WRITE);
+  uint32_t One = 1;
+  __asm volatile("ldaddal %w[v], %w[v], [%[p]]" : [v] "+r"(One) : [p] "r"(P + 14) : "memory");
+  return OK;
+}
+static int StatusMisalignedAtomicProtNone(void) {
+  char* P = FaultStatusSetup(PROT_NONE);
+  uint32_t One = 1;
+  __asm volatile("ldaddal %w[v], %w[v], [%[p]]" : [v] "+r"(One) : [p] "r"(P + 14) : "memory");
+  return OK;
+}
+static int StatusUnmapped(void) {
+  FaultStatusSetup(PROT_READ);
+  (void)*(volatile char*)0x7f0000000000ULL;
+  return OK;
+}
+
 // ---- Driver ----
 
 static enum Outcome Run(const char* Name, int (*Case)(void)) {
@@ -390,6 +460,12 @@ static const struct ProbeCase Cases[] = {
   {"Read midr_el1 from user space", ReadMIDR, REPORT_ONLY},
   {"Read id_aa64isar0_el1 from user space", ReadISAR0, REPORT_ONLY},
   {"dc cvau from user space", DCCVAU, OK},
+  {"Fault status: load from a PROT_NONE page", StatusLoadProtNone, ACCESS_FAULT},
+  {"Fault status: store to a read-only page", StatusStoreReadOnly, ACCESS_FAULT},
+  {"Fault status: atomic add on a PROT_NONE page", StatusAtomicProtNone, ACCESS_FAULT},
+  {"Fault status: load from an unmapped address", StatusUnmapped, ACCESS_FAULT},
+  {"Fault status: misaligned atomic across 16 bytes", StatusMisalignedAtomic, ALIGNMENT_FAULT},
+  {"Fault status: misaligned atomic on a PROT_NONE page", StatusMisalignedAtomicProtNone, ALIGNMENT_FAULT},
 };
 
 int main(int argc, char** argv) {

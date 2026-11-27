@@ -251,6 +251,7 @@ int main(int argc, char** argv, char** const envp) {
     return ExitFail;
   }
   fexmac_x86_state GuestState;
+  fexmac_x86_state_init(&GuestState);
   fexmac_thread_get_state(Thread, &GuestState);
   GuestState.rip = Loader.DefaultRIP();
   fexmac_thread_set_state(Thread, &GuestState);
@@ -263,7 +264,8 @@ int main(int argc, char** argv, char** const envp) {
 
   // The tests end with `hlt`. Anything else (a guest fault, a system call) means the
   // test went wrong.
-  fexmac_stop Stop {};
+  fexmac_stop Stop;
+  fexmac_stop_init(&Stop);
   const auto RunResult = fexmac_thread_run(Thread, &Stop);
   const bool DidFault = RunResult != FEXMAC_OK || Stop.reason != FEXMAC_STOP_HALT;
   fexmac_thread_get_state(Thread, &GuestState);

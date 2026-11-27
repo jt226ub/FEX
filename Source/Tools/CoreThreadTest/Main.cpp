@@ -49,6 +49,7 @@ void Run(fexmac_context* Context, uint64_t Code, Worker* Self) {
   }
 
   fexmac_x86_state State;
+  fexmac_x86_state_init(&State);
   fexmac_thread_get_state(Thread, &State);
   State.rip = Code;
   State.gpr[0] = 0;           // rax
@@ -56,7 +57,8 @@ void Run(fexmac_context* Context, uint64_t Code, Worker* Self) {
   fexmac_thread_set_state(Thread, &State);
   Self->Started = true;
 
-  fexmac_stop Stop {};
+  fexmac_stop Stop;
+  fexmac_stop_init(&Stop);
   if (fexmac_thread_run(Thread, &Stop) == FEXMAC_OK) {
     Self->Halted = Stop.reason == FEXMAC_STOP_HALT;
   }

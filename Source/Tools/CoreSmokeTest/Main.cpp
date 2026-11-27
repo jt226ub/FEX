@@ -85,6 +85,7 @@ int main() {
     return Fail("could not create the thread", Result);
   }
   fexmac_x86_state State;
+  fexmac_x86_state_init(&State);
   fexmac_thread_get_state(Thread, &State);
   State.rip = GuestCodeBase;
   State.gpr[4] = reinterpret_cast<uint64_t>(Stack) + StackSize - 64; // rsp
@@ -94,6 +95,7 @@ int main() {
   fflush(stdout);
 
   fexmac_stop Stop;
+  fexmac_stop_init(&Stop);
   if (auto Result = fexmac_thread_run(Thread, &Stop); Result != FEXMAC_OK) {
     return Fail("run failed", Result);
   }

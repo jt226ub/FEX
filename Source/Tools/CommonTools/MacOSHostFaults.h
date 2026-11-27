@@ -69,7 +69,12 @@ inline void FaultHandler(int Signal, siginfo_t* Info, void* RawContext) {
     }
   }
 
-  if (Thread && Signal == SIGBUS && Info->si_code == BUS_ADRALN && Thread->CTX->IsAddressInCodeBuffer(Thread, PC)) {
+  // macOS reports a protection fault as SIGBUS with si_code BUS_ADRALN too, so only the
+  // data abort's fault status code (ESR DFSC 0x21) identifies an alignment fault. See
+  // Source/Embedding/Faults.cpp.
+  const uint32_t ESR = Context->uc_mcontext->__es.__esr;
+  const bool AlignmentFault = ((ESR >> 26) == 0x24 || (ESR >> 26) == 0x25) && (ESR & 0x3F) == 0x21;
+  if (Thread && Signal == SIGBUS && AlignmentFault && Thread->CTX->IsAddressInCodeBuffer(Thread, PC)) {
     const auto Result = FEXCore::ArchHelpers::Arm64::HandleUnalignedAccess(
       Thread, FEXCore::ArchHelpers::Arm64::UnalignedHandlerType::HalfBarrier, PC, &State.__x[0]);
     if (Result.has_value()) {

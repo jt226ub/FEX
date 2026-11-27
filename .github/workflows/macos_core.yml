@@ -129,6 +129,8 @@ jobs:
           codesign --force --sign - --options runtime --entitlements Data/macOS/jit.entitlements fexmac_c_test-hardened
           echo "=== hardened runtime"
           ./fexmac_c_test-hardened 2>&1 | tee fexmac-c-test-hardened.log
+          # Behaviour that needs the library's test hooks (fexmac_testing build only).
+          build/Bin/fexmac_hook_test 2>&1 | tee fexmac-hook-test.log
 
       - name: Run the multi-thread test
         run: |
@@ -272,6 +274,7 @@ jobs:
             thread-test.log
             fexmac-c-test.log
             fexmac-c-test-hardened.log
+            fexmac-hook-test.log
             ordering-on.log
             ordering-on-hardened.log
             ordering-off.log

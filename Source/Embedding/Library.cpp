@@ -471,6 +471,10 @@ fexmac_result fexmac_context_create(const fexmac_config* config, fexmac_context*
     return Result;
   }
   *out_context = nullptr;
+  // Package F: cached translations. Refused until they are implemented.
+  if (config->code_cache_directory || config->code_cache_enabled || config->reserved || config->reserved2) {
+    return FEXMAC_ERROR_UNSUPPORTED;
+  }
 
   {
     std::lock_guard Lock {RegistryMutex};

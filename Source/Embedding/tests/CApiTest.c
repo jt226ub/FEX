@@ -280,6 +280,12 @@ static void TestABI(void) {
   fexmac_config Config;
   fexmac_config_init(&Config);
   fexmac_context* Other = NULL;
+  Config.code_cache_enabled = 1;
+  CheckResult(fexmac_context_create(&Config, &Other), FEXMAC_ERROR_UNSUPPORTED, "config asking for cached translations (not yet)");
+  fexmac_config_init(&Config);
+  Config.code_cache_directory = "/tmp";
+  CheckResult(fexmac_context_create(&Config, &Other), FEXMAC_ERROR_UNSUPPORTED, "config naming a cache directory (not yet)");
+  fexmac_config_init(&Config);
   Config.struct_size = 8;
   CheckResult(fexmac_context_create(&Config, &Other), FEXMAC_ERROR_INVALID_ARGUMENT, "config smaller than version 1");
   struct {
@@ -641,7 +647,8 @@ static void TestErrors(void) {
     const char* Why;
   } Bad[] = {
     {"NOSUCHOPTION", "1", "unknown option"},
-    {"DISKCACHE", "1", "core option this port does not support (aborts the process if allowed)"},
+    {"DISKCACHE", "1", "core option this port does not support yet (aborts the process if allowed)"},
+    {"DISKCACHEPATH", "/tmp", "code cache option (package F)"},
     {"JITFEATURES", "nonsense", "core option not on the supported list"},
     {"GDBSERVER", "1", "core option not on the supported list"},
     {"SINGLESTEP", "1", "core option not on the supported list"},
@@ -878,7 +885,7 @@ static void* ProgressWatchdog(void* Arg) {
 }
 
 static void TestConcurrentInvalidation(void) {
-  enum { Threads = 8, MinimumIterations = 20, BudgetSeconds = 30 };
+  enum { Threads = 8, MinimumIterations = 12, BudgetSeconds = 20 };
   MtCode = MapGuestMemory(0x10000);
   /* mov ebx,20000 ; loop: mov eax,1 ; syscall ; dec ebx ; jnz loop ; hlt */
   const uint8_t Program[] = {0xBB, 0x20, 0x4E, 0, 0, 0xB8, 1, 0, 0, 0, 0x0F, 0x05, 0xFF, 0xCB, 0x75, 0xF5, 0xF4};

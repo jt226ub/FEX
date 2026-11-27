@@ -147,7 +147,23 @@ typedef struct fexmac_config {
   /* NULL: messages go to standard error. */
   fexmac_log_fn log;
   void* log_user_data;
+
+  /* Reserved for cached translations (package F; not available yet). Loading and saving
+   * translations to a directory will be switched on here. Must be NULL and 0: anything
+   * else is refused with FEXMAC_ERROR_UNSUPPORTED. The core's own options for this
+   * (DISKCACHE, DISKCACHEPATH) are refused too. */
+  const char* code_cache_directory;
+  uint32_t code_cache_enabled;
+  uint32_t reserved2;
 } fexmac_config;
+
+/* Planned with cached translations (package F), not declared until they exist:
+ *   fexmac_context_flush_cache(fexmac_context*)  writes pending translations to the
+ *     cache directory;
+ *   a query for translation counters (blocks compiled, loaded from the cache, rejected);
+ *   a way for the embedder to tell the library which guest ranges are mapped and
+ *     executable, so the core's QueryGuestExecutableRange reports them instead of
+ *     treating all memory as executable code (also needed by package D). */
 
 /* Fills a config with defaults: no options, no callbacks. */
 FEXMAC_EXPORT void fexmac_config_init(fexmac_config* config);
