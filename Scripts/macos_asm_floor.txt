@@ -1,0 +1,13 @@
+# Minimum instruction-test counts, read by Scripts/macos_asm_check.py for the hosted Mac
+# job (.github/workflows/macos_core.yml) and the physical-Mac job in the umbrella
+# repository. Raise them when tests are added or fixed; a run below a floor fails, so
+# tests cannot go missing unnoticed (a script change that stops finding or preparing
+# tests, a filter that matches less).
+#
+# tests_found   "Tests found" in the script's summary: upstream's 2,292 plus the port's 4.
+# pass          passes per mode, every mode, on a physical Apple silicon Mac (M4).
+# pass_virtual  passes per mode on GitHub's hosted Mac (a virtual machine that lacks some
+#               CPU features, so 8 more tests are skipped there).
+tests_found 2296
+pass 2265
+pass_virtual 2257

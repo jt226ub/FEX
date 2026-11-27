@@ -21,9 +21,10 @@ jobs:
     runs-on: macos-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 1
+          persist-credentials: false
 
       - name: Fetch the third-party code the core needs
         run: |
@@ -108,7 +109,11 @@ jobs:
           T="$(find build -name FEXCoreSmokeTest -type f | head -1)"
           cp "$T" FEXCoreSmokeTest-hardened
           codesign --force --sign - --options runtime --entitlements Data/macOS/jit.entitlements FEXCoreSmokeTest-hardened
-          codesign -d --verbose=2 --entitlements - FEXCoreSmokeTest-hardened 2>&1 | grep -E 'flags|allow-jit' || true
+          # The copy must really carry the hardened runtime and the JIT entitlement.
+          sig="$(codesign -d --verbose=2 --entitlements - FEXCoreSmokeTest-hardened 2>&1)"
+          echo "$sig" | grep -E 'flags|allow-jit'
+          grep -q -E 'flags=0x[0-9a-f]+\([^)]*runtime' <<< "$sig"
+          grep -q 'com.apple.security.cs.allow-jit' <<< "$sig"
           set +e
           ./FEXCoreSmokeTest-hardened 2>&1 | tee smoke-hardened.log
           code=${PIPESTATUS[0]}
@@ -215,9 +220,11 @@ jobs:
           T="$(find build -name FEXCoreASMTestRunner -type f | head -1)"
           set -o pipefail
           python3 Scripts/macos_asm_tests.py --runner "$T" --out asm-out 2>&1 | tee asm-tests.log
-          # The script fails on an unexpected failure; an expected failure that now passes
-          # must be looked at too (its entry in Known_Failures_macOS is stale).
-          if grep -E 'expected failures that now pass: [1-9]' asm-tests.log; then exit 1; fi
+          # The script fails on an unexpected failure. The check also fails on an expected
+          # failure that now passes (a stale Known_Failures_macOS entry), on tests that
+          # were not found or prepared, and on a pass count below the floor in
+          # Scripts/macos_asm_floor.txt (pass_virtual: this VM lacks some CPU features).
+          python3 Scripts/macos_asm_check.py asm-tests.log --modes 4 --full-virtual
 
       - name: Run the differential guest-fault test
         # Guest state at a page fault, after resuming, and through the write-protection
@@ -235,6 +242,8 @@ jobs:
           T="$(find build -name FEXCoreASMTestRunner -type f | head -1)"
           set -o pipefail
           python3 Scripts/macos_asm_tests.py --runner "$T" --out asm-smc --filter SelfModifyingCode --smc mtrack 2>&1 | tee asm-smc-tests.log
+          python3 Scripts/macos_asm_check.py asm-smc-tests.log --modes 4
+          [ "$(grep -c -E '^== jit[^:]*: pass 3$' asm-smc-tests.log)" -eq 4 ]
 
       - name: Run the code cache tests
         # Damaged and mismatched cache files, moving guest code, eight threads loading the
@@ -260,8 +269,9 @@ jobs:
           # jit_1 found the 3DNow! displacement patching bug (Frontend.cpp): keep it covered.
           python3 Scripts/macos_asm_tests.py --runner "$T" --out asm-cache-jit1 --modes jit_1 \
             --filter 3DNow/,TwoByte/,SelfModifyingCode/,FEX_bugs/ \
-            --cache-dir asm-code-cache-jit1 --cache-passes 2 2>&1 | tee -a asm-cache-tests.log
-          if grep -E 'expected failures that now pass: [1-9]' asm-cache-tests.log; then exit 1; fi
+            --cache-dir asm-code-cache-jit1 --cache-passes 2 2>&1 | tee asm-cache-jit1-tests.log
+          python3 Scripts/macos_asm_check.py asm-cache-tests.log --modes 2 --full-virtual
+          python3 Scripts/macos_asm_check.py asm-cache-jit1-tests.log --modes 1
 
       - name: Show instruction tests that did not behave as listed
         # No debugger here: the runner prints the faulting address of a crash, and
@@ -277,6 +287,7 @@ jobs:
       - name: Probe the low-memory rule
         if: always()
         run: |
+          set -o pipefail
           printf 'int main(void){return 0;}\n' > lowmem.c
           clang -o lowmem-default lowmem.c
           clang -o lowmem-pagezero lowmem.c -Wl,-pagezero_size,0x4000
@@ -288,11 +299,15 @@ jobs:
 
       - name: Probe executable-memory behaviour
         if: always()
+        # Report only (this VM does not enforce write protection, so --expect-enforced
+        # would fail); the physical-Mac job asserts it. A probe that crashes still fails.
         run: |
+          set -o pipefail
           clang -O1 -o JITWriteProbe Source/Tools/JITWriteProbe/Main.c
           echo "=== probe: as built"
           ./JITWriteProbe 2>&1 | tee probe.log
           codesign --force --sign - --options runtime --entitlements Data/macOS/jit.entitlements JITWriteProbe
+          grep -q -E 'flags=0x[0-9a-f]+\([^)]*runtime' <<< "$(codesign -d --verbose=2 JITWriteProbe 2>&1)"
           echo "=== probe: hardened runtime"
           ./JITWriteProbe 2>&1 | tee probe-hardened.log
 
@@ -330,7 +345,7 @@ jobs:
             fi
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
           name: macos-core-build-log
@@ -342,6 +357,7 @@ jobs:
             asm-tests.log
             asm-cache-tests.log
             asm-cache/cache.tsv
+            asm-cache-jit1-tests.log
             cache-tests.log
             thread-test.log
             fexmac-c-test.log
