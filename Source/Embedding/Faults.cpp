@@ -416,6 +416,12 @@ namespace {
   // ARM64 atomic instructions raise an alignment fault on an address that is not a
   // multiple of the operand size where the access crosses 16 bytes; x86 allows it. The
   // core rewrites the instruction sequence and execution resumes after it.
+#ifdef FEXMAC_TESTING
+  // Called in HandleMisalignedAtomic with the core's handling about to start (package E's
+  // test of the signal blocking), after the asynchronous signals are blocked.
+  std::atomic<void (*)()> TestMisalignedHook {};
+#endif
+
   bool HandleMisalignedAtomic(fexmac_thread* Current, const Classification& Kind, siginfo_t* Info, ucontext_t* Context) {
     auto* Thread = Current->Thread;
     auto& State = Context->uc_mcontext->__ss;
@@ -498,6 +504,9 @@ namespace {
 #ifdef FEXMAC_TESTING
     if (void* Page = TestProtectBeforeEmulation.load()) {
       ::mprotect(Page, FEXCore::Utils::FEX_HOST_PAGE_SIZE, PROT_NONE);
+    }
+    if (auto Hook = TestMisalignedHook.load()) {
+      Hook();
     }
 #endif
     SetKey(EmulatingKey, reinterpret_cast<uintptr_t>(Info->si_addr));
@@ -968,6 +977,10 @@ void fexmac_testing_fault_inside_handler(int enable, volatile uint32_t* fired) {
 
 void fexmac_testing_protect_before_emulation(void* page) {
   fexmac::TestProtectBeforeEmulation.store(page);
+}
+
+void fexmac_testing_set_misaligned_hook(void (*hook)(void)) {
+  fexmac::TestMisalignedHook.store(hook);
 }
 
 void fexmac_testing_log_from_fault_handler(int enable) {

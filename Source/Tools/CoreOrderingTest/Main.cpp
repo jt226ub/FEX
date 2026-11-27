@@ -20,7 +20,8 @@
 // tell the two apart. Every test must also show at least one outcome that is possible only
 // when its two threads overlap; otherwise it fails as NOT RACING, in every mode, since a
 // test whose threads never overlap passes for nothing. Store buffering (SB) is allowed
-// under TSO and its relaxed outcome must appear as well.
+// under TSO and its relaxed outcome must appear as well (except with emulation on and a
+// single group, where two threads may not show it at all).
 //
 // Further tests: store buffering with `mfence` or a locked instruction between store and
 // load (forbidden in every mode), and counting tests in which every thread of every group
@@ -1301,6 +1302,54 @@ std::vector<uint8_t> BuildProgram(const LitmusTest& T, int Role, int NumThreads)
 // the fault-time back-patching (and how often several threads fault on the same code).
 std::atomic<uint64_t> AlignmentFaults {};
 
+// Which guest threads took an alignment fault at each faulting instruction address (host
+// PC in translated code), to tell whether several threads faulted on the same instruction
+// (the concurrent case of the back-patching) rather than one thread on several, or on its
+// own copy again. Filled from the fault handler: open addressing with atomics only.
+constexpr size_t FaultSites = 8192;
+std::atomic<uint64_t> FaultSitePC[FaultSites];
+std::atomic<uint32_t> FaultSiteThreads[FaultSites];
+pthread_key_t ThreadIndexKey; // index + 1 of the guest thread running on this host thread
+
+void RecordFaultSite(uint64_t PC) {
+  const auto Index = reinterpret_cast<uintptr_t>(pthread_getspecific(ThreadIndexKey));
+  if (!Index || Index > 32) {
+    return;
+  }
+  for (size_t Probe = 0; Probe < FaultSites; ++Probe) {
+    auto& Slot = FaultSitePC[(PC / 4 + Probe) % FaultSites];
+    uint64_t Seen = Slot.load(std::memory_order_relaxed);
+    if (Seen == 0 && Slot.compare_exchange_strong(Seen, PC)) {
+      Seen = PC;
+    }
+    if (Seen == PC) {
+      FaultSiteThreads[(PC / 4 + Probe) % FaultSites].fetch_or(1U << (Index - 1), std::memory_order_relaxed);
+      return;
+    }
+  }
+}
+
+// The largest number of distinct threads that faulted on one instruction since the last
+// reset, and how many instructions faulted.
+std::pair<int, size_t> FaultSiteSummary() {
+  int Most = 0;
+  size_t Sites = 0;
+  for (size_t i = 0; i < FaultSites; ++i) {
+    if (FaultSitePC[i].load()) {
+      ++Sites;
+      Most = std::max(Most, __builtin_popcount(FaultSiteThreads[i].load()));
+    }
+  }
+  return {Most, Sites};
+}
+
+void ResetFaultSites() {
+  for (size_t i = 0; i < FaultSites; ++i) {
+    FaultSitePC[i] = 0;
+    FaultSiteThreads[i] = 0;
+  }
+}
+
 // Prints where a stalled thread is. Not async-signal-safe; it only runs when the tool is
 // about to give up anyway.
 void WhereHandler(int, siginfo_t*, void* RawContext) {
@@ -1320,9 +1369,11 @@ void WhereHandler(int, siginfo_t*, void* RawContext) {
 // default action is restored and the fault happens again.
 void FaultHandler(int Signal, siginfo_t* Info, void* RawContext) {
   const uint32_t ESR = static_cast<ucontext_t*>(RawContext)->uc_mcontext->__es.__esr;
+  const uint64_t PC = static_cast<ucontext_t*>(RawContext)->uc_mcontext->__ss.__pc;
   if (fexmac_handle_fault(Signal, Info, RawContext)) {
     if ((ESR & 0x3F) == 0x21) {
       AlignmentFaults.fetch_add(1, std::memory_order_relaxed);
+      RecordFaultSite(PC);
     }
     return;
   }
@@ -1330,6 +1381,7 @@ void FaultHandler(int Signal, siginfo_t* Info, void* RawContext) {
 }
 
 struct GuestThread {
+  int Index {}; // across all groups of the run
   uint64_t RIP {};
   uint64_t Regs[16] {};
   bool Done {};
@@ -1363,9 +1415,13 @@ void RunGuest(fexmac_context* Context, GuestThread* Self) {
   pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
   Self->Handle = pthread_self();
 
+  pthread_setspecific(ThreadIndexKey, reinterpret_cast<void*>(static_cast<uintptr_t>(Self->Index + 1)));
   fexmac_thread* Thread {};
-  if (fexmac_thread_create(Context, &Thread) != FEXMAC_OK) {
-    return;
+  if (const auto Result = fexmac_thread_create(Context, &Thread); Result != FEXMAC_OK) {
+    // The others would wait for this thread at the start barrier for ever.
+    fprintf(stderr, "FAIL: could not create guest thread %d: %s\n", Self->Index, fexmac_result_string(Result));
+    fflush(stderr);
+    _exit(1);
   }
   Self->Stage = 1;
   fexmac_x86_state State;
@@ -1510,6 +1566,7 @@ unsigned HostCPUs() {
 
 int main(int argc, char** argv) {
   setvbuf(stdout, nullptr, _IOLBF, 0);
+  pthread_key_create(&ThreadIndexKey, nullptr);
 
   const Options Opt = Parse(argc, argv);
   auto Tests = MakeTests();
@@ -1636,6 +1693,7 @@ int main(int argc, char** argv) {
     const uint64_t Iterations = std::max<uint64_t>(16, AllIterations / T.IterationDivisor);
     const auto TestStart = std::chrono::steady_clock::now();
     const uint64_t FaultsBefore = AlignmentFaults.load();
+    ResetFaultSites();
     std::vector<uint64_t> Counts(T.Labels.size(), 0);
     bool Broken = false;
     uint64_t FinalFailures = 0;
@@ -1645,13 +1703,18 @@ int main(int argc, char** argv) {
     // (reported): on a machine with few processors two threads sometimes share a core for
     // a whole run. Every outcome of every set counts, so this cannot hide a forbidden one.
     unsigned RunLimit = Runs;
+    // SB's relaxed outcome is also required, except with emulation on (or scalar) and a
+    // single group: there it needs a load-acquire to pass a store-release, which two
+    // threads sometimes never show over thousands of runs on a loaded machine (they still
+    // must overlap, as every test must).
+    const bool RelaxedRequired = T.Relaxed >= 0 && (Opt.Mode == Options::TSO::Off || Groups >= 2);
     unsigned ExtraSets = 0;
     auto Racing = [&] {
       uint64_t Overlap = 0;
       for (int I : T.Interleaved) {
         Overlap += Counts[I];
       }
-      return Overlap != 0 && (T.Relaxed < 0 || Counts[T.Relaxed] != 0);
+      return Overlap != 0 && (!RelaxedRequired || Counts[T.Relaxed] != 0);
     };
     for (unsigned Run = 0; Run < RunLimit && !Broken; ++Run) {
       // A fresh copy of the code for every run, so it is translated again and the
@@ -1733,6 +1796,7 @@ int main(int argc, char** argv) {
         }
         for (int R = 0; R < NumThreads; ++R) {
           auto& GT = Threads[G * NumThreads + R];
+          GT.Index = static_cast<int>(G * NumThreads + R);
           GT.RIP = reinterpret_cast<uint64_t>(Code + R * RoleCodeSize);
           GT.Regs[R14] = Iterations;
           GT.Regs[R13] = reinterpret_cast<uint64_t>(M.Results[R]);
@@ -1830,6 +1894,7 @@ int main(int argc, char** argv) {
     // meet its first execution together (start barrier above), so a misaligned test must
     // have seen some instruction fault on more than one thread at once.
     const bool NeedConcurrentFaults = T.PatchedPerRun && Opt.Mode == Options::TSO::On && Groups >= 2;
+    const auto [MostThreadsAtOneSite, FaultingSites] = FaultSiteSummary();
     const Expect Required = Opt.Want == Options::Expect::TSO    ? Expect::Hold :
                             Opt.Want == Options::Expect::Weak   ? T.Off :
                             Opt.Want == Options::Expect::Scalar ? T.Scalar :
@@ -1841,11 +1906,11 @@ int main(int argc, char** argv) {
     } else if (Overlapping == 0) {
       // Without overlap a test cannot show reordering, so passing would mean nothing.
       Verdict = "NOT RACING (no outcome that needs the threads to overlap)";
-    } else if (T.Relaxed >= 0 && Counts[T.Relaxed] == 0) {
+    } else if (RelaxedRequired && Counts[T.Relaxed] == 0) {
       Verdict = "NOT RACING (relaxed outcome never seen)";
-    } else if (NeedConcurrentFaults && Faults <= uint64_t(T.PatchedPerRun) * RunLimit) {
-      Verdict = "NOT CONCURRENT (no instruction faulted on several threads at once: " + std::to_string(Faults) + " faults for " +
-                std::to_string(T.PatchedPerRun * RunLimit) + " patched instructions)";
+    } else if (NeedConcurrentFaults && MostThreadsAtOneSite < 2) {
+      Verdict = "NOT CONCURRENT (no instruction faulted on two or more distinct threads: " + std::to_string(Faults) + " faults at " +
+                std::to_string(FaultingSites) + " instructions)";
     } else if (Required == Expect::Hold) {
       Failed = Forbidden != 0;
       Verdict = Forbidden ? "FAIL (TSO-forbidden outcome seen)" : "ok (no forbidden outcome)";
@@ -1877,7 +1942,8 @@ int main(int argc, char** argv) {
       }
     }
     if (Faults) {
-      printf("    misaligned-access faults handled: %llu over %u runs\n", static_cast<unsigned long long>(Faults), RunLimit);
+      printf("    misaligned-access faults handled: %llu over %u runs, at %zu instructions, up to %d distinct threads at one\n",
+             static_cast<unsigned long long>(Faults), RunLimit, FaultingSites, MostThreadsAtOneSite);
     }
     printf("    %s, %.1fs\n", Verdict.c_str(), Seconds);
   }

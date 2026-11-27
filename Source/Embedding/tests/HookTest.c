@@ -770,6 +770,77 @@ static void TestGuestTouchesCodeBufferGuard(void) {
   Shared[0] = 2;
 }
 
+/* ---- asynchronous signals are blocked while the core handles a misaligned access ---- */
+
+/* The host owns the fault signals (way 2) and installs them with an empty mask, so its
+ * own asynchronous signals are open when fexmac_handle_fault starts. The hook, called
+ * where the core is about to take its patch or split-lock lock, sends this thread a
+ * signal: it must stay pending until fexmac_handle_fault restores the host's mask (its
+ * handler must not run while the hook is still inside), and must then arrive. */
+static volatile sig_atomic_t UsrDelivered, UsrDuringCore;
+static volatile sig_atomic_t InCore;
+static uint32_t HookCalls;
+
+static void UsrHandler(int Signal) {
+  (void)Signal;
+  UsrDelivered += 1;
+  if (InCore) {
+    UsrDuringCore += 1;
+  }
+}
+
+static void SendDuringCore(void) {
+  ++HookCalls;
+  InCore = 1;
+  pthread_kill(pthread_self(), SIGUSR1);
+  InCore = 0;
+}
+
+static void ForwardFaults(int Signal, siginfo_t* Info, void* Context) {
+  if (!fexmac_handle_fault(Signal, Info, Context)) {
+    signal(Signal, SIG_DFL);
+  }
+}
+
+static void TestMisalignedBlocksSignals(void) {
+  struct sigaction Action;
+  memset(&Action, 0, sizeof(Action));
+  Action.sa_sigaction = ForwardFaults;
+  Action.sa_flags = SA_SIGINFO | SA_NODEFER;
+  sigemptyset(&Action.sa_mask);
+  sigaction(SIGBUS, &Action, NULL);
+  sigaction(SIGSEGV, &Action, NULL);
+  memset(&Action, 0, sizeof(Action));
+  Action.sa_handler = UsrHandler;
+  sigemptyset(&Action.sa_mask);
+  sigaction(SIGUSR1, &Action, NULL);
+
+  /* mov ecx, 1000 ; loop: lock add [rdi], eax ; nop ; dec ecx ; jnz loop ; hlt, on a
+   * dword crossing a 16-byte boundary. */
+  const uint8_t Program[] = {0xB9, 0xE8, 0x03, 0, 0, 0xF0, 0x01, 0x07, 0x90, 0xFF, 0xC9, 0x75, 0xF8, 0xF4};
+  uint8_t* Code = MapGuestMemory(0x10000);
+  uint8_t* Data = MapGuestMemory(0x10000);
+  memcpy(Code, Program, sizeof(Program));
+  fexmac_context* Context = CreateContext(NULL, NULL);
+  fexmac_thread* Thread = CreateThreadAt(Context, (uint64_t)(uintptr_t)Code, 0);
+  fexmac_x86_state State = GetState(Thread);
+  State.gpr[RDI] = (uint64_t)(uintptr_t)(Data + 64 + 14);
+  State.gpr[RAX] = 1;
+  SetState(Thread, &State);
+  fexmac_testing_set_misaligned_hook(SendDuringCore);
+  const fexmac_stop Stop = Run(Thread);
+  fexmac_testing_set_misaligned_hook(NULL);
+  uint32_t Value;
+  memcpy(&Value, Data + 64 + 14, sizeof(Value));
+  Check(Stop.reason == FEXMAC_STOP_HALT && Value == 1000, "1000 misaligned lock add ran (value %u)", Value);
+  Check(HookCalls == 1000, "the hook ran for every misaligned access (%u)", HookCalls);
+  Check(UsrDuringCore == 0, "no asynchronous signal was handled while the core handled the access (%d of %d)", (int)UsrDuringCore,
+        (int)UsrDelivered);
+  Check(UsrDelivered == 1000, "every signal arrived after the handling (%d)", (int)UsrDelivered);
+  fexmac_thread_destroy(Thread);
+  fexmac_context_destroy(Context);
+}
+
 #define MAP_FAILED_TEXT(MiB) "Couldn't make a " MiB " MiB code buffer: couldn't allocate the executable (MAP_JIT) memory (errno 12)"
 #define OVERRUN_TEXT "fexmac: SIGBUS: write past the end of a code buffer, at address 0x"
 
@@ -786,6 +857,7 @@ static const struct Subtest Subtests[] = {
   {"invalidation-mask", TestInvalidationMask, 0, NULL, NULL, 0},
   {"split-emulation-fault-dies", TestSplitEmulationFaultInstalled, SIGBUS, "misaligned atomic", NULL, 1},
   {"split-emulation-fault-hosted-dies", TestSplitEmulationFaultHosted, SIGBUS, "fault while emulating a misaligned atomic", NULL, 1},
+  {"misaligned-blocks-async-signals", TestMisalignedBlocksSignals, 0, NULL, NULL, 0},
   {"scratch-overflow-many", TestScratchOverflowMany, 0, NULL, NULL, 0},
   {"scratch-limit-stops", TestScratchLimitStops, 0, "still overflows its translation buffer", NULL, 1},
   {"code-buffer-guard-pages", TestCodeBufferGuardPages, 0, NULL, NULL, 0},
