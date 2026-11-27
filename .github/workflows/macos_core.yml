@@ -181,13 +181,15 @@ jobs:
 
       - name: Check the upstream sync script
         if: always()
-        # Syntax, usage text and option checks only: these stop before any fetch. The
-        # fetch and merge themselves are run by hand (docs/macOS-upstream-sync.md).
+        # Offline: throwaway repositories in a temporary directory with spaces in its
+        # path, a local stand-in for upstream, and macOS's own bash 3.2. Checks the
+        # never-push hardening for every remote address form, each refusal by its exit
+        # status and message, that the dry run changes nothing, and that a clean merge,
+        # a conflict and a merge that does not start are told apart.
         run: |
-          bash -n Scripts/macos_sync_upstream.sh
-          Scripts/macos_sync_upstream.sh --help | grep -q 'macos/v1'
-          if Scripts/macos_sync_upstream.sh --here --branch x 2>/dev/null; then exit 1; fi
-          if Scripts/macos_sync_upstream.sh --bogus 2>/dev/null; then exit 1; fi
+          /bin/bash -n Scripts/macos_sync_upstream.sh
+          Scripts/macos_sync_upstream.sh --help | grep -q 'default macos/v1'
+          /bin/bash Scripts/macos_sync_upstream_test.sh
 
       - name: Summarise errors
         if: always()
