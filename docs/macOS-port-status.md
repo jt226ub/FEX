@@ -33,6 +33,11 @@ Related documents:
   tests see no forbidden outcome in 100 million tries each, and see them by the million
   with it off; vector and string-instruction ordering are each shown to depend on their
   own setting (physical Mac).
+- **Fault handling is complete for an embedder** (criterion 4): misaligned atomics,
+  scratch-buffer restart, self-modifying code detected by write-protecting translated
+  pages, stopping a thread from another thread at a safe point, and guest page faults
+  delivered as stops with the guest state reconstructed, each tested through the C
+  interface as built and hardened. See "Fault handling for an embedder" below.
 - **Linux is unaffected.** The core-only Linux build passes with the same changes.
 
 Only the translator core is built on macOS. FEX's Linux process loader, syscall emulation,
@@ -166,10 +171,44 @@ with `JITWriteProbe`:
 
 Still unproven or open:
 
-1. **The interrupt fault page and guest signals.** Not exercised.
-2. **Self-modifying code detected by write-protecting pages.** Only the
-   check-on-every-block kind is exercised.
-3. **Speed.** Nothing has been measured.
+1. **Speed.** Nothing has been measured.
+
+(The interrupt fault page and self-modifying code by write protection, open here before,
+are exercised now: see "Fault handling for an embedder".)
+
+## Fault handling for an embedder (criterion 4)
+
+`docs/macOS-embedding-interface.md` has the contracts; this is the evidence, all from
+`fexmac_c_test` and `fexmac_hook_test` (C, public header only) on the M4, as built and
+under the hardened runtime.
+
+| Fault path | Tests | Result |
+|---|---|---|
+| Misaligned atomics | `faults-installed`, `faults-chained`, `faults-hosted`, `split-locks-concurrent`, `split-lock-faults`, `guest-misaligned-atomic-prot-none`, `split-emulation-fault-dies`, `split-emulation-fault-hosted-dies` | pass; with the second half on a PROT_NONE or read-only page, four threads each stop with a page fault at the locked instruction, nothing written, and after the fix the totals are exact |
+| Scratch-buffer restart | `scratch-guard-disarmed-after-translation`; the instruction tests' `CodeBufferOverflow` | pass |
+| Self-modifying code by page protection | `smc-patch-loop`, `smc-self-patch`, `smc-data-on-code-page`, `smc-cross-thread`, `smc-misaligned-atomic`, `split-lock-on-code-page`, `smc-embedder-write`, `smc-embedder-write-unbracketed-dies`; the instruction tests' `SelfModifyingCode/*` with `--smc mtrack` in all four modes | pass; about 30 us per write to a page holding translated code (machine loaded) |
+| Stopping a thread from another thread | `stop-latency`, `stop-rep`, `stop-not-running`, `stop-during-callback`, `stop-many-threads` | pass; median 4 to 6 us from request to return with eight busy host threads; 99th percentile 30 to 130 us on a quiet machine, up to 1.2 ms with other builds running |
+| Guest fault with correct guest state | `fault-mid-block`, `fault-flags`, `fault-store-loop`, `fault-kinds`, `fault-rep`, `fault-vector`, `fault-stack`, `fault-fetch`, `guest-*`, `guest-load-callret-low-guard`, `guest-store-callret-high-guard` | pass |
+
+Core changes, all macOS-only (`#ifdef __APPLE__`): the interrupt check is always emitted
+(`Core.cpp`) and also on conditional back-edges (`BranchOps.cpp`, with a RIP entry for
+the stub, `JITClass.h`), and the flags are materialised in canonical form before every
+instruction with a memory operand (`OpcodeDispatcher.h`, `Core.cpp`), so a guest resumed
+at a faulting instruction sees the carry it had. Cost: one store per block entry and
+back-edge and possibly a `cfinv` or an NZCV write before a memory instruction; the
+instruction tests took 1:10 to 1:40 for all four modes in this branch, as before.
+
+Limits, from the core: a `rep movs`/`rep stos` that faults part-way reports its registers
+from before the instruction (it is one host loop) and is not interrupted by a stop
+request; flags no later instruction reads may be stale at a fault; data sharing a 16K
+host page with translated code costs a fault per write. A hosted (virtual) Mac can show
+all three facilities (they use ordinary page protection, not the JIT write protection it
+does not enforce); its latencies are not meaningful.
+
+The 11 instruction tests that crashed at checked addresses: 8 of them were data aborts in
+translated code and are now guest page-fault stops at the same addresses, listed by
+outcome (`guest-fault signal=11 trap=14 si_code=1 at=<rip> fault=<address>`); the 3 whose
+fault is in host code (the translator reading guest code at `0x10028`) still crash.
 
 ## x86 memory ordering between threads
 
@@ -368,8 +407,8 @@ All of these run in the Mac job on every push to a `macos/**` branch.
 | `FEXCoreASMTestRunner` with `Scripts/macos_asm_tests.py` | Upstream's 2,292 assembly instruction tests plus the port's four in `unittests/macOS/ASM`, in four modes | 2,253 pass in each mode (before the upstream sync added one test) | 2,265 of 2,296 pass in each mode, both |
 | `FEXCoreOrderingTest` | Multi-thread x86 memory-ordering litmus tests and misaligned locked-operation counts, in three emulation modes; see above | not yet run | pass, both, in each mode |
 | `FEXCoreMutexWakeTest` | The core's reader-writer lock never loses a wake-up, in six queueing orders | not yet run | pass, both; with the bug restored, two orders hang |
-| `fexmac_c_test` | A C program using only `fexmac.h`, linked as an outside project would be: 35 subtests covering system calls (prefixed, restarted), stops, state, guest faults, invalidation (also from 8 threads at once), misaligned atomics with each signal-handler arrangement, call/return stack overflow and underflow, guest accesses to protected pages, chained handlers (one that leaves with siglongjmp, over 306 stack layouts; one that faults itself, which must end the process quickly; one that returns without fixing the fault) and sent signals, garbage struct sizes, lifetime races, split locked operations from 8 threads (exact totals) and error paths | not yet run | pass, both |
-| `fexmac_hook_test` | The same library built with test hooks, 9 subtests: guest and callback accesses to guard pages are not claimed, the scratch-buffer guard is disarmed after each translation, a log callback cannot re-enter the library, a fault inside the handler crashes with a message instead of hanging, the log callback is never called from a signal handler, a failed create leaves no log hook, invalidation leaves fault signals unblocked | not yet run | pass, both |
+| `fexmac_c_test` | A C program using only `fexmac.h`, linked as an outside project would be: 58 subtests covering system calls (prefixed, restarted), stops, state, guest faults, invalidation (also from 8 threads at once), misaligned atomics with each signal-handler arrangement, call/return stack overflow and underflow, guest page faults delivered with reconstructed state, stopping threads from other threads, self-modifying code by write protection, chained handlers (one that leaves with siglongjmp, over 306 stack layouts; one that faults itself, which must end the process quickly; one that returns without fixing the fault) and sent signals, garbage struct sizes, lifetime races, split locked operations from 8 threads (exact totals) and error paths | not yet run | pass, both |
+| `fexmac_hook_test` | The same library built with test hooks, 11 subtests: guest accesses to guard pages are the guest's page faults and callback accesses are not claimed, a fault inside the split-lock emulation ends the process in both arrangements, the scratch-buffer guard is disarmed after each translation, a log callback cannot re-enter the library, a fault inside the handler crashes with a message instead of hanging, the log callback is never called from a signal handler, a failed create leaves no log hook, invalidation leaves fault signals unblocked | not yet run | pass, both |
 | `JITWriteProbe` | Reports how the machine treats executable memory, including writes and switches from a fault handler and instruction-cache flushing | report only | see the facts above |
 | `JITWriteProbe --expect-enforced` | The same, but exits 1 unless every asserted case gives the result the port relies on with write protection enforced, or if a fault-handler case's handler never ran | not run: the hosted Mac does not enforce, so it would fail | pass, as built and hardened |
 | `Scripts/macos_check_linkage.sh` | Fails if the core or a test tool links anything but `libSystem` and `libc++`, if one of them is missing, or if the bundled `fmt` was not compiled. Homebrew's `fmt` is installed first. `otool` shows only that no fmt dylib is linked; the `build.ninja` check covers a static one | not yet run (added after the last hosted run) | pass, both toolchains |
@@ -389,10 +428,10 @@ reason; the script also prints each skip with its reason.
 | Skipped by the runner | 6 |
 | Skipped by upstream's own lists | 6 |
 | Skipped because the test reaches low memory through a 32-bit operand | 4 |
-| Expected failures: 11 crashes and 1 stop (`32bit_syscall`) | 12 |
+| Expected failures: 3 crashes, 8 guest page-fault stops and 1 stop (`32bit_syscall`) | 12 |
 | Port tests whose correct result is a stop (`ud2`, `mov_fs`, `tf_int80`) | 3 |
 
-The script counts the last two rows together as 15 expected failures (11 crash, 4 fail).
+The script counts the last two rows together as 15 expected failures (3 crash, 12 fail).
 
 Before package B, on the merged base (the fexmac runner), the counts were pass 2,255,
 runner skips 8, low-memory skips 5 and 18 expected failures (12 crash, 6 fail). Nine

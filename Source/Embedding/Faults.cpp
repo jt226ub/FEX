@@ -136,6 +136,10 @@ namespace {
     pthread_key_create(&EmulatingKey, nullptr);
   }
 
+#ifdef FEXMAC_TESTING
+  std::atomic<void*> TestProtectBeforeEmulation {};
+#endif
+
   uintptr_t GetKey(pthread_key_t Key) {
     return reinterpret_cast<uintptr_t>(pthread_getspecific(Key));
   }
@@ -398,15 +402,37 @@ namespace {
       return false;
     }
     // ARM64 checks alignment before permissions, so the memory may not allow the access
-    // at all, and the rewrite would fault inside this handler. The access is at most 16
-    // bytes from the fault address.
+    // at all. The core's rewrite (for a locked operation, an emulation under the core's
+    // process-wide split-lock lock) must never fault on it: a fault there is inside this
+    // handler, with the lock held and one half possibly written, and cannot be left. So
+    // the access is checked first and a guest fault is reported from this, the outer,
+    // context, with nothing written. The check is only valid if no protection is reduced
+    // between it and the emulation: the library's own changes (write protection of
+    // translated code, fexmac_memory_*) wait for emulations in progress and make new ones
+    // retry (GuestMemory::Emulations); a raw mprotect or munmap of the page by the
+    // embedder at that moment is outside the contract, and the nested fault then ends the
+    // process (it never hangs; see fexmac_handle_fault). The access is at most 16 bytes
+    // from the fault address.
     const auto Address = reinterpret_cast<uint64_t>(Info->si_addr);
     const bool Write = IsWriteFault(Kind, PC);
     auto* Embedding = Current->Context;
-    if (Write && Embedding->WriteProtectCode && Embedding->Memory.Tracking()) {
+    auto& Memory = Embedding->Memory;
+    Memory.Emulations.fetch_add(1, std::memory_order_seq_cst);
+    struct EmulationGuard {
+      GuestMemory& Memory;
+      ~EmulationGuard() {
+        Memory.Emulations.fetch_sub(1, std::memory_order_seq_cst);
+      }
+    } Guard {Memory};
+    if (Memory.ProtectionChanges.load(std::memory_order_seq_cst) != 0) {
+      // A protection change is about to be applied: run the instruction again, which
+      // faults again once it is done.
+      return true;
+    }
+    if (Write && Embedding->WriteProtectCode && Memory.Tracking()) {
       for (uint64_t Byte : {Address, Address + 15}) {
-        const uint8_t Page = Embedding->Memory.Page(Byte);
-        if ((Page & GuestMemory::Mapped) && (Page & FEXMAC_PROT_WRITE) && Embedding->Memory.CodeProtected(Byte)) {
+        const uint8_t Page = Memory.Page(Byte);
+        if ((Page & GuestMemory::Mapped) && (Page & FEXMAC_PROT_WRITE) && Memory.CodeProtected(Byte)) {
           // Translated code on the page: resolve that first; the atomic then runs again
           // as a single instruction and is rewritten on writable memory.
           SpillGuestState(Current, Context);
@@ -415,8 +441,16 @@ namespace {
         }
       }
     }
-    if (!HostAllows(Address, 16, Write)) {
-      for (uint64_t Byte : {Address, Address + 15}) {
+    // The bytes the access touches: the size is in bits 31:30 of every load/store
+    // encoding; a pair (CASP, LDXP/STXP, LDP/STP) touches two.
+    const uint32_t Instruction = *reinterpret_cast<const uint32_t*>(PC);
+    const bool Pair = (Instruction & 0x3F200000) == 0x08200000 || (Instruction & 0x3A000000) == 0x28000000;
+    const uint64_t Size = (1ULL << (Instruction >> 30)) * (Pair ? 2 : 1);
+    if (!HostAllows(Address, Size, Write)) {
+      for (uint64_t Byte : {Address, (Address + Size - 1) & ~(GuestMemory::GuestPage - 1)}) {
+        if (Byte < Address) {
+          continue;
+        }
         if (!HostAllows(Byte, 1, Write)) {
           SpillGuestState(Current, Context);
           fexmac_stop Stop {};
@@ -428,10 +462,27 @@ namespace {
         }
       }
     }
+    // Asynchronous signals stay blocked while the emulation holds the core's locks, also
+    // when the host owns the signals and installed its handler with a wider mask (an
+    // asynchronous handler that left with siglongjmp or suspended the thread would leave
+    // the lock and the thread's JIT write mode held). pthread_sigmask is
+    // async-signal-safe.
+    sigset_t Block, Old;
+    sigfillset(&Block);
+    for (int Synchronous : SynchronousSignals) {
+      sigdelset(&Block, Synchronous);
+    }
+    pthread_sigmask(SIG_BLOCK, &Block, &Old);
+#ifdef FEXMAC_TESTING
+    if (void* Page = TestProtectBeforeEmulation.load()) {
+      ::mprotect(Page, FEXCore::Utils::FEX_HOST_PAGE_SIZE, PROT_NONE);
+    }
+#endif
     SetKey(EmulatingKey, reinterpret_cast<uintptr_t>(Info->si_addr));
     const auto Result = FEXCore::ArchHelpers::Arm64::HandleUnalignedAccess(
       Thread, FEXCore::ArchHelpers::Arm64::UnalignedHandlerType::HalfBarrier, PC, &State.__x[0]);
     SetKey(EmulatingKey, 0);
+    pthread_sigmask(SIG_SETMASK, &Old, nullptr);
     if (!Result.has_value()) {
       return false;
     }
@@ -655,12 +706,13 @@ namespace {
       const auto Emulating = GetKey(EmulatingKey);
       const auto Address = reinterpret_cast<uintptr_t>(Info->si_addr);
       if (Emulating && Address + 16 >= Emulating && Address < Emulating + 32) {
-        // The core was rewriting a misaligned atomic whose memory is not accessible:
-        // the guest's own fault, not a bug in the handler.
+        // The core was emulating a misaligned atomic and its memory became inaccessible
+        // under it (see HandleMisalignedAtomic), with the split-lock lock held: end the
+        // process rather than leave the emulation.
         WriteRaw(Signal == SIGBUS ? "fexmac: SIGBUS" : "fexmac: SIGSEGV");
-        WriteRaw(": guest memory access fault in translated code at address ");
+        WriteRaw(": fault while emulating a misaligned atomic at address ");
         WriteHex(Address);
-        WriteRaw(" (misaligned atomic on an inaccessible page, changed while the core rewrote it)\n");
+        WriteRaw(" (the page's protection changed under it); ending the process\n");
       } else {
         WriteRaw("fexmac: fault inside the fault handler; restoring the default action\n");
       }
@@ -752,6 +804,18 @@ int fexmac_handle_fault(int signal, siginfo_t* info, void* ucontext) {
   static_assert(offsetof(__darwin_arm_thread_state64, __sp) == 31 * sizeof(uint64_t));
 
   pthread_once(&fexmac::KeysOnce, fexmac::CreateKeys);
+  if (fexmac::GetKey(fexmac::EmulatingKey) != 0) {
+    // A fault inside the core's emulation of a misaligned atomic, with its split-lock
+    // lock held (only possible if the embedder changed the page's protection directly at
+    // that moment; see HandleMisalignedAtomic). It must not reach the host's handler,
+    // which might leave it with siglongjmp and the lock held: every later split locked
+    // operation would then spin forever. End the process instead: claim it and let it
+    // fault again with the default action.
+    fexmac::WriteRaw("fexmac: fault while emulating a misaligned atomic (the page's protection changed under it); "
+                     "ending the process\n");
+    fexmac::SetDefaultAction(signal);
+    return 1;
+  }
   fexmac::EnterOwnCode();
 
   const auto Kind = fexmac::ClassifyFault(Context);
@@ -802,6 +866,10 @@ void fexmac_testing_fault_inside_handler(int enable, volatile uint32_t* fired) {
   if (Page != MAP_FAILED) {
     fexmac::TestFaultPage.store(static_cast<volatile uint32_t*>(Page));
   }
+}
+
+void fexmac_testing_protect_before_emulation(void* page) {
+  fexmac::TestProtectBeforeEmulation.store(page);
 }
 
 void fexmac_testing_log_from_fault_handler(int enable) {

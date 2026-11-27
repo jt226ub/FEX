@@ -191,6 +191,16 @@ jobs:
           set -o pipefail
           python3 Scripts/macos_asm_tests.py --runner "$T" --out asm-out 2>&1 | tee asm-tests.log
 
+      - name: Run the self-modifying-code instruction tests with write protection
+        # SMCCHECKS mtrack with the runner's memory registered with fexmac: translated
+        # pages are write-protected and a guest write discards their code. Uses ordinary
+        # page protection, so the hosted Mac can show it (as it can fexmac_c_test's
+        # guest-fault, stop-request and smc subtests; only their timings differ).
+        run: |
+          T="$(find build -name FEXCoreASMTestRunner -type f | head -1)"
+          set -o pipefail
+          python3 Scripts/macos_asm_tests.py --runner "$T" --out asm-smc --filter SelfModifyingCode --smc mtrack 2>&1 | tee asm-smc-tests.log
+
       - name: Diagnose the tests that are not understood
         if: always()
         run: |

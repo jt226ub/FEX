@@ -522,10 +522,15 @@ FEXMAC_EXPORT fexmac_result fexmac_install_fault_handlers(void);
  * per-block patch lock (the few instructions of a patch) and the core's process-wide
  * split-lock lock (one emulated locked operation on a word that crosses 16 bytes; it
  * makes those operations atomic with each other and cannot be switched off). The latter
- * is held while guest memory is accessed: if that access faults, the fault reaches the
- * host's handler with the lock held, so a host using way 2 must not leave such a fault
- * with siglongjmp (every later such operation in the process would wait forever); dying
- * or returning after fixing the cause is fine. If the core meets an atomic instruction it cannot rewrite
+ * is held while guest memory is accessed. The library checks that memory first and
+ * reports an inaccessible page as the guest's page fault before the emulation starts,
+ * and keeps its own protection changes out of the way of an emulation in progress, so no
+ * fault is taken with the lock held. If one is anyway (the embedder changed the page with
+ * a raw mprotect or munmap at that moment, which the "Guest memory" contract excludes),
+ * this function claims it, writes a message and restores the default action: the process
+ * ends, and the fault never reaches the host's handler with the lock held. Asynchronous
+ * signals are blocked by the library itself while the lock is held, whatever mask the
+ * host's handler has. If the core meets an atomic instruction it cannot rewrite
  * (which would be a core bug), the core formats an error message, which allocates; the
  * library writes it with write(2) and the fault is not claimed. */
 FEXMAC_EXPORT int fexmac_handle_fault(int signal, siginfo_t* info, void* ucontext);

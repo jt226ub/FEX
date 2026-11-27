@@ -32,6 +32,11 @@ FEXMAC_EXPORT void fexmac_testing_set_invalidation_hook(void (*hook)(void));
  * translation). */
 FEXMAC_EXPORT void fexmac_testing_guard_pages(fexmac_thread* thread, uint64_t* callret_low, uint64_t* callret_high, uint64_t* scratch);
 
+/* While page is not NULL, the library makes that host page inaccessible (mprotect
+ * PROT_NONE) right after checking a misaligned atomic's memory and before the core
+ * emulates it: the race with a raw mprotect by the embedder that the contract excludes. */
+FEXMAC_EXPORT void fexmac_testing_protect_before_emulation(void* page);
+
 /* Logs a core message at info level, outside any fault handler. */
 FEXMAC_EXPORT void fexmac_testing_log(const char* message);
 

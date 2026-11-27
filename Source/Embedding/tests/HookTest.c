@@ -286,6 +286,53 @@ static void TestLogCallbackReentry(void) {
   CheckResult(fexmac_context_destroy(LogContext), FEXMAC_OK, "fexmac_context_destroy afterwards");
 }
 
+/* ---- a fault inside the split-lock emulation ends the process, in both arrangements ---- */
+
+/* The page is made inaccessible after the library checked it and before the core
+ * emulates the misaligned lock xadd (the race with a raw mprotect that the contract
+ * excludes): the nested fault, taken with the split-lock lock held, must not reach a
+ * host handler (which might leave it with siglongjmp) and must not hang; the process ends. */
+static void HostSawNested(int Signal, siginfo_t* Info, void* Context) {
+  if (fexmac_handle_fault(Signal, Info, Context)) {
+    return;
+  }
+  Shared[0] = 99; /* the host was given the fault */
+  _exit(3);
+}
+
+static void RunSplitEmulationFault(int Hosted) {
+  if (Hosted) {
+    struct sigaction Action;
+    memset(&Action, 0, sizeof(Action));
+    Action.sa_sigaction = HostSawNested;
+    Action.sa_flags = SA_SIGINFO | SA_NODEFER;
+    sigaction(SIGBUS, &Action, NULL);
+    sigaction(SIGSEGV, &Action, NULL);
+  } else {
+    fexmac_install_fault_handlers();
+  }
+  static const uint8_t LockXadd[] = {0xF0, 0x0F, 0xC1, 0x07, 0xF4}; /* lock xadd [rdi], eax ; hlt */
+  uint8_t* Code = MapGuestMemory(0x10000);
+  uint8_t* Data = MapGuestMemory(0x4000);
+  memcpy(Code, LockXadd, sizeof(LockXadd));
+  fexmac_context* Context = CreateContext(NULL, NULL);
+  fexmac_thread* Thread = CreateThreadAt(Context, (uint64_t)(uintptr_t)Code, 0);
+  fexmac_x86_state State = GetState(Thread);
+  State.gpr[RDI] = (uint64_t)(uintptr_t)Data + 64 + 14;
+  SetState(Thread, &State);
+  fexmac_testing_protect_before_emulation(Data);
+  Shared[0] = 1;
+  fexmac_thread_run(Thread, NULL);
+  Shared[0] = 98; /* survived */
+  exit(1);
+}
+
+static void TestSplitEmulationFaultInstalled(void) {
+  RunSplitEmulationFault(0);
+}
+static void TestSplitEmulationFaultHosted(void) {
+  RunSplitEmulationFault(1);
+}
 
 static const struct Subtest Subtests[] = {
   {"guest-load-callret-low-guard", TestGuestLoadCallRetLowGuard, 0, NULL, "fexmac:", 2},
@@ -298,6 +345,8 @@ static const struct Subtest Subtests[] = {
    NULL, 7},
   {"log-restored-after-failed-create", TestLogRestoredAfterFailedCreate, 0, NULL, NULL, 0},
   {"invalidation-mask", TestInvalidationMask, 0, NULL, NULL, 0},
+  {"split-emulation-fault-dies", TestSplitEmulationFaultInstalled, SIGBUS, "misaligned atomic", NULL, 1},
+  {"split-emulation-fault-hosted-dies", TestSplitEmulationFaultHosted, SIGBUS, "fault while emulating a misaligned atomic", NULL, 1},
 };
 
 int main(int argc, char** argv) {

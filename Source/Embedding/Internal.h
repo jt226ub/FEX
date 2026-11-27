@@ -114,13 +114,24 @@ public:
   void SetCodeProtected(uint64_t HostPageAddress, bool Value);
   // The protection the host page should have: the union of its guest pages' protections,
   // without write access when the library write-protects it for code.
-  int HostProtection(uint64_t HostPageAddress) const;
+  int HostProtection(uint64_t HostPageAddress, bool IgnoreCodeProtection = false) const;
   // Host pages that the embedder is writing between fexmac_memory_write_begin and _end;
   // they are not write-protected meanwhile. Count per host page.
   std::map<uint64_t, uint32_t> Writers;
   void StartTracking() {
     TrackingFlag.store(true, std::memory_order_release);
   }
+
+  // Emulations of misaligned atomics in progress in fault handlers, and protection
+  // reductions the library is about to apply. Before reducing a protection the library
+  // raises ProtectionChanges and waits for Emulations to be zero; an emulation raises
+  // Emulations and backs off (the instruction runs again) while ProtectionChanges is
+  // raised. So the access check the handler makes before an emulation stays true until
+  // the emulation ends. Sequentially consistent, lock-free.
+  std::atomic<uint32_t> Emulations {};
+  std::atomic<uint32_t> ProtectionChanges {};
+  // mprotect that waits as described, for any change that may remove access.
+  int ReduceProtection(uint64_t Address, uint64_t Size, int Prot);
 
   // Number of writes to write-protected code handled (statistics, relaxed).
   std::atomic<uint64_t> CodeWriteFaults {};

@@ -1184,6 +1184,201 @@ static void TestSMCEmbedderWriteUnbracketed(void) {
   RunEmbedderWrite(WriteCodeUnbracketed);
 }
 
+/* ---------------------------------------------------------------------------------
+ * Misaligned locked operations on memory the guest may not access
+ *
+ * A locked operation on a word crossing 16 bytes is emulated by the core in the fault
+ * handler, under its process-wide split-lock lock. With the word's second half on an
+ * inaccessible page, the library reports the guest's page fault before emulating anything
+ * (from the outer handler, nothing written, the lock never taken); several threads fault,
+ * the embedder fixes the page, every thread runs the same instruction again, and the
+ * totals are exact. A further round afterwards shows the lock is free.
+ * --------------------------------------------------------------------------------- */
+
+/* clang-format off */
+static const uint8_t SplitXadd[] = {
+  0x4C, 0x89, 0xC0,                         /*  0: mov rax, r8 */
+  0xF0, 0x48, 0x0F, 0xC1, 0x07,             /*  3: lock xadd [rdi], rax */
+  0x48, 0xFF, 0xC9,                         /*  8: dec rcx */
+  0x75, 0xF3,                               /* 11: jnz 0 */
+  0xF4,                                     /* 13: hlt */
+};
+static const uint8_t SplitCmpxchg[] = {
+  0x48, 0x8B, 0x07,                         /*  0: mov rax, [rdi] */
+  0x4A, 0x8D, 0x14, 0x00,                   /*  3: lea rdx, [rax + r8] */
+  0xF0, 0x48, 0x0F, 0xB1, 0x17,             /*  7: lock cmpxchg [rdi], rdx */
+  0x75, 0xF2,                               /* 12: jnz 0 */
+  0x48, 0xFF, 0xC9,                         /* 14: dec rcx */
+  0x75, 0xED,                               /* 17: jnz 0 */
+  0xF4,                                     /* 19: hlt */
+};
+static const uint8_t SplitXchgLock[] = {
+  0xB8, 0x01, 0x00, 0x00, 0x00,             /*  0: mov eax, 1 */
+  0x48, 0x87, 0x06,                         /*  5: xchg [rsi], rax */
+  0x48, 0x85, 0xC0,                         /*  8: test rax, rax */
+  0x75, 0xF3,                               /* 11: jnz 0 */
+  0x48, 0xFF, 0x07,                         /* 13: inc qword [rdi] */
+  0x48, 0xC7, 0x06, 0x00, 0x00, 0x00, 0x00, /* 16: mov qword [rsi], 0 */
+  0x48, 0xFF, 0xC9,                         /* 23: dec rcx */
+  0x75, 0xE4,                               /* 26: jnz 0 */
+  0xF4,                                     /* 28: hlt */
+};
+/* clang-format on */
+
+enum { SplitFaultThreads = 4, SplitFaultIterations = 20000 };
+
+struct SplitRun {
+  fexmac_context* Context;
+  uint64_t Code, Rdi, Rsi, LockedAt, Word;
+  atomic_int Faulted;
+  atomic_int Fixed;
+  atomic_int Bad;
+  atomic_int Halted;
+};
+
+static void* SplitFaultWorker(void* Argument) {
+  struct SplitRun* R = Argument;
+  fexmac_thread* Thread = CreateThreadAt(R->Context, R->Code, 0);
+  fexmac_x86_state State = GetState(Thread);
+  State.gpr[RDI] = R->Rdi;
+  State.gpr[RSI] = R->Rsi;
+  State.gpr[RCX] = SplitFaultIterations;
+  State.gpr[8] = 0x100000001ULL;
+  SetState(Thread, &State);
+  for (;;) {
+    const fexmac_stop Stop = Run(Thread);
+    if (Stop.reason == FEXMAC_STOP_HALT) {
+      const fexmac_x86_state Final = GetState(Thread);
+      if (Final.gpr[RCX] != 0 || Final.gpr[8] != 0x100000001ULL || Final.gpr[RDI] != R->Rdi) {
+        printf("  halted with rcx %" PRIu64 " r8 0x%" PRIx64 " rdi 0x%" PRIx64 "\n", Final.gpr[RCX], Final.gpr[8], Final.gpr[RDI]);
+        atomic_fetch_add(&R->Bad, 1);
+      }
+      atomic_fetch_add(&R->Halted, 1);
+      break;
+    }
+    const fexmac_x86_state After = GetState(Thread);
+    /* The locked instruction (a write), or, for the cmpxchg loop on a PROT_NONE page, the
+     * plain load of the word before it (a read). */
+    const int AtLocked = After.rip == R->LockedAt && Stop.access == FEXMAC_ACCESS_WRITE;
+    const int AtLoad = After.rip == R->Code && Stop.access == FEXMAC_ACCESS_READ;
+    if (Stop.reason != FEXMAC_STOP_GUEST_FAULT || Stop.trap_number != 14 || !(AtLocked || AtLoad) || Stop.fault_address < R->Word ||
+        Stop.fault_address >= R->Word + 8) {
+      atomic_fetch_add(&R->Bad, 1);
+      break;
+    }
+    atomic_fetch_add(&R->Faulted, 1);
+    while (!atomic_load(&R->Fixed)) {
+    }
+  }
+  fexmac_thread_destroy(Thread);
+  return NULL;
+}
+
+static void TestSplitLockFaults(void) {
+  fexmac_install_fault_handlers();
+  static const struct {
+    const char* Name;
+    const uint8_t* Program;
+    size_t Size;
+    uint64_t LockedAt;
+  } Programs[] = {
+    {"lock xadd", SplitXadd, sizeof(SplitXadd), 3},
+    {"lock cmpxchg", SplitCmpxchg, sizeof(SplitCmpxchg), 7},
+    {"xchg spin lock", SplitXchgLock, sizeof(SplitXchgLock), 5},
+  };
+  for (int Variant = 0; Variant < 12; ++Variant) {
+    const int Which = Variant % 3, ReadOnly = (Variant / 3) & 1, Registered = Variant / 6;
+    printf("  %s, second half on a %s page, %s\n", Programs[Which].Name, ReadOnly ? "read-only" : "PROT_NONE",
+           Registered ? "registered memory" : "nothing registered");
+    struct SplitRun R;
+    memset(&R, 0, sizeof(R));
+    R.Context = MakeContext(1, 0, NULL, NULL, NULL);
+    uint8_t* Code = MapCode(R.Context, Programs[Which].Program, Programs[Which].Size, Registered);
+    uint8_t* Data = MapData(R.Context, 0x8000, PROT_READ | PROT_WRITE, FEXMAC_PROT_READ | FEXMAC_PROT_WRITE, Registered);
+    (void)*(volatile uint8_t*)(Data + 0x4000);
+    SetProt(R.Context, Data + 0x4000, 0x4000, ReadOnly ? PROT_READ : PROT_NONE, ReadOnly ? FEXMAC_PROT_READ : FEXMAC_PROT_NONE, Registered);
+    R.Code = Addr(Code);
+    R.LockedAt = Addr(Code) + Programs[Which].LockedAt;
+    R.Word = Addr(Data) + 0x4000 - 4;
+    if (Which == 2) {
+      R.Rsi = R.Word;
+      R.Rdi = Addr(Data) + 0x100;
+    } else {
+      R.Rdi = R.Word;
+    }
+    pthread_t Workers[SplitFaultThreads];
+    for (int i = 0; i < SplitFaultThreads; ++i) {
+      pthread_create(&Workers[i], NULL, SplitFaultWorker, &R);
+    }
+    const double Start = Now();
+    while (atomic_load(&R.Faulted) < SplitFaultThreads && atomic_load(&R.Bad) == 0 && Now() - Start < 10) {
+    }
+    SetProt(R.Context, Data + 0x4000, 0x4000, PROT_READ | PROT_WRITE, FEXMAC_PROT_READ | FEXMAC_PROT_WRITE, Registered);
+    atomic_store(&R.Fixed, 1);
+    for (int i = 0; i < SplitFaultThreads; ++i) {
+      pthread_join(Workers[i], NULL);
+    }
+    uint64_t Total;
+    memcpy(&Total, Which == 2 ? Data + 0x100 : Data + 0x4000 - 4, sizeof(Total));
+    const uint64_t Want = (uint64_t)SplitFaultThreads * SplitFaultIterations * (Which == 2 ? 1 : 0x100000001ULL);
+    Check(atomic_load(&R.Faulted) == SplitFaultThreads && atomic_load(&R.Bad) == 0,
+          "every thread stopped once with a page fault in the word at the locked instruction (or the load before it) (%d faults, %d bad)",
+          atomic_load(&R.Faulted), atomic_load(&R.Bad));
+    Check(atomic_load(&R.Halted) == SplitFaultThreads && Total == Want, "after the fix every thread finished; total %" PRIu64 " of %" PRIu64,
+          Total, Want);
+    fexmac_context_destroy(R.Context);
+  }
+  /* The split-lock lock is free: another round on accessible memory completes. */
+  struct SplitRun R;
+  memset(&R, 0, sizeof(R));
+  R.Context = MakeContext(1, 0, NULL, NULL, NULL);
+  uint8_t* Code = MapCode(R.Context, SplitXadd, sizeof(SplitXadd), 0);
+  uint8_t* Data = MapGuestMemory(0x8000);
+  R.Code = Addr(Code);
+  R.Rdi = Addr(Data) + 0x4000 - 4;
+  atomic_store(&R.Fixed, 1);
+  pthread_t Workers[SplitFaultThreads];
+  for (int i = 0; i < SplitFaultThreads; ++i) {
+    pthread_create(&Workers[i], NULL, SplitFaultWorker, &R);
+  }
+  for (int i = 0; i < SplitFaultThreads; ++i) {
+    pthread_join(Workers[i], NULL);
+  }
+  uint64_t Total;
+  memcpy(&Total, Data + 0x4000 - 4, sizeof(Total));
+  Check(Total == (uint64_t)SplitFaultThreads * SplitFaultIterations * 0x100000001ULL, "a later round of split locked operations completes (no lock left held)");
+  fexmac_context_destroy(R.Context);
+}
+
+/* The split word on a host page holding the threads' translated code: every emulation
+ * meets write protection being added and removed by the other threads. */
+static void TestSplitLockOnCodePage(void) {
+  fexmac_install_fault_handlers();
+  struct SplitRun R;
+  memset(&R, 0, sizeof(R));
+  R.Context = MakeContext(1, 0, "mtrack", NULL, NULL);
+  uint8_t* Code = MapCode(R.Context, SplitXadd, sizeof(SplitXadd), 1);
+  R.Code = Addr(Code);
+  R.Rdi = Addr(Code) + 0x2000 - 4; /* crosses 16 bytes, same host page as the code */
+  atomic_store(&R.Fixed, 1);
+  const int NT = SplitFaultThreads;
+  pthread_t Workers[SplitFaultThreads];
+  for (int i = 0; i < NT; ++i) {
+    pthread_create(&Workers[i], NULL, SplitFaultWorker, &R);
+  }
+  for (int i = 0; i < NT; ++i) {
+    pthread_join(Workers[i], NULL);
+  }
+  uint64_t Total;
+  memcpy(&Total, (void*)(uintptr_t)R.Rdi, sizeof(Total));
+  const uint64_t Want = (uint64_t)NT * SplitFaultIterations * 0x100000001ULL;
+  printf("  %" PRIu64 " code writes handled\n", fexmac_memory_code_write_count(R.Context));
+  Check(atomic_load(&R.Bad) == 0 && atomic_load(&R.Halted) == NT && Total == Want,
+        "4 threads, lock xadd across 16 bytes on their code page: total %" PRIu64 " of %" PRIu64 " (%d unexpected stops, %d halted)", Total,
+        Want, atomic_load(&R.Bad), atomic_load(&R.Halted));
+  fexmac_context_destroy(R.Context);
+}
+
 const struct Subtest FaultSubtests[] = {
   {"fault-mid-block", TestFaultMidBlock, 0, NULL, "fexmac:", 0},
   {"fault-flags", TestFaultFlags, 0, NULL, "fexmac:", 0},
@@ -1204,6 +1399,8 @@ const struct Subtest FaultSubtests[] = {
   {"smc-data-on-code-page", TestSMCDataOnCodePage, 0, NULL, "fexmac:", 0},
   {"smc-misaligned-atomic", TestSMCMisalignedAtomic, 0, NULL, "fexmac:", 0},
   {"smc-cross-thread", TestSMCCrossThread, 0, NULL, "fexmac:", 0},
+  {"split-lock-faults", TestSplitLockFaults, 0, NULL, "fexmac:", 0},
+  {"split-lock-on-code-page", TestSplitLockOnCodePage, 0, NULL, "fexmac:", 0},
   {"smc-embedder-write", TestSMCEmbedderWrite, 0, NULL, "fexmac:", 2},
   {"smc-embedder-write-unbracketed-dies", TestSMCEmbedderWriteUnbracketed, SIGBUS, "fexmac_memory_write_begin", NULL, 1},
 };

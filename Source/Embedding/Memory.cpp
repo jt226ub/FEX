@@ -30,6 +30,7 @@
 #include <algorithm>
 #include <cstring>
 #include <signal.h>
+#include <sched.h>
 #include <sys/mman.h>
 
 namespace fexmac {
@@ -119,7 +120,7 @@ void GuestMemory::SetCodeProtected(uint64_t HostPageAddress, bool Value) {
                    Value ? HostCodeProtected : uint8_t {0}, __ATOMIC_RELEASE);
 }
 
-int GuestMemory::HostProtection(uint64_t HostPageAddress) const {
+int GuestMemory::HostProtection(uint64_t HostPageAddress, bool IgnoreCodeProtection) const {
   uint32_t Prot = 0;
   for (uint64_t Page = HostPageAddress; Page < HostPageAddress + HostPage; Page += GuestPage) {
     const uint8_t Info = this->Page(Page);
@@ -127,7 +128,7 @@ int GuestMemory::HostProtection(uint64_t HostPageAddress) const {
       Prot |= Info & ProtMask;
     }
   }
-  if (CodeProtected(HostPageAddress)) {
+  if (!IgnoreCodeProtection && CodeProtected(HostPageAddress)) {
     Prot &= ~FEXMAC_PROT_WRITE;
   }
   // x86 has no write-only or execute-only pages: writable or executable implies readable.
@@ -137,6 +138,16 @@ int GuestMemory::HostProtection(uint64_t HostPageAddress) const {
   }
   // Guest memory is never executed by the host; the translator only reads it.
   return Host;
+}
+
+int GuestMemory::ReduceProtection(uint64_t Address, uint64_t Size, int Prot) {
+  ProtectionChanges.fetch_add(1, std::memory_order_seq_cst);
+  while (Emulations.load(std::memory_order_seq_cst) != 0) {
+    sched_yield();
+  }
+  const int Result = ::mprotect(reinterpret_cast<void*>(Address), Size, Prot);
+  ProtectionChanges.fetch_sub(1, std::memory_order_seq_cst);
+  return Result;
 }
 
 namespace {
@@ -206,17 +217,19 @@ fexmac_result SetGuestMemory(fexmac_context* Context, uint64_t Address, uint64_t
     Start = Address & ~HostPageMask;
     End = (Address + Size + HostPageMask) & ~HostPageMask;
     for (uint64_t HostPage = Start; HostPage < End; HostPage += GuestMemory::HostPage) {
-      // Translations of the page are discarded below, so it needs no write protection.
-      Memory.SetCodeProtected(HostPage, false);
       bool Mapped = false;
       for (uint64_t Page = HostPage; Page < HostPage + GuestMemory::HostPage; Page += GuestMemory::GuestPage) {
         Mapped |= (Memory.Page(Page) & GuestMemory::Mapped) != 0;
       }
       // A host page none of whose guest pages is mapped is left alone: the embedder
       // owns whatever is there (or nothing is).
-      if (Mapped && ::mprotect(reinterpret_cast<void*>(HostPage), GuestMemory::HostPage, Memory.HostProtection(HostPage)) != 0) {
+      // Translations of the page are discarded below, so it needs no write protection.
+      // The host protection changes first and the mark after: a fault handler that finds
+      // the page not marked must find the host's protection already the guest's.
+      if (Mapped && Memory.ReduceProtection(HostPage, GuestMemory::HostPage, Memory.HostProtection(HostPage, true)) != 0) {
         Result = FEXMAC_ERROR_UNSUPPORTED;
       }
+      Memory.SetCodeProtected(HostPage, false);
     }
   });
   return Result;
@@ -238,8 +251,8 @@ fexmac_result WriteBegin(fexmac_context* Context, uint64_t Address, uint64_t Siz
       if (Begin) {
         ++Memory.Writers[HostPage];
         if (Memory.CodeProtected(HostPage)) {
+          ::mprotect(reinterpret_cast<void*>(HostPage), GuestMemory::HostPage, Memory.HostProtection(HostPage, true));
           Memory.SetCodeProtected(HostPage, false);
-          ::mprotect(reinterpret_cast<void*>(HostPage), GuestMemory::HostPage, Memory.HostProtection(HostPage));
         }
       } else {
         auto It = Memory.Writers.find(HostPage);
@@ -313,7 +326,7 @@ void SyscallHandler::MarkGuestExecutableRange(FEXCore::Core::InternalThreadState
       continue;
     }
     Memory.SetCodeProtected(HostPage, true);
-    if (::mprotect(reinterpret_cast<void*>(HostPage), GuestMemory::HostPage, Memory.HostProtection(HostPage)) != 0) {
+    if (Memory.ReduceProtection(HostPage, GuestMemory::HostPage, Memory.HostProtection(HostPage)) != 0) {
       Memory.SetCodeProtected(HostPage, false);
     }
   }
@@ -332,8 +345,10 @@ void ResolveCodeWrite(fexmac_thread* Thread, uint64_t Address) {
   WithCodeLocked(Context, false, [&](uint64_t& Start, uint64_t& End) {
     auto& Memory = Context->Memory;
     ++Memory.Writers[HostPage];
+    // Write access first, then the mark: a fault handler that finds the page not marked
+    // (HandleMisalignedAtomic, HandleCodeWrite) must find it writable.
+    ::mprotect(reinterpret_cast<void*>(HostPage), GuestMemory::HostPage, Memory.HostProtection(HostPage, true));
     Memory.SetCodeProtected(HostPage, false);
-    ::mprotect(reinterpret_cast<void*>(HostPage), GuestMemory::HostPage, Memory.HostProtection(HostPage));
     Memory.CodeWriteFaults.fetch_add(1, std::memory_order_relaxed);
     Start = HostPage;
     End = HostPage + GuestMemory::HostPage;
