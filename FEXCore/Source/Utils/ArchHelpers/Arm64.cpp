@@ -174,6 +174,46 @@ static bool StoreCAS8(uint8_t& Expected, uint8_t Val, uint64_t Addr) {
   return Atom.compare_exchange_strong(Expected, Val);
 }
 
+// The two compare-and-swaps of an emulated read-modify-write that crosses a 16-byte (or,
+// for 16-bit accesses, an 8-byte) boundary. Returns true if both succeeded. On failure,
+// the Expected value of the compare-and-swap that failed holds what memory had, and Torn
+// says whether the other half had already been written, in which case the operation can
+// neither be completed nor retried.
+//
+// Upstream always writes the upper half first, so any failure of the lower one is a tear.
+// On macOS the half that the operation does not change is compared first instead (a
+// compare-and-swap of a value with itself), and a failure of the second is then not a
+// tear: nothing has been written and the caller retries. This matters for an `xchg` lock
+// word or a flag whose value lives in one half: a plain store from another thread (such
+// as the lock's release) landing between the two compare-and-swaps used to make the
+// operation report a stale "old value" without having written, so two threads could
+// both take the lock (FEXCoreOrderingTest's LOCK-xchg-split16 lost increments). When both
+// halves change, a tear is still possible, as upstream.
+template<typename T>
+static bool SplitCAS(T& ExpectedLower, T DesiredLower, uint64_t AddrLower, T& ExpectedUpper, T DesiredUpper, uint64_t AddrUpper,
+                     bool (*CAS)(T&, T, uint64_t), bool& Torn) {
+  Torn = false;
+#ifdef __APPLE__
+  if (ExpectedUpper != DesiredUpper && ExpectedLower == DesiredLower) {
+    if (!CAS(ExpectedLower, DesiredLower, AddrLower)) {
+      return false;
+    }
+    return CAS(ExpectedUpper, DesiredUpper, AddrUpper);
+  }
+  const bool UpperChanges = ExpectedUpper != DesiredUpper;
+#else
+  constexpr bool UpperChanges = true;
+#endif
+  if (!CAS(ExpectedUpper, DesiredUpper, AddrUpper)) {
+    return false;
+  }
+  if (CAS(ExpectedLower, DesiredLower, AddrLower)) {
+    return true;
+  }
+  Torn = UpperChanges;
+  return false;
+}
+
 static uint16_t DoLoad16(uint64_t Addr) {
   uint64_t AlignmentMask = 0b1111;
   if ((Addr & AlignmentMask) == 15) {
@@ -669,18 +709,19 @@ static uint16_t DoCAS16(uint16_t DesiredSrc, uint16_t ExpectedSrc, uint64_t Addr
 
       bool Tear = false;
       if (ActualUpper == ExpectedUpper && ActualLower == ExpectedLower) {
-        if (StoreCAS8(ExpectedUpper, DesiredUpper, AddrUpper)) {
-          if (StoreCAS8(ExpectedLower, DesiredLower, Addr)) {
-            // Stored successfully
-            return Expected;
-          } else {
-            // CAS managed to tear, we can't really solve this
-            // Continue down the path to let the guest know values weren't expected
-            Tear = true;
-            FEXCORE_TELEMETRY_SET(TYPE_CAS_16BIT_TEAR, 1);
-          }
+        if (SplitCAS<uint8_t>(ExpectedLower, DesiredLower, Addr, ExpectedUpper, DesiredUpper, AddrUpper, StoreCAS8, Tear)) {
+          // Stored successfully
+          return Expected;
+        } else if (Tear) {
+          // CAS managed to tear, we can't really solve this
+          // Continue down the path to let the guest know values weren't expected
+          FEXCORE_TELEMETRY_SET(TYPE_CAS_16BIT_TEAR, 1);
         }
 
+#ifdef __APPLE__
+        // SplitCAS may have compared the upper half second; report what it found.
+        ActualUpper = ExpectedUpper;
+#endif
         ActualLower = ExpectedLower;
       }
 
@@ -955,16 +996,13 @@ static uint32_t DoCAS32(uint32_t DesiredSrc, uint32_t ExpectedSrc, uint64_t Addr
         uint32_t TmpDesiredLower = TmpDesired;
         uint32_t TmpDesiredUpper = TmpDesired >> 32;
 
-        if (StoreCAS32(TmpExpectedUpper, TmpDesiredUpper, AddrUpper)) {
-          if (StoreCAS32(TmpExpectedLower, TmpDesiredLower, Addr)) {
-            // Stored successfully
-            return Expected;
-          } else {
-            // CAS managed to tear, we can't really solve this
-            // Continue down the path to let the guest know values weren't expected
-            Tear = true;
-            FEXCORE_TELEMETRY_SET(TYPE_CAS_32BIT_TEAR, 1);
-          }
+        if (SplitCAS<uint32_t>(TmpExpectedLower, TmpDesiredLower, Addr, TmpExpectedUpper, TmpDesiredUpper, AddrUpper, StoreCAS32, Tear)) {
+          // Stored successfully
+          return Expected;
+        } else if (Tear) {
+          // CAS managed to tear, we can't really solve this
+          // Continue down the path to let the guest know values weren't expected
+          FEXCORE_TELEMETRY_SET(TYPE_CAS_32BIT_TEAR, 1);
         }
 
         TmpExpected = TmpExpectedUpper;
@@ -1189,16 +1227,13 @@ static uint64_t DoCAS64(uint64_t DesiredSrc, uint64_t ExpectedSrc, uint64_t Addr
 
       bool Tear = false;
       if (TmpExpected == TmpActual) {
-        if (StoreCAS64(TmpExpectedUpper, TmpDesiredUpper, AddrUpper)) {
-          if (StoreCAS64(TmpExpectedLower, TmpDesiredLower, Addr)) {
-            // Stored successfully
-            return Expected;
-          } else {
-            // CAS managed to tear, we can't really solve this
-            // Continue down the path to let the guest know values weren't expected
-            Tear = true;
-            FEXCORE_TELEMETRY_SET(TYPE_CAS_64BIT_TEAR, 1);
-          }
+        if (SplitCAS<uint64_t>(TmpExpectedLower, TmpDesiredLower, Addr, TmpExpectedUpper, TmpDesiredUpper, AddrUpper, StoreCAS64, Tear)) {
+          // Stored successfully
+          return Expected;
+        } else if (Tear) {
+          // CAS managed to tear, we can't really solve this
+          // Continue down the path to let the guest know values weren't expected
+          FEXCORE_TELEMETRY_SET(TYPE_CAS_64BIT_TEAR, 1);
         }
 
         TmpExpected = TmpExpectedUpper;

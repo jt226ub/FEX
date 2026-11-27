@@ -137,6 +137,17 @@ if (CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
   list(APPEND LIBS atomic)
 endif()
 
+# Default for StrictInProcessSplitLocks. On macOS it is on: without it, a locked
+# read-modify-write on an address that crosses a 16-byte boundary is emulated in the
+# fault handler as two compare-and-swaps that can tear under contention and drop the
+# update (FEXCoreOrderingTest's LOCK-xadd-split* tests lose increments). The lock
+# serialises these emulated operations in the process; they already cost a fault each.
+if (APPLE)
+  set(FEX_STRICT_SPLIT_LOCKS_DEFAULT "true")
+else()
+  set(FEX_STRICT_SPLIT_LOCKS_DEFAULT "false")
+endif()
+
 # Generate config
 configure_file(${CMAKE_CURRENT_SOURCE_DIR}/Interface/Config/Config.json.in
   ${CMAKE_BINARY_DIR}/generated/Config/Config.json)
