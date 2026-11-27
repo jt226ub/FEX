@@ -1788,6 +1788,57 @@ static void TestRflagsReservedBits(void) {
   fexmac_context_destroy(Context);
 }
 
+/* Which 4K protections within one 16K host page are accepted without
+ * FEXMAC_PROT_ALLOW_UNENFORCED: those whose guest pages need the same from the host (no
+ * access; read for R, X and RX; read and write for any W). Execute is enforced per 4K
+ * page by the library. A partial unmap next to accessible pages is done and reported as
+ * FEXMAC_DONE_UNENFORCED. */
+static void TestMemoryHostPageRules(void) {
+  fexmac_install_fault_handlers();
+  fexmac_context* Context = MakeContext(1, 0, NULL, NULL, NULL);
+  uint8_t* Area = MapGuestMemory(0x10000);
+  const uint64_t A = Addr(Area);
+  /* R next to RX (.text next to .rodata): accepted, enforced; a jump into the R page is
+   * an execute fault there. */
+  memset(Area, 0xF4, 0x4000);
+  const uint8_t Jump[] = {0xE9, 0xFB, 0x0F, 0, 0}; /* jmp +0x1000 from the start */
+  memcpy(Area, Jump, sizeof(Jump));
+  CheckResult(fexmac_memory_map(Context, A, 0x4000, FEXMAC_PROT_READ), FEXMAC_OK, "a read-only host page");
+  CheckResult(fexmac_memory_protect(Context, A, 0x1000, FEXMAC_PROT_READ | FEXMAC_PROT_EXEC), FEXMAC_OK, "R+X next to R");
+  fexmac_thread* Thread = CreateThreadAt(Context, A, 0);
+  fexmac_stop Stop = Run(Thread);
+  Check(Stop.reason == FEXMAC_STOP_GUEST_FAULT && Stop.access == FEXMAC_ACCESS_EXECUTE && Stop.fault_address == A + 0x1000,
+        "a jump into the R page is an execute fault there (reason %d, access %u, +0x%" PRIx64 ")", Stop.reason, Stop.access,
+        Stop.fault_address - A);
+  fexmac_thread_destroy(Thread);
+  /* W against RW: the same host need. */
+  CheckResult(fexmac_memory_map(Context, A + 0x4000, 0x4000, FEXMAC_PROT_READ | FEXMAC_PROT_WRITE), FEXMAC_OK, "a writable host page");
+  CheckResult(fexmac_memory_protect(Context, A + 0x4000, 0x1000, FEXMAC_PROT_WRITE), FEXMAC_OK, "W next to RW");
+  /* R next to RW: refused. */
+  CheckResult(fexmac_memory_protect(Context, A + 0x5000, 0x1000, FEXMAC_PROT_READ), FEXMAC_ERROR_UNSUPPORTED, "R next to RW");
+  /* PROT_NONE next to unmapped: both no access. */
+  CheckResult(fexmac_memory_map(Context, A + 0x8000, 0x1000, FEXMAC_PROT_NONE), FEXMAC_OK, "PROT_NONE in an otherwise unmapped host page");
+  /* A 4K page mapped into an otherwise empty host page: its neighbours would become
+   * accessible to the guest; refused unless accepted. */
+  CheckResult(fexmac_memory_map(Context, A + 0xC000, 0x1000, FEXMAC_PROT_READ), FEXMAC_ERROR_UNSUPPORTED,
+              "a readable 4K page alone in a host page");
+  Check(fexmac_memory_unenforced_count(Context) == 0, "nothing counted so far");
+  CheckResult(fexmac_memory_map(Context, A + 0xC000, 0x1000, FEXMAC_PROT_READ | FEXMAC_PROT_ALLOW_UNENFORCED), FEXMAC_OK,
+              "the same, accepted");
+  Check(fexmac_memory_unenforced_count(Context) == 1, "and counted");
+  /* Partial unmap next to accessible pages: done, reported, counted; next to PROT_NONE
+   * or the whole host page: plain success. */
+  CheckResult(fexmac_memory_unmap(Context, A + 0x4000, 0x1000), FEXMAC_DONE_UNENFORCED, "unmapping 4K of a writable host page");
+  uint32_t Prot = 1;
+  int Mapped = 1;
+  fexmac_memory_query(Context, A + 0x4000, &Prot, &Mapped);
+  Check(Mapped == 0 && fexmac_memory_unenforced_count(Context) == 2, "it is unmapped for the library, and counted");
+  CheckResult(fexmac_memory_unmap(Context, A + 0x8000, 0x4000), FEXMAC_OK, "unmapping next to nothing accessible");
+  CheckResult(fexmac_memory_unmap(Context, A, 0x4000), FEXMAC_OK, "unmapping a whole host page");
+  fexmac_context_destroy(Context);
+  munmap(Area, 0x10000);
+}
+
 const struct Subtest FaultSubtests[] = {
   {"fault-mid-block", TestFaultMidBlock, 0, NULL, "fexmac:", 0},
   {"fault-flags", TestFaultFlags, 0, NULL, "fexmac:", 0},
@@ -1800,6 +1851,7 @@ const struct Subtest FaultSubtests[] = {
   {"memory-arguments", TestMemoryArguments, 0, NULL, NULL, 0},
   {"stop-latency", TestStopLatency, 0, NULL, "fexmac:", 0},
   {"rflags-reserved-bits", TestRflagsReservedBits, 0, NULL, NULL, 0},
+  {"memory-host-page-rules", TestMemoryHostPageRules, 0, NULL, NULL, 0},
   {"stop-rep-movs", TestStopRepMovs, 0, NULL, "fexmac:", 0},
   {"stop-rep", TestStopRep, 0, NULL, "fexmac:", 0},
   {"stop-not-running", TestStopNotRunning, 0, NULL, "fexmac:", 0},

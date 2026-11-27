@@ -81,6 +81,10 @@ typedef enum fexmac_result {
   FEXMAC_ERROR_UNSUPPORTED = 7,
   /* The core returned without a recorded stop reason. Indicates a bug in the library. */
   FEXMAC_ERROR_INTERNAL = 8,
+  /* Not an error: fexmac_memory_unmap did what was asked, but the unmapped 4K guest pages
+   * share a 16K host page with guest pages still mapped and accessible, so the guest can
+   * still read (and maybe write) them without a fault (see "Granularity"). */
+  FEXMAC_DONE_UNENFORCED = 9,
 } fexmac_result;
 
 /* A short English description of a result, never NULL. */
@@ -480,28 +484,36 @@ FEXMAC_EXPORT fexmac_result fexmac_thread_request_stop(fexmac_thread* thread);
  *
  * Granularity. Guest pages are 4K; addresses and sizes must be multiples of 4K. Host
  * pages are 16K and carry one protection: the library sets each host page to the union
- * of the protections of its four guest pages (minus write access while it holds
- * translated code). So a guest protection is only enforced where all four guest pages of
- * a host page agree (same protection, all mapped). fexmac_memory_map and
- * fexmac_memory_protect refuse (FEXMAC_ERROR_UNSUPPORTED, nothing changed) a change that
- * would leave a host page with guest pages that disagree, unless the protection carries
- * FEXMAC_PROT_ALLOW_UNENFORCED: then the host page gets the union of the four.
+ * of what its four guest pages need from the host (minus write access while it holds
+ * translated code). A guest page needs no access (unmapped or PROT_NONE), read (R, X or
+ * R+X: x86 has no execute-only pages, and EXEC is checked by the library per 4K page from
+ * its own table, not by the host), or read and write (any W). THE RULE: a change is
+ * enforced exactly when, after it, the four guest pages of every host page it touches
+ * need the same. So R next to R+X (.text next to .rodata), W next to RW, and PROT_NONE
+ * next to unmapped are accepted and enforced, executable or not per 4K page. Any other
+ * change (R next to RW, a mapped readable page next to unmapped ones, PROT_NONE next to
+ * accessible) is refused by fexmac_memory_map and fexmac_memory_protect
+ * (FEXMAC_ERROR_UNSUPPORTED, nothing changed) unless the protection carries
+ * FEXMAC_PROT_ALLOW_UNENFORCED; this includes a 4K mapping into an otherwise unmapped
+ * host page, which would make its unmapped neighbours accessible. fexmac_memory_unmap of
+ * part of a host page whose other guest pages stay accessible is done (the library
+ * records the pages as unmapped and reports them so) but returns FEXMAC_DONE_UNENFORCED.
+ * Accepted and partial-unmap cases are counted by fexmac_memory_unenforced_count.
  *
- *   !!! LIMIT OF THIS VERSION. On a host page whose four 4K guest pages disagree
- *   (accepted with FEXMAC_PROT_ALLOW_UNENFORCED), the guest gets the MOST PERMISSIVE
- *   protection of the four for all of them. NOT enforced on such a page: a PROT_NONE
- *   guard page next to an accessible one is readable and writable by the guest without
- *   a fault (stack guard pages, ASan-style red zones, end-of-buffer guards do not work);
- *   a read-only page next to a writable one is writable; a non-executable page next to
- *   an executable one is executable. Self-modifying-code write protection does not
- *   cover a guest page that is not writable for the guest but shares a host page with
- *   a writable one (a write to it through the union is not seen: run SMCCHECKS full or
- *   call fexmac_invalidate). Still enforced: unmapped vs mapped reporting
- *   (fexmac_memory_query), instruction-fetch checks against the guest's EXEC bit (the
- *   translator reads code only from guest-executable 4K pages), and every protection
- *   on host pages whose four guest pages agree. fexmac_memory_unenforced_count counts
- *   the accepted changes. Lay guest memory out on 16K boundaries (or 16K-align every
- *   protection change) to keep every protection enforced.
+ *   !!! LIMIT OF THIS VERSION. On a host page whose guest pages need different host
+ *   protections (accepted with FEXMAC_PROT_ALLOW_UNENFORCED, or left by a partial unmap
+ *   that returned FEXMAC_DONE_UNENFORCED), the guest gets the MOST PERMISSIVE of them
+ *   for all four. NOT enforced on such a page: a PROT_NONE guard page or an unmapped
+ *   4K page next to an accessible one is readable (and writable, next to a writable
+ *   one) without a fault (stack guard pages, ASan-style red zones, end-of-buffer guards
+ *   do not work there); a read-only page next to a writable one is writable.
+ *   Self-modifying-code write protection does not cover a guest page that is not
+ *   writable for the guest but shares a host page with a writable one (a write to it is
+ *   not seen: run SMCCHECKS full or call fexmac_invalidate). Still enforced everywhere:
+ *   mapped/unmapped and protection reporting (fexmac_memory_query and the fault
+ *   details), and instruction fetch only from guest-executable 4K pages. Lay guest
+ *   memory out on 16K boundaries, or keep each host page's guest pages to one of the
+ *   three needs, to keep every protection enforced.
  *
  * After registering, the embedder must change protections only with these functions,
  * not with mprotect (which would undo the write protection without discarding
@@ -536,7 +548,9 @@ FEXMAC_EXPORT fexmac_result fexmac_memory_map(fexmac_context* context, uint64_t 
  * mprotect); FEXMAC_ERROR_INVALID_ARGUMENT if any page of it is not. */
 FEXMAC_EXPORT fexmac_result fexmac_memory_protect(fexmac_context* context, uint64_t address, uint64_t size, uint32_t prot);
 /* Records that the range is no longer mapped and discards translations of its host pages.
- * Call it before mapping something else there; the library does not munmap. */
+ * Call it before mapping something else there; the library does not munmap. Returns
+ * FEXMAC_DONE_UNENFORCED (done) when part of a host page stays mapped and accessible, so
+ * the unmapped pages stay reachable by the guest (see "Granularity"). */
 FEXMAC_EXPORT fexmac_result fexmac_memory_unmap(fexmac_context* context, uint64_t address, uint64_t size);
 /* The registered guest protection of the page holding `address`, and whether it is
  * mapped (out values may be NULL). */

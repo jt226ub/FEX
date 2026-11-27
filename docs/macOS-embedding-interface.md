@@ -490,25 +490,36 @@ fault handler.
   has no write-only pages, so write or execute implies read, and guest memory is never
   executed by the host. The embedder must not `mprotect` registered memory itself (that
   would undo write protection without discarding code) and must report every guest
-  `mmap`, `mprotect` and `munmap`. A 4K guest protection is enforced only where all four
-  guest pages of a host page agree. A change that would make them disagree is refused
-  (`FEXMAC_ERROR_UNSUPPORTED`, nothing changed) unless the protection carries
-  `FEXMAC_PROT_ALLOW_UNENFORCED`; then the host page gets the union (a PROT_NONE 4K guard
-  page next to accessible ones is accessible) and `fexmac_memory_unenforced_count` counts
-  it. A partial `fexmac_memory_unmap` of a host page is always done and counted.
+  `mmap`, `mprotect` and `munmap`.
 
-  **This is the 1.0 behaviour and a real limit.** On such a host page the guest gets the
-  most permissive protection of its four guest pages for all of them. Not enforced there:
-  PROT_NONE guard pages (a stack guard, a red zone, an end-of-buffer guard next to
-  accessible memory) are readable and writable without a fault; read-only pages next to
-  writable ones are writable; non-executable pages next to executable ones execute.
+  **The rule.** A guest page needs from its host page: no access (unmapped or
+  PROT_NONE), read (R, X or R+X), or read and write (any W). EXEC is checked by the
+  library per 4K page from its table. A change is enforced exactly when, afterwards, the
+  four guest pages of every host page it touches need the same; then it is accepted.
+  Accepted and enforced: R next to R+X (.text next to .rodata), W next to RW, PROT_NONE
+  next to unmapped. Refused (`FEXMAC_ERROR_UNSUPPORTED`, nothing changed) unless the
+  protection carries `FEXMAC_PROT_ALLOW_UNENFORCED`: R next to RW, PROT_NONE next to
+  anything accessible, and a 4K mapping into an otherwise unmapped host page (its
+  unmapped neighbours would become accessible), so a guest `mmap` whose size or place is
+  not a multiple of 16K needs the flag or a 16K-rounded layout. With the flag the host
+  page gets the union and `fexmac_memory_unenforced_count` counts it. A
+  `fexmac_memory_unmap` of part of a host page whose other guest pages stay accessible
+  is done (the pages are unmapped for the library and reported so) and returns
+  `FEXMAC_DONE_UNENFORCED`, also counted, so an embedder cannot miss that the guest can
+  still reach them. Tests: `memory-host-page-rules`, `memory-arguments`.
+
+  **This is the 1.0 behaviour and a real limit.** On a host page whose guest pages need
+  different host protections the guest gets the most permissive for all four. Not
+  enforced there: PROT_NONE guard pages and unmapped 4K pages next to accessible memory
+  (a stack guard, a red zone, an end-of-buffer guard) are readable, and writable next to
+  writable memory, without a fault; read-only pages next to writable ones are writable.
   Self-modifying-code write protection (`mtrack`) does not cover a guest page that is not
   guest-writable but shares a host page with a writable one: a write to it goes through
   the union unseen, so the embedder uses `SMCCHECKS full` or calls `fexmac_invalidate`.
-  Still enforced: mapped/unmapped reporting, instruction fetch only from guest-executable
-  4K pages (the translator checks the guest's EXEC bit itself), and all protections on
-  host pages whose four guest pages agree. An embedder that lays guest memory out on 16K
-  boundaries never meets the limit; `fexmac_memory_unenforced_count` says whether it did.
+  Still enforced everywhere: mapped/unmapped and protection reporting, and instruction
+  fetch only from guest-executable 4K pages. An embedder that keeps each host page's
+  guest pages to one need never meets the limit; `fexmac_memory_unenforced_count` says
+  whether it did.
 
   Future work, the sound scheme: give the host page the *most restrictive* protection of
   its guest pages and have the library complete, in the fault handler, each access the
@@ -974,8 +985,8 @@ mapped as a code range, flushes before exiting and prints the translation counte
   in a prototype. It would be an embedder setting, default the current check.
 - An adaptive fallback for host pages where data and code share a page and every write
   faults (see "Self-modifying code").
-- Enforcing 4K guest protections that differ within a 16K host page (refused unless
-  `FEXMAC_PROT_ALLOW_UNENFORCED`).
+- Enforcing 4K guest protections whose host needs differ within a 16K host page (refused
+  unless `FEXMAC_PROT_ALLOW_UNENFORCED`; a partial unmap returns `FEXMAC_DONE_UNENFORCED`).
 - A misaligned atomic whose page the embedder changes with a raw `mprotect` during the
   emulation ends the process instead of being a guest fault (see "Fault handler locks").
 - The fault-handler contract does not say what happens when the library chains to a

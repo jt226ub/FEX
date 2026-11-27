@@ -266,24 +266,36 @@ namespace {
 
 // Sets the guest pages of [Address, Address + Size) to Value and every host page they
 // touch to its new protection, discarding those host pages' translations.
-// Whether, with [Address, Address + Size) set to Value, every host page the range touches
-// has four guest pages with the same protection and mapped state: only then can the
-// host's single protection per 16K page enforce the guest's.
+// What a guest page needs from the host's single protection for its 16K host page: no
+// access (unmapped or PROT_NONE), read (R, X or RX: x86 has no execute-only pages, and
+// execute permission is checked by the library per 4K page, not by the host), or read and
+// write (any W). With [Address, Address + Size) set to Value, every host page the range
+// touches is enforceable when its four guest pages need the same: then the host's
+// protection is each one's, and the rest (mapped or not, executable or not) comes from
+// the per-4K table.
+static uint8_t HostNeed(uint8_t Page) {
+  if (!(Page & GuestMemory::Mapped) || !(Page & GuestMemory::ProtMask)) {
+    return 0;
+  }
+  return (Page & FEXMAC_PROT_WRITE) ? 2 : 1;
+}
+
 static bool Enforceable(const GuestMemory& Memory, uint64_t Address, uint64_t Size, uint8_t Value) {
   for (uint64_t HostPage = Address & ~HostPageMask; HostPage < Address + Size; HostPage += GuestMemory::HostPage) {
     std::optional<uint8_t> First;
     for (uint64_t Page = HostPage; Page < HostPage + GuestMemory::HostPage; Page += GuestMemory::GuestPage) {
-      const uint8_t Byte = (Page >= Address && Page < Address + Size) ? Value : Memory.Page(Page);
-      if (First && *First != Byte) {
+      const uint8_t Need = HostNeed((Page >= Address && Page < Address + Size) ? Value : Memory.Page(Page));
+      if (First && *First != Need) {
         return false;
       }
-      First = Byte;
+      First = Need;
     }
   }
   return true;
 }
 
-fexmac_result SetGuestMemory(fexmac_context* Context, uint64_t Address, uint64_t Size, uint8_t Value, bool RequireMapped, bool AllowUnenforced) {
+fexmac_result SetGuestMemory(fexmac_context* Context, uint64_t Address, uint64_t Size, uint8_t Value, bool RequireMapped, bool AllowUnenforced,
+                             bool* Unenforced) {
   if (!ValidRange(Address, Size) || (Value & GuestMemory::ProtMask) != (Value & ~GuestMemory::Mapped)) {
     return FEXMAC_ERROR_INVALID_ARGUMENT;
   }
@@ -306,6 +318,9 @@ fexmac_result SetGuestMemory(fexmac_context* Context, uint64_t Address, uint64_t
         return;
       }
       Memory.UnenforcedChanges.fetch_add(1, std::memory_order_relaxed);
+      if (Unenforced) {
+        *Unenforced = true;
+      }
     }
     if (!Memory.Tracking()) {
       // Code translated before memory was tracked has no record of its pages.

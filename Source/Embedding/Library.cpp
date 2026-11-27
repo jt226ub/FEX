@@ -416,7 +416,8 @@ void InvalidateLocked(fexmac_context* Context, uint64_t Start, uint64_t Length) 
   }
 }
 
-fexmac_result SetGuestMemory(fexmac_context* Context, uint64_t Address, uint64_t Size, uint8_t Value, bool RequireMapped, bool AllowUnenforced);
+fexmac_result SetGuestMemory(fexmac_context* Context, uint64_t Address, uint64_t Size, uint8_t Value, bool RequireMapped, bool AllowUnenforced,
+                             bool* Unenforced = nullptr);
 fexmac_result WriteBegin(fexmac_context* Context, uint64_t Address, uint64_t Size, bool Begin);
 
 void SyscallHandler::HandleSyscall(FEXCore::Core::CpuStateFrame* Frame) {
@@ -480,6 +481,7 @@ const char* fexmac_result_string(fexmac_result result) {
   case FEXMAC_ERROR_OUT_OF_MEMORY: return "out of memory";
   case FEXMAC_ERROR_UNSUPPORTED: return "not supported";
   case FEXMAC_ERROR_INTERNAL: return "internal error";
+  case FEXMAC_DONE_UNENFORCED: return "done, but the host page keeps the unmapped guest pages accessible";
   }
   return "unknown result";
 }
@@ -1084,9 +1086,12 @@ fexmac_result fexmac_memory_unmap(fexmac_context* context, uint64_t address, uin
     return FEXMAC_ERROR_INVALID_HANDLE;
   }
   // Unmapping part of a host page is always done (the memory is gone for the guest), but
-  // if the rest of the host page stays mapped the guest can still reach the unmapped
-  // part: counted in fexmac_memory_unenforced_count.
-  return SetGuestMemory(context, address, size, 0, false, true);
+  // if the rest of the host page stays mapped and accessible the guest can still reach
+  // the unmapped part: counted in fexmac_memory_unenforced_count and reported as
+  // FEXMAC_DONE_UNENFORCED, so that an embedder cannot miss it.
+  bool Unenforced = false;
+  const fexmac_result Result = SetGuestMemory(context, address, size, 0, false, true, &Unenforced);
+  return Result == FEXMAC_OK && Unenforced ? FEXMAC_DONE_UNENFORCED : Result;
 }
 
 fexmac_result fexmac_memory_query(fexmac_context* context, uint64_t address, uint32_t* prot, int* mapped) {
