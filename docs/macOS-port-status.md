@@ -401,11 +401,70 @@ hardened, and the mutation test run in the Mac workflow; they assert no timing. 
 hosted Mac may not have Rosetta 2, in which case the script compares with native arm64
 only.
 
+## On-disk code cache
+
+Implemented by copying cached code into the live `MAP_JIT` buffer, using upstream's
+per-block `DiskCache`; details in `docs/macOS-code-cache-design.md`. Switched on with
+`FEX_DISKCACHE=1` and `FEX_DISKCACHEPATH=<dir>` (default `~/Library/Caches/fex-emu/DiskCache/`); an
+embedder calls `Context::FlushDiskCache()` before exiting and can read
+`Context::GetTranslationCounters()`.
+
+Added by this port to upstream's cache: keying on the core's Mach-O UUID, CPU model,
+enumerated options and the effective TSO emulation state; no caching of blocks with a
+custom IR handler or forced-TSO instructions; a checked description per database; an
+integrity hash (covering the index's extents too) and full bounds checks on every entry,
+including entry points against the block's guest extents and code before the block tail,
+before anything reaches executable memory; refusal (never narrowing) of directories and
+files not private to the user, including ACL entries that grant write, opened without
+following links; the size limit enforced; the index read once and parsed lazily; repair
+of a partly written index record before every append; fork support; pruning only of
+buckets unused for a week; a default thread implementation for the core's writer thread.
+Fixed in the frontend: a RIP-relative displacement followed by another field (3DNow!) was
+patched one byte off on load. Fixed in the store path: guest code that changed between
+decoding and storing was filed under its new bytes. Details and the trust model:
+`docs/macOS-code-cache-design.md`.
+
+Physical Mac (M4), all four modes, 2,296 tests, through the fexmac-based runner, cold
+pass then warm pass in one directory with six processes at a time, as built and
+hardened: in the warm pass no test that passes compiled a block; the only blocks
+compiled (6 per mode) belong to expected failures that stop at code the translator cannot
+translate, which is never cached. Loaded 181,174 / 4,743 / 2,630 / 2,630 blocks (jit_1,
+jit_500, jit_500_m, jit_500_tso); every result identical to the cold pass and to the run
+without the cache; no entry rejected. 59 MB on disk. Also a jit_1 two-pass over `3DNow`,
+`TwoByte`, `SelfModifyingCode` and `FEX_bugs` (regression run for the 3DNow! fix).
+
+The runner registers the memory it maps as guest code (`fexmac_add_code_range`), with or
+without the cache. Three expected failures (`PrimaryGroup/5_FF_05`, `_03_o64`,
+`_03_o64_imm`, which jump to an address cut to 32 bits) therefore now stop with a guest
+page fault at that address instead of dying of a host fault while the translator read
+unmapped memory; `Known_Failures_macOS` says so.
+
+Speed: little gained on these tiny tests. Pass times (as built): cold 59 s, warm 19 s;
+hardened 53 s and 17 s. Per process, start-up dominates. In jit_1, whose database has
+85,000 entries (10.7MB index): before the index was made lazy a warm run cost 8.5 ms
+against 3.4 ms uncached (reading the index twice and parsing every entry took about
+9 ms); after, 5.8 ms against 2.9 ms; with the fexmac runner on a quieter machine, 2.7 ms
+warm and 2.7 ms uncached. The largest test (`FEX_bugs/XeSS_quadratic`, 65,538 blocks in
+jit_1) took 72 ms compiling and 79 ms loading. A benefit has to be shown with real
+programs (package G).
+
+`Scripts/macos_code_cache_tests.py` (93 checks, as built and hardened): 37 kinds of
+damage to the files, 300 randomly damaged caches, re-sealed entries with bad entry
+points or tails, bad index records, a record torn by a dying process followed by
+appends, seven configuration changes, a database under another configuration's name or
+with a different format version or build, custom IR handlers, hardware and forced TSO,
+guest code changed between decoding and storing, changed guest bytes at the same
+address, the same code at three addresses, eight threads at once, fork with a cold and a
+warm cache, the size limit, and the directory, file, ACL and link rules.
+
+Found on the way: on APFS, processes creating the same new file at once can get ENOENT
+from `openat(O_CREAT)`; the cache retries such a create briefly.
+
 ## Not implemented, by decision or for lack of a macOS method
 
-- **On-disk code cache loading.** Linux publishes cached code with `mremap`. macOS has no
-  `mremap` and will not remap `MAP_JIT` memory. The macOS path stops with an error until it
-  has its own design.
+- **Upstream's whole-section code cache (`FXCC`, `EnableCodeCachingWIP`).** It publishes
+  code with `mremap`, which macOS lacks, so its macOS path still stops with an error. It
+  is not needed: the per-block disk cache above does the job by copying.
 - **Hardware memory ordering.** macOS gives ordinary processes no way to switch on the
   x86-style ordering mode, so FEX's software emulation is used. `prctl` is stubbed to
   report "not supported".
@@ -428,6 +487,10 @@ All of these run in the Mac job on every push to a `macos/**` branch.
 |---|---|---|---|
 | `FEXCoreSmokeTest` | Translates and runs a 23-byte loop, as built and under the hardened runtime | pass, both | pass, both |
 | `FEXCoreThreadTest` | Eight host threads share a context, each summing a different count in a long guest loop | pass | pass, both |
+| `FEXCoreCacheTest` | Eight threads run a chain of 200 blocks at once, with the code cache on; checks results that depend on every constant and on the code's address, and the cache counters | added in package F, not yet run there | pass, both; 150 of 150 runs after the mutex fix (hung about one run in 30 before it) |
+| `Scripts/macos_code_cache_tests.py` | Damaged, mismatched and moved caches, fuzzing, threads, fork, directory rules (see above) | added in package F, not yet run there | 93 of 93, both |
+| `fexmac_c_test` cache subtests | `cache-off`, `cache-cold-warm`, `cache-cross-process`, `cache-untrusted`, `cache-options`, `cache-fork`, `code-ranges` (with the rest: 41 subtests) | added in package F, not yet run there | pass, both |
+| `Scripts/macos_asm_tests.py --cache-dir DIR --cache-passes 2` | The instruction tests cold then warm; fails if a warm result differs, a finished warm run compiled anything, or an entry was rejected | added in package F, not yet run there (two modes in the job) | pass, all four modes, both |
 | `FEXCoreASMTestRunner` with `Scripts/macos_asm_tests.py` | Upstream's 2,292 assembly instruction tests plus the port's four in `unittests/macOS/ASM`, in four modes | 2,253 pass in each mode (before the upstream sync added one test) | 2,265 of 2,296 pass in each mode, both |
 | `FEXCoreOrderingTest` | Multi-thread x86 memory-ordering litmus tests and misaligned locked-operation counts, in three emulation modes; see above | not yet run | pass, both, in each mode |
 | `FEXCoreMutexWakeTest` | The core's reader-writer lock never loses a wake-up, in six queueing orders | not yet run | pass, both; with the bug restored, two orders hang |

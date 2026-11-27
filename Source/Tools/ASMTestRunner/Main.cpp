@@ -148,6 +148,19 @@ public:
 
   bool Failed {};
 
+  // The mapped pages as [begin, end) ranges, for fexmac_add_code_range.
+  std::vector<std::pair<uint64_t, uint64_t>> Ranges() const {
+    std::vector<std::pair<uint64_t, uint64_t>> Out;
+    for (uint64_t Page : Mapped) {
+      if (!Out.empty() && Out.back().second == Page) {
+        Out.back().second += PageSize;
+      } else {
+        Out.emplace_back(Page, Page + PageSize);
+      }
+    }
+    return Out;
+  }
+
 private:
   uint64_t PageSize;
   std::set<uint64_t> Mapped;
@@ -366,8 +379,19 @@ int main(int argc, char** argv, char** const envp) {
   }
   const auto OptionArray = Options.Get();
 
+  // The code cache, switched on by the environment the way the core's own option names
+  // would (Scripts/macos_asm_tests.py --cache-dir): FEX_DISKCACHE=1 and
+  // FEX_DISKCACHEPATH=<dir>, turned into fexmac's config fields.
+  const char* CacheEnv = getenv("FEX_DISKCACHE");
+  const char* CachePath = getenv("FEX_DISKCACHEPATH");
+  const bool UseCache = CacheEnv && std::string_view {CacheEnv} == "1";
+
   fexmac_config Config;
   fexmac_config_init(&Config);
+  if (UseCache) {
+    Config.code_cache_enabled = 1;
+    Config.code_cache_directory = CachePath && *CachePath ? CachePath : nullptr;
+  }
   Config.options = OptionArray.data();
   Config.option_count = OptionArray.size();
   Config.log = LogHandler;
@@ -457,6 +481,12 @@ int main(int argc, char** argv, char** const envp) {
     fextl::fmt::print("Failed to map the test's memory\n");
     return ExitFail;
   }
+  // Everything this runner mapped may hold code, and tests write to it. Registering it
+  // makes the core treat only that memory as code (a jump elsewhere stops with a guest
+  // fault), and the code cache hashes and patches guest bytes only inside it.
+  for (const auto& [Begin, End] : Mapper.Ranges()) {
+    fexmac_add_code_range(Context, Begin, End - Begin, 1);
+  }
 
   fexmac_thread* Thread {};
   if (const auto Result = fexmac_thread_create(Context, &Thread); Result != FEXMAC_OK) {
@@ -539,6 +569,17 @@ int main(int argc, char** argv, char** const envp) {
   }
 
   const bool Passed = !DidFault && Loader.CompareStates(&State, nullptr, SupportsAVX);
+
+  if (UseCache) {
+    // Wait for this run's translations to be written; the process skips teardown below.
+    // The counters line is what Scripts/macos_asm_tests.py --cache-dir checks.
+    fexmac_context_flush_cache(Context);
+    fexmac_translation_counters Counters;
+    fexmac_translation_counters_init(&Counters);
+    fexmac_context_get_counters(Context, &Counters);
+    fextl::fmt::print("Code cache: compiled {} loaded {} rejected {} queued {}\n", Counters.blocks_compiled, Counters.blocks_loaded,
+                      Counters.cache_entries_rejected, Counters.cache_entries_queued);
+  }
   fextl::fmt::print("Faulted? {}\nPassed? {}\n", DidFault ? "Yes" : "No", Passed ? "Yes" : "No");
   fflush(nullptr);
   // Skip teardown: the result is known and the process is about to exit.

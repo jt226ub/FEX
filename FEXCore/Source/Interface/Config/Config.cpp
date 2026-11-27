@@ -549,7 +549,15 @@ fextl::string SerializeForCache() {
 #define OPT_STR(group, enum, json, default) \
   SerializeValue.template operator()<fextl::string, CONFIG_##enum>(FEXCore::Config::Get_##enum(), default);
 #define OPT_STRARRAY(group, enum, json, default) // Unsupported.
-#define OPT_STRENUM(group, enum, json, default)  // Unsupported.
+#ifdef __APPLE__
+  // macOS port: enumerated options are kept as a number and some change code generation
+  // (JITFeatures, for one). Leaving them out would let a cache made with one setting be
+  // loaded under another, so they are serialized as their numeric value.
+#define OPT_STRENUM(group, enum, json, default) \
+  SerializeValue.template operator()<uint64_t, CONFIG_##enum>(FEXCore::Config::Get_##enum(), default);
+#else
+#define OPT_STRENUM(group, enum, json, default) // Unsupported.
+#endif
 #include <FEXCore/Config/ConfigValues.inl>
   return Config;
 }

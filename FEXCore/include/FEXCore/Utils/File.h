@@ -98,6 +98,14 @@ public:
   File(const File&) = delete;
   File& operator=(const File&) = delete;
 
+#ifdef __APPLE__
+  // Wraps a descriptor the caller opened (the macOS disk cache opens files relative to a
+  // checked directory, without following links). The File owns and closes it.
+  static File FromOwnedHandle(FileHandleType Handle, bool Seekable) {
+    return File(Handle, true, Seekable);
+  }
+#endif
+
   FileHandleType GetHandle() {
     return Handle;
   }
