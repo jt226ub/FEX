@@ -60,7 +60,7 @@ jobs:
       - name: Build
         run: |
           set -o pipefail
-          ninja -C build -k 0 FEXCore FEXCore_shared Common CommonTools FEXCoreSmokeTest FEXCoreASMTestRunner FEXCoreThreadTest FEXCoreOrderingTest FEXCoreMutexWakeTest fexmac fexmac_shared fexmac_bundle fexmac_c_test fexmac_hook_test 2>&1 | tee build.log
+          ninja -C build -k 0 FEXCore FEXCore_shared Common CommonTools FEXCoreSmokeTest FEXCoreASMTestRunner FEXCoreThreadTest FEXCoreOrderingTest FEXCoreMutexWakeTest FEXCoreBench fexmac fexmac_shared fexmac_bundle fexmac_c_test fexmac_hook_test 2>&1 | tee build.log
 
       - name: Inspect what was built
         run: |
@@ -184,6 +184,16 @@ jobs:
             fi
           done
 
+      - name: Run the guest benchmark (checksums only)
+        # A freestanding x86-64 program (unittests/macOS/Bench) run through fexmac by
+        # FEXCoreBench, in quick mode: every kernel's checksum must match the recorded
+        # value and the native arm64 build (and Rosetta 2's, where the runner has it). No
+        # timing is checked here; docs/macOS-benchmarks.md has the measured numbers.
+        run: |
+          set -o pipefail
+          python3 Scripts/macos_bench.py --loader build/Bin/FEXCoreBench --out bench-quick --quick 2>&1 | tee bench-quick.log
+          python3 Scripts/macos_bench.py --loader build/Bin/FEXCoreBench --out bench-quick-hardened --quick --hardened 2>&1 | tee bench-quick-hardened.log
+
       - name: Run the assembly instruction tests
         run: |
           brew list nasm >/dev/null 2>&1 || brew install nasm
@@ -290,6 +300,8 @@ jobs:
             ordering-off.log
             ordering-scalar.log
             mutex-wake.log
+            bench-quick.log
+            bench-quick-hardened.log
             asm-out/results.tsv
             probe-hardened.log
             build/CMakeFiles/CMakeConfigureLog.yaml
