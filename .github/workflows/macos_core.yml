@@ -60,7 +60,7 @@ jobs:
       - name: Build
         run: |
           set -o pipefail
-          ninja -C build -k 0 FEXCore FEXCore_shared Common CommonTools FEXCoreSmokeTest FEXCoreASMTestRunner FEXCoreThreadTest FEXCoreOrderingTest FEXCoreMutexWakeTest fexmac fexmac_shared fexmac_bundle fexmac_c_test fexmac_hook_test 2>&1 | tee build.log
+          ninja -C build -k 0 FEXCore FEXCore_shared Common CommonTools FEXCoreSmokeTest FEXCoreASMTestRunner FEXCoreThreadTest FEXCoreOrderingTest FEXCoreMutexWakeTest FEXCoreBench FEXCoreCacheTest fexmac fexmac_shared fexmac_testing fexmac_bundle fexmac_c_test fexmac_hook_test 2>&1 | tee build.log
 
       - name: Inspect what was built
         run: |
@@ -184,12 +184,48 @@ jobs:
             fi
           done
 
+      - name: Run the guest benchmark (checksums only)
+        # A freestanding x86-64 program (unittests/macOS/Bench) run through fexmac by
+        # FEXCoreBench, in quick mode: every kernel's checksum must match the recorded
+        # value and the native arm64 build (and Rosetta 2's, where the runner has it). No
+        # timing is checked here; docs/macOS-benchmarks.md has the measured numbers.
+        run: |
+          set -o pipefail
+          python3 Scripts/macos_bench.py --loader build/Bin/FEXCoreBench --out bench-quick --quick 2>&1 | tee bench-quick.log
+          python3 Scripts/macos_bench.py --loader build/Bin/FEXCoreBench --out bench-quick-hardened --quick --hardened 2>&1 | tee bench-quick-hardened.log
+
       - name: Run the assembly instruction tests
         run: |
           brew list nasm >/dev/null 2>&1 || brew install nasm
           T="$(find build -name FEXCoreASMTestRunner -type f | head -1)"
           set -o pipefail
           python3 Scripts/macos_asm_tests.py --runner "$T" --out asm-out 2>&1 | tee asm-tests.log
+
+      - name: Run the code cache tests
+        # Damaged and mismatched cache files, moving guest code, eight threads loading the
+        # same cached blocks, directory rules. See docs/macOS-code-cache-design.md.
+        run: |
+          set -o pipefail
+          R="$(find build -name FEXCoreASMTestRunner -type f | head -1)"
+          C="$(find build -name FEXCoreCacheTest -type f | head -1)"
+          python3 Scripts/macos_code_cache_tests.py --runner "$R" --cache-test "$C" --work cache-tests 2>&1 | tee cache-tests.log
+          cp "$C" FEXCoreCacheTest-hardened
+          codesign --force --sign - --options runtime --entitlements Data/macOS/jit.entitlements FEXCoreCacheTest-hardened
+          FEX_DISKCACHE=1 FEX_DISKCACHEPATH="$PWD/cache-hardened" ./FEXCoreCacheTest-hardened --threads 8 2>&1 | tail -3 | tee -a cache-tests.log
+          FEX_DISKCACHE=1 FEX_DISKCACHEPATH="$PWD/cache-hardened" ./FEXCoreCacheTest-hardened --threads 8 --expect warm 2>&1 | tail -3 | tee -a cache-tests.log
+
+      - name: Run the instruction tests twice with the code cache
+        # Cold pass fills the cache, warm pass must compile nothing and give the same
+        # results. Two modes here to bound the job's time; every mode on a physical Mac.
+        run: |
+          set -o pipefail
+          T="$(find build -name FEXCoreASMTestRunner -type f | head -1)"
+          python3 Scripts/macos_asm_tests.py --runner "$T" --out asm-cache --modes jit_500,jit_500_tso \
+            --cache-dir asm-code-cache --cache-passes 2 2>&1 | tee asm-cache-tests.log
+          # jit_1 found the 3DNow! displacement patching bug (Frontend.cpp): keep it covered.
+          python3 Scripts/macos_asm_tests.py --runner "$T" --out asm-cache-jit1 --modes jit_1 \
+            --filter 3DNow/,TwoByte/,SelfModifyingCode/,FEX_bugs/ \
+            --cache-dir asm-code-cache-jit1 --cache-passes 2 2>&1 | tee -a asm-cache-tests.log
 
       - name: Diagnose the tests that are not understood
         if: always()
@@ -281,6 +317,9 @@ jobs:
             smoke-hardened.log
             probe.log
             asm-tests.log
+            asm-cache-tests.log
+            asm-cache/cache.tsv
+            cache-tests.log
             thread-test.log
             fexmac-c-test.log
             fexmac-c-test-hardened.log
@@ -290,6 +329,8 @@ jobs:
             ordering-off.log
             ordering-scalar.log
             mutex-wake.log
+            bench-quick.log
+            bench-quick-hardened.log
             asm-out/results.tsv
             probe-hardened.log
             build/CMakeFiles/CMakeConfigureLog.yaml
