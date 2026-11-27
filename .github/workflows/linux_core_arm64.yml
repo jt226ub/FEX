@@ -1,0 +1,142 @@
+name: Linux arm64 build and instruction tests
+
+# The macOS port's branches built natively on Linux (GitHub's hosted arm64 Ubuntu), so a
+# change for macOS cannot break the Linux build unnoticed, and upstream's instruction tests
+# run on a second arm64 platform through upstream's own machinery for comparison with the
+# Mac's results (Scripts/macos_linux_asm_compare.py).
+#
+#   core-only  BUILD_FEXCORE_ONLY=ON, the configuration the port adds: FEXCore,
+#              FEXCore_shared, Common, CommonTools. The port's own tools (smoke test,
+#              thread test, ASM test runner, fexmac) are Apple-only by design.
+#   asm-tests  the ordinary Linux configuration with testing on: TestHarnessRunner and
+#              the 64-bit assembly tests through CTest (upstream's asm_tests machinery,
+#              with upstream's Known_Failures and Disabled_Tests lists). No x86-64 root
+#              file system is needed for these tests; nasm is.
+
+on:
+  push:
+    branches:
+      - 'macos/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: linux-arm64-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CC: clang
+  CXX: clang++
+
+jobs:
+  core-only:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Fetch the third-party code the core needs
+        run: |
+          git submodule update --init --depth 1 Source/Common/cpp-optparse External/fmt External/xxhash \
+            External/rpmalloc External/range-v3 External/unordered_dense External/jemalloc_glibc
+
+      - name: Install tools
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q ninja-build clang lld python3
+          uname -a; clang --version | head -1; cmake --version | head -1; getconf PAGESIZE
+
+      - name: Configure (core only)
+        run: |
+          cmake -G Ninja -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_FEXCORE_ONLY=ON -DBUILD_TESTING=OFF \
+            -DENABLE_LTO=OFF -DENABLE_CCACHE=OFF -DENABLE_ASSERTIONS=ON -DUSE_LINKER=lld 2>&1 | tee configure.log
+
+      - name: Build
+        run: |
+          set -o pipefail
+          ninja -C build -k 0 FEXCore FEXCore_shared Common CommonTools 2>&1 | tee build.log
+
+      - name: Check the port's macOS-only targets are absent and nothing macOS leaked in
+        run: |
+          grep -q 'CoreSmokeTest: not built' configure.log
+          if ninja -C build -t targets all | grep -E '^(fexmac[a-z_]*|FEXCoreSmokeTest|FEXCoreASMTestRunner):'; then
+            echo "a macOS-only target exists in the Linux build"; exit 1
+          fi
+          find build -name 'libFEXCore*' -exec ls -l {} +
+          # Exported symbols of the shared core: none of the port's macOS entry points.
+          so="$(find build -name 'libFEXCore*.so' | head -1)"
+          if nm -D --defined-only "$so" | grep -i -E 'fexmac|_np$'; then echo "macOS symbols in $so"; exit 1; fi
+
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: linux-core-only-logs
+          path: |
+            configure.log
+            build.log
+          if-no-files-found: ignore
+
+  asm-tests:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Fetch third-party code (not the large test-binary repositories)
+        run: |
+          git submodule update --init --depth 1 Source/Common/cpp-optparse External/fmt External/xxhash \
+            External/rpmalloc External/range-v3 External/unordered_dense External/jemalloc_glibc \
+            External/Catch2 External/vixl External/drm-headers External/Vulkan-Headers External/tracy External/zydis
+
+      - name: Install tools
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q ninja-build clang lld nasm python3
+          uname -a; clang --version | head -1; nasm -v; getconf PAGESIZE
+          grep -m1 -E 'Features' /proc/cpuinfo || true
+          python3 Scripts/ClassifyCPU.py
+
+      - name: Configure (Linux, testing on)
+        run: |
+          cmake -G Ninja -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON -DENABLE_LTO=OFF \
+            -DENABLE_CCACHE=OFF -DENABLE_ASSERTIONS=ON -DBUILD_FEXCONFIG=OFF -DUSE_LINKER=lld 2>&1 | tee configure.log
+
+      - name: Build TestHarnessRunner and the 64-bit test files
+        run: |
+          set -o pipefail
+          ninja -C build -k 0 TestHarnessRunner asm_files 2>&1 | tee build.log
+
+      - name: Run the 64-bit instruction tests through CTest
+        # A red result here means a test did not behave as upstream's lists say on this
+        # machine. The table of raw outcomes is uploaded for comparison with the Mac.
+        run: |
+          cd build
+          set +e
+          ctest --timeout 302 -j "$(nproc)" -R '64Bit.*\.asm$' --output-junit linux-asm.xml > ../ctest.log 2>&1
+          code=$?
+          set -e
+          tail -30 ../ctest.log
+          python3 ../Scripts/macos_linux_asm_compare.py --junit linux-asm.xml --out ../linux-asm-results.tsv | tee ../linux-asm-counts.log
+          grep -E '\(Failed\)|\(Timeout\)|\(SEGFAULT\)|\(Subprocess aborted\)' ../ctest.log | head -60 || true
+          exit $code
+
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: linux-asm-tests
+          path: |
+            configure.log
+            build.log
+            ctest.log
+            linux-asm-results.tsv
+            linux-asm-counts.log
+            build/linux-asm.xml
+          if-no-files-found: ignore
