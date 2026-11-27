@@ -148,19 +148,45 @@ jobs:
           python3 "$RUNNER_TEMP/macos_linux_asm_compare.py" --root .. --junit linux-asm.xml --out ../linux-asm-results.tsv | tee ../linux-asm-counts.log
           exit $code
 
+      - name: Show the instruction tests that failed, run directly
+        # No output reaches CTest's log for a test that dies; run each failing one again
+        # with its environment, then under gdb for a backtrace (gdb works on this Linux
+        # host; it is the Mac where debuggers hang).
+        if: failure()
+        run: |
+          sudo apt-get install -y -q gdb > /dev/null
+          awk -F'\t' '$4 == "failed" { print $1 "\t" $2 }' linux-asm-results.tsv | head -5 | while IFS=$'\t' read -r mode name; do
+            rel="${name#Test_}"
+            bin="build/unittests/ASM/$rel.bin"; cfg="build/unittests/ASM/$rel.config.bin"
+            case "$mode" in
+              jit_1) env="FEX_MAXINST=1 FEX_MULTIBLOCK=0" ;;
+              jit_500) env="FEX_MAXINST=500 FEX_MULTIBLOCK=0" ;;
+              jit_500_m) env="FEX_MAXINST=500 FEX_MULTIBLOCK=1" ;;
+            esac
+            echo "=== $mode $name"
+            set +e
+            env FEX_SILENTLOG=0 FEX_DUMPGPRS=1 FEX_TSOENABLED=0 $env timeout 120 build/Bin/TestHarnessRunner "$bin" "$cfg" 2>&1 | tail -40
+            echo "exit status ${PIPESTATUS[0]}"
+            env FEX_SILENTLOG=0 FEX_TSOENABLED=0 $env timeout 300 gdb -q -batch -ex 'handle SIGSEGV nostop noprint pass' \
+              -ex 'handle SIGBUS nostop noprint pass' -ex run -ex 'bt 30' -ex 'info registers pc' \
+              --args build/Bin/TestHarnessRunner "$bin" "$cfg" 2>&1 | tail -50
+            set -e
+          done
+
       - name: Run upstream's unit tests that need no root file system
-        # The same targets upstream's CI runs: Catch2 API tests of FEXCore and of the
-        # Linux front end, and the arm64 code emitter tests.
+        # The tests of upstream's fexcore_apitests, api_tests and emitter_tests targets.
+        # The FutexSpin-Timed tests measure wall-clock waits and fail on these shared
+        # virtual machines on the upstream base too (seen in the first runs), so they are
+        # left out here.
         if: ${{ !cancelled() }}
         run: |
-          set -o pipefail
-          bad=0
-          for t in fexcore_apitests api_tests emitter_tests; do
-            echo "=== $t"
-            cmake --build build --target "$t" > "unit-$t.log" 2>&1 || bad=1
-            grep -E 'tests passed|tests failed|Failed|\*\*\*' "unit-$t.log" | tail -20
-          done
-          exit $bad
+          cd build
+          set +e
+          ctest --timeout 302 -j "$(nproc)" -R '\.FEXCore_Tests$|\.APITest$|\.Emitter$' -E 'FutexSpin-Timed' \
+            --output-on-failure > ../unit-tests.log 2>&1
+          code=$?
+          grep -E 'tests passed|tests failed|\(Failed\)|\(Timeout\)' ../unit-tests.log | tail -20
+          exit $code
 
       - uses: actions/upload-artifact@v7
         if: always()
@@ -170,7 +196,7 @@ jobs:
             configure.log
             build.log
             ctest.log
-            unit-*.log
+            unit-tests.log
             linux-asm-results.tsv
             linux-asm-counts.log
           if-no-files-found: ignore
