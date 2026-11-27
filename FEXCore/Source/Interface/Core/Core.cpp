@@ -368,6 +368,13 @@ bool ContextImpl::InitCore() {
     // If gdbserver is enabled then this needs to be enabled.
     Config.NeedsPendingInterruptFaultCheck = true;
   }
+#ifdef __APPLE__
+  // The macOS embedding library (fexmac) stops a running thread from another thread by
+  // making the thread's interrupt fault page read-only: translated code then faults at
+  // the next block entry or loop back-edge, a point where the guest state can be
+  // reconstructed. Costs one store per block entry and back-edge.
+  Config.NeedsPendingInterruptFaultCheck = true;
+#endif
 
   if constexpr (BLOCK_DEBUGGING) {
     // If the developer wants to do any single-stepping points or watch points.
@@ -636,6 +643,20 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
         // side effect here and (if that behaviour is required) we should handle
         // that more explicitly later.
         Thread->OpDispatcher->FlushRegisterCache(true);
+
+#ifdef __APPLE__
+        if (TableInfo && TableInfo->OpcodeDispatcher.OpDispatch) {
+          // An instruction that may access memory may fault there; see
+          // MaterializeFlagsForFault. A register-only instruction cannot.
+          const auto IsMemory = [](const X86Tables::DecodedOperand& Operand) {
+            return Operand.IsGPRIndirect() || Operand.IsRIPRelative() || Operand.IsSIB();
+          };
+          if ((TableInfo->Flags & X86Tables::InstFlags::FLAGS_DEBUG_MEM_ACCESS) || IsMemory(DecodedInfo->Dest) ||
+              IsMemory(DecodedInfo->Src[0]) || IsMemory(DecodedInfo->Src[1]) || IsMemory(DecodedInfo->Src[2])) {
+            Thread->OpDispatcher->MaterializeFlagsForFault();
+          }
+        }
+#endif
 
         if (ExtendedDebugInfo || Thread->OpDispatcher->CanHaveSideEffects(TableInfo, DecodedInfo)) {
           Thread->OpDispatcher->_GuestOpcode(InstAddress - GuestRIP);

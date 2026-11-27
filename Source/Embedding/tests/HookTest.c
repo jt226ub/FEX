@@ -8,6 +8,8 @@
  *        fexmac_hook_test <name>     run one subtest in this process
  */
 #include "TestSupport.h"
+
+#include <inttypes.h>
 #include "fexmac_testing.h"
 
 #include <pthread.h>
@@ -163,9 +165,15 @@ static void GuestTouchesGuard(int Which, const uint8_t* Program, size_t Size) {
   Check(State.gpr[RDI] != 64, "found the guard page");
   SetState(GuardThread, &State);
   Shared[0] = 1;
-  fexmac_thread_run(GuardThread, NULL);
-  printf("  FAIL: survived a guest access to a guard page\n");
-  exit(1);
+  const fexmac_stop Stop = Run(GuardThread);
+  const fexmac_x86_state After = GetState(GuardThread);
+  /* Delivered as the guest's page fault at the guard address: no reset of the call/return
+   * stack pointer and no retry loop. */
+  Check(Stop.reason == FEXMAC_STOP_GUEST_FAULT && Stop.trap_number == 14 && Stop.fault_address == State.gpr[RDI] &&
+          After.rip == State.rip,
+        "the guest's access is its own page fault at the guard address (reason %d, address 0x%" PRIx64 ")", Stop.reason,
+        Stop.fault_address);
+  Shared[0] = 2;
 }
 
 static const uint8_t GuardLoad[] = {0x8B, 0x07, 0xF4};  /* mov eax,[rdi] ; hlt */
@@ -278,11 +286,10 @@ static void TestLogCallbackReentry(void) {
   CheckResult(fexmac_context_destroy(LogContext), FEXMAC_OK, "fexmac_context_destroy afterwards");
 }
 
-#define GUARD_TEXT "guest memory access fault in translated code at address 0x"
 
 static const struct Subtest Subtests[] = {
-  {"guest-load-callret-low-guard-dies", TestGuestLoadCallRetLowGuard, SIGBUS, GUARD_TEXT, "fault inside", 1},
-  {"guest-store-callret-high-guard-dies", TestGuestStoreCallRetHighGuard, SIGBUS, GUARD_TEXT, "fault inside", 1},
+  {"guest-load-callret-low-guard", TestGuestLoadCallRetLowGuard, 0, NULL, "fexmac:", 2},
+  {"guest-store-callret-high-guard", TestGuestStoreCallRetHighGuard, 0, NULL, "fexmac:", 2},
   {"scratch-guard-disarmed-after-translation", TestScratchGuardDisarmed, 0, NULL, NULL, 0},
   {"callback-callret-guard-passed-on", TestCallbackCallRetGuard, 0, NULL, "fexmac:", 2},
   {"log-callback-reentry", TestLogCallbackReentry, 0, NULL, NULL, 0},

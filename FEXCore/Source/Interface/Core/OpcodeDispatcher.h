@@ -1257,6 +1257,19 @@ public:
     _StoreContext(Size, Class, Value, Offset);
   }
 
+#ifdef __APPLE__
+  // Before a guest instruction that can fault on memory: put the flags in NZCV, in the
+  // form the rest of the core expects (carry inverted). The macOS embedding library
+  // reconstructs the guest flags from NZCV when such an instruction faults, and the guest
+  // may be resumed at that instruction; without this, flags of an earlier instruction can
+  // still be pending in a temporary or have the carry the other way round there. Flags
+  // nothing reads later are still removed by the flag optimisation.
+  void MaterializeFlagsForFault() {
+    CalculateDeferredFlags();
+    RectifyCarryInvert(CFInvertedABI);
+  }
+#endif
+
   void FlushRegisterCache(bool SRAOnly = false, bool MMXOnly = false) {
     // At block boundaries, fix up the carry flag.
     if (!SRAOnly) {

@@ -58,6 +58,24 @@ void WriteRaw(const char* Message) {
   (void)!::write(STDERR_FILENO, Message, Length);
 }
 
+void WriteHex(uint64_t Value) {
+  char Buffer[19] = "0x";
+  int Digits = 1;
+  for (uint64_t V = Value >> 4; V; V >>= 4) {
+    ++Digits;
+  }
+  for (int i = 0; i < Digits; ++i) {
+    const unsigned Nibble = (Value >> (4 * (Digits - 1 - i))) & 0xF;
+    Buffer[2 + i] = static_cast<char>(Nibble < 10 ? '0' + Nibble : 'a' + Nibble - 10);
+  }
+  Buffer[2 + Digits] = '\0';
+  WriteRaw(Buffer);
+}
+
+void ProtectInterruptPage(fexmac_thread* Thread, bool ReadOnly) {
+  ::mprotect(InterruptPage(Thread), FEXCore::Utils::FEX_HOST_PAGE_SIZE, ReadOnly ? PROT_READ : PROT_READ | PROT_WRITE);
+}
+
 namespace {
   std::mutex RegistryMutex;
   std::unordered_set<const void*> LiveContexts;
@@ -214,6 +232,12 @@ namespace {
     if (Fault.Untranslatable) {
       Stop.reason = FEXMAC_STOP_UNSUPPORTED_INSTRUCTION;
     }
+    // The only page fault the core raises itself is an instruction fetch from memory
+    // QueryGuestExecutableRange says is not executable (NoExecOrPartialOp), at the first
+    // byte it could not read. Describe it from the registered memory, as for data.
+    if (Fault.TrapNo == FEXCore::X86State::X86_TRAPNO_PF && !Fault.Untranslatable) {
+      DescribePageFault(Thread->Context, &Stop, Fault.FaultAddress, FEXMAC_ACCESS_EXECUTE, SIGSEGV, true);
+    }
     Thread->PendingStop = Stop;
     LeaveDispatcher(Thread, Frame);
   }
@@ -334,18 +358,6 @@ namespace {
     return true;
   }
 
-  // The signals a thread that waits for the invalidation lock blocks when it is not a
-  // guest thread: every asynchronous one, so the core's lock is not taken re-entrantly
-  // from a host signal handler, but no synchronous fault signal, so a fault while
-  // waiting still reaches its handler instead of hanging the thread.
-  uint64_t InvalidationSignalMask() {
-    uint64_t Mask = ~0ULL;
-    for (int Signal : {SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGTRAP, SIGSYS}) {
-      Mask &= ~(1ULL << (Signal - 1));
-    }
-    return Mask;
-  }
-
 #ifdef FEXMAC_TESTING
   std::atomic<void (*)()> TestInvalidationHook {};
 #endif
@@ -362,10 +374,7 @@ namespace {
       Hook();
     }
 #endif
-    Context->CTX->InvalidateCodeBuffersCodeRange(Start, Length);
-    for (auto* Thread : Context->Threads) {
-      Context->CTX->InvalidateThreadCachedCodeRange(Thread->Thread, Start, Length);
-    }
+    InvalidateLocked(Context, Start, Length);
   }
 
   void SetInCallback(fexmac_thread* Thread, bool Value) {
@@ -373,6 +382,28 @@ namespace {
     Thread->InCallback = Value;
   }
 } // namespace
+
+// The signals a thread that waits for the invalidation lock blocks when it is not a
+// guest thread: every asynchronous one, so the core's lock is not taken re-entrantly
+// from a host signal handler, but no synchronous fault signal, so a fault while
+// waiting still reaches its handler instead of hanging the thread.
+uint64_t InvalidationSignalMask() {
+  uint64_t Mask = ~0ULL;
+  for (int Signal : {SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGTRAP, SIGSYS}) {
+    Mask &= ~(1ULL << (Signal - 1));
+  }
+  return Mask;
+}
+
+void InvalidateLocked(fexmac_context* Context, uint64_t Start, uint64_t Length) {
+  Context->CTX->InvalidateCodeBuffersCodeRange(Start, Length);
+  for (auto* Thread : Context->Threads) {
+    Context->CTX->InvalidateThreadCachedCodeRange(Thread->Thread, Start, Length);
+  }
+}
+
+fexmac_result SetGuestMemory(fexmac_context* Context, uint64_t Address, uint64_t Size, uint8_t Value, bool RequireMapped);
+fexmac_result WriteBegin(fexmac_context* Context, uint64_t Address, uint64_t Size, bool Begin);
 
 void SyscallHandler::HandleSyscall(FEXCore::Core::CpuStateFrame* Frame) {
   auto* Thread = static_cast<fexmac_thread*>(Frame->Thread->FrontendPtr);
@@ -513,6 +544,11 @@ fexmac_result fexmac_context_create(const fexmac_config* config, fexmac_context*
   if (!Context) {
     return Fail(FEXMAC_ERROR_OUT_OF_MEMORY, true);
   }
+  if (!Context->Memory.Initialize()) {
+    delete Context;
+    return Fail(FEXMAC_ERROR_OUT_OF_MEMORY, true);
+  }
+  Context->WriteProtectCode = FEXCore::Config::Get_SMCCHECKS() == FEXCore::Config::CONFIG_SMC_MTRACK;
   Context->SyscallFn = config->syscall;
   Context->SyscallUserData = config->syscall_user_data;
 
@@ -545,6 +581,7 @@ fexmac_result fexmac_context_create(const fexmac_config* config, fexmac_context*
     std::lock_guard Lock {RegistryMutex};
     LiveContexts.insert(Context);
   }
+  ProcessContext.store(Context);
   *out_context = Context;
   return FEXMAC_OK;
 }
@@ -568,6 +605,7 @@ fexmac_result fexmac_context_destroy(fexmac_context* context) {
     // From here no call can find the context.
     LiveContexts.erase(context);
   }
+  ProcessContext.store(nullptr);
 
   context->CTX.reset();
   context->Syscalls.reset();
@@ -793,7 +831,19 @@ fexmac_result fexmac_thread_run(fexmac_thread* thread, fexmac_stop* stop) {
   SetCurrentThread(thread);
   thread->PendingStop = {};
 
-  thread->Context->CTX->ExecuteThread(thread->Thread);
+  if (thread->StopRequested.exchange(0)) {
+    // A stop requested while the thread was not running (or one that arrived as the last
+    // run ended): answer it before running anything.
+    ProtectInterruptPage(thread, false);
+    thread->PendingStop = fexmac_stop {.struct_size = sizeof(fexmac_stop),
+                                       .reason = FEXMAC_STOP_REQUESTED,
+                                       .instruction_address = thread->Thread->CurrentFrame->State.rip};
+  } else {
+    thread->Context->CTX->ExecuteThread(thread->Thread);
+    // The run can end (a guest fault, a stop) before a store to write-protected code
+    // that was being single-stepped reached the next block.
+    FinishCodeWrite(thread);
+  }
 
   SetCurrentThread(Previous);
   const fexmac_stop Result = thread->PendingStop;
@@ -808,6 +858,107 @@ fexmac_result fexmac_thread_run(fexmac_thread* thread, fexmac_stop* stop) {
     stop->struct_size = Size;
   }
   return Result.reason == FEXMAC_STOP_NONE ? FEXMAC_ERROR_INTERNAL : FEXMAC_OK;
+}
+
+fexmac_result fexmac_thread_request_stop(fexmac_thread* thread) {
+  // Async-signal-safe: no lock, no allocation. The store comes first so that the fault
+  // the read-only page causes always finds the request.
+  if (!thread) {
+    return FEXMAC_ERROR_INVALID_ARGUMENT;
+  }
+  thread->StopRequested.store(1, std::memory_order_seq_cst);
+  ProtectInterruptPage(thread, true);
+  return FEXMAC_OK;
+}
+
+fexmac_result fexmac_memory_map(fexmac_context* context, uint64_t address, uint64_t size, uint32_t prot) {
+  if (InLogCallback) {
+    return FEXMAC_ERROR_BUSY;
+  }
+  ContextUse Use {context};
+  if (!Use) {
+    return FEXMAC_ERROR_INVALID_HANDLE;
+  }
+  if (prot & ~GuestMemory::ProtMask) {
+    return FEXMAC_ERROR_INVALID_ARGUMENT;
+  }
+  return SetGuestMemory(context, address, size, static_cast<uint8_t>(prot | GuestMemory::Mapped), false);
+}
+
+fexmac_result fexmac_memory_protect(fexmac_context* context, uint64_t address, uint64_t size, uint32_t prot) {
+  if (InLogCallback) {
+    return FEXMAC_ERROR_BUSY;
+  }
+  ContextUse Use {context};
+  if (!Use) {
+    return FEXMAC_ERROR_INVALID_HANDLE;
+  }
+  if (prot & ~GuestMemory::ProtMask) {
+    return FEXMAC_ERROR_INVALID_ARGUMENT;
+  }
+  return SetGuestMemory(context, address, size, static_cast<uint8_t>(prot | GuestMemory::Mapped), true);
+}
+
+fexmac_result fexmac_memory_unmap(fexmac_context* context, uint64_t address, uint64_t size) {
+  if (InLogCallback) {
+    return FEXMAC_ERROR_BUSY;
+  }
+  ContextUse Use {context};
+  if (!Use) {
+    return FEXMAC_ERROR_INVALID_HANDLE;
+  }
+  return SetGuestMemory(context, address, size, 0, false);
+}
+
+fexmac_result fexmac_memory_query(fexmac_context* context, uint64_t address, uint32_t* prot, int* mapped) {
+  if (InLogCallback) {
+    return FEXMAC_ERROR_BUSY;
+  }
+  ContextUse Use {context};
+  if (!Use) {
+    return FEXMAC_ERROR_INVALID_HANDLE;
+  }
+  const uint8_t Info = context->Memory.Page(address);
+  if (prot) {
+    *prot = Info & GuestMemory::ProtMask;
+  }
+  if (mapped) {
+    *mapped = (Info & GuestMemory::Mapped) != 0;
+  }
+  return FEXMAC_OK;
+}
+
+fexmac_result fexmac_memory_write_begin(fexmac_context* context, uint64_t address, uint64_t size) {
+  if (InLogCallback) {
+    return FEXMAC_ERROR_BUSY;
+  }
+  ContextUse Use {context};
+  if (!Use) {
+    return FEXMAC_ERROR_INVALID_HANDLE;
+  }
+  return WriteBegin(context, address, size, true);
+}
+
+fexmac_result fexmac_memory_write_end(fexmac_context* context, uint64_t address, uint64_t size) {
+  if (InLogCallback) {
+    return FEXMAC_ERROR_BUSY;
+  }
+  ContextUse Use {context};
+  if (!Use) {
+    return FEXMAC_ERROR_INVALID_HANDLE;
+  }
+  return WriteBegin(context, address, size, false);
+}
+
+uint64_t fexmac_memory_code_write_count(fexmac_context* context) {
+  if (InLogCallback) {
+    return 0;
+  }
+  ContextUse Use {context};
+  if (!Use) {
+    return 0;
+  }
+  return context->Memory.CodeWriteFaults.load(std::memory_order_relaxed);
 }
 
 #ifdef FEXMAC_TESTING

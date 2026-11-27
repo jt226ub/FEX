@@ -13,6 +13,7 @@
 #include "TestSupport.h"
 
 #include <inttypes.h>
+#include <stddef.h>
 #include <pthread.h>
 #include <setjmp.h>
 #include <signal.h>
@@ -280,6 +281,20 @@ static void TestABI(void) {
   memset(&Stop, 0xAA, sizeof(Stop));
   CheckResult(fexmac_thread_run(Thread, &Stop), FEXMAC_ERROR_INVALID_ARGUMENT, "run with an uninitialised stop record");
   CheckResult(fexmac_thread_run(Thread, NULL), FEXMAC_OK, "run with no stop record");
+  /* The 2.0 stop record gained access and reserved (package D) before 2.0 shipped: 48
+   * bytes; the 40-byte draft layout is not a size this library knows. */
+  Check(sizeof(fexmac_stop) == 48 && offsetof(fexmac_stop, access) == 40, "stop record is 48 bytes with access at 40");
+  memset(&Stop, 0xAA, sizeof(Stop));
+  Stop.struct_size = 40;
+  CheckResult(fexmac_thread_run(Thread, &Stop), FEXMAC_ERROR_INVALID_ARGUMENT, "run with a 40-byte stop record");
+  fexmac_stop_init(&Stop);
+  fexmac_x86_state Rewind;
+  fexmac_x86_state_init(&Rewind);
+  fexmac_thread_get_state(Thread, &Rewind);
+  Rewind.rip = (uint64_t)(uintptr_t)Code;
+  fexmac_thread_set_state(Thread, &Rewind);
+  CheckResult(fexmac_thread_run(Thread, &Stop), FEXMAC_OK, "run with an initialised stop record");
+  Check(Stop.reason == FEXMAC_STOP_HALT && Stop.access == 0 && Stop.reserved == 0, "a halt has no access kind");
 
   fexmac_config Config;
   fexmac_context* Other = NULL;
@@ -531,9 +546,12 @@ static void TestCallRetUnderflow(void) {
   Check(Rcx == 0, "200,000 unmatched returns complete");
 }
 
-/* ---- guest memory faults in translated code: never claimed, never a loop ---- */
+/* ---- guest memory faults in translated code: delivered as stops, then fixed and re-run ---- */
 
-static void RunGuestAccess(const uint8_t* Program, size_t Size, int Protection, const char* TSO) {
+/* Runs a one-instruction access on a protected page (rdi = page + Offset), checks the
+ * stop the library reports, makes the page accessible and runs the same instruction
+ * again to the hlt after it. */
+static void RunGuestAccess(const uint8_t* Program, size_t Size, int Protection, const char* TSO, uint64_t Offset, uint32_t Access) {
   uint8_t* Code = MapGuestMemory(0x10000);
   uint8_t* Data = mmap(NULL, (size_t)PageSize, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
   memcpy(Code, Program, Size);
@@ -545,13 +563,32 @@ static void RunGuestAccess(const uint8_t* Program, size_t Size, int Protection, 
   fexmac_context* Context = CreateContextWithOptions(Options, 1, NULL, NULL);
   fexmac_thread* Thread = CreateThreadAt(Context, (uint64_t)(uintptr_t)Code, 0);
   fexmac_x86_state State = GetState(Thread);
-  State.gpr[RDI] = (uint64_t)(uintptr_t)Data + 64;
-  Shared[1] = (uint32_t)(State.gpr[RDI] & 0xFFFFFFFF);
+  State.gpr[RDI] = (uint64_t)(uintptr_t)Data + Offset;
+  State.gpr[RAX] = 5;
   SetState(Thread, &State);
   Shared[0] = 1; /* reached the guest run */
-  fexmac_thread_run(Thread, NULL);
-  printf("  FAIL: survived a guest access to a protected page\n");
-  exit(1);
+  fexmac_stop Stop = Run(Thread);
+  fexmac_x86_state After = GetState(Thread);
+  const uint64_t Expected = (uint64_t)(uintptr_t)Data + Offset;
+  Check(Stop.reason == FEXMAC_STOP_GUEST_FAULT && Stop.trap_number == 14, "the access stops the run as a page fault (reason %d, trap %u)",
+        Stop.reason, Stop.trap_number);
+  Check(Stop.instruction_address == (uint64_t)(uintptr_t)Code && After.rip == (uint64_t)(uintptr_t)Code,
+        "rip and instruction_address name the faulting instruction");
+  Check(Stop.fault_address >= (uint64_t)(uintptr_t)Data && Stop.fault_address <= Expected + 15 &&
+          (Stop.fault_address == Expected || Offset % 16 != 0),
+        "fault address 0x%" PRIx64 " is the access (0x%" PRIx64 ")", Stop.fault_address, Expected);
+  Check(Stop.access == Access, "access %u (expected %u)", Stop.access, Access);
+  Check(Stop.signal == SIGSEGV && Stop.si_code == SEGV_ACCERR, "SIGSEGV with SEGV_ACCERR (signal %d, si_code %d)", Stop.signal, Stop.si_code);
+  const uint32_t ExpectedError = FEXMAC_PF_USER | (Access == FEXMAC_ACCESS_WRITE ? FEXMAC_PF_WRITE : 0) |
+                                 (Protection == PROT_READ ? FEXMAC_PF_PRESENT : 0);
+  Check(Stop.error_code == ExpectedError, "#PF error code 0x%x (expected 0x%x)", Stop.error_code, ExpectedError);
+  Check(After.gpr[RAX] == 5 && After.gpr[RDI] == Expected, "registers as before the instruction");
+  mprotect(Data, (size_t)PageSize, PROT_READ | PROT_WRITE);
+  Stop = Run(Thread);
+  Check(Stop.reason == FEXMAC_STOP_HALT, "after the page is made accessible the same instruction runs (reason %d)", Stop.reason);
+  Shared[0] = 2;
+  fexmac_thread_destroy(Thread);
+  fexmac_context_destroy(Context);
 }
 
 static const uint8_t LockXadd[] = {0xF0, 0x0F, 0xC1, 0x07, 0xF4};
@@ -561,54 +598,51 @@ static const uint8_t Store[] = {0x89, 0x07, 0xF4};
 
 static void TestGuestLoadProtNone(void) {
   fexmac_install_fault_handlers();
-  RunGuestAccess(Load, sizeof(Load), PROT_NONE, "1");
+  RunGuestAccess(Load, sizeof(Load), PROT_NONE, "1", 64, FEXMAC_ACCESS_READ);
 }
 static void TestGuestLockXaddProtNone(void) {
   fexmac_install_fault_handlers();
-  RunGuestAccess(LockXadd, sizeof(LockXadd), PROT_NONE, "1");
+  RunGuestAccess(LockXadd, sizeof(LockXadd), PROT_NONE, "1", 64, FEXMAC_ACCESS_WRITE);
 }
 static void TestGuestLockCmpxchgProtNone(void) {
   fexmac_install_fault_handlers();
-  RunGuestAccess(LockCmpxchg, sizeof(LockCmpxchg), PROT_NONE, "0");
+  RunGuestAccess(LockCmpxchg, sizeof(LockCmpxchg), PROT_NONE, "0", 64, FEXMAC_ACCESS_WRITE);
 }
-/* A misaligned atomic on a PROT_NONE page: the alignment fault comes first and the core
- * starts rewriting it; the rewrite then faults on the page. That is the guest's fault,
- * and is reported as such. */
+/* A misaligned atomic on a PROT_NONE page: the alignment fault comes first. The library
+ * sees that the memory is inaccessible before the core starts rewriting the access (which
+ * would fault inside the handler) and reports the guest's page fault. */
 static void TestGuestMisalignedProtNone(void) {
   fexmac_install_fault_handlers();
-  uint8_t* Code = MapGuestMemory(0x10000);
-  uint8_t* Data = mmap(NULL, (size_t)PageSize, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-  memcpy(Code, LockXadd, sizeof(LockXadd));
-  fexmac_context* Context = CreateContext(NULL, NULL);
-  fexmac_thread* Thread = CreateThreadAt(Context, (uint64_t)(uintptr_t)Code, 0);
-  fexmac_x86_state State = GetState(Thread);
-  State.gpr[RDI] = (uint64_t)(uintptr_t)Data + 64 + 14;
-  SetState(Thread, &State);
-  Shared[0] = 1;
-  fexmac_thread_run(Thread, NULL);
-  printf("  FAIL: survived a misaligned atomic on an inaccessible page\n");
-  exit(1);
+  RunGuestAccess(LockXadd, sizeof(LockXadd), PROT_NONE, "0", 64 + 14, FEXMAC_ACCESS_WRITE);
 }
 
 static void TestGuestStoreReadOnly(void) {
   fexmac_install_fault_handlers();
-  RunGuestAccess(Store, sizeof(Store), PROT_READ, "0");
+  RunGuestAccess(Store, sizeof(Store), PROT_READ, "0", 64, FEXMAC_ACCESS_WRITE);
 }
 
-/* With the host owning the signals, fexmac_handle_fault refuses a guest access fault and
- * the host sees it with the guest's address. */
+/* With the host owning the signals, fexmac_handle_fault claims the guest's fault (the run
+ * stops) and the host handler never sees it; a fault of the host's own still reaches it. */
+static volatile int HostSawFault;
+static sigjmp_buf HostFaultJump;
 static void GuestFaultHostHandler(int Signal, siginfo_t* Info, void* Context) {
   if (fexmac_handle_fault(Signal, Info, Context)) {
     return;
   }
-  const uint32_t Low = (uint32_t)((uintptr_t)Info->si_addr & 0xFFFFFFFF);
-  Shared[0] = Shared[0] == 1 && Low == Shared[1] ? 2 : 3;
-  _exit(0);
+  HostSawFault = 1;
+  siglongjmp(HostFaultJump, 1);
 }
 
 static void TestGuestFaultHosted(void) {
   InstallHostHandler(GuestFaultHostHandler, SA_NODEFER);
-  RunGuestAccess(LockXadd, sizeof(LockXadd), PROT_NONE, "1");
+  RunGuestAccess(LockXadd, sizeof(LockXadd), PROT_NONE, "1", 64, FEXMAC_ACCESS_WRITE);
+  Check(!HostSawFault, "the host handler did not see the guest's fault");
+  volatile uint8_t* Page = mmap(NULL, (size_t)PageSize, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (!sigsetjmp(HostFaultJump, 1)) {
+    (void)Page[0];
+  }
+  Check(HostSawFault, "a fault in host code still reaches the host handler");
+  Shared[0] = HostSawFault ? 3 : 4;
 }
 
 /* ---- callbacks: what a system call callback may and may not do ---- */
@@ -1272,7 +1306,6 @@ static void TestLifetimeRaces(void) {
 
 /* ---- driver ---- */
 
-#define GUEST_FAULT_TEXT "guest memory access fault in translated code at address 0x"
 
 static const struct Subtest Subtests[] = {
   {"run", TestRun, 0, NULL, NULL, 0},
@@ -1288,12 +1321,12 @@ static const struct Subtest Subtests[] = {
   {"callret-deep-recursion", TestCallRetDeepRecursion, 0, NULL, NULL, 0},
   {"callret-overflow", TestCallRetOverflow, 0, NULL, NULL, 0},
   {"callret-underflow", TestCallRetUnderflow, 0, NULL, NULL, 0},
-  {"guest-load-prot-none-dies", TestGuestLoadProtNone, SIGBUS, GUEST_FAULT_TEXT, "fault inside", 1},
-  {"guest-lock-xadd-prot-none-dies", TestGuestLockXaddProtNone, SIGBUS, GUEST_FAULT_TEXT, "fault inside", 1},
-  {"guest-lock-cmpxchg-prot-none-dies", TestGuestLockCmpxchgProtNone, SIGBUS, GUEST_FAULT_TEXT, "fault inside", 1},
-  {"guest-store-read-only-dies", TestGuestStoreReadOnly, SIGBUS, GUEST_FAULT_TEXT, "fault inside", 1},
-  {"guest-misaligned-atomic-prot-none-dies", TestGuestMisalignedProtNone, SIGBUS, "misaligned atomic on an inaccessible page", "fault inside", 1},
-  {"guest-fault-hosted", TestGuestFaultHosted, 0, NULL, "fexmac:", 2},
+  {"guest-load-prot-none", TestGuestLoadProtNone, 0, NULL, "fexmac:", 2},
+  {"guest-lock-xadd-prot-none", TestGuestLockXaddProtNone, 0, NULL, "fexmac:", 2},
+  {"guest-lock-cmpxchg-prot-none", TestGuestLockCmpxchgProtNone, 0, NULL, "fexmac:", 2},
+  {"guest-store-read-only", TestGuestStoreReadOnly, 0, NULL, "fexmac:", 2},
+  {"guest-misaligned-atomic-prot-none", TestGuestMisalignedProtNone, 0, NULL, "fexmac:", 2},
+  {"guest-fault-hosted", TestGuestFaultHosted, 0, NULL, "fexmac:", 3},
   {"callbacks", TestCallbacks, 0, NULL, NULL, 0},
   {"errors", TestErrors, 0, NULL, NULL, 0},
   {"chained-mask", TestChainedMask, 0, NULL, NULL, 0},
@@ -1311,6 +1344,14 @@ static const struct Subtest Subtests[] = {
   {"lifetime-races", TestLifetimeRaces, 0, NULL, NULL, 0},
 };
 
+/* FaultHandlingTest.c */
+extern const struct Subtest FaultSubtests[];
+extern const size_t FaultSubtestCount;
+
 int main(int argc, char** argv) {
-  return RunSubtests(argc, argv, Subtests, sizeof(Subtests) / sizeof(Subtests[0]), 120);
+  enum { Own = sizeof(Subtests) / sizeof(Subtests[0]) };
+  struct Subtest* All = malloc(sizeof(struct Subtest) * (Own + FaultSubtestCount));
+  memcpy(All, Subtests, sizeof(Subtests));
+  memcpy(All + Own, FaultSubtests, sizeof(struct Subtest) * FaultSubtestCount);
+  return RunSubtests(argc, argv, All, Own + FaultSubtestCount, 120);
 }

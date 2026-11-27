@@ -15,11 +15,15 @@
 #                           (ESR class <c>, fault status <s>)" for every fault the fexmac
 #                           library does not claim, and results.tsv keeps that line.
 #                           fault= is required.
-#   guest-fault | unsupported-instruction  signal=<n> trap=<n> si_code=<n> at=<rip>
+#   guest-fault | unsupported-instruction  signal=<n> trap=<n> si_code=<n> at=<rip> [fault=<a>]
 #                           the run stops with that fexmac stop reason: a guest exception
-#                           (FEXMAC_STOP_GUEST_FAULT), or code the translator cannot
-#                           translate (FEXMAC_STOP_UNSUPPORTED_INSTRUCTION). Runner line
-#                           "Stopped:".
+#                           (FEXMAC_STOP_GUEST_FAULT; trap 14 is a page fault in translated
+#                           code at fault address <a>, si_code 1 SEGV_MAPERR: nothing
+#                           mapped there), or code the translator cannot translate
+#                           (FEXMAC_STOP_UNSUPPORTED_INSTRUCTION). Runner line "Stopped:".
+#                           Before guest fault delivery (package D) the page faults below
+#                           were crashes at the same addresses, data aborts in translated
+#                           code.
 #
 # Every entry was checked on an M4 by running it in all four modes; each faulting address
 # is the moved address cut to 32 bits, exactly as stated. None is a translator fault.
@@ -27,16 +31,16 @@
 # A 32-bit address-size override (0x67) cuts the address to 32 bits; the result is below
 # 4GB and cannot be mapped. a32_lods and a32_rep_lods: RSI 0x1_0008_0000 cut to 0x80000,
 # as the test intends. A6_addrmod and A6_REP_addrmod: RDI 0x61626364_10000200 cut to
-# EDI. AE_addrmod: EDI 0x10000100. All data aborts in translated code (ESR class 0x24).
-Test_FEX_bugs/a32_lods.asm               crash fault=0x80000 signal=SIGSEGV where=translated
-Test_FEX_bugs/a32_rep_lods.asm           crash fault=0x80000 signal=SIGSEGV where=translated
-Test_Primary/Primary_A6_REP_addrmod.asm  crash fault=0x10000200 signal=SIGSEGV where=translated
-Test_Primary/Primary_A6_addrmod.asm      crash fault=0x10000200 signal=SIGSEGV where=translated
-Test_Primary/Primary_AE_addrmod.asm      crash fault=0x10000100 signal=SIGSEGV where=translated
+# EDI. AE_addrmod: EDI 0x10000100. All page faults in translated code, delivered as stops.
+Test_FEX_bugs/a32_lods.asm               guest-fault signal=11 trap=14 si_code=1 at=0x1000001003e fault=0x80000
+Test_FEX_bugs/a32_rep_lods.asm           guest-fault signal=11 trap=14 si_code=1 at=0x1000001005a fault=0x80000
+Test_Primary/Primary_A6_REP_addrmod.asm  guest-fault signal=11 trap=14 si_code=1 at=0x10000010039 fault=0x10000200
+Test_Primary/Primary_A6_addrmod.asm      guest-fault signal=11 trap=14 si_code=1 at=0x1000001002e fault=0x10000200
+Test_Primary/Primary_AE_addrmod.asm      guest-fault signal=11 trap=14 si_code=1 at=0x10000010019 fault=0x10000100
 
 # The same, in the middle of a test of vector moves: `vmovd xmm2, [edx]` with RDX
 # 0x100_e000_0000.
-Test_VEX/vmovq_vmovd_reg.asm             crash fault=0xe0000000 signal=SIGSEGV where=translated
+Test_VEX/vmovq_vmovd_reg.asm             guest-fault signal=11 trap=14 si_code=1 at=0x10000010056 fault=0xe0000000
 
 # Far jumps and calls through an m16:32 pointer: the test stores `lea edi, [rel .success]`,
 # the code address cut to 32 bits, as the target. The translator reads a 32-bit offset
@@ -49,8 +53,8 @@ Test_VEX/vmovq_vmovd_reg.asm             crash fault=0xe0000000 signal=SIGSEGV w
 # behaviour (Intel reads m16:64). The intended guest, a console with an AMD CPU, expects
 # AMD's.
 Test_PrimaryGroup/5_FF_05.asm            crash fault=0x10028 signal=SIGSEGV where=host
-Test_PrimaryGroup/5_FF_05_03_o32.asm     crash fault=0xe0000ff0 signal=SIGSEGV where=translated
-Test_PrimaryGroup/5_FF_05_03_o32_imm.asm crash fault=0xe0000ff0 signal=SIGSEGV where=translated
+Test_PrimaryGroup/5_FF_05_03_o32.asm     guest-fault signal=11 trap=14 si_code=1 at=0x10000010023 fault=0xe0000ff0
+Test_PrimaryGroup/5_FF_05_03_o32_imm.asm guest-fault signal=11 trap=14 si_code=1 at=0x10000010023 fault=0xe0000ff0
 Test_PrimaryGroup/5_FF_05_03_o64.asm     crash fault=0x10028 signal=SIGSEGV where=host
 Test_PrimaryGroup/5_FF_05_03_o64_imm.asm crash fault=0x10028 signal=SIGSEGV where=host
 

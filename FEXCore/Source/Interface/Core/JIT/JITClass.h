@@ -638,6 +638,8 @@ private:
                   ARMEmitter::Register Divisor);
 
   void EmitSuspendInterruptCheck();
+  template<ARMEmitter::IsLabel T>
+  void EmitCondJumpBranch(const IR::IROp_CondJump* Op, T* TrueTargetLabel);
 
   void EmitEntryPoint(ARMEmitter::BackwardLabel& HeaderLabel, bool CheckTF);
 

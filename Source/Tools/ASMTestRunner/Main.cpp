@@ -146,6 +146,20 @@ public:
     return reinterpret_cast<void*>(Address);
   }
 
+  // Tells fexmac about every page mapped for the test (readable, writable and executable,
+  // as the tests use them), so that it tracks guest memory: SMCCHECKS mtrack then
+  // write-protects translated code. Only with FEXMAC_RUNNER_REGISTER_MEMORY=1: registered
+  // memory also turns a jump to an unmapped address into a guest fault stop instead of a
+  // crash, which would change the outcome some expected failures are matched by.
+  bool Register(fexmac_context* Context) const {
+    for (uint64_t Page : Mapped) {
+      if (fexmac_memory_map(Context, Page, PageSize, FEXMAC_PROT_READ | FEXMAC_PROT_WRITE | FEXMAC_PROT_EXEC) != FEXMAC_OK) {
+        return false;
+      }
+    }
+    return true;
+  }
+
   bool Failed {};
 
 private:
@@ -202,6 +216,12 @@ fexmac_syscall_action SyscallHandler(fexmac_thread* Thread, void*) {
   if (RAX == LinuxSysTime) {
     // time(time_t* tloc): seconds since the epoch, also stored through tloc if non-null.
     const uint64_t Now = static_cast<uint64_t>(::time(nullptr));
+    // The page may hold translated code that fexmac write-protects (SMCCHECKS mtrack with
+    // registered memory); a host write to guest memory goes between write_begin and _end.
+    auto* Context = fexmac_thread_context(Thread);
+    if (RDI) {
+      fexmac_memory_write_begin(Context, RDI, sizeof(uint64_t));
+    }
     if (RDI && !IsWritable(RDI, sizeof(uint64_t))) {
       RAX = -LinuxEFAULT;
     } else {
@@ -209,6 +229,9 @@ fexmac_syscall_action SyscallHandler(fexmac_thread* Thread, void*) {
         memcpy(reinterpret_cast<void*>(RDI), &Now, sizeof(Now));
       }
       RAX = Now;
+    }
+    if (RDI) {
+      fexmac_memory_write_end(Context, RDI, sizeof(uint64_t));
     }
   } else {
     RAX = -LinuxENOSYS;
@@ -455,6 +478,10 @@ int main(int argc, char** argv, char** const envp) {
   };
   if (!Loader.MapMemory(DoMmap) || Mapper.Failed) {
     fextl::fmt::print("Failed to map the test's memory\n");
+    return ExitFail;
+  }
+  if (const char* Register = getenv("FEXMAC_RUNNER_REGISTER_MEMORY"); Register && strcmp(Register, "1") == 0 && !Mapper.Register(Context)) {
+    fextl::fmt::print("Failed to register the test's memory with fexmac\n");
     return ExitFail;
   }
 

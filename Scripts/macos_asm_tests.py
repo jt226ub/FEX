@@ -211,9 +211,9 @@ def read_outcomes(path):
     `crash fault=<address> signal=SIGSEGV|SIGBUS where=host|translated`: the process dies
     of a host fault at that address, as the runner reports it, with the pc in host code
     or in translated code. `fault=` is required: a bare `crash` would match any crash.
-    `guest-fault` or `unsupported-instruction`, with `signal=<n> trap=<n> si_code=<n> at=<rip>`: the
-    run stops with that fexmac stop reason (a guest exception, or code the translator
-    cannot translate) and the given details.
+    `guest-fault` or `unsupported-instruction`, with `signal=<n> trap=<n> si_code=<n> at=<rip>`
+    and optionally `fault=<address>`: the run stops with that fexmac stop reason (a guest
+    exception, a page fault, or code the translator cannot translate) and the given details.
     """
     outcomes = {}
     if os.path.exists(path):
@@ -249,6 +249,7 @@ def observed_outcome(status, detail):
             seen["kind"] = STOP_KINDS.get(match.group(1), "stop-reason-" + match.group(1))
             seen["signal"], seen["trap"], seen["si_code"] = match.group(2), match.group(3), match.group(4)
             seen["at"] = hex(int(match.group(5), 16))
+            seen["fault"] = hex(int(match.group(6), 16))
     return seen
 
 
@@ -305,12 +306,17 @@ def prepare(root, asm_dir, source, out_dir):
     return binary, config
 
 
-def run_one(runner, name, mode, binary, config, timeout):
+def run_one(runner, name, mode, binary, config, timeout, smc="full"):
     env = dict(os.environ)
     env.update(COMMON_ENV)
     env.update(MODES[mode])
     if "SelfModifyingCode" in name:
-        env["FEX_SMCCHECKS"] = "full"
+        # full: the translator checks the code before every instruction. mtrack: the
+        # runner registers the test's memory with fexmac, which write-protects pages it
+        # has translated code from and discards that code when the guest writes them.
+        env["FEX_SMCCHECKS"] = smc
+        if smc == "mtrack":
+            env["FEXMAC_RUNNER_REGISTER_MEMORY"] = "1"
     try:
         result = subprocess.run([runner, binary, config], capture_output=True, text=True, errors="replace", env=env, timeout=timeout)
     except subprocess.TimeoutExpired:
@@ -338,6 +344,9 @@ def main():
     parser.add_argument("--timeout", type=int, default=60)
     parser.add_argument("--modes", default=",".join(MODES))
     parser.add_argument("--filter", default="", help="only run tests whose name contains this text")
+    parser.add_argument("--smc", choices=["full", "mtrack"], default="full",
+                        help="how the SelfModifyingCode tests detect changed code: checks in every block (full) "
+                             "or write protection of translated pages (mtrack)")
     args = parser.parse_args()
 
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -401,7 +410,7 @@ def main():
         futures = {}
         for mode in modes:
             for name, binary, config in tests:
-                futures[pool.submit(run_one, runner, name, mode, binary, config, args.timeout)] = (mode, name)
+                futures[pool.submit(run_one, runner, name, mode, binary, config, args.timeout, args.smc)] = (mode, name)
         for future in concurrent.futures.as_completed(futures):
             results[futures[future]] = future.result()
 
