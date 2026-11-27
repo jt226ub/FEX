@@ -363,9 +363,10 @@ Evidence, Mac mini M4, macOS 27.0.1, 27 November 2026, other workers using about
 
 - **Criterion 7.** All 18 checksums equal Rosetta 2's and native arm64's (x87: Rosetta's;
   `long double` is 64-bit on arm64), bit-exact including floating point, in quick and
-  full sizes, as built and hardened, with `MAXINST=500 MULTIBLOCK=1` and TSO on, scalar
-  TSO only, multiblock off, `MAXINST=1`, `MAXINST=5000` with half-barriers off,
-  `SMCCHECKS=full` and `HOSTFEATURES=disableatomics`. Two differences are expected and
+  full sizes with `MAXINST=500 MULTIBLOCK=1` and TSO on, scalar TSO only and multiblock
+  off; in quick size also as hardened (TSO on, off, multiblock off) and with `MAXINST=1`,
+  `MAXINST=5000` with half-barriers off, `SMCCHECKS=full` and
+  `HOSTFEATURES=disableatomics`. Two differences are expected and
   seen: with TSO off the message-passing kernel reads stale data (wrong and varying
   checksum), and with `X87REDUCEDPRECISION=1` the x87 checksum changes. No translator
   bug was found.
