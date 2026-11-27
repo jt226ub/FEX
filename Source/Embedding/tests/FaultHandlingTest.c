@@ -1627,6 +1627,31 @@ static void TestSMCAliasNeedsInvalidate(void) {
   close(Fd);
 }
 
+/* The self-modifying-code defaults (no SMCCHECKS option): with no memory registered the
+ * patch in SelfPatch's block is not seen (eax -1: the stale instruction ran), as before
+ * guest memory registration existed; with the code registered it is (eax 32), by the
+ * per-instruction check, not by write protection (no code write handled). */
+static void TestSMCDefaultPolicy(void) {
+  fexmac_install_fault_handlers();
+  for (int Registered = 0; Registered < 2; ++Registered) {
+    fexmac_context* Context = CreateContext(NULL, NULL);
+    uint8_t* Code = MapCode(Context, SelfPatch, sizeof(SelfPatch), Registered);
+    fexmac_thread* Thread = CreateThreadAt(Context, Addr(Code), 0);
+    const fexmac_stop Stop = Run(Thread);
+    const fexmac_x86_state State = GetState(Thread);
+    if (Registered) {
+      Check(Stop.reason == FEXMAC_STOP_HALT && State.gpr[RAX] == 32 && fexmac_memory_code_write_count(Context) == 0,
+            "registered memory, default: the write is seen by the full check (eax 0x%" PRIx64 ", %" PRIu64 " code writes)", State.gpr[RAX],
+            fexmac_memory_code_write_count(Context));
+    } else {
+      Check(Stop.reason == FEXMAC_STOP_HALT && (State.gpr[RAX] & 0xFFFFFFFF) == 0xFFFFFFFF,
+            "nothing registered, default: nothing detected, as before (eax 0x%" PRIx64 ")", State.gpr[RAX]);
+    }
+    fexmac_thread_destroy(Thread);
+    fexmac_context_destroy(Context);
+  }
+}
+
 const struct Subtest FaultSubtests[] = {
   {"fault-mid-block", TestFaultMidBlock, 0, NULL, "fexmac:", 0},
   {"fault-flags", TestFaultFlags, 0, NULL, "fexmac:", 0},
@@ -1652,6 +1677,7 @@ const struct Subtest FaultSubtests[] = {
   {"stop-resync-storm", TestStopResyncStorm, 0, NULL, "fexmac:", 0},
   {"split-lock-unmap-race", TestSplitLockUnmapRace, 0, NULL, "fexmac:", 0},
   {"stop-after-destroy", TestStopAfterDestroy, 0, NULL, "fexmac:", 0},
+  {"smc-default-policy", TestSMCDefaultPolicy, 0, NULL, "fexmac:", 0},
   {"smc-alias-needs-invalidate", TestSMCAliasNeedsInvalidate, 0, NULL, "fexmac:", 0},
   {"smc-embedder-write", TestSMCEmbedderWrite, 0, NULL, "fexmac:", 2},
   {"smc-embedder-write-unbracketed-dies", TestSMCEmbedderWriteUnbracketed, SIGBUS, "fexmac_memory_write_begin", NULL, 1},

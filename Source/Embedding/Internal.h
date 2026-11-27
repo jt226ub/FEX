@@ -191,8 +191,12 @@ struct fexmac_context {
   // Destroyed threads' handles, freed with the context (see fexmac_thread::Dead).
   // Guarded by ThreadsMutex.
   fextl::vector<fexmac_thread*> DeadThreads;
-  // SMCCHECKS is mtrack: translated pages are write-protected once memory is registered.
+  // SMCCHECKS mtrack given explicitly: translated pages are write-protected once memory is
+  // registered.
   bool WriteProtectCode {};
+  // SMCCHECKS given at all. If not, registered memory gets full checks (see
+  // fexmac_context_create).
+  bool SMCExplicit {};
 
   // Whether the embedder asked for the code cache.
   bool CacheRequested {};

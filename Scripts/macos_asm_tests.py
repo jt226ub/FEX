@@ -38,7 +38,10 @@ MODES = {
     "jit_500_tso": {"FEX_MAXINST": "500", "FEX_MULTIBLOCK": "1", "FEX_TSOENABLED": "1", "FEX_VECTORTSOENABLED": "1",
                     "FEX_MEMCPYSETTSOENABLED": "1"},
 }
-COMMON_ENV = {"FEX_SILENTLOG": "0", "FEX_DUMPGPRS": "1", "FEX_TSOENABLED": "0"}
+# The self-modifying-code mode is stated: none for every test but the SelfModifyingCode
+# ones (full, or mtrack with --smc), so results do not follow fexmac's default (which
+# gives registered memory, as the runner's is, full checks).
+COMMON_ENV = {"FEX_SILENTLOG": "0", "FEX_DUMPGPRS": "1", "FEX_TSOENABLED": "0", "FEX_SMCCHECKS": "none"}
 if sys.platform == "darwin":
     # No Apple chip so far implements FEAT_RNG (the M4 has no hw.optional.arm.FEAT_RNG and
     # `mrs RNDR` raises SIGILL), so RDRAND and RDSEED exist for a guest on a Mac only

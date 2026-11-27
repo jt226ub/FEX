@@ -114,6 +114,7 @@ int32_t Decoder::CheckRangeExecutable(uint64_t Address, uint64_t Size) {
     ExecutableRangeBase = RangeInfo.Base;
     ExecutableRangeEnd = RangeInfo.Base + RangeInfo.Size;
     ExecutableRangeWritable = RangeInfo.Writable;
+    ExecutableRangeFullSMCChecks = RangeInfo.FullSMCChecks;
 
     if (RangeInfo.Size == 0) {
       // Return the number of bytes that couldn't be decoded.
@@ -1698,6 +1699,12 @@ void Decoder::DecodeLoop(const uint8_t* _InstStream, uint64_t GuestSizePause) {
 
       LastFieldReadSize = 0;
       BlockIt->BlockStatus = DecodeInstruction(OpAddress);
+#ifdef __APPLE__
+      if (ExecutableRangeFullSMCChecks) {
+        // The embedding library asks for full self-modifying-code checks in this range.
+        BlockIt->ForceFullSMCDetection = true;
+      }
+#endif
       if (HitBadRelocation) {
         BlockInfo.TotalInstructionCount = 0;
         BlockInfo.Blocks = {*BlockIt};

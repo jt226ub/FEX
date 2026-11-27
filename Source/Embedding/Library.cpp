@@ -552,12 +552,6 @@ fexmac_result fexmac_context_create(const fexmac_config* config, fexmac_context*
     // emulation; why that is safe is in docs/macOS-embedding-interface.md (fault handler
     // locks).
     {FEXCore::Config::CONFIG_STRICTINPROCESSSPLITLOCKS, "1"},
-    // Self-modifying code is detected by a check of the guest bytes in every block unless
-    // the embedder asks for SMCCHECKS mtrack (write protection of translated pages, which
-    // has known gaps: see fexmac.h, "Guest memory") or none. The core's own default,
-    // mtrack, would detect nothing without registered memory, and with it would switch
-    // write protection on without the embedder choosing it.
-    {FEXCore::Config::CONFIG_SMCCHECKS, "2"},
   };
   if (const auto Result = ParseOptions(*config, &Parsed); Result != FEXMAC_OK) {
     return Fail(Result, false);
@@ -588,7 +582,19 @@ fexmac_result fexmac_context_create(const fexmac_config* config, fexmac_context*
     delete Context;
     return Fail(FEXMAC_ERROR_OUT_OF_MEMORY, true);
   }
-  Context->WriteProtectCode = FEXCore::Config::Get_SMCCHECKS() == FEXCore::Config::CONFIG_SMC_MTRACK;
+  // Self-modifying-code policy. Only an explicit SMCCHECKS mtrack switches on write
+  // protection of translated pages. Without the option the core keeps its own default
+  // (mtrack), which with no memory registered detects nothing, as on macos/v1 before
+  // package D (the embedder calls fexmac_invalidate); once memory is registered, code
+  // translated from it gets the full per-instruction check (QueryGuestExecutableRange).
+  Context->SMCExplicit = false;
+  for (size_t i = 0; i < config->option_count; ++i) {
+    const char* Name = config->options[i].name;
+    if (Name && (strcmp(Name, "SMCCHECKS") == 0 || strcmp(Name, "SMCChecks") == 0)) {
+      Context->SMCExplicit = true;
+    }
+  }
+  Context->WriteProtectCode = Context->SMCExplicit && FEXCore::Config::Get_SMCCHECKS() == FEXCore::Config::CONFIG_SMC_MTRACK;
   Context->SyscallFn = config->syscall;
   Context->SyscallUserData = config->syscall_user_data;
   Context->CacheRequested = config->code_cache_enabled != 0;

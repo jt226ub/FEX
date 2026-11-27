@@ -504,9 +504,9 @@ def main():
         ("TSO on, memcpy TSO on", {"FEX_TSOENABLED": "1", "FEX_MEMCPYSETTSOENABLED": "1"}),
         ("max instructions 1", {"FEX_MAXINST": "1"}),
         ("multiblock on", {"FEX_MULTIBLOCK": "1"}),
-        # fexmac's default is SMCCHECKS full (package D), so the other modes are the mismatch.
+        # FEXCoreCacheTest states SMCCHECKS none unless told otherwise.
+        ("full self-modifying-code checks", {"FEX_SMCCHECKS": "full"}),
         ("self-modifying-code detection by write protection", {"FEX_SMCCHECKS": "mtrack"}),
-        ("no self-modifying-code detection", {"FEX_SMCCHECKS": "none"}),
         ("x87 reduced precision", {"FEX_X87REDUCEDPRECISION": "1"}),
     ]:
         # Within one run the core may load blocks it stored itself moments earlier, so
@@ -711,8 +711,8 @@ def main():
     # generation starts, the previous one is still read, and older ones are deleted.
     target = os.path.join(work, "generations")
     gen_cmd = [cache_test, "--threads", "1", "--blocks", "120", "--distinct", "--base", "0x8000000000"]
-    # Sized for code without per-instruction self-modifying-code checks (fexmac's default
-    # became SMCCHECKS full with package D, which makes every entry larger).
+    # Sized for code without per-instruction self-modifying-code checks (stated, as
+    # FEXCoreCacheTest's own default).
     gen_env = {"FEX_DISKCACHEMAXFILESIZE": "16384", "FEX_SMCCHECKS": "none"}
     first = run(gen_cmd, target, gen_env)
     names = sorted(f for folder, _, files in os.walk(target) for f in files if f.endswith("_idx.foz"))

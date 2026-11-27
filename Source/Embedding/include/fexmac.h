@@ -450,16 +450,18 @@ FEXMAC_EXPORT fexmac_result fexmac_thread_request_stop(fexmac_thread* thread);
  *  - Instruction fetch: the translator only reads code from pages registered as
  *    executable. A jump to anything else stops with a page fault (access EXECUTE) at
  *    that address, instead of the translator crashing on unmapped memory.
- *  - Self-modifying code, only if the embedder opts in with the option SMCCHECKS mtrack:
- *    when code on a writable page is translated, the library removes host write access
- *    from that page; a guest write to it then faults, the library discards the
- *    translations of that host page for every thread, gives write access back and lets
- *    the write happen. THE DEFAULT IS SMCCHECKS full: the translator checks the guest
- *    bytes of each instruction before running it, which is slower but has no known gap.
- *    mtrack is opt-in because guest state can be wrong when a write to translated code
- *    is re-run (see "Guest memory faults": the same restart limits apply) and writes
- *    through aliased mappings are not seen. none detects nothing (the embedder calls
- *    fexmac_invalidate).
+ *  - Self-modifying code. DEFAULTS (no SMCCHECKS option given): with no memory
+ *    registered, nothing is detected and the embedder calls fexmac_invalidate after
+ *    changing code (the behaviour before guest memory registration existed); with memory
+ *    registered, code translated from registered memory checks its guest bytes before
+ *    every instruction (as SMCCHECKS full), which is correct but slower. SMCCHECKS full:
+ *    that check everywhere. SMCCHECKS none: no detection anywhere. SMCCHECKS mtrack
+ *    (opt-in): write protection of translated pages of registered memory: when code on
+ *    a writable page is translated, the library removes host write access from that page;
+ *    a guest write to it faults, the library discards the translations of that host page
+ *    for every thread, gives write access back and lets the write happen. Writes through
+ *    another mapping of the same memory are not seen (the embedder that made the alias
+ *    calls fexmac_invalidate for it).
  *
  * Until the first fexmac_memory_map the library knows nothing about guest memory and
  * behaves as before: every address is executable, nothing is write-protected, and an
@@ -487,7 +489,7 @@ FEXMAC_EXPORT fexmac_result fexmac_thread_request_stop(fexmac_thread* thread);
  * fexmac_memory_write_begin and fexmac_memory_write_end, from any host thread: between
  * them the host pages in the range are writable and are not write-protected again, and
  * _end discards translations made from the range meanwhile. Without memory tracking or
- * with SMCCHECKS other than mtrack (the default) both return at once.
+ * with SMCCHECKS other than mtrack both return at once.
  * --------------------------------------------------------------------------------- */
 
 #define FEXMAC_PROT_NONE 0u

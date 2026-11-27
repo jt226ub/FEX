@@ -403,7 +403,10 @@ FEXCore::HLE::ExecutableRangeInfo SyscallHandler::QueryGuestExecutableRange(FEXC
   while (End - Page < Reach && Same(End)) {
     End += GuestMemory::GuestPage;
   }
-  return {Begin, End - Begin, Writable};
+  FEXCore::HLE::ExecutableRangeInfo Info {Begin, End - Begin, Writable};
+  // Default policy for registered memory: full checks (see fexmac_context_create).
+  Info.FullSMCChecks = !Context->SMCExplicit;
+  return Info;
 }
 
 void SyscallHandler::MarkGuestExecutableRange(FEXCore::Core::InternalThreadState*, uint64_t Start, uint64_t Length) {

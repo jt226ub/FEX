@@ -459,9 +459,25 @@ int main(int argc, char** argv) {
     Names.push_back(T.substr(0, Eq));
     Values.push_back(T.substr(Eq + 1));
   }
+  // The self-modifying-code mode is stated, not left to fexmac's default (which differs
+  // with and without registered memory), so measured figures do not change with it:
+  // none, as the benchmark never writes its code and as macos/v1 measured it.
+  bool HaveSMC = false;
+  for (const auto& Name : Names) {
+    HaveSMC |= Name == "SMCCHECKS" || Name == "SMCChecks";
+  }
+  if (!HaveSMC) {
+    Names.push_back("SMCCHECKS");
+    Values.push_back("none");
+  }
   std::vector<fexmac_option> Options;
   for (size_t i = 0; i < Names.size(); ++i) {
     Options.push_back({Names[i].c_str(), Values[i].c_str()});
+  }
+  for (size_t i = 0; i < Names.size(); ++i) {
+    if (Names[i] == "SMCCHECKS" || Names[i] == "SMCChecks") {
+      fprintf(stderr, "FEXCoreBench: SMCCHECKS %s\n", Values[i].c_str());
+    }
   }
 
   const Image Img = LoadImage(ImagePath);

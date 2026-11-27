@@ -34,6 +34,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <algorithm>
 #include <cstring>
 #include <dirent.h>
 #include <execinfo.h>
@@ -413,6 +414,12 @@ int main(int argc, char** argv) {
       Names.push_back(Name);
       Values.emplace_back(Entry.substr(Equals + 1));
     }
+  }
+  // The self-modifying-code mode is stated (FEX_SMCCHECKS, default none), not left to
+  // fexmac's default, because it is part of the cache key.
+  if (std::find(Names.begin(), Names.end(), "SMCCHECKS") == Names.end()) {
+    Names.push_back("SMCCHECKS");
+    Values.push_back("none");
   }
   std::vector<fexmac_option> Options;
   for (size_t i = 0; i < Names.size(); ++i) {
