@@ -135,12 +135,18 @@ namespace {
       return std::nullopt;
     case Rule::HostFeatures: {
       // A comma-separated list of the core's names; every name must be known (the core's
-      // own parser skips unknown ones with a message).
+      // own parser skips unknown ones with a message). Only "off" and the disable* names:
+      // an enable* name forces a feature on whether or not the host has it, and translated
+      // code then executes instructions the CPU lacks (enablesve dies with SIGILL on an
+      // M4).
       uint64_t Mask = 0;
       std::string_view Rest = Value;
       while (true) {
         const auto Comma = Rest.find(',');
         const std::string_view Name = Rest.substr(0, Comma);
+        if (Name != "off" && !Name.starts_with("disable")) {
+          return std::nullopt;
+        }
         bool Found = false;
         for (const auto& [EnumName, Bits] : FEXCore::Config::HostFeatures_EnumPairs) {
           if (EnumName == Name) {

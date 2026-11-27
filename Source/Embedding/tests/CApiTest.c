@@ -14,6 +14,7 @@
 
 #include <inttypes.h>
 #include <pthread.h>
+#include <setjmp.h>
 #include <signal.h>
 #include <stdatomic.h>
 #include <stdio.h>
@@ -246,6 +247,8 @@ static void TestState(void) {
 
 /* ---- abi: struct_size rules for caller-allocated structures ---- */
 
+/* Nothing past a structure the library does not know the size of is ever written: an
+ * uninitialised or garbage struct_size is refused with the memory untouched. */
 static void TestABI(void) {
   uint8_t* Code = MapGuestMemory(0x10000);
   const uint8_t Program[] = {0xB8, 0x2A, 0, 0, 0, 0xF4};
@@ -253,52 +256,44 @@ static void TestABI(void) {
   fexmac_context* Context = CreateContext(NULL, NULL);
   fexmac_thread* Thread = CreateThreadAt(Context, (uint64_t)(uintptr_t)Code, 0);
 
-  fexmac_x86_state State;
-  memset(&State, 0, sizeof(State));
-  CheckResult(fexmac_thread_get_state(Thread, &State), FEXMAC_ERROR_INVALID_ARGUMENT, "get state with struct_size 0");
-  State.struct_size = sizeof(State) - 8;
-  CheckResult(fexmac_thread_get_state(Thread, &State), FEXMAC_ERROR_INVALID_ARGUMENT, "get state with a size smaller than version 1");
-
-  /* A newer header's larger structure. */
   struct {
     fexmac_x86_state State;
-    uint64_t Newer[4];
-  } Bigger;
-  memset(&Bigger, 0xAB, sizeof(Bigger));
-  Bigger.State.struct_size = sizeof(Bigger);
-  CheckResult(fexmac_thread_get_state(Thread, &Bigger.State), FEXMAC_OK, "get state into a larger structure");
-  Check(Bigger.Newer[0] == 0 && Bigger.Newer[3] == 0 && Bigger.State.struct_size == sizeof(Bigger), "unknown output fields are zeroed");
-  CheckResult(fexmac_thread_set_state(Thread, &Bigger.State), FEXMAC_OK, "set state from a larger structure with unknown fields zero");
-  Bigger.Newer[2] = 1;
-  CheckResult(fexmac_thread_set_state(Thread, &Bigger.State), FEXMAC_ERROR_UNSUPPORTED, "set state with an unknown field set");
+    uint64_t After[64];
+  } Frame;
+  const uint32_t Sizes[] = {0, sizeof(fexmac_x86_state) - 8, sizeof(fexmac_x86_state) + 8, sizeof(fexmac_x86_state) + 256, 0xAAAAAAAA};
+  int Untouched = 1, Refused = 1;
+  for (size_t i = 0; i < sizeof(Sizes) / sizeof(Sizes[0]); ++i) {
+    memset(&Frame, 0xAA, sizeof(Frame));
+    Frame.State.struct_size = Sizes[i];
+    Refused &= fexmac_thread_get_state(Thread, &Frame.State) == FEXMAC_ERROR_INVALID_ARGUMENT;
+    Refused &= fexmac_thread_set_state(Thread, &Frame.State) == FEXMAC_ERROR_INVALID_ARGUMENT;
+    const uint8_t* Bytes = (const uint8_t*)&Frame;
+    for (size_t b = sizeof(uint32_t); b < sizeof(Frame); ++b) {
+      Untouched &= Bytes[b] == 0xAA;
+    }
+  }
+  Check(Refused, "get and set state refuse every struct_size but the known one (0, smaller, larger, garbage)");
+  Check(Untouched, "and write nothing, inside the structure or past it");
 
   fexmac_stop Stop;
-  memset(&Stop, 0, sizeof(Stop));
-  CheckResult(fexmac_thread_run(Thread, &Stop), FEXMAC_ERROR_INVALID_ARGUMENT, "run with a stop record of size 0");
+  memset(&Stop, 0xAA, sizeof(Stop));
+  CheckResult(fexmac_thread_run(Thread, &Stop), FEXMAC_ERROR_INVALID_ARGUMENT, "run with an uninitialised stop record");
   CheckResult(fexmac_thread_run(Thread, NULL), FEXMAC_OK, "run with no stop record");
 
   fexmac_config Config;
-  fexmac_config_init(&Config);
   fexmac_context* Other = NULL;
+  memset(&Config, 0xAA, sizeof(Config));
+  CheckResult(fexmac_context_create(&Config, &Other), FEXMAC_ERROR_INVALID_ARGUMENT, "uninitialised config");
+  fexmac_config_init(&Config);
+  Config.struct_size += 8;
+  CheckResult(fexmac_context_create(&Config, &Other), FEXMAC_ERROR_INVALID_ARGUMENT, "config of an unknown (larger) size");
+  fexmac_config_init(&Config);
   Config.code_cache_enabled = 1;
   CheckResult(fexmac_context_create(&Config, &Other), FEXMAC_ERROR_UNSUPPORTED, "config asking for cached translations (not yet)");
   fexmac_config_init(&Config);
   Config.code_cache_directory = "/tmp";
   CheckResult(fexmac_context_create(&Config, &Other), FEXMAC_ERROR_UNSUPPORTED, "config naming a cache directory (not yet)");
-  fexmac_config_init(&Config);
-  Config.struct_size = 8;
-  CheckResult(fexmac_context_create(&Config, &Other), FEXMAC_ERROR_INVALID_ARGUMENT, "config smaller than version 1");
-  struct {
-    fexmac_config Config;
-    uint64_t Newer;
-  } BigConfig;
-  memset(&BigConfig, 0, sizeof(BigConfig));
-  fexmac_config_init(&BigConfig.Config);
-  BigConfig.Config.struct_size = sizeof(BigConfig);
-  BigConfig.Newer = 5;
-  CheckResult(fexmac_context_create(&BigConfig.Config, &Other), FEXMAC_ERROR_UNSUPPORTED, "config with an unknown field set");
-  BigConfig.Newer = 0;
-  CheckResult(fexmac_context_create(&BigConfig.Config, &Other), FEXMAC_ERROR_BUSY, "a larger config is accepted (then refused as a second context)");
+  Check(fexmac_version() == ((2u << 16) | 0u) && FEXMAC_VERSION_MAJOR == 2, "version 2.0, the first with struct_size");
 
   fexmac_thread_destroy(Thread);
   fexmac_context_destroy(Context);
@@ -468,6 +463,38 @@ static void TestCallRetRecursion(void) {
   Check(Rax == 100000 && Rcx == 0, "recursion 100,000 deep returns to the top (eax %" PRIu64 ")", Rax);
 }
 
+/* Recursion 1,000,000 deep, counting on the way back (the reviewer's rec.c): every
+ * return after the stack was reset still lands where the guest expects. */
+static void TestCallRetDeepRecursion(void) {
+  /* clang-format off */
+  const uint8_t Program[] = {
+    0xB9, 0, 0, 0, 0,             /*  0: mov ecx, N */
+    0xE8, 0x01, 0x00, 0x00, 0x00, /*  5: call 11 */
+    0xF4,                         /* 10: hlt */
+    0xFF, 0xC9,                   /* 11: dec ecx */
+    0x74, 0x07,                   /* 13: jz 22 */
+    0xE8, 0xF7, 0xFF, 0xFF, 0xFF, /* 15: call 11 */
+    0xFF, 0xC2,                   /* 20: inc edx */
+    0xC3,                         /* 22: ret */
+  };
+  /* clang-format on */
+  uint8_t* Code = MapGuestMemory(0x10000);
+  const size_t StackSize = 64u << 20;
+  uint8_t* Stack = MapGuestMemory(StackSize);
+  const uint32_t Count = 1000000;
+  memcpy(Code, Program, sizeof(Program));
+  memcpy(Code + 1, &Count, sizeof(Count));
+  fexmac_install_fault_handlers();
+  fexmac_context* Context = CreateContext(NULL, NULL);
+  fexmac_thread* Thread = CreateThreadAt(Context, (uint64_t)(uintptr_t)Code, (uint64_t)(uintptr_t)Stack + StackSize - 64);
+  const fexmac_stop Stop = Run(Thread);
+  const fexmac_x86_state State = GetState(Thread);
+  Check(Stop.reason == FEXMAC_STOP_HALT && State.gpr[RDX] == Count - 1 && State.rip == (uint64_t)(uintptr_t)Code + 10,
+        "recursion 1,000,000 deep returns through every level (edx %" PRIu64 ")", State.gpr[RDX]);
+  fexmac_thread_destroy(Thread);
+  fexmac_context_destroy(Context);
+}
+
 /* 200,000 calls that never return (the guest stack is rebalanced with pop): overflow. */
 static void TestCallRetOverflow(void) {
   /* clang-format off */
@@ -543,6 +570,25 @@ static void TestGuestLockCmpxchgProtNone(void) {
   fexmac_install_fault_handlers();
   RunGuestAccess(LockCmpxchg, sizeof(LockCmpxchg), PROT_NONE, "0");
 }
+/* A misaligned atomic on a PROT_NONE page: the alignment fault comes first and the core
+ * starts rewriting it; the rewrite then faults on the page. That is the guest's fault,
+ * and is reported as such. */
+static void TestGuestMisalignedProtNone(void) {
+  fexmac_install_fault_handlers();
+  uint8_t* Code = MapGuestMemory(0x10000);
+  uint8_t* Data = mmap(NULL, (size_t)PageSize, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  memcpy(Code, LockXadd, sizeof(LockXadd));
+  fexmac_context* Context = CreateContext(NULL, NULL);
+  fexmac_thread* Thread = CreateThreadAt(Context, (uint64_t)(uintptr_t)Code, 0);
+  fexmac_x86_state State = GetState(Thread);
+  State.gpr[RDI] = (uint64_t)(uintptr_t)Data + 64 + 14;
+  SetState(Thread, &State);
+  Shared[0] = 1;
+  fexmac_thread_run(Thread, NULL);
+  printf("  FAIL: survived a misaligned atomic on an inaccessible page\n");
+  exit(1);
+}
+
 static void TestGuestStoreReadOnly(void) {
   fexmac_install_fault_handlers();
   RunGuestAccess(Store, sizeof(Store), PROT_READ, "0");
@@ -665,6 +711,8 @@ static void TestErrors(void) {
     {"MULTIBLOCK", "true", "boolean spelt true"},
     {"SMCCHECKS", "sometimes", "unknown named value"},
     {"HOSTFEATURES", "disablesve,nonsense", "unknown host feature name"},
+    {"HOSTFEATURES", "enablesve", "forcing a feature on (the M4 has no SVE: SIGILL)"},
+    {"HOSTFEATURES", "disableavx,enableafp", "any enable name"},
     {"IS64BIT_MODE", "0", "32-bit mode"},
     {NULL, "1", "option without a name"},
   };
@@ -679,7 +727,8 @@ static void TestErrors(void) {
   Check(!fexmac_option_known("FEX_MULTIBLOCK") && !fexmac_option_known("DISKCACHE") && !fexmac_option_known(NULL), "other names unknown");
 
   /* After all those failures, a good configuration still works. */
-  fexmac_option Good[] = {{"SMCCHECKS", "full"}, {"MaxInst", "0x100"}, {"MULTIBLOCK", "0"}, {"HOSTFEATURES", "disablesve,disablefrintts"}};
+  fexmac_option Good[] = {{"SMCCHECKS", "full"}, {"MaxInst", "0x100"}, {"MULTIBLOCK", "0"}, {"HOSTFEATURES", "disablesve,disablefrintts"},
+                          {"HostFeatures", "off"}};
   fexmac_config_init(&Config);
   Config.options = Good;
   Config.option_count = sizeof(Good) / sizeof(Good[0]);
@@ -789,6 +838,63 @@ static void TestChainedHandlerFaults(void) {
   ((volatile uint8_t*)HostPage)[16] = 42;
   printf("  FAIL: survived a fault inside the host's handler\n");
   exit(1);
+}
+
+/* A previous handler that leaves with siglongjmp (the usual memory-probe idiom; the
+ * reviewer's ljmp.c). The library must not take the next fault for a fault inside that
+ * handler, must keep handling its own faults, and logging must still reach the callback. */
+static sigjmp_buf ProbeJump;
+
+static void ProbeHandler(int Signal, siginfo_t* Info, void* Context) {
+  (void)Signal;
+  (void)Info;
+  (void)Context;
+  siglongjmp(ProbeJump, 1);
+}
+
+static int Readable(volatile uint8_t* Address) {
+  if (sigsetjmp(ProbeJump, 1)) {
+    return 0;
+  }
+  (void)*Address;
+  return 1;
+}
+
+static uint32_t LogCalls;
+static void CountLog(fexmac_log_level Level, const char* Message, void* UserData) {
+  (void)Level;
+  (void)Message;
+  (void)UserData;
+  ++LogCalls;
+}
+
+static void TestChainedSiglongjmp(void) {
+  struct sigaction Action;
+  memset(&Action, 0, sizeof(Action));
+  Action.sa_sigaction = ProbeHandler;
+  Action.sa_flags = SA_SIGINFO;
+  sigemptyset(&Action.sa_mask);
+  sigaction(SIGSEGV, &Action, NULL);
+  sigaction(SIGBUS, &Action, NULL);
+  fexmac_install_fault_handlers();
+  uint8_t* Bad = mmap(NULL, (size_t)PageSize, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  int Probes = 0;
+  for (int i = 0; i < 3; ++i) {
+    Probes += Readable(Bad) == 0;
+  }
+  Check(Probes == 3, "three probes in a row, each left with siglongjmp, all report unreadable");
+  RunMisalignedAtomic();
+  /* A log message still reaches the callback (the bad option is logged). */
+  const fexmac_option BadOption = {"NOSUCHOPTION", "1"};
+  fexmac_config Config;
+  fexmac_config_init(&Config);
+  Config.options = &BadOption;
+  Config.option_count = 1;
+  Config.log = CountLog;
+  fexmac_context* Context = NULL;
+  fexmac_context_create(&Config, &Context);
+  Check(LogCalls == 1, "after the jumps the log callback is still called (%u calls)", LogCalls);
+  Check(Readable(Bad) == 0, "and a fourth probe still works");
 }
 
 /* A SIGSEGV sent with kill() while the previous action was "ignore" is ignored, and the
@@ -1064,18 +1170,21 @@ static const struct Subtest Subtests[] = {
   {"faults-chained", TestFaultsChained, 0, NULL, NULL, 0},
   {"faults-hosted", TestFaultsHosted, 0, NULL, NULL, 0},
   {"callret-recursion", TestCallRetRecursion, 0, NULL, NULL, 0},
+  {"callret-deep-recursion", TestCallRetDeepRecursion, 0, NULL, NULL, 0},
   {"callret-overflow", TestCallRetOverflow, 0, NULL, NULL, 0},
   {"callret-underflow", TestCallRetUnderflow, 0, NULL, NULL, 0},
   {"guest-load-prot-none-dies", TestGuestLoadProtNone, SIGBUS, GUEST_FAULT_TEXT, "fault inside", 1},
   {"guest-lock-xadd-prot-none-dies", TestGuestLockXaddProtNone, SIGBUS, GUEST_FAULT_TEXT, "fault inside", 1},
   {"guest-lock-cmpxchg-prot-none-dies", TestGuestLockCmpxchgProtNone, SIGBUS, GUEST_FAULT_TEXT, "fault inside", 1},
   {"guest-store-read-only-dies", TestGuestStoreReadOnly, SIGBUS, GUEST_FAULT_TEXT, "fault inside", 1},
+  {"guest-misaligned-atomic-prot-none-dies", TestGuestMisalignedProtNone, SIGBUS, "misaligned atomic on an inaccessible page", "fault inside", 1},
   {"guest-fault-hosted", TestGuestFaultHosted, 0, NULL, "fexmac:", 2},
   {"callbacks", TestCallbacks, 0, NULL, NULL, 0},
   {"errors", TestErrors, 0, NULL, NULL, 0},
   {"chained-mask", TestChainedMask, 0, NULL, NULL, 0},
   {"chained-resethand-dies", TestChainedResetHand, SIGBUS, NULL, "fexmac:", 1},
   {"chained-handler-faults-dies", TestChainedHandlerFaults, SIGBUS, "fault inside the previously installed handler", NULL, 1},
+  {"chained-siglongjmp", TestChainedSiglongjmp, 0, NULL, "fault inside", 0},
   {"sent-signal-ignored", TestSentSignalIgnored, 0, NULL, NULL, 0},
   {"sent-signal-default-dies", TestSentSignalDefaultDies, SIGSEGV, NULL, "fexmac:", 1},
   {"unclaimed-fault-dies", TestUnclaimedFaultDies, SIGBUS, NULL, "fexmac:", 1},

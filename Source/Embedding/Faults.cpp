@@ -60,10 +60,18 @@ namespace {
   //  - HandlerStateKey: where the library's own signal handler is (see HandlerState).
   pthread_key_t HandleDepthKey;
   pthread_key_t HandlerStateKey;
+  pthread_key_t HandlerFrameKey;
+  pthread_key_t HandlerCanaryKey;
+  pthread_key_t HandlerMarkerKey;
+  pthread_key_t EmulatingKey;
   pthread_once_t KeysOnce = PTHREAD_ONCE_INIT;
   void CreateKeys() {
     pthread_key_create(&HandleDepthKey, nullptr);
     pthread_key_create(&HandlerStateKey, nullptr);
+    pthread_key_create(&HandlerFrameKey, nullptr);
+    pthread_key_create(&HandlerCanaryKey, nullptr);
+    pthread_key_create(&HandlerMarkerKey, nullptr);
+    pthread_key_create(&EmulatingKey, nullptr);
   }
 
   enum HandlerState : uintptr_t {
@@ -136,14 +144,29 @@ namespace {
 
   // ---- The core's faults ----
 
+  // Whether PC is in translated code or the dispatcher of this thread's context.
+  bool IsTranslatedOrDispatcher(fexmac_thread* Current, uint64_t PC) {
+    const auto& Config = Current->Context->Delegator->GetConfig();
+    return Current->Thread->CTX->IsAddressInCodeBuffer(Current->Thread, PC) || (PC >= Config.DispatcherBegin && PC < Config.DispatcherEnd);
+  }
+
   // The translator writes each block into a per-thread scratch buffer followed by an
   // inaccessible page. Running into it means the buffer was too small: resume the thread
   // at the translator's restart point, which retries with a larger buffer. On macOS the
   // inaccessible page is a whole host page placed at the next host page boundary after
   // JITGuardPage, so the fault can land anywhere from JITGuardPage to the end of it.
-  bool HandleScratchBufferOverflow(FEXCore::Core::InternalThreadState* Thread, const Classification& Kind, siginfo_t* Info,
-                                   ucontext_t* Context) {
-    if (!Thread->JITGuardPage || Kind.Kind != FaultKind::Access) {
+  //
+  // Only the translator itself may claim this: guest addresses are host addresses, so a
+  // guest load from that page, or a bug in the embedder's system call callback reading
+  // it, lands in the same range and must not be "restarted" (that would jump to a stale
+  // restart point). The core does not mark when it is translating, so the translator is
+  // recognised by what only it does there: a write (the emitter appending code), from
+  // host code (not translated code or the dispatcher), while no system call callback is
+  // running on the thread. The restart point is disarmed after use; the core arms it
+  // again when it retries the block.
+  bool HandleScratchBufferOverflow(fexmac_thread* Current, const Classification& Kind, siginfo_t* Info, ucontext_t* Context) {
+    auto* Thread = Current->Thread;
+    if (!Thread->JITGuardPage || Kind.Kind != FaultKind::Access || !Kind.Write || Current->InCallback) {
       return false;
     }
     const uintptr_t HostPage = FEXCore::Utils::FEX_HOST_PAGE_SIZE;
@@ -154,6 +177,10 @@ namespace {
       return false;
     }
     auto& State = Context->uc_mcontext->__ss;
+    if (IsTranslatedOrDispatcher(Current, State.__pc)) {
+      return false;
+    }
+    Thread->JITGuardPage = 0;
     FEXCore::UncheckedLongJump::ManuallyLoadJumpBuf(Thread->RestartJump, Thread->JITGuardOverflowArgument, &State.__x[0],
                                                     &Context->uc_mcontext->__ns.__v[0], &State.__pc);
     return true;
@@ -164,6 +191,12 @@ namespace {
   // so losing its contents is harmless: reset its pointer to the starting position and
   // retry the instruction, as FEX's Linux front end does. The pointer lives in x25
   // (REG_CALLRET_SP in FEXCore's Arm64Emitter.h) while translated code runs.
+  //
+  // Claimed only for the call/return stack's own push or pop: the faulting instruction
+  // is in translated code or the dispatcher, is a load/store pair whose base register is
+  // x25, and the fault address is within the 16 bytes it moves. A guest access to the
+  // guard page (a wild pointer, a memory scan) or a host bug reading it is not this, and
+  // resetting x25 then would corrupt a host register and retry the access forever.
   bool HandleCallRetStackGuard(fexmac_thread* Current, const Classification& Kind, siginfo_t* Info, ucontext_t* Context) {
     if (Kind.Kind != FaultKind::Access || !Current->CallRetAllocation) {
       return false;
@@ -173,22 +206,40 @@ namespace {
     if (Address < Begin || Address >= Begin + Current->CallRetAllocationSize) {
       return false;
     }
-    constexpr int CallRetStackRegister = 25;
-    Context->uc_mcontext->__ss.__x[CallRetStackRegister] = Current->CallRetDefault;
+    auto& State = Context->uc_mcontext->__ss;
+    if (!IsTranslatedOrDispatcher(Current, State.__pc)) {
+      return false;
+    }
+    constexpr unsigned CallRetStackRegister = 25;
+    // Load/store pair, any indexing mode: bits 29:27 are 101 (bit 26 selects SIMD).
+    const uint32_t Instruction = *reinterpret_cast<const uint32_t*>(State.__pc);
+    const bool IsPair = (Instruction & 0x3A000000) == 0x28000000;
+    const unsigned BaseRegister = (Instruction >> 5) & 0x1F;
+    const uint64_t Pointer = State.__x[CallRetStackRegister];
+    if (!IsPair || BaseRegister != CallRetStackRegister || Address + 16 < Pointer || Address >= Pointer + 16) {
+      return false;
+    }
+    State.__x[CallRetStackRegister] = Current->CallRetDefault;
     return true;
   }
+
+  // The address a misaligned atomic is being rewritten for, per thread, so that a fault
+  // on it inside the rewrite (the target page is also protected) is reported as the
+  // guest memory fault it is rather than as a bug in the handler (EmulatingKey).
 
   // ARM64 atomic instructions raise an alignment fault on an address that is not a
   // multiple of the operand size where the access crosses 16 bytes; x86 allows it. The
   // core rewrites the instruction sequence and execution resumes after it.
-  bool HandleMisalignedAtomic(FEXCore::Core::InternalThreadState* Thread, const Classification& Kind, ucontext_t* Context) {
+  bool HandleMisalignedAtomic(FEXCore::Core::InternalThreadState* Thread, const Classification& Kind, siginfo_t* Info, ucontext_t* Context) {
     auto& State = Context->uc_mcontext->__ss;
     const uint64_t PC = State.__pc;
     if (Kind.Kind != FaultKind::Alignment || !Thread->CTX->IsAddressInCodeBuffer(Thread, PC)) {
       return false;
     }
+    SetKey(EmulatingKey, reinterpret_cast<uintptr_t>(Info->si_addr));
     const auto Result = FEXCore::ArchHelpers::Arm64::HandleUnalignedAccess(
       Thread, FEXCore::ArchHelpers::Arm64::UnalignedHandlerType::HalfBarrier, PC, &State.__x[0]);
+    SetKey(EmulatingKey, 0);
     if (!Result.has_value()) {
       return false;
     }
@@ -266,13 +317,15 @@ namespace {
     }
     sigset_t Old;
     pthread_sigmask(SIG_BLOCK, &Mask, &Old);
+    // If the previous handler leaves with siglongjmp, the record it leaves behind is
+    // recognised as dead (see RecordedHandlerIsLive) and the mask is whatever the jump
+    // restores, as without the library.
     SetKey(HandlerStateKey, InPreviousHandler);
     if (Previous.sa_flags & SA_SIGINFO) {
       Previous.sa_sigaction(Signal, Info, RawContext);
     } else {
       Previous.sa_handler(Signal);
     }
-    SetKey(HandlerStateKey, NotInHandler);
     pthread_sigmask(SIG_SETMASK, &Old, nullptr);
   }
 
@@ -282,22 +335,83 @@ namespace {
   std::atomic<bool> TestLogFromHandler {};
 #endif
 
+  // Nesting. On entry the handler records its own frame (its frame pointer) and a fresh
+  // marker value in a local. A later entry on the same thread is a nested fault only if
+  // that handler is still running: walking the frame-pointer chain of the interrupted
+  // code (Apple's arm64 ABI keeps frame records) reaches the recorded frame, and the
+  // marker there is intact. A handler that was left without returning (a previous handler
+  // that siglongjmp'd out, the usual memory-probe idiom) leaves its record behind, but its
+  // frame is no longer on anyone's chain, so the record is ignored and replaced. A flag
+  // that only a return clears would instead treat every later fault as nested, and stack
+  // depth alone cannot tell: code that runs deeper than the dead frame faults below it.
+  std::atomic<uint64_t> MarkerCounter {0x6665786d6163ULL};
+
+  bool RecordedHandlerIsLive(uintptr_t StartFrame, uintptr_t Here) {
+    if (GetKey(HandlerStateKey) == NotInHandler) {
+      return false;
+    }
+    const uintptr_t Frame = GetKey(HandlerFrameKey);
+    constexpr uintptr_t MaximumDepth = 8 * 1024 * 1024;
+    uintptr_t FP = StartFrame;
+    for (int i = 0; i < 1024; ++i) {
+      if (FP == Frame) {
+        return *reinterpret_cast<volatile uint64_t*>(GetKey(HandlerMarkerKey)) == GetKey(HandlerCanaryKey);
+      }
+      // Only frames above this one on the same stack, each above the last.
+      if (FP <= Here || FP - Here > MaximumDepth || (FP & 7) != 0 || FP > Frame) {
+        return false;
+      }
+      const uintptr_t Next = *reinterpret_cast<const uintptr_t*>(FP);
+      if (Next <= FP) {
+        return false;
+      }
+      FP = Next;
+    }
+    return false;
+  }
+
+  void LeaveHandler(volatile uint64_t* Marker) {
+    *Marker = 0;
+    SetKey(HandlerStateKey, NotInHandler);
+  }
+
   void LibraryHandler(int Signal, siginfo_t* Info, void* RawContext) {
     pthread_once(&KeysOnce, CreateKeys);
-    const auto State = GetKey(HandlerStateKey);
-    if (State != NotInHandler) {
+    volatile uint64_t Marker = 0;
+    const auto Here = reinterpret_cast<uintptr_t>(&Marker);
+    const auto* Interrupted = static_cast<const ucontext_t*>(RawContext);
+    if (RecordedHandlerIsLive(Interrupted->uc_mcontext->__ss.__fp, Here)) {
       // A fault inside this handler, or inside the previous handler it called. Every
       // asynchronous signal is blocked in the handler, so nothing else can have
       // interrupted it. The handler is installed with SA_NODEFER, so the nested fault
       // reaches here instead of hanging the thread with the signal blocked. Put the
       // default action back and return: the instruction faults again and the process dies
       // with the usual signal, where a crash report shows it.
-      WriteRaw(State == InLibraryHandler ? "fexmac: fault inside the fault handler; restoring the default action\n" :
-                                           "fexmac: fault inside the previously installed handler the library chained to; restoring "
-                                           "the default action\n");
+      const auto State = GetKey(HandlerStateKey);
+      const auto Emulating = GetKey(EmulatingKey);
+      const auto Address = reinterpret_cast<uintptr_t>(Info->si_addr);
+      if (State == InLibraryHandler && Emulating && Address + 16 >= Emulating && Address < Emulating + 32) {
+        // The core was rewriting a misaligned atomic whose memory is not accessible:
+        // the guest's own fault, not a bug in the handler.
+        WriteRaw(Signal == SIGBUS ? "fexmac: SIGBUS" : "fexmac: SIGSEGV");
+        WriteRaw(": guest memory access fault in translated code at address ");
+        WriteHex(Address);
+        WriteRaw(" (misaligned atomic on an inaccessible page); guest fault delivery is not implemented, passing it on\n");
+      } else {
+        WriteRaw(State == InLibraryHandler ? "fexmac: fault inside the fault handler; restoring the default action\n" :
+                                             "fexmac: fault inside the previously installed handler the library chained to; restoring "
+                                             "the default action\n");
+      }
       SetDefaultAction(Signal);
       return;
     }
+    // Any record left here belongs to a handler that is gone; this entry replaces it.
+    Marker = MarkerCounter.fetch_add(1) ^ Here;
+    SetKey(HandlerFrameKey, reinterpret_cast<uintptr_t>(__builtin_frame_address(0)));
+    SetKey(HandlerMarkerKey, Here);
+    SetKey(HandlerCanaryKey, Marker);
+    SetKey(HandleDepthKey, 0);
+    SetKey(EmulatingKey, 0);
     SetKey(HandlerStateKey, InLibraryHandler);
 
 #ifdef FEXMAC_TESTING
@@ -317,7 +431,7 @@ namespace {
     const bool Sent = IsSentSignal(Info, static_cast<ucontext_t*>(RawContext));
     const bool Handled = !Sent && fexmac_handle_fault(Signal, Info, RawContext) != 0;
     if (Handled) {
-      SetKey(HandlerStateKey, NotInHandler);
+      LeaveHandler(&Marker);
       return;
     }
 
@@ -327,11 +441,12 @@ namespace {
                                                               (Stored->sa_handler != SIG_DFL && Stored->sa_handler != SIG_IGN);
     if (HasHandler) {
       CallPrevious(Signal, Info, RawContext, Stored);
+      LeaveHandler(&Marker);
       return;
     }
 
     const bool Ignored = !(Stored->sa_flags & SA_SIGINFO) && Stored->sa_handler == SIG_IGN;
-    SetKey(HandlerStateKey, NotInHandler);
+    LeaveHandler(&Marker);
     if (Sent) {
       // Sent with kill() or similar. Ignored before the library: ignore it now. Default
       // before: re-send it with the default action, which ends the process as it would
@@ -351,7 +466,9 @@ namespace {
 
 bool InFaultHandling() {
   pthread_once(&KeysOnce, CreateKeys);
-  return GetKey(HandleDepthKey) != 0 || GetKey(HandlerStateKey) != NotInHandler;
+  volatile uint64_t Probe = 0;
+  return GetKey(HandleDepthKey) != 0 ||
+         RecordedHandlerIsLive(reinterpret_cast<uintptr_t>(__builtin_frame_address(0)), reinterpret_cast<uintptr_t>(&Probe) - 1);
 }
 } // namespace fexmac
 
@@ -386,8 +503,8 @@ int fexmac_handle_fault(int signal, siginfo_t* info, void* ucontext) {
 
   const auto Kind = fexmac::ClassifyFault(Context);
   int Handled = 0;
-  if (fexmac::HandleScratchBufferOverflow(Thread, Kind, info, Context) || fexmac::HandleCallRetStackGuard(Current, Kind, info, Context) ||
-      fexmac::HandleMisalignedAtomic(Thread, Kind, Context)) {
+  if (fexmac::HandleScratchBufferOverflow(Current, Kind, info, Context) || fexmac::HandleCallRetStackGuard(Current, Kind, info, Context) ||
+      fexmac::HandleMisalignedAtomic(Thread, Kind, info, Context)) {
     Handled = 1;
   }
   // Package D adds its checks here (see the top of this file).

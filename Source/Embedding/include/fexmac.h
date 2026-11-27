@@ -23,11 +23,18 @@
  * process-wide, so at most one context exists at a time.
  *
  * Structures the caller allocates (fexmac_config, fexmac_x86_state, fexmac_stop) start
- * with struct_size, which the caller sets to sizeof of the structure as its header
- * declares it (the *_init functions do this). A library accepts any size from the first
- * version's up to its own: fields past the caller's size are neither read nor written.
- * A larger size from a newer header is accepted if the fields this library does not know
- * are zero on input; on output they are set to zero.
+ * with struct_size, which the caller sets with the *_init functions (or to sizeof of the
+ * structure as this header declares it). A library accepts only sizes of layouts it
+ * knows and reads or writes nothing otherwise (FEXMAC_ERROR_INVALID_ARGUMENT), so an
+ * uninitialised structure is refused, not written past. A later minor version that grows
+ * a structure keeps accepting the older sizes; a program built against a newer header
+ * than the library it runs with gets FEXMAC_ERROR_INVALID_ARGUMENT for a structure that
+ * grew, so check fexmac_version() first.
+ *
+ * Versions: a program must refuse to run if fexmac_version() >> 16 differs from
+ * FEXMAC_VERSION_MAJOR, and should check that the minor part is at least the one it was
+ * built with. 2.0 is the first version with struct_size fields; nothing built against the
+ * 1.x headers of the development branch is compatible with it.
  */
 #ifndef FEXMAC_H
 #define FEXMAC_H
@@ -47,9 +54,9 @@ extern "C" {
 #endif
 
 /* Version of this header. fexmac_version() returns the version the library was built
- * with; a program should refuse to run if the major part differs. */
-#define FEXMAC_VERSION_MAJOR 1
-#define FEXMAC_VERSION_MINOR 1
+ * with; see "Versions" above. */
+#define FEXMAC_VERSION_MAJOR 2
+#define FEXMAC_VERSION_MINOR 0
 #define FEXMAC_VERSION ((FEXMAC_VERSION_MAJOR << 16) | FEXMAC_VERSION_MINOR)
 
 typedef struct fexmac_context fexmac_context;
@@ -57,7 +64,7 @@ typedef struct fexmac_thread fexmac_thread;
 
 typedef enum fexmac_result {
   FEXMAC_OK = 0,
-  /* A required pointer was NULL, or a struct_size is outside the accepted range. */
+  /* A required pointer was NULL, or a struct_size is not a size this library knows. */
   FEXMAC_ERROR_INVALID_ARGUMENT = 1,
   /* The handle is not a live context or thread (never created, or already destroyed). */
   FEXMAC_ERROR_INVALID_HANDLE = 2,
@@ -69,8 +76,8 @@ typedef enum fexmac_result {
   /* The core could not be initialised. */
   FEXMAC_ERROR_INIT_FAILED = 5,
   FEXMAC_ERROR_OUT_OF_MEMORY = 6,
-  /* The request needs something this library version does not provide (for example a
-   * newer structure with fields set that this library does not know). */
+  /* The request needs something this library version does not provide (for example the
+   * reserved cached-translation fields of fexmac_config). */
   FEXMAC_ERROR_UNSUPPORTED = 7,
   /* The core returned without a recorded stop reason. Indicates a bug in the library. */
   FEXMAC_ERROR_INTERNAL = 8,
@@ -129,7 +136,9 @@ typedef enum fexmac_log_level {
 
 /* Receives the core's log messages. May be called on any host thread, never from inside
  * a signal handler: a message the core produces while the library handles a fault is
- * written to standard error with write(2) instead. */
+ * written to standard error with write(2) instead. It must not call fexmac: the core can
+ * log while the library holds its locks, so such calls are refused (FEXMAC_ERROR_BUSY;
+ * NULL or no effect for the functions without a result). */
 typedef void (*fexmac_log_fn)(fexmac_log_level level, const char* message, void* user_data);
 
 typedef struct fexmac_config {

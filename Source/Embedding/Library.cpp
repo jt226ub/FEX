@@ -70,6 +70,12 @@ namespace {
   fexmac_log_fn LogFn {};
   void* LogUserData {};
 
+  // Set while the embedder's log callback runs on this host thread. The core can log
+  // while the library holds its registry lock, so a callback that called back into the
+  // library could deadlock; such calls are refused with FEXMAC_ERROR_BUSY (or ignored,
+  // for the functions that return no result). Never read from a signal handler.
+  thread_local bool InLogCallback {};
+
   void MsgHandler(LogMan::DebugLevels Level, const char* Message) {
     if (InFaultHandling()) {
       // Never call the embedder or stdio from a signal handler.
@@ -79,7 +85,9 @@ namespace {
       return;
     }
     if (LogFn) {
+      InLogCallback = true;
       LogFn(static_cast<fexmac_log_level>(Level), Message, LogUserData);
+      InLogCallback = false;
     } else {
       fprintf(stderr, "[%s] %s\n", LogMan::DebugLevelStr(Level), Message);
       fflush(stderr);
@@ -149,33 +157,14 @@ namespace {
 
   // ---- Caller-allocated structures with a struct_size ----
 
-  // Sizes beyond this are treated as garbage rather than as a much newer header.
-  constexpr uint32_t MaximumStructSize = 64 * 1024;
-
-  // Input: the caller's size must cover this version's fields (the first version's size
-  // is this version's), and any bytes past them must be zero.
+  // struct_size must be the size of a layout this library knows, or nothing is read or
+  // written: a garbage size (an uninitialised structure) must never make the library write
+  // past the caller's object. Version 2.0 is the first layout of each structure, so its
+  // size is the only one; a later minor version that grows a structure adds the older
+  // size here and handles it field by field.
   template<typename T>
-  fexmac_result CheckInput(const T* In) {
-    if (In->struct_size < sizeof(T) || In->struct_size > MaximumStructSize) {
-      return FEXMAC_ERROR_INVALID_ARGUMENT;
-    }
-    const auto* Bytes = reinterpret_cast<const uint8_t*>(In);
-    for (uint32_t i = sizeof(T); i < In->struct_size; ++i) {
-      if (Bytes[i]) {
-        return FEXMAC_ERROR_UNSUPPORTED;
-      }
-    }
-    return FEXMAC_OK;
-  }
-
-  // Output: fields past this version's are zeroed.
-  template<typename T>
-  fexmac_result CheckOutput(T* Out) {
-    if (Out->struct_size < sizeof(T) || Out->struct_size > MaximumStructSize) {
-      return FEXMAC_ERROR_INVALID_ARGUMENT;
-    }
-    memset(reinterpret_cast<uint8_t*>(Out) + sizeof(T), 0, Out->struct_size - sizeof(T));
-    return FEXMAC_OK;
+  bool KnownSize(const T* Value) {
+    return Value->struct_size == sizeof(T);
   }
 
   // ---- Leaving the dispatcher ----
@@ -464,11 +453,14 @@ void fexmac_stop_init(fexmac_stop* stop) {
 }
 
 fexmac_result fexmac_context_create(const fexmac_config* config, fexmac_context** out_context) {
+  if (InLogCallback) {
+    return FEXMAC_ERROR_BUSY;
+  }
   if (!config || !out_context) {
     return FEXMAC_ERROR_INVALID_ARGUMENT;
   }
-  if (const auto Result = CheckInput(config); Result != FEXMAC_OK) {
-    return Result;
+  if (!KnownSize(config)) {
+    return FEXMAC_ERROR_INVALID_ARGUMENT;
   }
   *out_context = nullptr;
   // Package F: cached translations. Refused until they are implemented.
@@ -554,6 +546,9 @@ fexmac_result fexmac_context_create(const fexmac_config* config, fexmac_context*
 }
 
 fexmac_result fexmac_context_destroy(fexmac_context* context) {
+  if (InLogCallback) {
+    return FEXMAC_ERROR_BUSY;
+  }
   {
     std::lock_guard Lock {RegistryMutex};
     if (!context || !LiveContexts.contains(context)) {
@@ -584,6 +579,9 @@ fexmac_result fexmac_context_destroy(fexmac_context* context) {
 }
 
 fexmac_result fexmac_cpuid(fexmac_context* context, uint32_t function, uint32_t leaf, uint32_t out[4]) {
+  if (InLogCallback) {
+    return FEXMAC_ERROR_BUSY;
+  }
   if (!out) {
     return FEXMAC_ERROR_INVALID_ARGUMENT;
   }
@@ -600,6 +598,9 @@ fexmac_result fexmac_cpuid(fexmac_context* context, uint32_t function, uint32_t 
 }
 
 fexmac_result fexmac_invalidate(fexmac_context* context, uint64_t address, uint64_t size) {
+  if (InLogCallback) {
+    return FEXMAC_ERROR_BUSY;
+  }
   ContextUse Use {context};
   if (!Use) {
     return FEXMAC_ERROR_INVALID_HANDLE;
@@ -614,6 +615,9 @@ fexmac_result fexmac_invalidate(fexmac_context* context, uint64_t address, uint6
 }
 
 fexmac_result fexmac_thread_create(fexmac_context* context, fexmac_thread** out_thread) {
+  if (InLogCallback) {
+    return FEXMAC_ERROR_BUSY;
+  }
   if (!out_thread) {
     return FEXMAC_ERROR_INVALID_ARGUMENT;
   }
@@ -661,6 +665,9 @@ fexmac_result fexmac_thread_create(fexmac_context* context, fexmac_thread** out_
 }
 
 fexmac_result fexmac_thread_destroy(fexmac_thread* thread) {
+  if (InLogCallback) {
+    return FEXMAC_ERROR_BUSY;
+  }
   {
     std::lock_guard Lock {RegistryMutex};
     if (!thread || !LiveThreads.contains(thread)) {
@@ -689,11 +696,17 @@ fexmac_result fexmac_thread_destroy(fexmac_thread* thread) {
 }
 
 fexmac_context* fexmac_thread_context(fexmac_thread* thread) {
+  if (InLogCallback) {
+    return nullptr;
+  }
   std::lock_guard Lock {RegistryMutex};
   return thread && LiveThreads.contains(thread) ? thread->Context : nullptr;
 }
 
 void fexmac_thread_set_user_data(fexmac_thread* thread, void* user_data) {
+  if (InLogCallback) {
+    return;
+  }
   std::lock_guard Lock {RegistryMutex};
   if (thread && LiveThreads.contains(thread)) {
     thread->UserData = user_data;
@@ -701,16 +714,22 @@ void fexmac_thread_set_user_data(fexmac_thread* thread, void* user_data) {
 }
 
 void* fexmac_thread_get_user_data(fexmac_thread* thread) {
+  if (InLogCallback) {
+    return nullptr;
+  }
   std::lock_guard Lock {RegistryMutex};
   return thread && LiveThreads.contains(thread) ? thread->UserData : nullptr;
 }
 
 fexmac_result fexmac_thread_get_state(fexmac_thread* thread, fexmac_x86_state* state) {
+  if (InLogCallback) {
+    return FEXMAC_ERROR_BUSY;
+  }
   if (!state) {
     return FEXMAC_ERROR_INVALID_ARGUMENT;
   }
-  if (const auto Result = CheckOutput(state); Result != FEXMAC_OK) {
-    return Result;
+  if (!KnownSize(state)) {
+    return FEXMAC_ERROR_INVALID_ARGUMENT;
   }
   std::lock_guard Lock {RegistryMutex};
   if (!thread || !LiveThreads.contains(thread)) {
@@ -724,11 +743,14 @@ fexmac_result fexmac_thread_get_state(fexmac_thread* thread, fexmac_x86_state* s
 }
 
 fexmac_result fexmac_thread_set_state(fexmac_thread* thread, const fexmac_x86_state* state) {
+  if (InLogCallback) {
+    return FEXMAC_ERROR_BUSY;
+  }
   if (!state) {
     return FEXMAC_ERROR_INVALID_ARGUMENT;
   }
-  if (const auto Result = CheckInput(state); Result != FEXMAC_OK) {
-    return Result;
+  if (!KnownSize(state)) {
+    return FEXMAC_ERROR_INVALID_ARGUMENT;
   }
   std::lock_guard Lock {RegistryMutex};
   if (!thread || !LiveThreads.contains(thread)) {
@@ -742,10 +764,11 @@ fexmac_result fexmac_thread_set_state(fexmac_thread* thread, const fexmac_x86_st
 }
 
 fexmac_result fexmac_thread_run(fexmac_thread* thread, fexmac_stop* stop) {
-  if (stop) {
-    if (const auto Result = CheckOutput(stop); Result != FEXMAC_OK) {
-      return Result;
-    }
+  if (InLogCallback) {
+    return FEXMAC_ERROR_BUSY;
+  }
+  if (stop && !KnownSize(stop)) {
+    return FEXMAC_ERROR_INVALID_ARGUMENT;
   }
   {
     std::lock_guard Lock {RegistryMutex};
@@ -784,6 +807,19 @@ fexmac_result fexmac_thread_run(fexmac_thread* thread, fexmac_stop* stop) {
 }
 
 #ifdef FEXMAC_TESTING
+void fexmac_testing_guard_pages(fexmac_thread* thread, uint64_t* callret_low, uint64_t* callret_high, uint64_t* scratch) {
+  std::lock_guard Lock {RegistryMutex};
+  if (!thread || !LiveThreads.contains(thread)) {
+    return;
+  }
+  constexpr uint64_t HostPage = FEXCore::Utils::FEX_HOST_PAGE_SIZE;
+  const auto Base = reinterpret_cast<uint64_t>(thread->CallRetAllocation);
+  *callret_low = Base;
+  *callret_high = Base + thread->CallRetAllocationSize - HostPage;
+  const uint64_t Guard = thread->Thread->JITGuardPage;
+  *scratch = Guard ? (Guard + FEXCore::Utils::FEX_PAGE_SIZE + HostPage - 1) & ~(HostPage - 1) : 0;
+}
+
 void fexmac_testing_set_invalidation_hook(void (*hook)(void)) {
   TestInvalidationHook.store(hook);
 }

@@ -134,7 +134,151 @@ static void TestInvalidationMask(void) {
   fexmac_context_destroy(Context);
 }
 
+/* ---- guard pages: only the core's own accesses are claimed ---- */
+
+/* Runs `Program` with rdi pointing into one of the thread's guard pages (Which: 0 low
+ * call/return guard, 1 high call/return guard, 2 scratch-buffer guard). The thread runs
+ * a block first so that it has a scratch buffer. */
+static fexmac_thread* GuardThread;
+static uint8_t* GuardCode;
+
+static uint64_t GuardAddress(int Which) {
+  uint64_t Low = 0, High = 0, Scratch = 0;
+  fexmac_testing_guard_pages(GuardThread, &Low, &High, &Scratch);
+  return (Which == 0 ? Low : Which == 1 ? High : Scratch) + 64;
+}
+
+static void GuestTouchesGuard(int Which, const uint8_t* Program, size_t Size) {
+  fexmac_install_fault_handlers();
+  GuardCode = MapGuestMemory(0x10000);
+  const uint8_t Warm[] = {0xB8, 0x01, 0, 0, 0, 0xF4}; /* mov eax,1 ; hlt: translates one block */
+  memcpy(GuardCode, Warm, sizeof(Warm));
+  memcpy(GuardCode + 0x100, Program, Size);
+  fexmac_context* Context = CreateContext(NULL, NULL);
+  GuardThread = CreateThreadAt(Context, (uint64_t)(uintptr_t)GuardCode, 0);
+  Run(GuardThread);
+  fexmac_x86_state State = GetState(GuardThread);
+  State.rip = (uint64_t)(uintptr_t)GuardCode + 0x100;
+  State.gpr[RDI] = GuardAddress(Which);
+  Check(State.gpr[RDI] != 64, "found the guard page");
+  SetState(GuardThread, &State);
+  Shared[0] = 1;
+  fexmac_thread_run(GuardThread, NULL);
+  printf("  FAIL: survived a guest access to a guard page\n");
+  exit(1);
+}
+
+static const uint8_t GuardLoad[] = {0x8B, 0x07, 0xF4};  /* mov eax,[rdi] ; hlt */
+static const uint8_t GuardStore[] = {0x89, 0x07, 0xF4}; /* mov [rdi],eax ; hlt */
+
+static void TestGuestLoadCallRetLowGuard(void) {
+  GuestTouchesGuard(0, GuardLoad, sizeof(GuardLoad));
+}
+static void TestGuestStoreCallRetHighGuard(void) {
+  GuestTouchesGuard(1, GuardStore, sizeof(GuardStore));
+}
+static void TestGuestLoadScratchGuard(void) {
+  GuestTouchesGuard(2, GuardLoad, sizeof(GuardLoad));
+}
+static void TestGuestStoreScratchGuard(void) {
+  GuestTouchesGuard(2, GuardStore, sizeof(GuardStore));
+}
+
+/* The embedder's system call callback touches a guard page (a host bug): the fault is
+ * passed on to the host's handler, not claimed. */
+static int CallbackGuard;
+
+static void RecordingHostHandler(int Signal, siginfo_t* Info, void* Context) {
+  (void)Signal;
+  (void)Context;
+  Shared[0] = (uint64_t)(uintptr_t)Info->si_addr == GuardAddress(CallbackGuard) ? 2 : 3;
+  _exit(0);
+}
+
+static fexmac_syscall_action TouchingSyscall(fexmac_thread* Thread, void* UserData) {
+  (void)Thread;
+  (void)UserData;
+  volatile uint8_t* Address = (volatile uint8_t*)(uintptr_t)GuardAddress(CallbackGuard);
+  if (CallbackGuard == 2) {
+    *Address = 1; /* a write, like the translator's own */
+  } else {
+    (void)*Address;
+  }
+  return FEXMAC_SYSCALL_STOP;
+}
+
+static void CallbackTouchesGuard(int Which) {
+  struct sigaction Action;
+  memset(&Action, 0, sizeof(Action));
+  Action.sa_sigaction = RecordingHostHandler;
+  Action.sa_flags = SA_SIGINFO | SA_NODEFER;
+  sigaction(SIGBUS, &Action, NULL);
+  sigaction(SIGSEGV, &Action, NULL);
+  fexmac_install_fault_handlers();
+  CallbackGuard = Which;
+  GuardCode = MapGuestMemory(0x10000);
+  const uint8_t Program[] = {0xB8, 0x27, 0, 0, 0, 0x0F, 0x05, 0xF4}; /* mov eax,39 ; syscall ; hlt */
+  memcpy(GuardCode, Program, sizeof(Program));
+  fexmac_context* Context = CreateContext(TouchingSyscall, NULL);
+  GuardThread = CreateThreadAt(Context, (uint64_t)(uintptr_t)GuardCode, 0);
+  Shared[0] = 1;
+  fexmac_thread_run(GuardThread, NULL);
+  printf("  FAIL: the callback's access to the guard page did not fault\n");
+  exit(1);
+}
+
+static void TestCallbackCallRetGuard(void) {
+  CallbackTouchesGuard(0);
+}
+static void TestCallbackScratchGuard(void) {
+  CallbackTouchesGuard(2);
+}
+
+/* ---- a log callback that calls back into the library ---- */
+
+static fexmac_context* LogContext;
+static fexmac_result FromLog[3];
+static int LogEntries;
+
+static void ReentrantLog(fexmac_log_level Level, const char* Message, void* UserData) {
+  (void)Level;
+  (void)Message;
+  (void)UserData;
+  uint32_t Regs[4];
+  fexmac_thread* Thread = NULL;
+  FromLog[0] = fexmac_cpuid(LogContext, 0, 0, Regs);
+  FromLog[1] = fexmac_thread_create(LogContext, &Thread);
+  FromLog[2] = fexmac_context_destroy(LogContext);
+  ++LogEntries;
+}
+
+static void TestLogCallbackReentry(void) {
+  fexmac_config Config;
+  fexmac_config_init(&Config);
+  Config.log = ReentrantLog;
+  if (fexmac_context_create(&Config, &LogContext) != FEXMAC_OK) {
+    exit(2);
+  }
+  fexmac_testing_log("a message");
+  Check(LogEntries == 1, "the log callback ran");
+  CheckResult(FromLog[0], FEXMAC_ERROR_BUSY, "fexmac_cpuid from the log callback");
+  CheckResult(FromLog[1], FEXMAC_ERROR_BUSY, "fexmac_thread_create from the log callback");
+  CheckResult(FromLog[2], FEXMAC_ERROR_BUSY, "fexmac_context_destroy from the log callback");
+  uint32_t Regs[4];
+  CheckResult(fexmac_cpuid(LogContext, 0, 0, Regs), FEXMAC_OK, "fexmac_cpuid afterwards");
+  CheckResult(fexmac_context_destroy(LogContext), FEXMAC_OK, "fexmac_context_destroy afterwards");
+}
+
+#define GUARD_TEXT "guest memory access fault in translated code at address 0x"
+
 static const struct Subtest Subtests[] = {
+  {"guest-load-callret-low-guard-dies", TestGuestLoadCallRetLowGuard, SIGBUS, GUARD_TEXT, "fault inside", 1},
+  {"guest-store-callret-high-guard-dies", TestGuestStoreCallRetHighGuard, SIGBUS, GUARD_TEXT, "fault inside", 1},
+  {"guest-load-scratch-guard-dies", TestGuestLoadScratchGuard, SIGBUS, GUARD_TEXT, "fault inside", 1},
+  {"guest-store-scratch-guard-dies", TestGuestStoreScratchGuard, SIGBUS, GUARD_TEXT, "fault inside", 1},
+  {"callback-callret-guard-passed-on", TestCallbackCallRetGuard, 0, NULL, "fexmac:", 2},
+  {"callback-scratch-guard-passed-on", TestCallbackScratchGuard, 0, NULL, "fexmac:", 2},
+  {"log-callback-reentry", TestLogCallbackReentry, 0, NULL, NULL, 0},
   {"fault-inside-handler-dies", TestFaultInsideHandlerDies, SIGBUS, "fexmac: fault inside the fault handler", NULL, 1},
   {"no-log-callback-in-handler", TestNoLogCallbackInHandler, 0, "core message during fault handling: test message from the fault handler",
    NULL, 7},
