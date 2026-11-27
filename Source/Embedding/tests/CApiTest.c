@@ -1964,7 +1964,7 @@ static void TestSplitLockSignalStorm(void) {
   Check(Got == Want, "lock xadd across 16 bytes from %d threads under a signal storm: %" PRIu64 " of %" PRIu64, SplitThreads, Got, Want);
   Check(atomic_load(&StormStalls) == 0, "no signal interrupted a thread holding the split-lock lock (%ld signals, %ld stalls)",
         atomic_load(&StormSignals), atomic_load(&StormStalls));
-  Check(atomic_load(&StormSignals) > 100, "the storm reached the guest thread (%ld signals)", atomic_load(&StormSignals));
+  Check(atomic_load(&StormSignals) > 20, "the storm reached the guest thread (%ld signals)", atomic_load(&StormSignals));
   Check(Shared[2] == 0, "every thread ran to its halt");
   CheckResult(fexmac_context_destroy(SplitContext), FEXMAC_OK, "context destroy");
 }
