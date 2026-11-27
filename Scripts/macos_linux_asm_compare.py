@@ -94,6 +94,15 @@ def main():
     else:
         ap.error("give --junit or --linux")
 
+    # Nothing compared is not a pass: a JUnit file without the expected tests, an empty
+    # table or a mode missing on one side fails.
+    if not rows:
+        print("no instruction-test rows: nothing to compare")
+        return 1
+    for mode in COMMON_MODES:
+        if not any(r[0] == mode for r in rows):
+            print("no rows for mode %s" % mode)
+            return 1
     for mode, c in sorted(counts(rows).items()):
         ctest_failed = sum(1 for r in rows if r[0] == mode and r[3] == "failed")
         print("linux %s: raw pass %d, fail %d, skip %d (CTest failures, i.e. not as upstream expects: %d)" %
@@ -102,6 +111,9 @@ def main():
         with open(args.base) as handle:
             base = {tuple(parts[:2]): parts[2] for parts in (line.rstrip("\n").split("\t") for line in handle) if len(parts) >= 3}
         port = {(r[0], r[1]): r[2] for r in rows}
+        if not base or len(base) != len(port):
+            print("row counts differ: upstream base %d, port %d" % (len(base), len(port)))
+            return 1
         diffs = 0
         for key in sorted(set(base) | set(port)):
             b, p = base.get(key, "absent"), port.get(key, "absent")

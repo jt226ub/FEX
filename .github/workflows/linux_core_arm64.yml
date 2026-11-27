@@ -30,12 +30,17 @@ env:
   CC: clang
   CXX: clang++
 
+# bash with -e and -o pipefail for every step: a failing command piped into tee fails it.
+defaults:
+  run:
+    shell: bash
+
 jobs:
   core-only:
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 40
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 1
           persist-credentials: false
@@ -72,7 +77,7 @@ jobs:
           so="$(find build -name 'libFEXCore*.so' | head -1)"
           if nm -D --defined-only "$so" | grep -i -E 'fexmac|_np$'; then echo "macOS symbols in $so"; exit 1; fi
 
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
           name: linux-core-only-logs
@@ -93,7 +98,7 @@ jobs:
       matrix:
         source: [port, upstream-base]
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: ${{ matrix.source == 'port' && 1 || 0 }}
           filter: ${{ matrix.source == 'port' && '' || 'blob:none' }}
@@ -141,7 +146,7 @@ jobs:
         run: |
           cd build
           set +e
-          ctest --timeout 302 -j "$(nproc)" -R '64Bit.*\.asm$' --output-on-failure --output-junit linux-asm.xml > ../ctest.log 2>&1
+          ctest --no-tests=error --timeout 302 -j "$(nproc)" -R '64Bit.*\.asm$' --output-on-failure --output-junit linux-asm.xml > ../ctest.log 2>&1
           code=$?
           set -e
           tail -30 ../ctest.log
@@ -175,20 +180,20 @@ jobs:
 
       - name: Run upstream's unit tests that need no root file system
         # The tests of upstream's fexcore_apitests, api_tests and emitter_tests targets.
-        # The FutexSpin-Timed tests measure wall-clock waits and fail on these shared
-        # virtual machines on the upstream base too (seen in the first runs), so they are
-        # left out here.
+        # The four FutexSpin-Timed tests (8, 16, 32 and 64 bit) measure wall-clock waits
+        # and fail at random on these shared virtual machines, on the upstream base too
+        # (seen in the first runs), so they are left out here.
         if: ${{ !cancelled() }}
         run: |
           cd build
           set +e
-          ctest --timeout 302 -j "$(nproc)" -R '\.FEXCore_Tests$|\.APITest$|\.Emitter$' -E 'FutexSpin-Timed' \
+          ctest --no-tests=error --timeout 302 -j "$(nproc)" -R '\.FEXCore_Tests$|\.APITest$|\.Emitter$' -E 'FutexSpin-Timed' \
             --output-on-failure > ../unit-tests.log 2>&1
           code=$?
-          grep -E 'tests passed|tests failed|\(Failed\)|\(Timeout\)' ../unit-tests.log | tail -20
+          grep -E 'tests passed|tests failed|\(Failed\)|\(Timeout\)' ../unit-tests.log | tail -20 || true
           exit $code
 
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
           name: linux-tests-${{ matrix.source }}
@@ -208,15 +213,15 @@ jobs:
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 1
           persist-credentials: false
-      - uses: actions/download-artifact@v7
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           pattern: linux-tests-*
       - name: Compare
         run: |
-          ls -R linux-tests-* | head
+          ls linux-tests-*
           python3 Scripts/macos_linux_asm_compare.py --linux linux-tests-port/linux-asm-results.tsv \
             --base linux-tests-upstream-base/linux-asm-results.tsv
