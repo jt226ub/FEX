@@ -428,6 +428,11 @@ public:
   [[nodiscard]]
   CompileCodeResult CompileCode(FEXCore::Core::InternalThreadState* Thread, uint64_t GuestRIP, uint64_t MaxInst = 0);
   uintptr_t CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_t GuestRIP, uint64_t MaxInst = 0);
+#ifdef __APPLE__
+  // CompileBlock for the two places that branch to its result (the dispatcher and block
+  // linking): a block that cannot be translated gives a guest fault instead of 0.
+  uintptr_t CompileBlockOrFault(FEXCore::Core::CpuStateFrame* Frame, uint64_t GuestRIP, uint64_t MaxInst = 0);
+#endif
   uintptr_t CompileSingleStep(FEXCore::Core::CpuStateFrame* Frame, uint64_t GuestRIP);
 
   FEXCore::JITSymbols Symbols;

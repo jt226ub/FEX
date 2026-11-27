@@ -720,7 +720,12 @@ void Dispatcher::EmitDispatcher() {
   (void)Bind(&l_Sleep);
   dc64(reinterpret_cast<uint64_t>(SleepThread));
   (void)Bind(&l_CompileBlock);
+#ifdef __APPLE__
+  // Never 0: see CompileBlockOrFault.
+  FEXCore::Utils::MemberFunctionToPointerCast PMFCompileBlock(&FEXCore::Context::ContextImpl::CompileBlockOrFault);
+#else
   FEXCore::Utils::MemberFunctionToPointerCast PMFCompileBlock(&FEXCore::Context::ContextImpl::CompileBlock);
+#endif
   dc64(PMFCompileBlock.GetConvertedPointer());
   (void)Bind(&l_CompileSingleStep);
 
