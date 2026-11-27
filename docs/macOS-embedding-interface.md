@@ -121,7 +121,7 @@ The header documents every function. The design decisions:
 
 ## Options
 
-Only these 14 options are accepted; any other name, and any value that does not fit the
+Only these 15 options are accepted; any other name, and any value that does not fit the
 option's rule, gives `FEXMAC_ERROR_BAD_CONFIG`. Names are the core's environment-variable
 name without `FEX_`, or its configuration-file name. Numbers are decimal or `0x`
 hexadecimal; a leading 0 is refused rather than read as octal.
@@ -134,6 +134,7 @@ hexadecimal; a leading 0 is refused rather than read as octal.
 | `SMCCHECKS` | `none`, `mtrack`, `full` (or 0, 1, 2) | `mtrack` needs page-protection tracking (package D); until then it detects nothing and the embedder calls `fexmac_invalidate` |
 | `X87REDUCEDPRECISION`, `HIDEHYPERVISORBIT` | 0, 1 | |
 | `HOSTFEATURES` | `off`, or comma-separated `disable*` names the core knows | `enable*` names are refused: they force a feature on whether the host has it or not (`enablesve` dies with SIGILL on an M4) |
+| `SOFTWARERNG` | 0, 1 | RDRAND and RDSEED from `arc4random_buf`; no Apple chip so far has FEAT_RNG, so without it the guest CPUID offers neither |
 | `SILENTLOG`, `DUMPGPRS`, `DISABLETELEMETRY` | 0, 1 | `DISABLETELEMETRY` defaults to 1 |
 | `IS64BIT_MODE` | 1 | 32-bit guests cannot have the memory they need on macOS |
 
