@@ -3,11 +3,11 @@
 This is the evidence for exit criteria 7 ("a real guest program runs") and 8 ("speed is
 measured") of `docs/macOS-v1.0-plan.md`, and the method behind it.
 
-**The timing numbers below are provisional.** They were taken while other work was
-loading the machine, with the load recorded. The final measurement is to be made on an
-idle machine with the same script (`--final --write-docs`, see "How to run it"), which
-replaces the generated block in this document and labels it FINAL only if the machine
-was quiet enough.
+**The timing numbers in this document come from the generated blocks, which say whether
+they are provisional or final.** A final measurement is made on an idle machine with the
+same script (`--final --write-docs`, see "How to run it"), which replaces every generated
+block in this document and in the status document and labels them FINAL only if the
+machine was quiet enough.
 
 ## Two modes
 
@@ -74,9 +74,9 @@ verifies the outcome.
 | `nbody` | double n-body, `sqrt` and division | 48 bodies, 3,000 steps |
 | `fft` | radix-2 complex FFT forward and inverse | 240 x 4096 points |
 | `x87` | `long double`: 80-bit x87 on x86-64 (64-bit double on arm64) | 750,000 iterations |
-| `muldiv` | Miller-Rabin with Montgomery multiplication (`mul`), 64-bit `div` and `idiv` | 60,000 candidates near 2^62 |
+| `muldiv` | Miller-Rabin with Montgomery multiplication (`mul`); 64-bit `div` and `idiv` with divisors from 1 to 2^64 (quotients up to 2^64); 128-by-64 `divq` and `idivq` with large high halves | 60,000 candidates near 2^62 |
 | `calls` | recursive Fibonacci: call and return | fib(34) |
-| `deep_recursion` | 50,000-deep non-tail recursion (deeper than the core's call/return stack) | 100 times |
+| `deep_recursion` | 50,000-deep non-tail recursion (deeper than the core's call/return stack) | 100 repetitions |
 | `threads_lock` | 4 guest threads: spin lock (`xchg`) around shared updates, `lock xadd` | 4 x 400,000 |
 | `threads_mp` | 2 producer/consumer pairs through rings; data published with plain stores and release/acquire, which on x86 are plain moves relying on TSO | 2 x 1,000,000 messages |
 
@@ -103,9 +103,8 @@ is measured and subtracted), each iteration's writes go to separate regions so o
 sees all of them, and every run starts from the same destination contents; the FFT and
 n-body hash every output, Miller-Rabin every candidate's verdict, the recursion is
 combined through a bijection at every level. `Scripts/macos_bench_mutations.py` checks
-this: it applies 53 mutations, one at a time, to a copy of `kernels.c` and requires each
-to change its kernel's checksum (natively on arm64, and under Rosetta 2 for the three
-that exist only in the x86-64 string-instruction code). They include, per kernel:
+this: it applies 58 mutations, one at a time, to a copy of `kernels.c` and requires each
+to change its kernel's checksum (natively on arm64, and under Rosetta 2 for those that exist only in the x86-64 code). They include, per kernel:
 
 | Kernel | Mutations (each changes the checksum) |
 |---|---|
@@ -122,7 +121,7 @@ that exist only in the x86-64 string-instruction code). They include, per kernel
 | nbody | one pair interaction left out; wrong mass in one velocity component; one position not integrated at the last step |
 | fft | last butterfly stage skipped; imaginary part scaled wrong |
 | x87 | a product term changed; a zeta term changed (both arm64 and x86-64) |
-| muldiv | candidates shifted by one; wrong divisor; modular inverse one Newton step short |
+| muldiv | candidates shifted by one; wrong divisor; small divisors replaced by large ones; 128-by-64 division with the high half dropped; 128-by-64 quotient low bit lost; signed 128-by-64 division with a positive dividend only (arm64 and x86-64); `divq` given a zero high half (x86-64); modular inverse one Newton step short |
 | calls | base case wrong |
 | deep_recursion | one level off by one; one level shallower |
 | threads_lock | one lost counter update; one lost sum update; atomic add of the wrong value |
@@ -161,13 +160,26 @@ translator or port bug was found: there is no checksum difference to reduce.
 
 ## Speed (criterion 8)
 
+Every figure about speed in this document and in `docs/macOS-port-status.md` is in a
+block that `Scripts/macos_bench.py --write-docs` generates from one results file, which
+is committed beside this document as `docs/macOS-benchmarks-results.json`; the prose
+around the blocks states conclusions only and refers to them. `--check-docs` fails if a
+block differs from what that file gives or if a measured figure (a ratio, a time, a
+percentage) appears anywhere else, so a new measurement leaves nothing stale behind.
+
+### Summary
+
+<!-- bench-summary:begin -->
+<!-- bench-summary:end -->
+
 ### Method
 
-- Every build and configuration is launched `--launches` times (5), and the launches are
-  interleaved: each round runs every build once, starting one later each round, so drift
-  in the machine's state reaches all of them alike. Each launch does one warm-up and
-  `--reps` (3) timed runs of each kernel; a launch's value is the median of its runs, and
-  the report gives the median of the launch medians and their range.
+- Every build and configuration is launched `--launches` times (five by default), and
+  the launches are interleaved: each round runs every build once, starting one later each
+  round, so drift in the machine's state reaches all of them alike. Each launch does one
+  warm-up and `--reps` (three by default) timed runs of each kernel; a launch's value is
+  the median of its runs, and the report gives the median of the launch medians and
+  their range.
 - Every thread runs at the user-interactive quality of service, which keeps it on the
   performance cores when they are free.
 - The summary sets are fixed in the script and reported separately:
@@ -177,10 +189,21 @@ translator or port bug was found: there is no checksum difference to reduce.
     whose `long double` is a different type;
   - **thread kernels**: reported with their spread, in no mean.
   A kernel enters a configuration's mean only if it was right in every launch of it.
-- Load: other processes' CPU use (from `ps`, which macOS reports as a decaying average)
-  and the load average are sampled every 2 s and stored in the JSON with every
-  individual time. The load average on this Mac includes 4 processes stuck in Rosetta 2
-  since a launch earlier in this work (see "Rosetta 2 on this machine"); they use no CPU.
+- Load: every two seconds the script reads the whole machine's busy CPU time from the
+  kernel (`host_processor_info`) and subtracts its own CPU time and that of the program it
+  is running (`getrusage`, `proc_pid_rusage`); the difference is the load from other
+  processes. (`ps`'s `%cpu` is a decaying average that barely counts short-lived
+  processes such as a build's compiler jobs, and under-reported a saturated machine
+  several times over.) The samples, with the load average, go into the JSON. A run is
+  labelled FINAL only with `--final`, from a clean commit (`git describe --dirty`), and
+  only if other processes used at most half a core on average and one and a half at any
+  sample; `--measure-load SECONDS` reports the same verdict without running anything.
+  The load average on this Mac includes four processes stuck in Rosetta 2 since a launch
+  earlier in this work (see "Rosetta 2 on this machine"); they use no CPU.
+- Clock reads: the kernels hash their buffers outside the timed work, bracketed by two
+  clock reads, which under this port are system calls. The program measures the cost of
+  one read at start and subtracts it for every bracket, so the bias this would add is
+  removed; the measured cost is in the summary.
 - Translation overhead: blocks compiled and blocks loaded from the code cache per launch
   (`fexmac_context_get_counters`, printed by `FEXCoreBench` at exit), the time from
   launch to the first kernel result and the whole launch's time, per configuration; and
@@ -200,16 +223,23 @@ add the vector and string-instruction switches one at a time, to show what each 
 
 Two configurations show the code cache (exit criterion 6) on this program, both
 `tso_on` with `FEXCoreBench --code-cache DIR`, which sets `fexmac`'s
-`code_cache_enabled` and `code_cache_directory`: **`tso_on_cache_cold`** uses a fresh,
-empty directory for every launch (everything is compiled and written to the cache), and
-**`tso_on_cache_warm`** a directory that one run with the same arguments filled first
-(translations are loaded instead of compiled). The directories are private ones under
+`code_cache_enabled` and `code_cache_directory`: **`tso_on_cache_cold`** starts every
+launch with a fresh, empty directory, and **`tso_on_cache_warm`** uses a directory that
+one run with the same arguments filled first. The directories are private ones under
 `--out/code-cache`, never `~/Library/Caches`. Their checksums are checked like every
-other configuration's; a warm launch must load its blocks (at most 1 in 20 compiled) and
-a cold one must compile and queue them. `FEXCoreBench` registers the image's executable
-segments with `fexmac_add_code_range` in every configuration.
+other configuration's; a warm launch must load its blocks (at most one in twenty
+compiled), and a cold one must compile and queue them. A cold launch also loads a few
+blocks: ones it wrote itself earlier in the same launch. A cache entry records every
+entry point of its translated code, and when the guest later enters such a code region
+at an address the in-memory lookup does not hold (most likely the resume point after a
+system call, which is inside an already translated block), the entry the cache writer
+has stored meanwhile is found. The literal mode, which makes no system call until exit,
+loads none on a cold cache; the timed mode loads a few, and many more with multiblock
+off, where blocks are short and every system call return is a new entry.
+`FEXCoreBench` registers the image's executable segments with `fexmac_add_code_range`
+in every configuration.
 
-### Results (provisional)
+### Results
 
 <!-- bench-results:begin -->
 <!-- Generated by Scripts/macos_bench.py; replace by running it again, do not edit by hand. -->
@@ -317,21 +347,18 @@ Blocks compiled and loaded come from `fexmac_context_get_counters`. First result
 
 ### Where this port is far from Rosetta 2, and why
 
-In the provisional runs the like-for-like figure, all ordering on, is about **2.1 times
-Rosetta 2's time** over the headline kernels (geometric mean; 2.23 and 2.10 in the two
-runs). Scalar ordering alone costs about nothing against Rosetta overall (1.00 and
-1.06): it costs 1.1 to 2 times on the kernels dominated by scalar loads and stores, and
-FEX is faster on others. From there, vector ordering adds most of the rest (`tso_vector`
-1.80 and 2.13) and string-instruction ordering a smaller part, all of it in `rep_movs`
-(`tso_memcpy` 1.17 and 1.24). The generated block above is a third run, under heavier load
-(other processes 3.7 cores on average, load average 22, Rosetta 2 itself slower): there
-the same all-on code gave 1.55, 1.90 and 2.21 in its three configurations (`tso_on` and
-the two cache ones), which shows how far such runs are from a basis for figures. The
-worst kernels:
+The summary gives the figures; this section explains them. With all ordering on, FEX
+is slower than Rosetta 2 overall, and almost all of the difference is the cost of
+emulating x86 memory ordering in software, which Rosetta 2 gets from the hardware.
+Scalar ordering alone costs little overall: it slows the kernels dominated by scalar
+loads and stores, and FEX is faster than Rosetta 2 on others. Vector ordering adds most
+of the rest, and string-instruction ordering a smaller part, all of it in `rep_movs`. The
+summary lists the kernels each switch slows. Runs on a loaded machine move these ratios a
+lot, even between configurations that run the same code (`tso_on` and the two cache
+ones), so only a quiet run gives figures. The mechanisms:
 
-1. **SSE kernels with vector ordering on.** `copy_loop` 21 to 63 times Rosetta 2 (and
-   the most variable number in the table, see below), `matmul_f32x4` 5x, `fft` 4.3x,
-   `nbody` 3.2x, `matmul_f64` 2x (scalar `movsd` is a vector access in FEX). With vector
+1. **SSE kernels with vector ordering on** (`copy_loop`, `matmul_f32x4`, `fft`,
+   `nbody`, `matmul_f64`, where scalar `movsd` is a vector access in FEX). With vector
    ordering on, FEX puts a `dmb ishld` after every vector load and a `dmb ish` before
    every vector store (`FEXCore/Source/Interface/Core/JIT/MemoryOps.cpp`, the
    `IsVectorAtomicTSOEnabled()` paths of the TSO load and store ops), whatever the host
@@ -353,24 +380,23 @@ worst kernels:
    (Unsupported by FEXCore currently)"), and the M4 does not have the feature
    (`hw.optional.arm.FEAT_LRCPC3` does not exist), so neither is the cause here: the
    barriers are FEX's only method for vector ordering. With vector ordering off these
-   kernels run at 0.5x to 1.5x Rosetta.
+   kernels are close to Rosetta 2.
 
-   `copy_loop` with vector ordering is the number that depends most on the machine's
-   state: launch medians from 107 ms to 1,042 ms within one run, across the configurations with
-   vector ordering on. Earlier, two runs
-   alone gave 1.0 to 1.3 s and two with six other cores busy gave 0.1 to 0.75 s: a loop
-   that waits on a barrier after every load is bound by memory latency, which here
-   appears to be lower when the machine is busy. Its ratio is not a stable figure.
+   `copy_loop` with vector ordering is the result that depends most on the machine's
+   state (its range of launch medians in the table is the widest). In an earlier
+   experiment it ran several times faster with six other cores kept busy than with them
+   idle: a loop that waits on a barrier after every load is bound by memory latency,
+   which here appears to be lower when the machine is busy. Its ratio is not a stable
+   figure.
 
-2. **`rep_movs` with string ordering on: about 4.2x Rosetta 2, 17 to 19 times slower than
-   without it.** With `MEMCPYSETTSOENABLED=1`, `rep movsb` becomes a loop of one `ldaprb`
-   and one `stlrb` per byte (and `rep movsq` one `ldapr`/`stlr` per quadword); without
-   it, 64 bytes per iteration with `ldp q`/`stp q`. Rosetta 2 is itself 5 times slower
-   than native here.
+2. **`rep_movs` with string ordering on.** With `MEMCPYSETTSOENABLED=1`, `rep movsb`
+   becomes a loop of one `ldaprb` and one `stlrb` per byte (and `rep movsq` one
+   `ldapr`/`stlr` per quadword); without it, 64 bytes per iteration with `ldp q`/`stp q`.
+   Rosetta 2 is itself much slower than native here.
 
-3. **`interp`: about 1.9x Rosetta 2 with scalar ordering, 0.93x without.** Every guest
-   load that is not to the stack becomes `ldapur`/`ldapr` and every store `stlr`,
-   including the interpreter's reads of its instruction stream and register array:
+3. **`interp` with scalar ordering.** Every guest load that is not to the stack becomes
+   `ldapur`/`ldapr` and every store `stlr`, including the interpreter's reads of its
+   instruction stream and register array:
 
    ```
    ldapurb w10, [x4]          ; movzbl (%rax), %esi    (opcode)
@@ -378,31 +404,28 @@ worst kernels:
    ldapur  w20, [x4, #4]      ; movslq 0x4(%rax), %rcx
    ```
 
-   Indirect branches are not the problem: the jump-table `jmp *%rax` becomes an inline
-   lookup in the core's L1 code cache (`ldp` from the thread's table, compare, `br`),
-   six instructions on a hit. `sort` (1.1 to 1.3x) and `crc32` (1.15 to 1.3x) pay the
-   same, less.
+   With ordering off it runs at about Rosetta 2's speed. Indirect branches are not the
+   problem: the jump-table `jmp *%rax` becomes an inline lookup in the core's L1 code
+   cache (`ldp` from the thread's table, compare, `br`), six instructions on a hit.
+   `sort` and `crc32` pay the same, less.
 
-4. **`calls` with multiblock off: 5 to 6 times Rosetta 2** (1.3x with it on). Each call
-   and return ends a block and goes through the dispatcher.
+4. **`calls` with multiblock off.** Each call and return ends a block and goes through
+   the dispatcher; with multiblock on it is close to Rosetta 2.
 
-5. **Threads.** `threads_mp` is 4 to 5 times Rosetta 2 with ordering on and
-   `threads_lock` 1.5 to 1.8 times, with launch medians varying up to 4 times. Native
-   arm64 is itself much slower than Rosetta 2 on `threads_mp`, which is not explained.
-   Numbers this noisy on a shared machine are not a basis for conclusions.
+5. **Threads.** The thread kernels' launch medians vary widely, under every build.
+   Native arm64 is itself much slower than Rosetta 2 on `threads_mp`, which is not
+   explained. Numbers this noisy on a shared machine are not a basis for conclusions.
 
 **The code cache** works on this program: a warm launch compiles no block and loads all
-of them (about 80; about 540 with multiblock off), a cold one compiles and queues them.
-Its effect on time is not measurable here: translating the whole program is a small
-part of a launch (the first kernel result comes 0.07 to 0.09 s after launch with or
-without the cache), so the difference is within the noise of a loaded machine. A cold
-launch also pays for writing the cache. A program with much more code than this one is
-needed to show the time the cache saves.
+of them, a cold one compiles and queues them (see "Configurations" for the few it loads).
+Its effect on time is small here: translating the whole program is a small part of a
+launch, so the times with and without the cache in the translation table are close, and
+on a loaded machine within the noise. A cold launch also pays for writing the cache. A
+program with much more code than this one is needed to show the time the cache saves.
 
-**x87** is slow in every x86-64 build (Rosetta 2 about 590 ms, FEX about 430 ms, against
-3.6 ms for native arm64's double arithmetic, which is not comparable). FEX implements
-80-bit x87 arithmetic in software; Rosetta 2 appears to do the same. FEX is about 1.4
-times faster than Rosetta 2 at full precision, and about 20 times faster with
+**x87** is slow in every x86-64 build, against native arm64's double arithmetic, which
+is not comparable. FEX implements 80-bit x87 arithmetic in software; Rosetta 2 appears to
+do the same. FEX is faster than Rosetta 2 at full precision, and much faster with
 `X87REDUCEDPRECISION=1`, at the cost of a different answer.
 
 ### Candidates (recorded, not done in this package)
@@ -447,18 +470,22 @@ No debugger or profiler was used.
   the x86-64 builds, and `macos_bench.py` gives every launch a deadline after which it
   kills the process group and, if the process still does not end, reports it and goes
   on.
-- The first launch of a new x86-64 program costs Rosetta 2 about 0.13 to 0.17 s before
-  its first kernel result (ahead-of-time translation); later launches about 0.01 s.
+- The first launch of a new x86-64 program costs Rosetta 2 noticeably more time before
+  its first kernel result than later launches (ahead-of-time translation); the table
+  "Time to first kernel result" has the figures.
 
 ## How to run it
 
 ```
 ninja -j4 -C build FEXCoreBench
 # The measurement: writes bench-out/results.json and bench-out/results.md; with
-# --write-docs also replaces the generated block above. FINAL only if the machine was
-# quiet (other processes at most 0.5 cores on average and 1.5 at any sample; exit
-# status 2 otherwise).
+# --write-docs also replaces the generated blocks in both documents and copies the
+# results to docs/macOS-benchmarks-results.json. FINAL only from a clean commit and if
+# the machine was quiet (exit status 2 otherwise).
 python3 Scripts/macos_bench.py --loader build/Bin/FEXCoreBench --out bench-out --final --write-docs
+# Is the machine quiet enough now? And do the documents match the committed results?
+python3 Scripts/macos_bench.py --measure-load 30
+python3 Scripts/macos_bench.py --check-docs
 # The correctness check (what the Mac workflow runs, as built and with --hardened):
 python3 Scripts/macos_bench.py --loader build/Bin/FEXCoreBench --out bench-quick --quick [--hardened]
 python3 Scripts/macos_bench_mutations.py

@@ -58,9 +58,13 @@ static void cpu_relax(void) {
 }
 
 /* Checks that the kernels make outside their timed work (hashing whole buffers) are
- * excluded from the time: the driver subtracts g_untimed_ns. In the literal mode there is
- * no clock, so nothing is measured. */
+ * excluded from the time: the driver subtracts g_untimed_ns, and also the cost of the
+ * clock reads that bracket them (g_untimed_pairs times the calibrated cost of one read,
+ * g_clock_ns, measured once at start: under this port a guest clock read is a system
+ * call). In the literal mode there is no clock, so nothing is measured. */
 static uint64_t g_untimed_ns;
+static uint64_t g_untimed_pairs;
+static uint64_t g_clock_ns;
 static int g_literal;
 
 static uint64_t untimed_begin(void) {
@@ -70,7 +74,22 @@ static uint64_t untimed_begin(void) {
 static void untimed_end(uint64_t t0) {
   if (!g_literal) {
     g_untimed_ns += bench_time_ns() - t0;
+    ++g_untimed_pairs;
   }
+}
+
+/* The mean cost of one clock read: the best of several batches of back-to-back reads. */
+static uint64_t calibrate_clock(void) {
+  uint64_t best = ~0ull;
+  for (int batch = 0; batch < 5; ++batch) {
+    const uint64_t t0 = bench_time_ns();
+    for (int i = 0; i < 1000; ++i) {
+      (void)bench_time_ns();
+    }
+    const uint64_t per = (bench_time_ns() - t0) / 1001;
+    best = per < best ? per : best;
+  }
+  return best;
 }
 
 /* Position-sensitive hash of every byte of a buffer (n a multiple of 8): a running sum
@@ -984,6 +1003,35 @@ static int is_prime(uint64_t n) {
   return 1;
 }
 
+/* (hi:lo) / d with hi < d: divq on x86-64; the compiler's 128-bit division elsewhere. */
+static void div128(uint64_t hi, uint64_t lo, uint64_t d, uint64_t* q, uint64_t* r) {
+#if defined(__x86_64__)
+  __asm__("divq %4" : "=a"(*q), "=d"(*r) : "a"(lo), "d"(hi), "rm"(d) : "cc");
+#else
+  const unsigned __int128 n = ((unsigned __int128)hi << 64) | lo;
+  *q = (uint64_t)(n / d);
+  *r = (uint64_t)(n % d);
+#endif
+}
+
+/* The signed 128-bit value sign-extended from (int64)x * 2^40 + 12345, divided by d
+ * (|d| >= 2^42, so the quotient fits): idivq on x86-64. */
+static void idiv128(uint64_t x, int64_t d, int64_t* q, int64_t* r) {
+  if (d > -(1ll << 42) && d < (1ll << 42)) {
+    d = d < 0 ? d - (1ll << 42) : d + (1ll << 42);
+  }
+  const __int128 n = (__int128)(int64_t)x * ((__int128)1 << 40) + 12345;
+  const uint64_t lo = (uint64_t)n, hi = (uint64_t)(n >> 64);
+#if defined(__x86_64__)
+  __asm__("idivq %4" : "=a"(*q), "=d"(*r) : "a"(lo), "d"(hi), "rm"(d) : "cc");
+#else
+  (void)lo;
+  (void)hi;
+  *q = (int64_t)(n / d);
+  *r = (int64_t)(n % d);
+#endif
+}
+
 static uint64_t run_muldiv(int quick) {
   const uint64_t count = quick ? 2000 : 60000;
   uint64_t primes = 0, h = 0;
@@ -995,12 +1043,27 @@ static uint64_t run_muldiv(int quick) {
     primes += (uint64_t)p;
     h = mix(h, n * 2 + (uint64_t)p);
   }
-  /* Plain 64-bit division, signed and unsigned. */
+  /* 64-bit division, signed and unsigned: divisors from 1 up to 2^64, so quotients
+   * from 0 up to 2^64 (small divisors give large quotients); and 128-by-64 division
+   * with a large high half (kept below the divisor, so it never faults). */
   uint64_t s = 3, acc = 0;
   for (uint64_t i = 0; i < count * 20; ++i) {
-    const uint64_t a = splitmix(&s), b = (splitmix(&s) >> (i & 31)) | 1;
+    const uint64_t a = splitmix(&s), r = splitmix(&s);
+    const uint64_t b = (r >> (i & 63)) | 1;  /* 1 .. 2^64 */
+    const uint64_t small = (r & 0xFFFF) | 1; /* quotients near 2^48 and above */
     acc += a / b + a % b;
-    acc ^= (uint64_t)((int64_t)a / (int64_t)(b | 0x100));
+    acc = acc * 3 + a / small + a % small;
+    const int64_t sa = (int64_t)a, sb = (int64_t)(b | 0x100) * ((i & 1) ? -1 : 1);
+    acc ^= (uint64_t)(sa / sb) + (uint64_t)(sa % sb);
+    acc += (uint64_t)(sa / (int64_t)((small & 0xFF) | 1));
+    /* 128/64: high half just below the divisor, so the quotient uses all 64 bits. */
+    const uint64_t d = b | (1ull << 63) >> (i & 15);
+    uint64_t q, rem;
+    div128(r % d, a, d, &q, &rem);
+    acc = mix(acc, q) + rem;
+    int64_t sq, srem;
+    idiv128(a, (int64_t)(r & 0x3FFFFFFFFFFFull) - (int64_t)0x1FFFFFFFFFFFll, &sq, &srem);
+    acc = mix(acc, (uint64_t)sq) ^ (uint64_t)srem;
   }
   return mix(mix(h, primes), acc);
 }
@@ -1196,7 +1259,7 @@ static const kernel_t g_kernels[] = {
   {"nbody", 0, run_nbody, 0xe2f88f451af3998bull, 0x6eec4e36849af591ull, 0},
   {"fft", setup_fft, run_fft, 0x1c5961a0e586d092ull, 0x1ce6b15f6b66b513ull, 0},
   {"x87", 0, run_x87, X87_QUICK, X87_FULL, 0},
-  {"muldiv", 0, run_muldiv, 0x7413250006b4a54dull, 0xac017cef6837ff01ull, 0},
+  {"muldiv", 0, run_muldiv, 0xb26b3ab42e0e11daull, 0xf960dd4a14cc1005ull, 0},
   {"calls", 0, run_calls, 0x000000000000452full, 0x00000000005704e7ull, 0},
   {"deep_recursion", 0, run_deep_recursion, 0xc3031115a18a807bull, 0x390d2a223a3d2c55ull, 0},
   {"threads_lock", 0, run_threads_lock, 0xd33b3540666222e7ull, 0xff003f56a74a02ebull, 1},
@@ -1272,6 +1335,10 @@ int bench_main(int flags, int reps, const char* only, int* ran_out) {
     put_str(&l, quick ? " quick reps " : " full reps ");
     put_u64(&l, (uint64_t)reps);
     put_end(&l);
+    g_clock_ns = calibrate_clock();
+    put_str(&l, "CLOCK ns_per_read ");
+    put_u64(&l, g_clock_ns);
+    put_end(&l);
   }
 
   for (size_t k = 0; k < KERNEL_COUNT; ++k) {
@@ -1289,6 +1356,7 @@ int bench_main(int flags, int reps, const char* only, int* ran_out) {
      * literal mode runs each kernel once and has no clock. */
     for (int r = 0; r <= (literal ? 0 : reps); ++r) {
       g_untimed_ns = 0;
+      g_untimed_pairs = 0;
       const uint64_t t0 = literal ? 0 : bench_time_ns();
       const uint64_t sum = kn->run(quick);
       const uint64_t t1 = literal ? 0 : bench_time_ns();
@@ -1303,7 +1371,8 @@ int bench_main(int flags, int reps, const char* only, int* ran_out) {
         put_str(&l, " ");
         put_u64(&l, (uint64_t)r);
         put_str(&l, " ");
-        put_u64(&l, t1 - t0 - g_untimed_ns);
+        const uint64_t excluded = g_untimed_ns + g_untimed_pairs * g_clock_ns;
+        put_u64(&l, t1 - t0 > excluded ? t1 - t0 - excluded : 0);
         put_str(&l, " ");
         put_hex(&l, sum);
         put_end(&l);
