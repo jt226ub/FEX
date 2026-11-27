@@ -31,6 +31,17 @@ fexmac_x86_state GetState(fexmac_thread* Thread);
 void SetState(fexmac_thread* Thread, const fexmac_x86_state* State);
 fexmac_stop Run(fexmac_thread* Thread);
 
+/* Large blocks for the scratch-buffer and code-buffer tests. A block is `Count` times
+ * `rep movsq` (which translates to far more host code per IR node than the translator
+ * first allows for, so long runs of it overflow the scratch buffer; with rcx = 0 it does
+ * nothing), with an `add rax, 1` after every `Every`-th, then `hlt`. WriteBigBlock
+ * returns its length and sets *Expected to rax at the hlt; RunBigBlock runs it from its
+ * start with rax = rcx = 0 and returns whether it halted there with that rax.
+ * BigBlockOptions allows blocks of any length (MAXINST, MULTIBLOCK). */
+extern const fexmac_option BigBlockOptions[2];
+size_t WriteBigBlock(uint8_t* Code, size_t Count, size_t Every, uint64_t* Expected);
+int RunBigBlock(fexmac_thread* Thread, uint8_t* Code, size_t Length, uint64_t Expected, uint8_t* Data);
+
 struct Subtest {
   const char* Name;
   void (*Run)(void);

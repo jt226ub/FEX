@@ -1973,6 +1973,147 @@ static void TestSplitLockSignalStorm(void) {
 
 #define GUEST_FAULT_TEXT "guest memory access fault in translated code at address 0x"
 
+/* ---- the translator's scratch buffer and the code buffers: large blocks ---- */
+
+/* The translator emits each block into a per-thread scratch buffer sized from the
+ * block's IR, followed by a guard page; a block whose code is larger runs into the guard
+ * and the translation restarts with a buffer twice as generous. The finished block is
+ * copied into the shared code buffer, which is replaced by a larger one when the block
+ * does not fit in what is left. `rep movsq` produces far more host code per IR node than
+ * the first size allows (FEX_bugs/CodeBufferOverflow uses it the same way), so runs of
+ * it overflow; with rcx = 0 it does nothing. fexmac_hook_test counts the overflows. */
+
+/* Blocks of every size from below the first overflow to well past it, in steps of one
+ * instruction, so the guard is hit at every offset in its page. A thread keeps its
+ * scratch buffer between translations and only claims a larger one when a translation
+ * needs it, so each size gets a fresh context, and with it a first buffer of exactly
+ * the size the translator asks for. */
+static void TestScratchOverflowSizes(void) {
+  fexmac_install_fault_handlers();
+  uint8_t* Data = MapGuestMemory(0x10000);
+  int Wrong = 0, Runs = 0;
+  for (size_t Count = 96; Count <= 416; Count += 1, ++Runs) {
+    fexmac_context* Context = CreateContextWithOptions(BigBlockOptions, 2, NULL, NULL);
+    fexmac_thread* Thread = CreateThreadAt(Context, 0, (uint64_t)(uintptr_t)Data + 0x8000);
+    uint8_t* Code = MapGuestMemory(0x4000);
+    uint64_t Expected = 0;
+    const size_t Length = WriteBigBlock(Code, Count, 32, &Expected);
+    if (!RunBigBlock(Thread, Code, Length, Expected, Data) && Wrong++ < 5) {
+      printf("  block of %zu rep movsq: wrong result\n", Count);
+    }
+    fexmac_thread_destroy(Thread);
+    fexmac_context_destroy(Context);
+    munmap(Code, 0x4000);
+  }
+  Check(Wrong == 0, "%d blocks of 96 to 416 rep movsq, each one instruction longer, ran correctly", Runs);
+  /* Very large blocks, far past the first overflow, one after another on one thread. */
+  fexmac_context* Context = CreateContextWithOptions(BigBlockOptions, 2, NULL, NULL);
+  fexmac_thread* Thread = CreateThreadAt(Context, 0, (uint64_t)(uintptr_t)Data + 0x8000);
+  for (size_t Count = 2048; Count <= 8192; Count *= 2) {
+    uint8_t* Code = MapGuestMemory(0x10000);
+    uint64_t Expected = 0;
+    const size_t Length = WriteBigBlock(Code, Count, 64, &Expected);
+    Check(RunBigBlock(Thread, Code, Length, Expected, Data), "a block of %zu rep movsq ran correctly", Count);
+    fexmac_invalidate(Context, (uint64_t)(uintptr_t)Code, 0x10000);
+    munmap(Code, 0x10000);
+  }
+  fexmac_thread_destroy(Thread);
+  fexmac_context_destroy(Context);
+}
+
+/* Many threads translating large blocks at once: each has its own scratch buffer and
+ * restart point, and all share the code buffer. */
+#define SCRATCH_THREADS 8
+static fexmac_context* ScratchContext;
+static atomic_int ScratchWrong;
+
+static void* ScratchWorker(void* Arg) {
+  const size_t Index = (size_t)(uintptr_t)Arg;
+  uint8_t* Data = MapGuestMemory(0x10000);
+  fexmac_thread* Thread = NULL;
+  if (fexmac_thread_create(ScratchContext, &Thread) != FEXMAC_OK) {
+    atomic_fetch_add(&ScratchWrong, 1);
+    return NULL;
+  }
+  fexmac_x86_state State = GetState(Thread);
+  State.gpr[RSP] = (uint64_t)(uintptr_t)Data + 0x8000;
+  SetState(Thread, &State);
+  for (size_t Round = 0; Round < 12; ++Round) {
+    uint8_t* Code = MapGuestMemory(0x8000);
+    uint64_t Expected = 0;
+    const size_t Length = WriteBigBlock(Code, 200 + Index * 97 + Round * 131, 16, &Expected);
+    if (!RunBigBlock(Thread, Code, Length, Expected, Data)) {
+      atomic_fetch_add(&ScratchWrong, 1);
+    }
+    fexmac_invalidate(ScratchContext, (uint64_t)(uintptr_t)Code, 0x8000);
+    munmap(Code, 0x8000);
+  }
+  fexmac_thread_destroy(Thread);
+  return NULL;
+}
+
+static void TestScratchOverflowThreads(void) {
+  fexmac_install_fault_handlers();
+  ScratchContext = CreateContextWithOptions(BigBlockOptions, 2, NULL, NULL);
+  pthread_t Workers[SCRATCH_THREADS];
+  for (size_t i = 0; i < SCRATCH_THREADS; ++i) {
+    pthread_create(&Workers[i], NULL, ScratchWorker, (void*)(uintptr_t)i);
+  }
+  for (size_t i = 0; i < SCRATCH_THREADS; ++i) {
+    pthread_join(Workers[i], NULL);
+  }
+  Check(atomic_load(&ScratchWrong) == 0, "%d threads each translated and ran 12 large blocks at the same time", SCRATCH_THREADS);
+  fexmac_context_destroy(ScratchContext);
+}
+
+/* The same large block translated again and again (invalidated in between) until well
+ * past the end of the first code buffer (16MB) and into the next: each copy that does
+ * not fit in what is left moves translation to a new, larger buffer. With the code
+ * cache on, the copies after the first come from the cache by copy instead. */
+static void CodeBufferSwitch(int Cache) {
+  fexmac_install_fault_handlers();
+  if (Cache) {
+    MakeCacheDir();
+  }
+  fexmac_context* Context = Cache ? CreateCacheContext(CacheDir) : CreateContextWithOptions(BigBlockOptions, 2, NULL, NULL);
+  uint8_t* Code = MapGuestMemory(0x4000);
+  uint64_t Expected = 0;
+  const size_t Length = WriteBigBlock(Code, 1024, 8, &Expected);
+  if (Cache) {
+    CheckResult(fexmac_add_code_range(Context, (uint64_t)(uintptr_t)Code, 0x4000, 0), FEXMAC_OK, "registering the guest code");
+  }
+  uint8_t* Data = MapGuestMemory(0x10000);
+  fexmac_thread* Thread = CreateThreadAt(Context, 0, (uint64_t)(uintptr_t)Data + 0x8000);
+  int Wrong = 0;
+  const int Copies = 160;
+  for (int i = 0; i < Copies; ++i) {
+    if (!RunBigBlock(Thread, Code, Length, Expected, Data)) {
+      ++Wrong;
+    }
+    fexmac_invalidate(Context, (uint64_t)(uintptr_t)Code, Length);
+  }
+  const fexmac_translation_counters C = Counters(Context);
+  Check(Wrong == 0, "%d translations of a block of 1024 rep movsq ran correctly (%" PRIu64 " compiled, %" PRIu64 " loaded)", Copies,
+        C.blocks_compiled, C.blocks_loaded);
+  Check(C.blocks_compiled + C.blocks_loaded >= (uint64_t)Copies, "every copy was translated or loaded anew");
+  if (Cache) {
+    Check(C.blocks_loaded > 0, "copies were loaded from the code cache");
+  }
+  fexmac_thread_destroy(Thread);
+  fexmac_context_destroy(Context);
+  if (Cache) {
+    RemoveCacheDir();
+  }
+}
+
+static void TestCodeBufferSwitch(void) {
+  CodeBufferSwitch(0);
+}
+
+static void TestCodeBufferSwitchCached(void) {
+  CodeBufferSwitch(1);
+}
+
 static const struct Subtest Subtests[] = {
   {"run", TestRun, 0, NULL, NULL, 0},
   {"syscall-prefix", TestSyscallPrefix, 0, NULL, NULL, 0},
@@ -2020,6 +2161,10 @@ static const struct Subtest Subtests[] = {
   {"split-locks-concurrent", TestSplitLocks, 0, NULL, NULL, 0},
   {"split-locks-every-form", TestSplitLockForms, 0, NULL, NULL, 0},
   {"split-locks-signal-storm", TestSplitLockSignalStorm, 0, NULL, NULL, 0},
+  {"scratch-overflow-sizes", TestScratchOverflowSizes, 0, NULL, NULL, 0},
+  {"scratch-overflow-threads", TestScratchOverflowThreads, 0, NULL, NULL, 0},
+  {"code-buffer-switch", TestCodeBufferSwitch, 0, NULL, NULL, 0},
+  {"code-buffer-switch-cached", TestCodeBufferSwitchCached, 0, NULL, NULL, 0},
 };
 
 int main(int argc, char** argv) {

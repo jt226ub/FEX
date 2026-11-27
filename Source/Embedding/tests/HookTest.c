@@ -10,6 +10,9 @@
 #include "TestSupport.h"
 #include "fexmac_testing.h"
 
+#include <inttypes.h>
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
@@ -278,7 +281,207 @@ static void TestLogCallbackReentry(void) {
   CheckResult(fexmac_context_destroy(LogContext), FEXMAC_OK, "fexmac_context_destroy afterwards");
 }
 
+
+/* ---- the scratch buffer: overflows, restarts and the limit ---- */
+
+/* Translations that overflow the scratch buffer once, twice and many times, at every
+ * offset in the guard page. Each overflow restarts the translation from the restart
+ * point with a buffer twice as generous; the block must then run correctly, the thread
+ * must be back in executable state (or the translated code would fault), and the guard
+ * must be disarmed. With the core's default first size, a long run of rep movsq
+ * overflows once; starting from 1 byte per IR node, blocks overflow up to 6 times. */
+static uint64_t OverflowsForBlock(size_t Count, size_t Every, uint32_t Start, uint8_t* Data, int* Wrong) {
+  fexmac_context* Context = CreateContextWithOptions(BigBlockOptions, 2, NULL, NULL);
+  fexmac_thread* Thread = CreateThreadAt(Context, 0, (uint64_t)(uintptr_t)Data + 0x8000);
+  fexmac_testing_set_scratch_start(Thread, Start);
+  uint8_t* Code = MapGuestMemory(0x4000);
+  uint64_t Expected = 0;
+  const size_t Length = WriteBigBlock(Code, Count, Every, &Expected);
+  if (!RunBigBlock(Thread, Code, Length, Expected, Data)) {
+    ++*Wrong;
+  }
+  const uint64_t Overflows = fexmac_testing_scratch_overflows(Thread);
+  uint64_t Low = 0, High = 0, Scratch = 1;
+  fexmac_testing_guard_pages(Thread, &Low, &High, &Scratch);
+  if (Scratch != 0) {
+    ++*Wrong;
+  }
+  fexmac_thread_destroy(Thread);
+  fexmac_context_destroy(Context);
+  munmap(Code, 0x4000);
+  return Overflows;
+}
+
+static void TestScratchOverflowMany(void) {
+  fexmac_install_fault_handlers();
+  uint8_t* Data = MapGuestMemory(0x10000);
+  int Wrong = 0;
+
+  /* The default first size: the premise of fexmac_c_test scratch-overflow-sizes, whose
+   * sweep runs from a block that fits to one that overflows. */
+  const uint64_t Smallest = OverflowsForBlock(96, 32, 0, Data, &Wrong);
+  const uint64_t Largest = OverflowsForBlock(416, 32, 0, Data, &Wrong);
+  Check(Wrong == 0 && Smallest == 0 && Largest >= 1,
+        "with the default first size, 96 rep movsq fit (%" PRIu64 " overflows) and 416 overflow (%" PRIu64 ")", Smallest, Largest);
+
+  /* A thread keeps its scratch buffer between translations and only claims a larger
+   * one when a translation needs it, so each translation gets a fresh context, and with
+   * it a scratch buffer of exactly the requested size. */
+  int Seen[8] = {0};
+  uint64_t Most = 0;
+  const uint32_t Starts[] = {1, 6, 12};
+  for (size_t S = 0; S < sizeof(Starts) / sizeof(Starts[0]); ++S) {
+    for (size_t Count = 1; Count <= 600; Count += (Count < 200 ? 3 : 20)) {
+      const uint64_t Overflows = OverflowsForBlock(Count, 4, Starts[S], Data, &Wrong);
+      Seen[Overflows < 7 ? Overflows : 7] = 1;
+      Most = Overflows > Most ? Overflows : Most;
+    }
+  }
+  printf("  info: overflows per translation seen:");
+  for (int i = 0; i < 8; ++i) {
+    if (Seen[i]) {
+      printf(" %d%s", i, i == 7 ? "+" : "");
+    }
+  }
+  printf("\n");
+  Check(Wrong == 0, "blocks of 1 to 600 rep movsq, starting at 1, 6 and 12 bytes per IR node, ran correctly, guard disarmed after each");
+  Check(Seen[0] && Seen[1] && Seen[2] && Most >= 4, "they overflowed 0, 1, 2 and up to %" PRIu64 " times", Most);
+}
+
+/* A block that never fits: the translator stops at its limit instead of growing the
+ * buffer for ever, and the run stops cleanly as untranslatable at the block's start.
+ * The thread is left usable: with the limit lifted the same block translates and runs. */
+static void TestScratchLimitStops(void) {
+  fexmac_install_fault_handlers();
+  fexmac_context* Context = CreateContextWithOptions(BigBlockOptions, 2, NULL, NULL);
+  uint8_t* Data = MapGuestMemory(0x10000);
+  fexmac_thread* Thread = CreateThreadAt(Context, 0, (uint64_t)(uintptr_t)Data + 0x8000);
+  uint8_t* Code = MapGuestMemory(0x4000);
+  uint64_t Expected = 0;
+  const size_t Length = WriteBigBlock(Code, 1024, 8, &Expected);
+  fexmac_testing_set_scratch_start(Thread, 1);
+  fexmac_testing_set_scratch_limit(Thread, 64 * 1024);
+  fexmac_x86_state State = GetState(Thread);
+  State.rip = (uint64_t)(uintptr_t)Code;
+  SetState(Thread, &State);
+  const fexmac_stop Stop = Run(Thread);
+  Check(Stop.reason == FEXMAC_STOP_UNSUPPORTED_INSTRUCTION && Stop.instruction_address == (uint64_t)(uintptr_t)Code,
+        "a block that does not fit within the limit stops as untranslatable at its start (reason %d)", Stop.reason);
+  Check(fexmac_testing_scratch_overflows(Thread) >= 3, "after overflowing %" PRIu64 " times", fexmac_testing_scratch_overflows(Thread));
+  uint64_t Low = 0, High = 0, Scratch = 1;
+  fexmac_testing_guard_pages(Thread, &Low, &High, &Scratch);
+  Check(Scratch == 0, "the scratch-buffer guard is disarmed after giving up");
+  fexmac_testing_set_scratch_limit(Thread, 0);
+  fexmac_testing_set_scratch_start(Thread, 0);
+  Check(RunBigBlock(Thread, Code, Length, Expected, Data), "with the limit lifted the same block translates and runs");
+  Shared[0] = 1;
+  fexmac_thread_destroy(Thread);
+  fexmac_context_destroy(Context);
+}
+
+/* ---- the code buffer's guard page ---- */
+
+/* Protection of the page at Address, or -1 if nothing is mapped there. */
+static int PageProtection(uint64_t Address) {
+  mach_vm_address_t Region = Address;
+  mach_vm_size_t Size = 0;
+  vm_region_basic_info_data_64_t Info;
+  mach_msg_type_number_t Count = VM_REGION_BASIC_INFO_COUNT_64;
+  mach_port_t Object;
+  if (mach_vm_region(mach_task_self(), &Region, &Size, VM_REGION_BASIC_INFO_64, (vm_region_info_t)&Info, &Count, &Object) != KERN_SUCCESS ||
+      Region > Address) {
+    return -1;
+  }
+  return Info.protection;
+}
+
+/* Every code buffer, the first and the larger ones that replace it when a block does
+ * not fit in what is left, ends in an inaccessible host page, and the code before it is
+ * executable. */
+static void TestCodeBufferGuardPages(void) {
+  fexmac_install_fault_handlers();
+  fexmac_context* Context = CreateContextWithOptions(BigBlockOptions, 2, NULL, NULL);
+  uint8_t* Data = MapGuestMemory(0x10000);
+  fexmac_thread* Thread = CreateThreadAt(Context, 0, (uint64_t)(uintptr_t)Data + 0x8000);
+  uint8_t* Code = MapGuestMemory(0x4000);
+  uint64_t Expected = 0;
+  const size_t Length = WriteBigBlock(Code, 1024, 8, &Expected);
+  uint64_t Guard = 0;
+  int Buffers = 0, Wrong = 0, Copies = 0, Unguarded = 0;
+  for (; Copies < 400 && Buffers < 3; ++Copies) {
+    if (!RunBigBlock(Thread, Code, Length, Expected, Data)) {
+      ++Wrong;
+    }
+    const uint64_t Now = fexmac_testing_code_buffer_guard(Thread);
+    if (Now != Guard) {
+      /* A new buffer: the one before it has been released. */
+      Guard = Now;
+      ++Buffers;
+      const int Protection = PageProtection(Guard);
+      const int Before = PageProtection(Guard - 4);
+      printf("  info: code buffer %d after %d copies: guard page at 0x%" PRIx64 " protection %d, the page before it %d\n", Buffers, Copies, Guard,
+             Protection, Before);
+      if (Protection != VM_PROT_NONE || !(Before & VM_PROT_EXECUTE)) {
+        ++Unguarded;
+      }
+    }
+    fexmac_invalidate(Context, (uint64_t)(uintptr_t)Code, Length);
+  }
+  Check(Wrong == 0 && Buffers == 3, "%d copies of a large block ran correctly and filled %d code buffers", Copies, Buffers);
+  Check(Unguarded == 0, "each code buffer ends in an inaccessible page, with executable code before it");
+  fexmac_thread_destroy(Thread);
+  fexmac_context_destroy(Context);
+}
+
+/* A write running past the end of the code buffer, with the thread switched to writable
+ * as the translator is when it copies code in, faults on the guard page instead of
+ * landing in whatever is mapped next, and the process dies with a message naming it.
+ * Done from the system call callback, on the thread's own host thread while it runs. */
+static fexmac_syscall_action OverrunningSyscall(fexmac_thread* Thread, void* UserData) {
+  (void)UserData;
+  Shared[0] = 1;
+  fexmac_testing_overrun_code_buffer(Thread);
+  Shared[0] = 3;
+  return FEXMAC_SYSCALL_STOP;
+}
+
+static void OverrunCodeBuffer(void) {
+  fexmac_install_fault_handlers();
+  GuardCode = MapGuestMemory(0x10000);
+  const uint8_t Program[] = {0xB8, 0x27, 0, 0, 0, 0x0F, 0x05, 0xF4}; /* mov eax,39 ; syscall ; hlt */
+  memcpy(GuardCode, Program, sizeof(Program));
+  fexmac_context* Context = CreateContext(OverrunningSyscall, NULL);
+  GuardThread = CreateThreadAt(Context, (uint64_t)(uintptr_t)GuardCode, 0);
+  fexmac_thread_run(GuardThread, NULL);
+  printf("  FAIL: survived a write past the end of the code buffer\n");
+  exit(1);
+}
+
+static void TestCodeBufferOverrunDies(void) {
+  OverrunCodeBuffer();
+}
+
+/* With a handler of the host's installed before the library's, the message is still
+ * written, and the fault (at the guard page) is passed on to that handler. */
+static void OverrunHostHandler(int Signal, siginfo_t* Info, void* Context) {
+  (void)Signal;
+  (void)Context;
+  Shared[0] = (uint64_t)(uintptr_t)Info->si_addr == fexmac_testing_code_buffer_guard(GuardThread) ? 2 : 4;
+  _exit(0);
+}
+
+static void TestCodeBufferOverrunChained(void) {
+  struct sigaction Action;
+  memset(&Action, 0, sizeof(Action));
+  Action.sa_sigaction = OverrunHostHandler;
+  Action.sa_flags = SA_SIGINFO | SA_NODEFER;
+  sigaction(SIGBUS, &Action, NULL);
+  sigaction(SIGSEGV, &Action, NULL);
+  OverrunCodeBuffer();
+}
+
 #define GUARD_TEXT "guest memory access fault in translated code at address 0x"
+#define OVERRUN_TEXT "fexmac: SIGBUS: write past the end of a code buffer, at address 0x"
 
 static const struct Subtest Subtests[] = {
   {"guest-load-callret-low-guard-dies", TestGuestLoadCallRetLowGuard, SIGBUS, GUARD_TEXT, "fault inside", 1},
@@ -291,6 +494,11 @@ static const struct Subtest Subtests[] = {
    NULL, 7},
   {"log-restored-after-failed-create", TestLogRestoredAfterFailedCreate, 0, NULL, NULL, 0},
   {"invalidation-mask", TestInvalidationMask, 0, NULL, NULL, 0},
+  {"scratch-overflow-many", TestScratchOverflowMany, 0, NULL, NULL, 0},
+  {"scratch-limit-stops", TestScratchLimitStops, 0, "still overflows its translation buffer", NULL, 1},
+  {"code-buffer-guard-pages", TestCodeBufferGuardPages, 0, NULL, NULL, 0},
+  {"code-buffer-overrun-dies", TestCodeBufferOverrunDies, SIGBUS, OVERRUN_TEXT, "fault inside", 1},
+  {"code-buffer-overrun-chained", TestCodeBufferOverrunChained, 0, OVERRUN_TEXT, "fault inside", 2},
 };
 
 int main(int argc, char** argv) {
