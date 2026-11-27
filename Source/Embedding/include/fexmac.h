@@ -581,8 +581,9 @@ FEXMAC_EXPORT uint64_t fexmac_memory_code_write_count(fexmac_context* context);
  * the state before the faulting instruction, and running it again after fixing the
  * cause gives x86's result. That includes read-modify-write instructions on memory
  * (their flags are put back from an undo record the translated code saves before them;
- * xadd/cmpxchg write their register only after the store), pop [m] and leave (rsp put
- * back the same way), x87 store-and-pop (the stack is popped after the store), push/call/enter
+ * xadd/cmpxchg write their register only after the store), pop [m] and leave (reordered
+ * to move rsp after the access; pop to an rsp-based address puts rsp back from the
+ * record), x87 store-and-pop (the stack is popped after the store), push/call/enter
  * and 16- and 32-byte stores across a page (nothing written when the higher page faults),
  * and rep movs / stos / lods / scas / cmps, which stop part-way with rcx, rsi and rdi
  * counting exactly the elements done, as x86 does (rep movs/stos with a segment-override
