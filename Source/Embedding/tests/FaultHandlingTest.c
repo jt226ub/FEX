@@ -19,6 +19,7 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <time.h>
+#include <errno.h>
 #include <unistd.h>
 
 /* clang-format off */
@@ -1784,6 +1785,20 @@ static void TestRflagsReservedBits(void) {
   SetState(Thread, &State);
   State = GetState(Thread);
   Check(State.rflags == 0xa03, "reserved bits written into rflags are dropped (0x%" PRIx64 ")", State.rflags);
+  /* System bits (IOPL 3, RF, VM, VIF, VIP) are not accepted; user bits (NT, AC, ID, DF,
+   * CF) are, and the guest's pushfq shows the same as the state. */
+  static const uint8_t Pushf[] = {0x9C, 0x5B, 0xF4}; /* pushfq ; pop rbx ; hlt */
+  uint8_t* Code2 = MapCode(Context, Pushf, sizeof(Pushf), 0);
+  State.rip = Addr(Code2);
+  State.rflags = 0x3000 | 0x10000 | 0x20000 | 0x80000 | 0x100000 | 0x4000 | 0x40000 | 0x200000 | 0x400 | 0x1;
+  SetState(Thread, &State);
+  State = GetState(Thread);
+  const uint64_t Expected = 0x4000 | 0x40000 | 0x200000 | 0x400 | 0x1 | 0x202;
+  Check(State.rflags == Expected, "only user-mode bits are taken (0x%" PRIx64 ", want 0x%" PRIx64 ")", State.rflags, Expected);
+  const fexmac_stop Stop2 = Run(Thread);
+  State = GetState(Thread);
+  Check(Stop2.reason == FEXMAC_STOP_HALT && State.gpr[RBX] == Expected && (State.rflags & ~0x400ULL) == (Expected & ~0x400ULL),
+        "the guest's pushfq shows them too (0x%" PRIx64 ")", State.gpr[RBX]);
   fexmac_thread_destroy(Thread);
   fexmac_context_destroy(Context);
 }
@@ -1839,6 +1854,48 @@ static void TestMemoryHostPageRules(void) {
   munmap(Area, 0x10000);
 }
 
+/* The write contract: fexmac_memory_write_begin covers guest-writable memory only (a
+ * read-only page is refused, nothing changed, the first unwritable page reported, and a
+ * host read() into it fails with EFAULT as the guest's call should); with
+ * FEXMAC_WRITE_FORCE the embedder can write a read-only page (fread() into it works) and
+ * write_end puts the guest's protection back. */
+static void TestWriteBeginContract(void) {
+  fexmac_install_fault_handlers();
+  fexmac_context* Context = MakeContext(1, 0, "mtrack", NULL, NULL);
+  uint8_t* Area = MapGuestMemory(0x8000);
+  const uint64_t A = Addr(Area);
+  CheckResult(fexmac_memory_map(Context, A, 0x4000, FEXMAC_PROT_READ | FEXMAC_PROT_WRITE), FEXMAC_OK, "a writable host page");
+  CheckResult(fexmac_memory_map(Context, A + 0x4000, 0x4000, FEXMAC_PROT_READ), FEXMAC_OK, "a read-only host page");
+  CheckResult(fexmac_memory_write_begin(Context, A, 0x100), FEXMAC_OK, "write_begin on writable memory");
+  Area[0x10] = 7;
+  CheckResult(fexmac_memory_write_end(Context, A, 0x100), FEXMAC_OK, "write_end");
+  uint64_t First = 0;
+  CheckResult(fexmac_memory_write_begin_ex(Context, A + 0x3F00, 0x200, 0, &First), FEXMAC_ERROR_INVALID_ARGUMENT,
+              "write_begin across into read-only memory");
+  Check(First == A + 0x4000, "the first unwritable address is named (+0x%" PRIx64 ")", First - A);
+  CheckResult(fexmac_memory_write_end(Context, A + 0x3F00, 0x200), FEXMAC_ERROR_INVALID_ARGUMENT, "nothing was begun");
+  /* A kernel call on the guest's behalf into the read-only page fails as Linux would. */
+  int Pipe[2];
+  Check(pipe(Pipe) == 0 && write(Pipe[1], "abcd", 4) == 4, "a pipe with data");
+  errno = 0;
+  Check(read(Pipe[0], Area + 0x4000, 4) == -1 && errno == EFAULT, "read() into the read-only page fails with EFAULT (errno %d)", errno);
+  /* The embedder's own write (loading an image) with FEXMAC_WRITE_FORCE. */
+  CheckResult(fexmac_memory_write_begin_ex(Context, A + 0x4000, 0x1000, FEXMAC_WRITE_FORCE, NULL), FEXMAC_OK, "forced write_begin");
+  FILE* File = fdopen(Pipe[0], "r");
+  Check(File && fread(Area + 0x4000, 1, 4, File) == 4 && memcmp(Area + 0x4000, "abcd", 4) == 0, "fread() into it works");
+  CheckResult(fexmac_memory_write_end(Context, A + 0x4000, 0x1000), FEXMAC_OK, "write_end");
+  errno = 0;
+  Check(write(Pipe[1], "efgh", 4) == 4 && read(fileno(File), Area + 0x4000, 4) == -1 && errno == EFAULT,
+        "afterwards the page is read-only again (errno %d)", errno);
+  uint32_t Prot = 0;
+  fexmac_memory_query(Context, A + 0x4000, &Prot, NULL);
+  Check(Prot == FEXMAC_PROT_READ, "and registered read-only");
+  fclose(File);
+  close(Pipe[1]);
+  fexmac_context_destroy(Context);
+  munmap(Area, 0x8000);
+}
+
 const struct Subtest FaultSubtests[] = {
   {"fault-mid-block", TestFaultMidBlock, 0, NULL, "fexmac:", 0},
   {"fault-flags", TestFaultFlags, 0, NULL, "fexmac:", 0},
@@ -1852,6 +1909,7 @@ const struct Subtest FaultSubtests[] = {
   {"stop-latency", TestStopLatency, 0, NULL, "fexmac:", 0},
   {"rflags-reserved-bits", TestRflagsReservedBits, 0, NULL, NULL, 0},
   {"memory-host-page-rules", TestMemoryHostPageRules, 0, NULL, NULL, 0},
+  {"memory-write-begin-contract", TestWriteBeginContract, 0, NULL, NULL, 0},
   {"stop-rep-movs", TestStopRepMovs, 0, NULL, "fexmac:", 0},
   {"stop-rep", TestStopRep, 0, NULL, "fexmac:", 0},
   {"stop-not-running", TestStopNotRunning, 0, NULL, "fexmac:", 0},

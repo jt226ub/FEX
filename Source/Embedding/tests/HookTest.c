@@ -559,7 +559,7 @@ static void QuietLog(fexmac_log_level Level, const char* Message, void* UserData
   (void)UserData;
 }
 
-static char CacheDir[64];
+static char CacheDir[128];
 
 static fexmac_context* CreateBigBlockContext(int Cache) {
   fexmac_config Config;
@@ -567,10 +567,7 @@ static fexmac_context* CreateBigBlockContext(int Cache) {
   Config.options = BigBlockOptions;
   Config.option_count = 2;
   if (Cache) {
-    strcpy(CacheDir, "/tmp/fexmac-hook-cache-XXXXXX");
-    if (!mkdtemp(CacheDir)) {
-      exit(2);
-    }
+    MakeTestTempDir(CacheDir, sizeof(CacheDir), "hook-cache");
     Config.code_cache_enabled = 1;
     Config.code_cache_directory = CacheDir;
     Config.log = QuietLog;

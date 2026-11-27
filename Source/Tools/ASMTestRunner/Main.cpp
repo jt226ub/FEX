@@ -215,11 +215,10 @@ fexmac_syscall_action SyscallHandler(fexmac_thread* Thread, void*) {
     const uint64_t Now = static_cast<uint64_t>(::time(nullptr));
     // The page may hold translated code that fexmac write-protects (SMCCHECKS mtrack with
     // registered memory); a host write to guest memory goes between write_begin and _end.
+    // write_begin refuses a range the guest may not write: that is the guest's EFAULT.
     auto* Context = fexmac_thread_context(Thread);
-    if (RDI) {
-      fexmac_memory_write_begin(Context, RDI, sizeof(uint64_t));
-    }
-    if (RDI && !IsWritable(RDI, sizeof(uint64_t))) {
+    const bool Began = RDI && fexmac_memory_write_begin(Context, RDI, sizeof(uint64_t)) == FEXMAC_OK;
+    if (RDI && (!Began || !IsWritable(RDI, sizeof(uint64_t)))) {
       RAX = -LinuxEFAULT;
     } else {
       if (RDI) {
@@ -227,7 +226,7 @@ fexmac_syscall_action SyscallHandler(fexmac_thread* Thread, void*) {
       }
       RAX = Now;
     }
-    if (RDI) {
+    if (Began) {
       fexmac_memory_write_end(Context, RDI, sizeof(uint64_t));
     }
   } else {

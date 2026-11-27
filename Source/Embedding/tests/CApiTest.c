@@ -1336,18 +1336,14 @@ static const uint8_t CacheProgram[] = {
 };
 /* clang-format on */
 
-static char CacheDir[64];
+static char CacheDir[128];
 
 static void MakeCacheDir(void) {
-  strcpy(CacheDir, "/tmp/fexmac-cache-XXXXXX");
-  if (!mkdtemp(CacheDir)) {
-    fprintf(stderr, "mkdtemp failed\n");
-    exit(2);
-  }
+  MakeTestTempDir(CacheDir, sizeof(CacheDir), "cache");
 }
 
 static void RemoveCacheDir(void) {
-  char Command[128];
+  char Command[320];
   snprintf(Command, sizeof(Command), "chmod -RN %s 2>/dev/null; rm -rf %s", CacheDir, CacheDir);
   (void)!system(Command);
 }

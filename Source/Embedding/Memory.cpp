@@ -354,22 +354,45 @@ fexmac_result SetGuestMemory(fexmac_context* Context, uint64_t Address, uint64_t
   return Result;
 }
 
-fexmac_result WriteBegin(fexmac_context* Context, uint64_t Address, uint64_t Size, bool Begin) {
-  if (Size == 0 || Address >= GuestMemory::AddressLimit || Size > GuestMemory::AddressLimit - Address) {
-    return Size == 0 ? FEXMAC_OK : FEXMAC_ERROR_INVALID_ARGUMENT;
+fexmac_result WriteBegin(fexmac_context* Context, uint64_t Address, uint64_t Size, bool Begin, uint32_t Flags, uint64_t* FirstUnwritable) {
+  if (Size == 0 || Address >= GuestMemory::AddressLimit || Size > GuestMemory::AddressLimit - Address ||
+      (Flags & ~uint32_t {FEXMAC_WRITE_FORCE}) != 0) {
+    return Size == 0 && Flags == 0 ? FEXMAC_OK : FEXMAC_ERROR_INVALID_ARGUMENT;
   }
-  if (!Context->WriteProtectCode || !Context->Memory.Tracking()) {
+  if (!Context->Memory.Tracking()) {
+    // Nothing registered: the memory is the embedder's own.
     return FEXMAC_OK;
   }
+  const bool Force = (Flags & FEXMAC_WRITE_FORCE) != 0;
   fexmac_result Result = FEXMAC_OK;
   WithCodeLocked(Context, !Begin, [&](uint64_t& Start, uint64_t& End) {
     auto& Memory = Context->Memory;
     Start = Address & ~HostPageMask;
     End = (Address + Size + HostPageMask) & ~HostPageMask;
+    if (Begin && !Force) {
+      // A write on the guest's behalf (a kernel call it makes) may only reach memory the
+      // guest may write: refused, nothing changed, naming the first page it may not.
+      for (uint64_t Page = Address & ~(GuestMemory::GuestPage - 1); Page < Address + Size; Page += GuestMemory::GuestPage) {
+        const uint8_t Info = Memory.Page(Page);
+        if (!(Info & GuestMemory::Mapped) || !(Info & FEXMAC_PROT_WRITE)) {
+          if (FirstUnwritable) {
+            *FirstUnwritable = Page < Address ? Address : Page;
+          }
+          Result = FEXMAC_ERROR_INVALID_ARGUMENT;
+          Start = End = 0;
+          return;
+        }
+      }
+    }
     for (uint64_t HostPage = Start; HostPage < End; HostPage += GuestMemory::HostPage) {
       if (Begin) {
         ++Memory.Writers[HostPage];
-        if (Memory.CodeProtected(HostPage)) {
+        if (Force) {
+          if (Memory.Forced[HostPage]++ == 0) {
+            ::mprotect(reinterpret_cast<void*>(HostPage), GuestMemory::HostPage, PROT_READ | PROT_WRITE);
+          }
+          Memory.SetCodeProtected(HostPage, false);
+        } else if (Memory.CodeProtected(HostPage)) {
           ::mprotect(reinterpret_cast<void*>(HostPage), GuestMemory::HostPage, Memory.HostProtection(HostPage, true));
           Memory.SetCodeProtected(HostPage, false);
         }
@@ -381,6 +404,13 @@ fexmac_result WriteBegin(fexmac_context* Context, uint64_t Address, uint64_t Siz
         }
         if (--It->second == 0) {
           Memory.Writers.erase(It);
+        }
+        auto ForcedIt = Memory.Forced.find(HostPage);
+        if (ForcedIt != Memory.Forced.end() && --ForcedIt->second == 0) {
+          Memory.Forced.erase(ForcedIt);
+          // Back to the guest's protection (translations of the page are discarded below,
+          // so it needs no write protection now).
+          Memory.ReduceProtection(HostPage, GuestMemory::HostPage, Memory.HostProtection(HostPage, true));
         }
       }
     }

@@ -719,8 +719,18 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
             default: return false;
             }
           };
+          // Implicit stack accesses whose table entries do not carry the memory-access flag
+          // (call, ret, pushf, popf, iret, and their far forms) can fault too.
+          const auto ImplicitStack = [&] {
+            if (!TableInfo->Name) {
+              return false;
+            }
+            const std::string_view Name {TableInfo->Name};
+            return Name == "CALL" || Name == "RET" || Name == "PUSHF" || Name == "POPF" || Name == "IRET" || Name == "RETF" ||
+                   Name == "CALLF" || Name == "PUSHA" || Name == "POPA";
+          };
           MayFault = (TableInfo->Flags & X86Tables::InstFlags::FLAGS_DEBUG_MEM_ACCESS) || IsMemory(DecodedInfo->Dest) ||
-                     IsMemory(DecodedInfo->Src[0]) || IsMemory(DecodedInfo->Src[1]) || IsMemory(DecodedInfo->Src[2]);
+                     IsMemory(DecodedInfo->Src[0]) || IsMemory(DecodedInfo->Src[1]) || IsMemory(DecodedInfo->Src[2]) || ImplicitStack();
         }
         // Instructions that change guest state before their last access that can fault
         // save it first (CPUState::UndoMask), so the fault path can give the state
@@ -838,6 +848,15 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
         }
 
 #ifdef __APPLE__
+        // Flags reported at a fault in an instruction that can fault are the ones from
+        // before it (x86 faults are restartable), also flags the rest of the block
+        // overwrites unread (dead), which the flag passes would otherwise not compute.
+        // Every such instruction either changes the flags only after its last faulting
+        // access (loads, stores, store-first read-modify-writes, atomics) or saves them in
+        // the undo record. It emits no code; measured free on the review's loops.
+        if (MayFault) {
+          Thread->OpDispatcher->_KeepFlagsLive();
+        }
         // The undo record is saved after the self-modifying-code check above, which can
         // leave the block for retranslation: a record left set there would be applied to
         // whatever instruction faults next.

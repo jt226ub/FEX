@@ -6,11 +6,8 @@
 # Every restartable-fault entry (read-modify-write flags, pop [m], leave, rep movs/stos,
 # the 32-byte store, the call stack) is fixed: undo records and in-place rep loops.
 #
-# Dead flags: PF and AF (or any flag) that the rest of the block overwrites without reading
-# are not computed and are reported as whatever the frame held. Running again is not
-# affected. With SMCCHECKS full the extra per-instruction block split computes them.
-sub-carry-then-load-adc   at-fault
-flags-multiblock-edge     at-fault
+# Flags at the fault are exact (KeepFlagsLive before every instruction that can fault);
+# the dead-flags entries are gone. Entries apply to a case's flag-prelude variants too.
 #
 # Multi-part stores that can leave part of their data written before a fault (running
 # again writes the same data, so the resumed result is right; only the memory seen at the

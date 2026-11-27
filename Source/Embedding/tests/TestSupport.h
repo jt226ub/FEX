@@ -42,6 +42,10 @@ extern const fexmac_option BigBlockOptions[2];
 size_t WriteBigBlock(uint8_t* Code, size_t Count, size_t Every, uint64_t* Expected);
 int RunBigBlock(fexmac_thread* Thread, uint8_t* Code, size_t Length, uint64_t Expected, uint8_t* Data);
 
+/* A new directory under the run's temporary root (removed at the end of the run, also
+ * after a crash or a timeout). */
+void MakeTestTempDir(char* Out, size_t Size, const char* Name);
+
 struct Subtest {
   const char* Name;
   void (*Run)(void);

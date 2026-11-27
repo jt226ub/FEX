@@ -202,9 +202,9 @@ KNOWN_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "Sou
 SKIP = {"reason", "trap", "ia", "faddr", "access", "err", "sig", "code", "rip"}
 
 
-def assemble(src):
-    d = tempfile.mkdtemp()
-    s, o = os.path.join(d, "t.s"), os.path.join(d, "t.o")
+def assemble(src, d, tag="t"):
+    # Into the caller's temporary directory, which it removes (also on failure).
+    s, o = os.path.join(d, tag + ".s"), os.path.join(d, tag + ".o")
     with open(s, "w") as f:
         f.write(".intel_syntax noprefix\n.text\n" + src + "\n")
     subprocess.check_call(["clang", "-target", "x86_64-linux-gnu", "-c", s, "-o", o])
@@ -215,7 +215,7 @@ def assemble(src):
     strtab = secs[shstrndx]
     for sec in secs:
         if b[strtab[4] + sec[0]:].split(b"\0")[0] == b".text":
-            path = os.path.join(d, "t.bin")
+            path = os.path.join(d, tag + ".bin")
             with open(path, "wb") as f:
                 f.write(b[sec[4]:sec[4] + sec[5]])
             return path
@@ -243,35 +243,45 @@ def diff(a, b, pa, pb):
             a.get(pa + "." + k) != b.get(pb + "." + k)]
 
 
-# Cases whose marked instruction overwrites every status flag without reading one, and
-# computes them after its store (add/or/and/sub/xor/neg on memory, also locked; xadd and
-# cmpxchg on memory, always atomic): the
-# incoming status flags are dead there, so a block that does not read them does not
-# compute them, and at the fault they are as stale as any dead flag (the documented
-# dead-flags limit). For these the at-fault comparison leaves out the status flags
-# (CF, PF, AF, ZF, SF, OF); everything else, and the resumed result, is compared in full.
-# With SMCCHECKS full every instruction ends a block, so the flags are computed there and
-# the at-fault comparison is complete: it shows the reorder leaves them untouched.
-DEAD_STATUS_FLAGS_IN = re.compile(r"^(rmw-(add|or|and|sub|xor|neg|lock-add|xadd|cmpxchg|shr)-|rmw-shl-[a-z]+-r15-[15]$|carry-(neg|xadd|cmpxchg)-|split-(xadd|cmpxchg|or)-)")
-# Bit tests on memory overwrite only CF (the others are kept and compared).
-DEAD_CF_IN = re.compile(r"^(rmw-bt[src]-|carry-btc-|split-bts-)")
-STATUS_FLAGS = 0x8D5
+# Flags set to non-default values immediately before the faulting instruction, in each
+# polarity (r13 is not used by the cases): every case also runs with each of these
+# inserted before its marked line (and before the same instruction in a case's own
+# reference). fA: CF PF AF SF OF set, ZF clear; fB: ZF PF set, the rest clear; fC: all clear.
+PRELUDES = {
+    "fA": "mov r13d, 0x7fffffff\nadd r13d, 1\nstc",
+    "fB": "xor r13d, r13d",
+    "fC": "mov r13d, 1\nadd r13d, 0",
+}
 
 
-def without_status_flags(out, tag, flags=STATUS_FLAGS):
-    out = dict(out)
-    key = tag + ".rflags"
-    if key in out:
-        out[key] = "%x" % (int(out[key], 16) & ~flags)
-    return out
+def with_prelude(case, tag):
+    name, src, prot = case[0], case[1], case[2]
+    clean = case[3] if len(case) > 3 else True
+    ref = case[4] if len(case) > 4 else None
+    prelude = PRELUDES[tag]
+    lines = src.splitlines()
+    marked = next(i for i, l in enumerate(lines) if "FAULT:" in l)
+    instruction = lines[marked].split("FAULT:", 1)[1].strip()
+    lines[marked:marked] = prelude.splitlines()
+    if ref:
+        rlines = ref.splitlines()
+        at = next(i for i, l in enumerate(rlines) if l.strip() == instruction)
+        rlines[at:at] = prelude.splitlines()
+        ref = "\n".join(rlines)
+    return (name + "~" + tag, "\n".join(lines), prot, clean, ref)
 
 
 def check_case(tool, name, src, prot, clean=True, ref_src=None):
-    fault = assemble(src.replace("FAULT:", ""))
+    with tempfile.TemporaryDirectory(prefix="fexmac-fault-diff-") as d:
+        return check_case_in(tool, name, src, prot, clean, ref_src, d)
+
+
+def check_case_in(tool, name, src, prot, clean, ref_src, d):
+    fault = assemble(src.replace("FAULT:", ""), d, "fault")
     # The reference replaces the marked instruction (and nothing else on its line, such
     # as a label) by hlt, unless the case gives its own.
-    ref = assemble(ref_src) if ref_src else assemble("\n".join((l.split("FAULT:")[0] + "hlt" if "FAULT:" in l else l)
-                                                               for l in src.splitlines()))
+    ref = assemble(ref_src, d, "ref") if ref_src else assemble("\n".join((l.split("FAULT:")[0] + "hlt" if "FAULT:" in l else l)
+                                                                       for l in src.splitlines()), d, "ref")
     found = {}
     for mb, tso, smc in [(mb, tso, smc) for mb, tso in MODES for smc in FAULT_SMC + ["smc-path"]]:
         tag = "mb=%d tso=%d smc=%s" % (mb, tso, smc)
@@ -298,12 +308,7 @@ def check_case(tool, name, src, prot, clean=True, ref_src=None):
             continue
         if f.get("a.reason") != "3" or f.get("a.trap") != "14":
             found.setdefault("no-fault", []).append(tag + " reason " + str(f.get("a.reason")))
-        if DEAD_STATUS_FLAGS_IN.match(name) and smc != "full":
-            checks = [("at-fault", diff(without_status_flags(f, "a"), without_status_flags(r, "a"), "a", "a"))]
-        elif DEAD_CF_IN.match(name) and smc != "full":
-            checks = [("at-fault", diff(without_status_flags(f, "a", 1), without_status_flags(r, "a", 1), "a", "a"))]
-        else:
-            checks = [("at-fault", diff(f, r, "a", "a"))]
+        checks = [("at-fault", diff(f, r, "a", "a"))]
         if name.startswith("rep-") and f.get("a.reason") == "3":
             # x86 reports the first inaccessible byte of the element at rdi (store) or at
             # rsi plus the segment base (load), with the registers as at the fault (the
@@ -321,6 +326,10 @@ def check_case(tool, name, src, prot, clean=True, ref_src=None):
                 checks.append(("fault-address", ["faddr: got +%x, element at +%x" % (got, element)]))
         if clean:
             checks.append(("resume", diff(f, c, "b", "a")))
+            # The embedder's guest-signal round trip: the state read at the stop written
+            # back unchanged before running again.
+            t = run(tool, fault, mb, tso, prot, True, dict(nohash, ROUNDTRIP="1"))
+            checks.append(("roundtrip", ["died"] if "_rc" in t else diff(t, c, "b", "a")))
         for check, lines in checks:
             if lines:
                 found.setdefault(check, []).append(tag + ": " + "; ".join(lines))
@@ -340,25 +349,27 @@ def main():
             words = line.split("#", 1)[0].split()
             if len(words) >= 2:
                 known.add((words[0], words[1]))
-    cases = [c for c in CASES + REP_CASES + RMW_CASES if args.filter in c[0]]
+    base = CASES + REP_CASES + RMW_CASES
+    cases = [c for c in base + [with_prelude(c, t) for c in base for t in PRELUDES] if args.filter in c[0]]
     failures = 0
     seen = set()
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as pool:
         for name, found in pool.map(lambda c: check_case(args.tool, *c), cases):
             for check, lines in sorted(found.items()):
                 seen.add((name, check))
-                expected = (name, check) in known
+                expected = (name, check) in known or (name.split("~")[0], check) in known
                 print("%s %s %s" % ("known     " if expected else "UNEXPECTED", name, check))
                 if args.verbose or not expected:
                     for line in lines:
                         print("    " + line)
                 failures += not expected
     names = set(c[0] for c in cases)
+    seen |= set((n.split("~")[0], c) for n, c in seen)
     for name, check in sorted(known):
         if name in names and (name, check) not in seen:
             print("FIXED (remove from %s): %s %s" % (os.path.basename(KNOWN_FILE), name, check))
             failures += 1
-    print("%d cases x %d modes x %d ways; %d known differences; %d failures" % (len(cases), len(MODES), len(FAULT_SMC) + 1,
+    print("%d cases x %d modes x %d ways; %d known differences; %d failures" % (len(cases), len(MODES), len(FAULT_SMC) + 2,
                                                                              len(seen & known), failures))
     return 1 if failures else 0
 

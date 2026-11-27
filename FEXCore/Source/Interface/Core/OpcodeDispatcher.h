@@ -1273,6 +1273,14 @@ public:
     }
     _StoreContextGPR(OpSize::i32Bit, Constant(Mask), offsetof(Core::CPUState, UndoMask));
   }
+  // For flags computed after a store (store-first read-modify-writes): a copy of a
+  // non-constant operand, made after the store, so that the register allocator cannot
+  // put the operand itself (the loaded value) straight into the PF or AF register when a
+  // flag takes it as is: that register would change before the store that can fault.
+  Ref FlagOperand(Ref Value) {
+    uint64_t Const;
+    return IsValueConstant(WrapNode(Value), &Const) ? Value : _Copy(Value);
+  }
   void ClearUndoRecord() {
     _StoreContextGPR(OpSize::i32Bit, Constant(0), offsetof(Core::CPUState, UndoMask));
   }

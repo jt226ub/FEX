@@ -548,12 +548,23 @@ fault handler.
 - **Host writes to guest memory.** A write by host code (the embedder, or a kernel call
   it makes for the guest, such as `read()` into a guest buffer) to a page that holds
   translated code faults (or the call fails with `EFAULT`). Bracket it with
-  `fexmac_memory_write_begin` and `_end` (any host thread, the same range; they nest):
-  `begin` gives the host pages of the range write access and keeps them from being
-  write-protected again until `end`; `end` discards whatever was translated from them
-  meanwhile and makes other threads look their code up again. Both return at once when no
-  memory is registered or `SMCCHECKS` is not `mtrack`. The instruction-test runner does
-  this around the one system call it answers with a write (`time`).
+  `fexmac_memory_write_begin` and `_end` (any host thread, the same range; they nest).
+  **The contract:** `begin` covers memory the guest may write. If a 4K page of the range
+  is not registered mapped and writable for the guest, it changes nothing and returns
+  `FEXMAC_ERROR_INVALID_ARGUMENT` (`fexmac_memory_write_begin_ex` also gives the first
+  such address), and a kernel-emulating embedder fails the guest's call with `EFAULT`, as
+  Linux would. Otherwise `begin` gives the host pages of the range write access and keeps
+  them from being write-protected again until `end`; `end` discards whatever was
+  translated from them meanwhile and makes other threads look their code up again. For
+  the embedder's own writes to memory the guest may not write (loading an image into
+  read-only or executable pages), `fexmac_memory_write_begin_ex(..., FEXMAC_WRITE_FORCE,
+  ...)` makes the host pages writable whatever their guest protection until the matching
+  `end`, which puts the guest's protection back (the guest can write them meanwhile, so
+  no guest code should run that could). All return at once when no memory is registered.
+  Test: `memory-write-begin-contract` (a `read()` into a read-only page fails with
+  `EFAULT`; with the force flag `fread()` works; afterwards the page is read-only again).
+  The instruction-test runner uses it around the one system call it answers with a write
+  (`time`), returning `EFAULT` when it is refused.
 
 ## Guest memory faults
 
@@ -576,14 +587,18 @@ unmapped address (reported as `SEGV_MAPERR`, not present) and SIGBUS for a prote
 ### Guest memory faults: what is exact
 
 Checked by `Scripts/macos_fault_diff.py` (the package D review's differential harness,
-kept as a permanent test; tool `fexmac_fault_diff`): 281 programs, each with one marked
+kept as a permanent test; tool `fexmac_fault_diff`): 368 programs, each also run with
+three flag preludes inserted right before the marked instruction (CF PF AF SF OF set; ZF
+PF set; all clear), so 1,472 in all, each with one marked
 instruction that faults on a test page, in all four multiblock/TSO combinations, each
 translated with `SMCCHECKS` full and none, comparing the complete guest state (all GPRs,
 rip, rflags, MXCSR, x87 control/status/tags and registers, MMX, XMM, YMM upper halves,
 FS/GS bases, a hash of the data pages) at the fault against a reference run (the marked
 instruction replaced by `hlt`; for `rep` forms, the same program with rcx set to the
 elements x86 completes before the fault), the result after fixing the page and resuming
-against a clean run, and, for writes, the result through the write-protection path
+against a clean run, the result of the embedder's guest-signal round trip (the state
+read at the stop written back unchanged with `fexmac_thread_set_state`, then the page
+fixed and the program resumed) against a clean run, and, for writes, the result through the write-protection path
 (`mtrack`) against `SMCCHECKS` full. The data area is mapped at a fixed address so that
 stored addresses compare alike. Every difference fails the test unless
 `Source/Embedding/tests/fault_diff_known.txt` lists it; a listed difference that
@@ -636,11 +651,18 @@ copies ahead and behind by 1, 3, 8 and 31 bytes, a faulting source).
     xadd` and `shl/ror/bts` on memory run at +0 to 4%; a loop of only record-carrying
     forms (`rol [m],cl; rcl [m],1; sar [m],3`) +15%, of rotates only +13%. With a record on every
     read-modify-write (the first version of this rework) such loops took +65 to 130%.
-  - The flags an instruction overwrites without reading are dead before it, so a block
-    that does not read them later does not compute them, and at the fault they are as
-    stale as any dead flag (below); the harness compares them at the fault with
-    `SMCCHECKS full`, where they are computed, and leaves the status flags out of the
-    at-fault comparison for those forms otherwise (only CF for bit tests). x87
+  - **Flags at the fault are the flags before the instruction**, also the ones it
+    overwrites and ones the rest of the block overwrites unread: before every instruction
+    that can fault the translator emits `KeepFlagsLive`, an IR op with no code that the
+    flag passes treat as reading every flag, so the incoming flags are materialised (host
+    NZCV, PF/AF registers) where the fault can happen; every such instruction changes the
+    flags only after its last faulting access or saves them in the undo record. Measured
+    free (the loops in `docs/macOS-port-status.md`). For the store-first forms the
+    operands the flag calculation takes as they are go through a copy made after the
+    store: otherwise the register allocator put the loaded value straight into the AF
+    (or PF) register before the store (AF was lost at faults with AF set). Implicit stack
+    accesses (`call`, `ret`, `pushf`, `popf`, `iret`) count as instructions that can fault
+    too (CF was reported inverted at a fault in `call` after `add r, 0`). x87
     store-and-pop pops after the store (checked; no record needed). Before this, `stc; sbb qword [m], 1` on 0x100 resumed to 0xff (x86 0xfe).
 - **`rep movs` / `rep stos`** (JIT `MemCpy`/`MemSet`/`MemCpySrcBase`,
   `EmitRepStringInPlace` in `MemoryOps.cpp`): the loop uses the guest's own rcx/rsi/rdi
@@ -670,10 +692,6 @@ x86's result in every case):**
 - A 32-byte store whose *lower* page is the inaccessible one has already written its
   upper 16 bytes.
 - `fxsave` across a page may be partly written (x86 may leave it partly written too).
-- **Dead flags:** a flag that the rest of the block overwrites without reading (typically
-  PF and AF, when only CF or ZF is read later) is not computed and is reported as the
-  frame held it (`sub-carry-then-load-adc`, `flags-multiblock-edge`). Running again is
-  unaffected; a handler that reads EFLAGS sees it.
 
 The embedder may then fix the cause (map or unprotect the page) and run again, which runs
 the same instruction (`fault-mid-block`, `fault-store-loop`, the `guest-*` subtests), or
@@ -984,9 +1002,9 @@ mapped as a code range, flushes before exiting and prints the translation counte
 
 ## Not covered yet
 
-- Exact state at the fault (running again is right) for the four entries left in
-  `fault_diff_known.txt` (see "Guest memory faults: what is exact"): dead flags, a 32-byte
-  store whose lower page faults, `fxsave` across a page.
+- Exact memory at the fault (running again is right) for the two entries left in
+  `fault_diff_known.txt` (see "Guest memory faults: what is exact"): a 32-byte store whose
+  lower page faults, `fxsave` across a page.
 - A cheaper stop check (future option, not done): today every block entry, back-edge and
   `rep` loop writes the interrupt fault page; on a loop of two linked blocks without
   multiblock that costs +50% (+18% with multiblock, where the loop's own back-edge check

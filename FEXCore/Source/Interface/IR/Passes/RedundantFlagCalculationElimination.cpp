@@ -302,6 +302,9 @@ static constexpr FlagInfo ClassifyConst(IROps Op) {
     });
 
   case OP_LOADNZCV: return FlagInfo::Pack({.Read = FLAG_NZCV});
+#ifdef __APPLE__
+  case OP_KEEPFLAGSLIVE: return FlagInfo::Pack({.Read = FLAG_ALL});
+#endif
 
   case OP_ADC:
   case OP_ADCZERO:

@@ -122,8 +122,55 @@ static char* ReadAll(int Fd) {
   return Text;
 }
 
+/* Every temporary file or directory a test makes lives under one root that the runner
+ * creates and removes at its end, also when a subtest crashes or the run is killed by a
+ * timeout or an interrupt (the review once filled the disk with leftover caches). */
+static char TempRoot[64];
+static pid_t TempRootOwner;
+
+static void RemoveTempRoot(void) {
+  if (TempRoot[0] && getpid() == TempRootOwner) {
+    char Command[160];
+    snprintf(Command, sizeof(Command), "chmod -RN %s 2>/dev/null; chmod -R u+rwx %s 2>/dev/null; rm -rf %s", TempRoot, TempRoot, TempRoot);
+    (void)!system(Command);
+    TempRoot[0] = 0;
+  }
+}
+
+static void RemoveTempRootOnSignal(int Signal) {
+  RemoveTempRoot();
+  signal(Signal, SIG_DFL);
+  raise(Signal);
+}
+
+void MakeTestTempDir(char* Out, size_t Size, const char* Name) {
+  if (!TempRoot[0]) {
+    strcpy(TempRoot, "/tmp/fexmac-tests-XXXXXX");
+    if (!mkdtemp(TempRoot)) {
+      fprintf(stderr, "mkdtemp failed\n");
+      exit(2);
+    }
+    TempRootOwner = getpid();
+    atexit(RemoveTempRoot);
+    signal(SIGINT, RemoveTempRootOnSignal);
+    signal(SIGTERM, RemoveTempRootOnSignal);
+    signal(SIGALRM, RemoveTempRootOnSignal);
+    signal(SIGHUP, RemoveTempRootOnSignal);
+  }
+  snprintf(Out, Size, "%s/%s-XXXXXX", TempRoot, Name);
+  if (!mkdtemp(Out)) {
+    fprintf(stderr, "mkdtemp failed\n");
+    exit(2);
+  }
+}
+
 int RunSubtests(int argc, char** argv, const struct Subtest* Subtests, size_t Count, unsigned TimeoutSeconds) {
   PageSize = sysconf(_SC_PAGESIZE);
+  /* The root exists before any subtest forks, so the parent owns it and removes it. */
+  {
+    char Probe[96];
+    MakeTestTempDir(Probe, sizeof(Probe), "root");
+  }
   Shared = mmap(NULL, (size_t)PageSize, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
   setvbuf(stdout, NULL, _IOLBF, 0);
 

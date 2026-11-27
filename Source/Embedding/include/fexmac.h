@@ -321,7 +321,10 @@ typedef struct fexmac_x86_state {
   /* In x86 encoding order: rax rcx rdx rbx rsp rbp rsi rdi r8 ... r15. */
   uint64_t gpr[16];
   uint64_t rip;
-  /* RFLAGS as the guest's pushf would see it. */
+  /* RFLAGS as the guest's pushf would see it: the user-mode flags CF PF AF ZF SF TF DF
+   * OF NT AC ID, with bit 1 and IF set. On fexmac_thread_set_state only those user-mode
+   * flags are taken (what a sigreturn may set); IOPL, RF, VM, VIF, VIP and reserved bits
+   * are ignored. */
   uint64_t rflags;
   uint64_t fs_base;
   uint64_t gs_base;
@@ -522,10 +525,20 @@ FEXMAC_EXPORT fexmac_result fexmac_thread_request_stop(fexmac_thread* thread);
  * Writes by the embedder. A write by host code (the embedder, or a kernel call it makes
  * for the guest, such as read() into guest memory) to a write-protected page would fault
  * (or fail with EFAULT) and is not handled. Bracket such writes with
- * fexmac_memory_write_begin and fexmac_memory_write_end, from any host thread: between
- * them the host pages in the range are writable and are not write-protected again, and
- * _end discards translations made from the range meanwhile. Without memory tracking or
- * with SMCCHECKS other than mtrack both return at once.
+ * fexmac_memory_write_begin and fexmac_memory_write_end, from any host thread. THE
+ * CONTRACT: fexmac_memory_write_begin covers memory the guest may write: if any 4K page
+ * of the range is not registered as mapped and writable for the guest it changes nothing
+ * and returns FEXMAC_ERROR_INVALID_ARGUMENT (a kernel-emulating embedder then fails the
+ * guest's call with EFAULT, as Linux would; fexmac_memory_write_begin_ex reports the
+ * first such page). Otherwise, until the matching fexmac_memory_write_end, the host
+ * pages of the range are writable and are not write-protected again for translated
+ * code, and _end discards translations made from the range meanwhile. For the
+ * embedder's own writes into memory the guest may not write (loading an image into
+ * read-only or executable pages), fexmac_memory_write_begin_ex with FEXMAC_WRITE_FORCE
+ * makes the host pages writable whatever the guest protection, until the matching
+ * _end puts the guest's protection back; the guest itself can write those host pages
+ * meanwhile, so do it while no guest thread runs code that could. Without registered
+ * memory all of these return FEXMAC_OK at once.
  * --------------------------------------------------------------------------------- */
 
 #define FEXMAC_PROT_NONE 0u
@@ -558,6 +571,12 @@ FEXMAC_EXPORT fexmac_result fexmac_memory_query(fexmac_context* context, uint64_
 /* See "Writes by the embedder". Calls must pair up with the same range; they nest. */
 FEXMAC_EXPORT fexmac_result fexmac_memory_write_begin(fexmac_context* context, uint64_t address, uint64_t size);
 FEXMAC_EXPORT fexmac_result fexmac_memory_write_end(fexmac_context* context, uint64_t address, uint64_t size);
+/* As fexmac_memory_write_begin; flags 0 or FEXMAC_WRITE_FORCE. When refused,
+ * *first_unwritable (if not NULL) is the first address of the range in a page the guest
+ * may not write. End with fexmac_memory_write_end. */
+#define FEXMAC_WRITE_FORCE 1u
+FEXMAC_EXPORT fexmac_result fexmac_memory_write_begin_ex(fexmac_context* context, uint64_t address, uint64_t size, uint32_t flags,
+                                                         uint64_t* first_unwritable);
 /* Number of changes so far that left a host page with guest pages of different
  * protections (accepted with FEXMAC_PROT_ALLOW_UNENFORCED, or a partial unmap): on those
  * host pages the guest's 4K protections are not enforced. */
@@ -611,11 +630,12 @@ FEXMAC_EXPORT uint64_t fexmac_memory_code_write_count(fexmac_context* context);
  * 32-byte stores across a page (nothing written when the higher page faults), and rep
  * movs / stos / lods / scas / cmps, also with fs:/gs: on the source, which stop part-way
  * with rcx, rsi and rdi counting exactly the elements done, as x86 does, with the fault
- * address of the faulting element. Not exact, at the fault only (running again is
- * right): a 32-byte store whose LOWER page faults has already written its upper half,
- * fxsave/xsave across a page may be partly written (as on x86), and flags the rest of
- * the block overwrites without reading (PF and AF most often, and the incoming flags an
- * instruction overwrites) may be stale. See
+ * address of the faulting element. RFLAGS is the value before the faulting instruction,
+ * every flag, also ones the instruction or the rest of the block would overwrite, so a
+ * handler that reads EFLAGS, or writes the state back (a guest signal frame and its
+ * sigreturn), sees x86's value. Not exact, the memory at the fault only (running again
+ * is right): a 32-byte store whose LOWER page faults has already written its upper half,
+ * and fxsave/xsave across a page may be partly written (as on x86). See
  * docs/macOS-embedding-interface.md, "Guest memory faults: what is exact".
  *
  * One fault outside these is always a core bug: an access past the end of a code buffer,

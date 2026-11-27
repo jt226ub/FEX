@@ -125,6 +125,10 @@ public:
   // Host pages that the embedder is writing between fexmac_memory_write_begin and _end;
   // they are not write-protected meanwhile. Count per host page.
   std::map<uint64_t, uint32_t> Writers;
+  // Of those, the ones fexmac_memory_write_begin_ex with FEXMAC_WRITE_FORCE made writable
+  // although a guest page in them is not: count per host page; the guest's protection is
+  // put back when it drops to zero.
+  std::map<uint64_t, uint32_t> Forced;
   void StartTracking() {
     TrackingFlag.store(true, std::memory_order_release);
   }

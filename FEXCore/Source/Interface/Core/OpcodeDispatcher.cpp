@@ -256,7 +256,7 @@ void OpDispatchBuilder::ADCOp(OpcodeArgs, uint32_t SrcIndex, bool DestRAX) {
     // Memory destination: the sum with the incoming carry first (reads CF, sets no
     // flags), stored, then the flags (see ALUOp: restartable guest faults).
     StoreResultGPR(Op, Add(OpSize, Before, IncrementByCarry(OpSize, Src)));
-    CalculateFlags_ADC(Size, Before, Src);
+    CalculateFlags_ADC(Size, FlagOperand(Before), FlagOperand(Src));
     return;
   }
 #endif
@@ -305,7 +305,7 @@ void OpDispatchBuilder::SBBOp(OpcodeArgs, uint32_t SrcIndex, bool DestRAX) {
     // Memory destination: the difference with the incoming borrow first, stored, then
     // the flags (see ADCOp).
     StoreResultGPR(Op, Sub(OpSize, Before, IncrementByCarry(OpSize, Src)));
-    CalculateFlags_SBB(Size, Before, Src);
+    CalculateFlags_SBB(Size, FlagOperand(Before), FlagOperand(Src));
     return;
   }
 #endif
@@ -1477,6 +1477,7 @@ void OpDispatchBuilder::SHLImmediateOp(OpcodeArgs, bool SHL1Bit) {
     // result so that the register allocator cannot compute the stored value straight
     // into the PF register before the store.
     StoreResultGPR(Op, Result);
+    Dest = FlagOperand(Dest);
     CalculateFlags_ShiftLeftImmediate(OpSizeFromSrc(Op), _Lshl(Size == 64 ? OpSize::i64Bit : OpSize::i32Bit, Dest, Constant(Shift)), Dest,
                                       Shift);
     CalculateDeferredFlags();
@@ -1512,6 +1513,7 @@ void OpDispatchBuilder::SHRImmediateOp(OpcodeArgs, bool SHR1Bit) {
   if (!Op->Dest.IsGPR()) {
     // Memory destination: store first, flags after (see SHLImmediateOp).
     StoreResultGPR(Op, ALUOp);
+    Dest = FlagOperand(Dest);
     CalculateFlags_ShiftRightImmediate(OpSizeFromSrc(Op), _Lshr(Size == 64 ? OpSize::i64Bit : OpSize::i32Bit, Dest, Constant(Shift)), Dest,
                                        Shift);
     CalculateDeferredFlags();
@@ -3308,6 +3310,7 @@ void OpDispatchBuilder::INCOp(OpcodeArgs) {
   const bool StoreFirst = !IsLocked && !Op->Dest.IsGPR();
   if (StoreFirst) {
     StoreResultGPR(Op, Add(Size >= 32 ? OpSizeFromSrc(Op) : OpSize::i32Bit, Dest, 1));
+    Dest = FlagOperand(Dest);
   }
 #else
   const bool StoreFirst = false;
@@ -3359,6 +3362,7 @@ void OpDispatchBuilder::DECOp(OpcodeArgs) {
   const bool StoreFirst = !IsLocked && !Op->Dest.IsGPR();
   if (StoreFirst) {
     StoreResultGPR(Op, Sub(Size >= 32 ? OpSizeFromSrc(Op) : OpSize::i32Bit, Dest, 1));
+    Dest = FlagOperand(Dest);
   }
 #else
   const bool StoreFirst = false;
@@ -3896,7 +3900,7 @@ void OpDispatchBuilder::NEGOp(OpcodeArgs) {
     if (!Op->Dest.IsGPR()) {
       // Memory destination: store first, flags after (see ALUOp).
       StoreResultGPR(Op, Sub(std::max(OpSize::i32Bit, Size), ZeroConst, Dest));
-      CalculateFlags_SUB(Size, ZeroConst, Dest);
+      CalculateFlags_SUB(Size, ZeroConst, FlagOperand(Dest));
       return;
     }
 #endif
@@ -4987,6 +4991,8 @@ void OpDispatchBuilder::ALUOp(OpcodeArgs, FEXCore::IR::IROps ALUIROp, FEXCore::I
     default: Plain = _And(OpSize, Dest, Src); break;
     }
     StoreResultGPR_WithOpSize(Op, Op->Dest, Plain, ResultSize, OpSize::iInvalid, MemoryAccessType::DEFAULT);
+    Dest = FlagOperand(Dest);
+    Src = FlagOperand(Src);
     switch (ALUIROp) {
     case IR::IROps::OP_ADD: CalculateFlags_ADD(Size, Dest, Src); break;
     case IR::IROps::OP_SUB: CalculateFlags_SUB(Size, Dest, Src); break;

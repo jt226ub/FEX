@@ -247,8 +247,11 @@ namespace {
 
   // ---- Guest state ----
 
-  // CF PF AF ZF SF TF IF DF OF IOPL NT RF VM AC VIF VIP ID.
-  constexpr uint32_t X86DefinedFlags = 0x003F7FD5;
+  // What a user-mode program can set (popf, sigreturn): CF PF AF ZF SF TF DF OF NT AC ID.
+  // Bit 1 and IF (bit 9) always read as set in user mode; IOPL, RF, VM, VIF and VIP are
+  // system state that user mode cannot set, and the core does not honour.
+  constexpr uint32_t X86UserFlags = 0x00244DD5;
+  constexpr uint32_t X86FixedFlags = 0x00000202;
 
   void ReadState(fexmac_thread* Thread, fexmac_x86_state* Out) {
     auto* CTX = Thread->Context->CTX.get();
@@ -260,8 +263,8 @@ namespace {
     Out->rip = State.rip;
     // The core's reconstruction also ORs in the bytes where it keeps NZCV (flag slots 24
     // to 27, shifted into bits 24 to 31), so bit 31 could read as set (0x80000a03 after an
-    // rcl that set OF). Only the bits x86 defines are reported, bit 1 always set.
-    Out->rflags = (CTX->ReconstructCompactedEFLAGS(Thread->Thread, false, nullptr, 0) & X86DefinedFlags) | 2;
+    // rcl that set OF). Only the user-mode flags are reported, with bit 1 and IF set.
+    Out->rflags = (CTX->ReconstructCompactedEFLAGS(Thread->Thread, false, nullptr, 0) & X86UserFlags) | X86FixedFlags;
     Out->fs_base = State.fs_cached;
     Out->gs_base = State.gs_cached;
     Out->cs = State.cs_idx;
@@ -296,8 +299,8 @@ namespace {
     auto& State = Thread->Thread->CurrentFrame->State;
     memcpy(State.gregs, In->gpr, sizeof(In->gpr));
     State.rip = In->rip;
-    // Undefined and reserved bits are ignored, as an x86 popf ignores them.
-    CTX->SetFlagsFromCompactedEFLAGS(Thread->Thread, (static_cast<uint32_t>(In->rflags) & X86DefinedFlags) | 2);
+    // Only what a user-mode sigreturn may set; system and reserved bits are ignored.
+    CTX->SetFlagsFromCompactedEFLAGS(Thread->Thread, (static_cast<uint32_t>(In->rflags) & X86UserFlags) | X86FixedFlags);
     State.fs_cached = In->fs_base;
     State.gs_cached = In->gs_base;
 
@@ -418,7 +421,8 @@ void InvalidateLocked(fexmac_context* Context, uint64_t Start, uint64_t Length) 
 
 fexmac_result SetGuestMemory(fexmac_context* Context, uint64_t Address, uint64_t Size, uint8_t Value, bool RequireMapped, bool AllowUnenforced,
                              bool* Unenforced = nullptr);
-fexmac_result WriteBegin(fexmac_context* Context, uint64_t Address, uint64_t Size, bool Begin);
+fexmac_result WriteBegin(fexmac_context* Context, uint64_t Address, uint64_t Size, bool Begin, uint32_t Flags = 0,
+                         uint64_t* FirstUnwritable = nullptr);
 
 void SyscallHandler::HandleSyscall(FEXCore::Core::CpuStateFrame* Frame) {
   auto* Thread = static_cast<fexmac_thread*>(Frame->Thread->FrontendPtr);
@@ -1121,6 +1125,17 @@ fexmac_result fexmac_memory_write_begin(fexmac_context* context, uint64_t addres
     return FEXMAC_ERROR_INVALID_HANDLE;
   }
   return WriteBegin(context, address, size, true);
+}
+
+fexmac_result fexmac_memory_write_begin_ex(fexmac_context* context, uint64_t address, uint64_t size, uint32_t flags, uint64_t* first_unwritable) {
+  if (InLogCallback) {
+    return FEXMAC_ERROR_BUSY;
+  }
+  ContextUse Use {context};
+  if (!Use) {
+    return FEXMAC_ERROR_INVALID_HANDLE;
+  }
+  return WriteBegin(context, address, size, true, flags, first_unwritable);
 }
 
 fexmac_result fexmac_memory_write_end(fexmac_context* context, uint64_t address, uint64_t size) {

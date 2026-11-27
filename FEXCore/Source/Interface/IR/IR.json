@@ -178,6 +178,16 @@
         "RAOverride": "0",
         "JITDispatchOverride": "NoOp"
       },
+      "KeepFlagsLive": {
+        "Desc": ["macOS only: emits nothing; the flag passes treat it as reading every flag, so",
+                 "the guest flags are materialised (host NZCV, PF/AF registers) at this point.",
+                 "Put before every instruction that can fault, so a fault there reports the",
+                 "pre-instruction flags (the instruction changes them only after its last access",
+                 "that can fault, or saves them in the undo record)."],
+        "HasSideEffects": true,
+        "JITDispatchOverride": "NoOp"
+      },
+
       "InvalidateFlags u64:$Flags": {
         "HasSideEffects": true,
         "JITDispatchOverride": "NoOp"

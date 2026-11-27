@@ -166,6 +166,14 @@ int main(int argc, char** argv) {
   fexmac_thread_run(Thread, &Stop);
   Dump("a", &Stop);
   if (Resume) {
+    if (getenv("ROUNDTRIP") && !strcmp(getenv("ROUNDTRIP"), "1")) {
+      /* What an embedder does to deliver a guest signal and return from it: read the
+       * state at the stop and write the same values back before running again. */
+      fexmac_x86_state R;
+      fexmac_x86_state_init(&R);
+      fexmac_thread_get_state(Thread, &R);
+      fexmac_thread_set_state(Thread, &R);
+    }
     fexmac_memory_protect(Context, B + 0x14000, 0x4000, FEXMAC_PROT_READ | FEXMAC_PROT_WRITE);
     TestPageReadable = 1;
     fexmac_stop_init(&Stop);
