@@ -94,7 +94,7 @@ configuration below except the two differences that are expected:
 | TSO for scalar accesses only (`VECTORTSOENABLED=0`, `MEMCPYSETTSOENABLED=0`: FEX's defaults) | all 18 right |
 | TSO on, `MULTIBLOCK=0` | all 18 right |
 | TSO on, `X87REDUCEDPRECISION=1` | 17 right; `x87` differs (64-bit precision), as expected |
-| Quick size also: `MAXINST=1 MULTIBLOCK=0` with TSO on and off; `MAXINST=5000` with `HALFBARRIERTSOENABLED=0`; `SMCCHECKS=full`; `HOSTFEATURES=disableatomics` | all right (TSO off: `threads_mp` as above) |
+| Quick size also: `MAXINST=1 MULTIBLOCK=0` with TSO on and off; `MAXINST=5000` with `HALFBARRIERTSOENABLED=0`; `SMCCHECKS=full`; `HOSTFEATURES=disableatomics` | all right (TSO off: `threads_mp` wrong in most runs, as above; it can come out right by chance, which the script allows) |
 
 Also as built and signed for the hardened runtime (`--hardened`). No translator or port
 bug was found: there is no checksum difference to reduce.
@@ -137,6 +137,12 @@ configurations are `MAXINST=500 MULTIBLOCK=1` plus: `tso_off` all three TSO swit
 | threads_lock | 40.8 (36.6) | 33.4 (22.0) | 39.2 (32.1) 1.18 | 49.3 (46.3) 1.48 | 34.3 (26.9) 1.03 | 58.2 (47.6) 1.74 | 46.6 (43.1) 1.40 |
 | threads_mp | 56.2 (37.5) | 11.6 (6.2) | 3.5 (2.6) 0.30 [wrong] | 31.9 (25.8) 2.76 | 27.4 (23.3) 2.37 | 30.3 (20.0) 2.62 | 33.5 (15.7) 2.90 |
 | **geometric mean / Rosetta** | 0.61 | 1 | 0.74 | 1.91 | 0.89 | 2.19 | 1.66 |
+
+Measured on the branch base (`macos/v1` at `98a72c187`). After merging `macos/v1` at
+`c4cd33855` (package E follow-ups), the TSO-sensitive kernels were timed again (3 runs,
+TSO on and off: `interp`, `rep_movs`, `copy_loop`, `matmul_f32x4`, `fft`, `x87`) and
+are within 5% of the table, except `copy_loop` with TSO on at 1.4 s (machine idle, see
+below); the checksums are unchanged.
 
 `x87` on arm64 is double arithmetic, not comparable; `threads_mp` with TSO off computes a
 wrong answer, so its time means nothing. The geometric means include every kernel.
