@@ -6,7 +6,8 @@
  * ABI; the numbers are chosen so they cannot be mistaken for either.
  *
  *   rax              arguments                         result in rax
- *   BENCH_SYS_EXIT   rdi = status                      (does not return)
+ *   BENCH_SYS_EXIT   rdi = number of wrong checksums,  (does not return)
+ *                    rsi = number of kernels run
  *   BENCH_SYS_WRITE  rdi = address, rsi = length       bytes written
  *   BENCH_SYS_TIME   -                                 nanoseconds, CLOCK_UPTIME_RAW
  *   BENCH_SYS_SPAWN  rdi = entry, rsi = stack top,     thread handle, or -1
@@ -14,9 +15,10 @@
  *   BENCH_SYS_JOIN   rdi = handle                      0, or -1
  *   BENCH_SYS_THREAD_EXIT                              (does not return)
  *
- * The loader starts the image at bench_start with rdi = quick, rsi = repetitions and
- * rdx = the address of the kernel filter string (0 for all) and rsp at the top of the
- * stack it mapped.
+ * The loader starts the image at bench_start with rdi = flags (BENCH_QUICK,
+ * BENCH_LITERAL), rsi = repetitions and rdx = the address of the kernel filter string
+ * (0 for all) and rsp at the top of the stack it mapped. In the literal mode the guest
+ * makes exactly one system call: BENCH_SYS_EXIT.
  */
 #include "bench.h"
 
@@ -124,10 +126,11 @@ void __bzero(void* d, size_t n) {
   memset(d, 0, n);
 }
 
-void bench_start(uint64_t quick, uint64_t reps, const char* only) __attribute__((noreturn));
-void bench_start(uint64_t quick, uint64_t reps, const char* only) {
-  const int failures = bench_main((int)quick, (int)reps, only);
-  sys1(BENCH_SYS_EXIT, (uint64_t)failures);
+void bench_start(uint64_t flags, uint64_t reps, const char* only) __attribute__((noreturn));
+void bench_start(uint64_t flags, uint64_t reps, const char* only) {
+  int ran = 0;
+  const int failures = bench_main((int)flags, (int)reps, only, &ran);
+  sys4(BENCH_SYS_EXIT, (uint64_t)failures, (uint64_t)ran, 0, 0);
   for (;;) {
     __asm__ volatile("hlt");
   }

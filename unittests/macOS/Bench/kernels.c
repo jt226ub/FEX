@@ -57,6 +57,42 @@ static void cpu_relax(void) {
 #endif
 }
 
+/* Checks that the kernels make outside their timed work (hashing whole buffers) are
+ * excluded from the time: the driver subtracts g_untimed_ns. In the literal mode there is
+ * no clock, so nothing is measured. */
+static uint64_t g_untimed_ns;
+static int g_literal;
+
+static uint64_t untimed_begin(void) {
+  return g_literal ? 0 : bench_time_ns();
+}
+
+static void untimed_end(uint64_t t0) {
+  if (!g_literal) {
+    g_untimed_ns += bench_time_ns() - t0;
+  }
+}
+
+/* Position-sensitive hash of every byte of a buffer (n a multiple of 8): a running sum
+ * and a sum of running sums, so a missing, extra, changed or moved word changes it. */
+static uint64_t hash_buffer(uint64_t h, const uint8_t* p, size_t n) {
+  uint64_t a = 1, b = 0;
+  for (size_t i = 0; i < n; i += 8) {
+    uint64_t w;
+    __builtin_memcpy(&w, p + i, 8);
+    a += w ^ (i * 0x9E3779B97F4A7C15ull);
+    b += a;
+  }
+  return mix(mix(h, a), b);
+}
+
+static uint64_t hash_doubles(uint64_t h, const double* p, size_t n) {
+  for (size_t i = 0; i < n; ++i) {
+    h = mix(h, bits_of_double(p[i]));
+  }
+  return h;
+}
+
 /* Output without libc. */
 typedef struct {
   char data[256];
@@ -413,11 +449,14 @@ start:
 /* ------------------------------------------------------------------------------- */
 
 #define COPY_BYTES (1u << 20)
+#define DST_BYTES (COPY_BYTES + 128)
 static uint8_t g_src[COPY_BYTES + 128] __attribute__((aligned(64)));
-static uint8_t g_dst[COPY_BYTES + 128] __attribute__((aligned(64)));
+static uint8_t g_dst[DST_BYTES] __attribute__((aligned(64)));
 
 /* On x86-64 these are the string instructions the translator has to handle. arm64 has
- * none, so it gets the obvious loop (which the compiler turns into its best copy). */
+ * none, so it gets loops with the same meaning: x86 defines a string instruction as the
+ * element-by-element sequence, so overlapping copies replicate (forward) or move
+ * (backward) exactly as these loops do. */
 static void copy_bytes(void* d, const void* s, size_t n) {
 #if defined(__x86_64__)
   __asm__ volatile("rep movsb" : "+D"(d), "+S"(s), "+c"(n) : : "memory");
@@ -430,14 +469,48 @@ static void copy_bytes(void* d, const void* s, size_t n) {
 #endif
 }
 
+/* With the direction flag set: from the last byte down to the first. */
+static void copy_bytes_backward(void* d, const void* s, size_t n) {
+  if (n == 0) {
+    return;
+  }
+#if defined(__x86_64__)
+  uint8_t* de = (uint8_t*)d + n - 1;
+  const uint8_t* se = (const uint8_t*)s + n - 1;
+  __asm__ volatile("std\n\trep movsb\n\tcld" : "+D"(de), "+S"(se), "+c"(n) : : "memory", "cc");
+#else
+  uint8_t* dd = d;
+  const uint8_t* ss = s;
+  for (size_t i = n; i-- > 0;) {
+    dd[i] = ss[i];
+  }
+#endif
+}
+
+static void copy_dwords(void* d, const void* s, size_t n) {
+#if defined(__x86_64__)
+  __asm__ volatile("rep movsl" : "+D"(d), "+S"(s), "+c"(n) : : "memory");
+#else
+  uint8_t* dd = d;
+  const uint8_t* ss = s;
+  for (size_t i = 0; i < n * 4; i += 4) {
+    uint32_t v;
+    __builtin_memcpy(&v, ss + i, 4);
+    __builtin_memcpy(dd + i, &v, 4);
+  }
+#endif
+}
+
 static void copy_qwords(void* d, const void* s, size_t n) {
 #if defined(__x86_64__)
   __asm__ volatile("rep movsq" : "+D"(d), "+S"(s), "+c"(n) : : "memory");
 #else
-  uint64_t* dd = d;
-  const uint64_t* ss = s;
-  for (size_t i = 0; i < n; ++i) {
-    dd[i] = ss[i];
+  uint8_t* dd = d;
+  const uint8_t* ss = s;
+  for (size_t i = 0; i < n * 8; i += 8) {
+    uint64_t v;
+    __builtin_memcpy(&v, ss + i, 8);
+    __builtin_memcpy(dd + i, &v, 8);
   }
 #endif
 }
@@ -453,6 +526,17 @@ static void fill_bytes(void* d, uint8_t v, size_t n) {
 #endif
 }
 
+static void fill_qwords(void* d, uint64_t v, size_t n) {
+#if defined(__x86_64__)
+  __asm__ volatile("rep stosq" : "+D"(d), "+c"(n) : "a"(v) : "memory");
+#else
+  uint8_t* dd = d;
+  for (size_t i = 0; i < n * 8; i += 8) {
+    __builtin_memcpy(dd + i, &v, 8);
+  }
+#endif
+}
+
 static void setup_copy(int quick) {
   (void)quick;
   uint64_t s = 99;
@@ -461,39 +545,77 @@ static void setup_copy(int quick) {
   }
 }
 
-static uint64_t sample_dst(uint64_t h) {
-  for (uint32_t i = 0; i < COPY_BYTES; i += 4093) {
-    h = mix(h, g_dst[i]);
+/* Every run starts from the same destination contents, outside the timed work, so a
+ * run's checksum does not depend on what the run before it left there. */
+static void reset_dst(void) {
+  const uint64_t t0 = untimed_begin();
+  for (uint32_t i = 0; i < DST_BYTES; ++i) {
+    g_dst[i] = (uint8_t)(i * 13);
   }
+  untimed_end(t0);
+}
+
+/* Every byte of the destination, outside the timed work. */
+static uint64_t check_dst(uint64_t h) {
+  const uint64_t t0 = untimed_begin();
+  h = hash_buffer(h, g_dst, DST_BYTES);
+  untimed_end(t0);
   return h;
 }
 
+/* The destination is split into regions that each iteration's string instructions write
+ * separately, so one hash of the whole buffer at the end of an iteration sees every
+ * byte every instruction wrote (and any byte one failed to write: each iteration's
+ * values differ from the last's). Lengths, offsets and alignments change with the
+ * iteration, so element counts that are not multiples of a vector, misaligned starts and
+ * tails are all covered. */
+#define REG1 (512u << 10)
+#define REG2 (768u << 10)
+#define REG3 (896u << 10)
+#define REG4 (960u << 10)
+
 static uint64_t run_rep_movs(int quick) {
-  const int iters = quick ? 4 : 200;
+  const uint32_t iters = quick ? 4 : 200;
   uint64_t h = 0;
-  for (int k = 0; k < iters; ++k) {
-    fill_bytes(g_dst, (uint8_t)k, COPY_BYTES);
-    h = mix(h, g_dst[(uint32_t)k * 977u % COPY_BYTES]);
-    /* Misaligned byte copy, then an aligned quadword copy over part of it. */
-    copy_bytes(g_dst + (k * 7 & 63), g_src + (k & 63), COPY_BYTES - 64);
-    h = sample_dst(h);
-    copy_qwords(g_dst, g_src + 64, COPY_BYTES / 16);
-    h = sample_dst(h);
+  reset_dst();
+  for (uint32_t t = 0; t < iters; ++t) {
+    /* Region 0: rep stosb leaving a tail of t % 13 old bytes, then a misaligned,
+     * odd-length rep movsb inside it. */
+    fill_bytes(g_dst, (uint8_t)(t * 3 + 1), REG1 - t % 13);
+    copy_bytes(g_dst + (t * 7 & 63), g_src + (t & 63), REG1 - 128 - t % 61);
+    /* Region 1: rep stosq, then a rep movsq at an address that is not 8-aligned. */
+    fill_qwords(g_dst + REG1, 0x0101010101010101ull * (t + 5), (REG2 - REG1) / 8 - t % 5);
+    copy_qwords(g_dst + REG1 + 8 + (t & 7), g_src + 64 + (t & 15), (REG2 - REG1) / 8 - 4 - t % 7);
+    /* Region 2: rep movsl over a byte fill. */
+    fill_bytes(g_dst + REG2, (uint8_t)(t + 0x40), REG3 - REG2);
+    copy_dwords(g_dst + REG2 + 4 + (t & 3), g_src + 200 + t % 9, (REG3 - REG2) / 4 - 8 - t % 11);
+    /* Region 3: an overlapping forward rep movsb, destination 1 to 5 bytes above the
+     * source: it replicates the first bytes through the region. */
+    copy_bytes(g_dst + REG3, g_src + 300 + t % 17, 64);
+    copy_bytes(g_dst + REG3 + 1 + t % 5, g_dst + REG3, (REG4 - REG3) - 64 - t % 23);
+    /* Region 4: a backward rep movsb (direction flag set) onto an overlapping
+     * destination above the source, which moves the data like memmove. */
+    copy_bytes(g_dst + REG4, g_src + 500 + t % 29, (DST_BYTES - REG4) / 2);
+    copy_bytes_backward(g_dst + REG4 + 5 + t % 3, g_dst + REG4, (DST_BYTES - REG4) / 2 - t % 31);
+    h = check_dst(h);
   }
   return h;
 }
 
 static uint64_t run_copy_loop(int quick) {
-  const int iters = quick ? 4 : 600;
+  const uint32_t iters = quick ? 4 : 600;
   uint64_t h = 0;
+  reset_dst();
   uint64_t* d = (uint64_t*)g_dst;
   const uint64_t* s = (const uint64_t*)g_src;
-  for (int k = 0; k < iters; ++k) {
-    const uint64_t key = 0x0101010101010101ull * (uint64_t)k;
-    for (uint32_t i = 0; i < COPY_BYTES / 8; ++i) {
+  for (uint32_t k = 0; k < iters; ++k) {
+    const uint64_t key = 0x0101010101010101ull * (uint64_t)(k + 1);
+    /* Length varies so the vector loop's remainder is exercised too. */
+    const uint32_t n = COPY_BYTES / 8 - k % 3;
+    for (uint32_t i = 0; i < n; ++i) {
       d[i] = s[i] ^ key;
     }
-    h = sample_dst(h);
+    h = check_dst(h);
   }
   return h;
 }
@@ -657,9 +779,12 @@ static uint64_t run_nbody(int quick) {
     }
   }
   uint64_t h = 0;
-  for (int i = 0; i < BODIES; ++i) {
-    h = mix(mix(mix(h, bits_of_double(px[i])), bits_of_double(py[i])), bits_of_double(vz[i]));
-  }
+  h = hash_doubles(h, px, BODIES);
+  h = hash_doubles(h, py, BODIES);
+  h = hash_doubles(h, pz, BODIES);
+  h = hash_doubles(h, vx, BODIES);
+  h = hash_doubles(h, vy, BODIES);
+  h = hash_doubles(h, vz, BODIES);
   return h;
 }
 
@@ -742,13 +867,13 @@ static uint64_t run_fft(int quick) {
   uint64_t h = 0;
   for (int r = 0; r < rounds; ++r) {
     fft(g_fre, g_fim, 0);
-    h = mix(h, bits_of_double(g_fre[r]) ^ bits_of_double(g_fim[FFT_N - 1 - r]));
+    /* Every output of the forward transform, outside the timed work. */
+    const uint64_t t0 = untimed_begin();
+    h = hash_doubles(hash_doubles(h, g_fre, FFT_N), g_fim, FFT_N);
+    untimed_end(t0);
     fft(g_fre, g_fim, 1);
   }
-  for (int i = 0; i < FFT_N; i += 7) {
-    h = mix(h, bits_of_double(g_fre[i]));
-  }
-  return h;
+  return hash_doubles(hash_doubles(h, g_fre, FFT_N), g_fim, FFT_N);
 }
 
 /* ------------------------------------------------------------------------------- */
@@ -865,10 +990,10 @@ static uint64_t run_muldiv(int quick) {
   const uint64_t start = (1ull << 62) + 1;
   for (uint64_t i = 0; i < count; ++i) {
     const uint64_t n = start + 2 * i;
-    if (is_prime(n)) {
-      ++primes;
-      h = mix(h, n);
-    }
+    /* Every candidate's verdict enters the checksum, not only the primes. */
+    const int p = is_prime(n);
+    primes += (uint64_t)p;
+    h = mix(h, n * 2 + (uint64_t)p);
   }
   /* Plain 64-bit division, signed and unsigned. */
   uint64_t s = 3, acc = 0;
@@ -897,7 +1022,9 @@ static NOINLINE uint64_t descend(uint64_t depth, uint64_t acc) {
     return acc;
   }
   const uint64_t r = descend(depth - 1, acc * 31 + depth);
-  return (r >> 1) + depth; /* not a tail call, and no accumulator LLVM can rewrite */
+  /* Not a tail call, no accumulator LLVM can rewrite, and mix is a bijection in r, so
+   * every level of the recursion reaches the result. */
+  return mix(r, depth);
 }
 
 static uint64_t run_deep_recursion(int quick) {
@@ -1040,7 +1167,8 @@ typedef struct {
   const char* name;
   void (*setup)(int quick);
   uint64_t (*run)(int quick);
-  uint64_t expect_quick, expect_full; /* 0: not recorded */
+  uint64_t expect_quick, expect_full;
+  int threaded; /* uses guest threads: not run in the literal mode */
 } kernel_t;
 
 /* Expected checksums, recorded from all three builds agreeing (see
@@ -1055,31 +1183,30 @@ typedef struct {
 #endif
 
 static const kernel_t g_kernels[] = {
-  {"crc32", setup_bytes, run_crc32, 0x6d3868fcb274c7b6ull, 0x4b7aaa9108180289ull},
-  {"hash64", setup_bytes, run_hash64, 0xa6de4447ab09d03bull, 0x649a98274c2013fcull},
-  {"sort", 0, run_sort, 0xd87162ef2264ede8ull, 0x97821945178672ebull},
-  {"interp", 0, run_interp, 0xf10c7fe37629dfccull, 0x547d7b1b0381003full},
-  {"dfa", setup_text, run_dfa, 0xa42a6c91a4f0df58ull, 0x4d918429caa23301ull},
-  {"rep_movs", setup_copy, run_rep_movs, 0xc2795233e945d851ull, 0xbf7a41d6d2155edeull},
-  {"copy_loop", setup_copy, run_copy_loop, 0xf34882810293e1c7ull, 0x9f4154e98d608f38ull},
-  {"ptr_chase", setup_chase, run_ptr_chase, 0x1a681542e0b02100ull, 0x466db1ae182be898ull},
-  {"matmul_f64", setup_matrix, run_matmul_scalar, 0x717a6b1320ae3985ull, 0xf3d00de256019b4aull},
-  {"matmul_f32x4", setup_vmatrix, run_matmul_vec4, 0x0e5cf52fdf6fa1d4ull, 0xdab31eba4e7977b5ull},
-  {"nbody", 0, run_nbody, 0x33f8fb908f111258ull, 0xa83c67bfb74069cbull},
-  {"fft", setup_fft, run_fft, 0x43048cbd3ea38f70ull, 0x3821471867c986e1ull},
-  {"x87", 0, run_x87, X87_QUICK, X87_FULL},
-  {"muldiv", 0, run_muldiv, 0xda5adc5366947acdull, 0x12bad6a609cf11c6ull},
-  {"calls", 0, run_calls, 0x000000000000452full, 0x00000000005704e7ull},
-  {"deep_recursion", 0, run_deep_recursion, 0xe5e447e57197395aull, 0xd73d4842a01e7590ull},
-  {"threads_lock", 0, run_threads_lock, 0xd33b3540666222e7ull, 0xff003f56a74a02ebull},
-  {"threads_mp", 0, run_threads_mp, 0xa0cb8f09e9c3d925ull, 0x6a379e1e56d34819ull},
+  {"crc32", setup_bytes, run_crc32, 0x6d3868fcb274c7b6ull, 0x4b7aaa9108180289ull, 0},
+  {"hash64", setup_bytes, run_hash64, 0xa6de4447ab09d03bull, 0x649a98274c2013fcull, 0},
+  {"sort", 0, run_sort, 0xd87162ef2264ede8ull, 0x97821945178672ebull, 0},
+  {"interp", 0, run_interp, 0xf10c7fe37629dfccull, 0x547d7b1b0381003full, 0},
+  {"dfa", setup_text, run_dfa, 0xa42a6c91a4f0df58ull, 0x4d918429caa23301ull, 0},
+  {"rep_movs", setup_copy, run_rep_movs, 0x9ae8eae483079990ull, 0x7042b482f76ea844ull, 0},
+  {"copy_loop", setup_copy, run_copy_loop, 0x2b1ee526b1c194b6ull, 0xcfed8850c512a070ull, 0},
+  {"ptr_chase", setup_chase, run_ptr_chase, 0x1a681542e0b02100ull, 0x466db1ae182be898ull, 0},
+  {"matmul_f64", setup_matrix, run_matmul_scalar, 0x717a6b1320ae3985ull, 0xf3d00de256019b4aull, 0},
+  {"matmul_f32x4", setup_vmatrix, run_matmul_vec4, 0x0e5cf52fdf6fa1d4ull, 0xdab31eba4e7977b5ull, 0},
+  {"nbody", 0, run_nbody, 0xe2f88f451af3998bull, 0x6eec4e36849af591ull, 0},
+  {"fft", setup_fft, run_fft, 0x1c5961a0e586d092ull, 0x1ce6b15f6b66b513ull, 0},
+  {"x87", 0, run_x87, X87_QUICK, X87_FULL, 0},
+  {"muldiv", 0, run_muldiv, 0x7413250006b4a54dull, 0xac017cef6837ff01ull, 0},
+  {"calls", 0, run_calls, 0x000000000000452full, 0x00000000005704e7ull, 0},
+  {"deep_recursion", 0, run_deep_recursion, 0xc3031115a18a807bull, 0x390d2a223a3d2c55ull, 0},
+  {"threads_lock", 0, run_threads_lock, 0xd33b3540666222e7ull, 0xff003f56a74a02ebull, 1},
+  {"threads_mp", 0, run_threads_mp, 0xa0cb8f09e9c3d925ull, 0x6a379e1e56d34819ull, 1},
 };
+#define KERNEL_COUNT (sizeof(g_kernels) / sizeof(g_kernels[0]))
 
-static int selected(const char* only, const char* name) {
-  if (!only || !*only) {
-    return 1;
-  }
-  const char* p = only;
+/* 1 if name is one of the comma-separated names in list. */
+static int in_list(const char* list, const char* name) {
+  const char* p = list;
   while (*p) {
     const char* e = p;
     while (*e && *e != ',') {
@@ -1093,21 +1220,63 @@ static int selected(const char* only, const char* name) {
   return 0;
 }
 
-int bench_main(int quick, int reps, const char* only) {
+/* The first name in `only` that is not a kernel, as (start, length); length 0 if all
+ * are known. An empty name (",,") counts as unknown. */
+static size_t unknown_name(const char* only, const char** at) {
+  const char* p = only;
+  while (*p) {
+    const char* e = p;
+    while (*e && *e != ',') {
+      ++e;
+    }
+    int known = 0;
+    for (size_t k = 0; k < KERNEL_COUNT && e > p; ++k) {
+      known |= str_eq_n(p, g_kernels[k].name, (size_t)(e - p));
+    }
+    if (!known) {
+      *at = p;
+      return e > p ? (size_t)(e - p) : 1;
+    }
+    p = *e ? e + 1 : e;
+  }
+  return 0;
+}
+
+int bench_main(int flags, int reps, const char* only, int* ran_out) {
+  const int quick = (flags & BENCH_QUICK) != 0;
+  const int literal = (flags & BENCH_LITERAL) != 0;
   line_t l = {{0}, 0};
   int failures = 0, ran = 0;
+  g_literal = literal;
+  *ran_out = 0;
   if (reps < 0) {
     reps = 0;
   }
-  put_str(&l, "START ");
-  put_str(&l, bench_platform());
-  put_str(&l, quick ? " quick reps " : " full reps ");
-  put_u64(&l, (uint64_t)reps);
-  put_end(&l);
+  if (only && *only) {
+    const char* at = only;
+    const size_t len = unknown_name(only, &at);
+    if (len) {
+      if (!literal) {
+        put_str(&l, "ERROR unknown kernel name in --only: ");
+        for (size_t i = 0; i < len && at[i] && at[i] != ','; ++i) {
+          l.data[l.len++] = at[i];
+        }
+        put_end(&l);
+      }
+      return 1;
+    }
+  }
+  if (!literal) {
+    put_str(&l, "START ");
+    put_str(&l, bench_platform());
+    put_str(&l, quick ? " quick reps " : " full reps ");
+    put_u64(&l, (uint64_t)reps);
+    put_end(&l);
+  }
 
-  for (size_t k = 0; k < sizeof(g_kernels) / sizeof(g_kernels[0]); ++k) {
+  for (size_t k = 0; k < KERNEL_COUNT; ++k) {
     const kernel_t* kn = &g_kernels[k];
-    if (!selected(only, kn->name)) {
+    if ((only && *only && !in_list(only, kn->name)) || (literal && kn->threaded)) {
       continue;
     }
     ++ran;
@@ -1116,45 +1285,54 @@ int bench_main(int quick, int reps, const char* only) {
     }
     uint64_t first = 0;
     int varies = 0;
-    /* Repetition 0 is the warm-up: it includes translating the kernel's code. */
-    for (int r = 0; r <= reps; ++r) {
-      const uint64_t t0 = bench_time_ns();
+    /* Repetition 0 is the warm-up: it includes translating the kernel's code. The
+     * literal mode runs each kernel once and has no clock. */
+    for (int r = 0; r <= (literal ? 0 : reps); ++r) {
+      g_untimed_ns = 0;
+      const uint64_t t0 = literal ? 0 : bench_time_ns();
       const uint64_t sum = kn->run(quick);
-      const uint64_t t1 = bench_time_ns();
+      const uint64_t t1 = literal ? 0 : bench_time_ns();
       if (r == 0) {
         first = sum;
       } else if (sum != first) {
         varies = 1;
       }
-      put_str(&l, "K ");
-      put_str(&l, kn->name);
-      put_str(&l, " ");
-      put_u64(&l, (uint64_t)r);
-      put_str(&l, " ");
-      put_u64(&l, t1 - t0);
-      put_str(&l, " ");
-      put_hex(&l, sum);
-      put_end(&l);
+      if (!literal) {
+        put_str(&l, "K ");
+        put_str(&l, kn->name);
+        put_str(&l, " ");
+        put_u64(&l, (uint64_t)r);
+        put_str(&l, " ");
+        put_u64(&l, t1 - t0 - g_untimed_ns);
+        put_str(&l, " ");
+        put_hex(&l, sum);
+        put_end(&l);
+      }
     }
     const uint64_t expected = quick ? kn->expect_quick : kn->expect_full;
     const char* verdict = varies ? "VARIES" : expected == 0 ? "UNRECORDED" : expected == first ? "ok" : "MISMATCH";
-    if (varies || (expected != 0 && expected != first)) {
+    if (varies || expected != first) {
       ++failures;
     }
-    put_str(&l, "C ");
-    put_str(&l, kn->name);
-    put_str(&l, " ");
-    put_str(&l, verdict);
-    put_str(&l, " ");
-    put_hex(&l, first);
-    put_str(&l, " expected ");
-    put_hex(&l, expected);
+    if (!literal) {
+      put_str(&l, "C ");
+      put_str(&l, kn->name);
+      put_str(&l, " ");
+      put_str(&l, verdict);
+      put_str(&l, " ");
+      put_hex(&l, first);
+      put_str(&l, " expected ");
+      put_hex(&l, expected);
+      put_end(&l);
+    }
+  }
+  if (!literal) {
+    put_str(&l, "END kernels ");
+    put_u64(&l, (uint64_t)ran);
+    put_str(&l, " failures ");
+    put_u64(&l, (uint64_t)failures);
     put_end(&l);
   }
-  put_str(&l, "END kernels ");
-  put_u64(&l, (uint64_t)ran);
-  put_str(&l, " failures ");
-  put_u64(&l, (uint64_t)failures);
-  put_end(&l);
+  *ran_out = ran;
   return failures;
 }
