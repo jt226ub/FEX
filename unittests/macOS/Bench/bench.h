@@ -11,9 +11,10 @@
  *   platform_native.c  an ordinary macOS program (x86-64 under Rosetta 2, or arm64) using
  *                      libc and pthreads.
  *
- * The guest's whole host surface is: exit, write bytes to standard output, read a
- * monotonic clock, start a guest thread and wait for it. Nothing else (no files, no
- * memory allocation: all memory is static).
+ * In the timed mode the guest's host surface is: exit, write bytes to standard output,
+ * read a monotonic clock, start a guest thread and wait for it. In the literal mode
+ * (BENCH_LITERAL) it is exit only. Nothing else in either (no files, no memory
+ * allocation: all memory is static).
  */
 #ifndef BENCH_H
 #define BENCH_H
@@ -36,9 +37,20 @@ void bench_thread_join(int handle);
 /* Short name of the build, printed in the START line. */
 const char* bench_platform(void);
 
-/* The driver (kernels.c). quick: small sizes for the correctness check; reps: timed
- * repetitions after one warm-up run; only: NULL or a comma-separated list of kernel
- * names. Returns the number of checksum mismatches (the exit status). */
-int bench_main(int quick, int reps, const char* only);
+/* The driver (kernels.c).
+ *
+ * flags: BENCH_QUICK selects the small sizes (the correctness check). BENCH_LITERAL is
+ * the mode that meets exit criterion 7 to the letter: one run of every single-threaded
+ * kernel, and no host service at all (no output, no clock, no threads); the result is
+ * only the return value. Without it, the timed mode writes its results and reads the
+ * clock, and the thread kernels start guest threads.
+ *
+ * reps: timed repetitions after one warm-up run (ignored in the literal mode). only:
+ * NULL or a comma-separated list of kernel names; an unknown name is an error (returns
+ * 1, runs nothing). Returns the number of kernels whose checksum is not the recorded
+ * one; *ran is the number of kernels run. */
+#define BENCH_QUICK 1
+#define BENCH_LITERAL 2
+int bench_main(int flags, int reps, const char* only, int* ran);
 
 #endif
