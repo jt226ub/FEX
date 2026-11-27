@@ -21,6 +21,7 @@
 #include <cstdint>
 #include <cstring>
 #include <atomic>
+#include <condition_variable>
 
 namespace FEXCore {
 
@@ -291,6 +292,24 @@ namespace DiskCache {
       return false;
     }
 
+#ifdef __APPLE__
+    // macOS port: CacheFileSize is only kept when a file mapper is installed, which no
+    // macOS embedder does, so check the real sizes of both files (under the locks, so
+    // other processes' appends are counted).
+    if (!WithinSizeLimit(Blob.size(), sizeof(MesaFOZ::foz_payload_key) + sizeof(MesaFOZ::foz_payload_header) +
+                                        sizeof(MesaFOZ::mesa_index_db_file_entry) + IndexBlob.size())) {
+      MaxSizeReached = true;
+      CacheFOZ.Unlock();
+      IndexFOZ.Unlock();
+      return false;
+    }
+    if (!RepairIndexTail()) {
+      CacheFOZ.Unlock();
+      IndexFOZ.Unlock();
+      return false;
+    }
+#endif
+
     // write cache side first so we get offset for index
     std::span<const uint8_t> BlobChunks[] = {Blob};
     uint64_t BlobOffset = 0;
@@ -316,6 +335,9 @@ namespace DiskCache {
       return false;
     }
 
+#ifdef __APPLE__
+    NoteAppended();
+#endif
     CacheFOZ.Unlock();
     IndexFOZ.Unlock();
 
@@ -328,6 +350,9 @@ namespace DiskCache {
   }
 
   bool DiskCache::OpenCacheDB(const fextl::string& CacheDBName, bool ReadOnly) {
+#ifdef __APPLE__
+    return OpenCacheDBMacOS(CacheDBName, ReadOnly);
+#endif
     fextl::unique_ptr<IndexedDB> CurDB;
 
     if (!ReadOnly && RWCacheDB) {
@@ -354,6 +379,45 @@ namespace DiskCache {
     }
 
     return true;
+  }
+
+  struct DiskCache::FlushWorkItem final : WorkQueueThread::WorkItem {
+    struct State {
+      std::mutex Mutex;
+      std::condition_variable CV;
+      bool Done = false;
+    };
+    fextl::shared_ptr<State> Shared;
+    explicit FlushWorkItem(fextl::shared_ptr<State> Shared)
+      : Shared(std::move(Shared)) {}
+    void Run() override {
+      {
+        std::lock_guard lk {Shared->Mutex};
+        Shared->Done = true;
+      }
+      Shared->CV.notify_all();
+    }
+  };
+
+  bool DiskCache::Flush() {
+    if (!IsWritingDiskCache() || !Writer) {
+      return false;
+    }
+    // Stores count themselves after they are queued, so every store counted here was
+    // queued before the marker below, and the writer runs its queue in order.
+    const uint64_t QueuedBefore = QueuedCount.load(std::memory_order_acquire);
+    auto Shared = fextl::make_shared<FlushWorkItem::State>();
+    Writer->QueueWork(fextl::make_unique<FlushWorkItem>(Shared));
+    {
+      std::unique_lock lk {Shared->Mutex};
+      Shared->CV.wait(lk, [&] { return Shared->Done; });
+    }
+#ifdef __APPLE__
+    return FlushToDiskMacOS(QueuedBefore);
+#else
+    (void)QueuedBefore;
+    return true;
+#endif
   }
 
   FEX_DEFAULT_VISIBILITY void SetFileMapper(FileMapperFunc Func) {
@@ -386,7 +450,15 @@ namespace DiskCache {
 
         // Current behaviour is to remove entries that no longer match the MachineBucketHash.
         // This means that if the Disk Cache version no longer matches, or the FEXCore::HostFeatures differ, then they get removed.
+#ifdef __APPLE__
+        if (MacOS::KeepBucket(capture->CacheBase, name)) {
+          return;
+        }
+#endif
         if (name != capture->MachineBucketHash) {
+#ifdef __APPLE__
+          LogMan::Msg::IFmt("DiskCache: removing unused bucket {}/{}", capture->CacheBase, name);
+#endif
           FEXCore::FileUtils::RecursiveRemoveDirectory(fextl::fmt::format("{}/{}", capture->CacheBase, name));
         }
       },
@@ -429,6 +501,11 @@ namespace DiskCache {
       XXH3_64bits(BucketBytes.data() + sizeof(MachineBucketData), sizeof(HostFeatureHash.ProcessFeaturesHash) + SerializedConfig.size());
     BucketHash.high64 = MachineBucketHash;
     BucketHash.low64 = ProcessBucketHash;
+
+#ifdef __APPLE__
+    InitMacOS(BucketBytes, sizeof(MachineBucketData), ProcessBucketHash);
+    return;
+#endif
 
     fextl::string BasePath = BasePathOverride();
     if (BasePath.empty()) {
@@ -503,6 +580,11 @@ namespace DiskCache {
     if (MonoBackpatcher) {
       BlobKeyBytes.Flags |= 1 << 3;
     }
+#ifdef __APPLE__
+    // The effective memory-ordering emulation, which SetHardwareTSOSupport can change
+    // after the configuration was hashed.
+    BlobKeyBytes.Flags |= CodeGenStateFlags();
+#endif
 
     return XXH3_64bits(&BlobKeyBytes, sizeof(BlobKeyBytes));
   }
@@ -610,11 +692,19 @@ namespace DiskCache {
     fextl::multimap<uint64_t, IndexEntry>::iterator MoreEntriesIt;
     fextl::multimap<uint64_t, IndexEntry>* MapPointer = nullptr;
     IndexEntry* EntryUnderReview;
+#ifdef __APPLE__
+    // The writer thread fills in DB and Offset of an entry under IndexLock; read a copy
+    // taken under the lock, not the live entry.
+    IndexEntry Snapshot;
+#endif
     fextl::shared_ptr<fextl::vector<uint8_t>> BlobRef;
     std::optional<fextl::list<MemoryLRUKey>::iterator> LRUIter;
     uint64_t CurrentFootprint = 0;
     {
       std::lock_guard Guard(IndexLock);
+#ifdef __APPLE__
+      ResolveLazyLocked(LookupKey);
+#endif
       auto It = Index.find(LookupKey);
       if (It == Index.end()) {
         // definite miss
@@ -629,6 +719,10 @@ namespace DiskCache {
       }
       if (MapPointer && MoreEntriesIt != It->second.MoreEntries->end()) {
         EntryUnderReview = &MoreEntriesIt->second;
+#ifdef __APPLE__
+        Snapshot = *EntryUnderReview;
+        EntryUnderReview = &Snapshot;
+#endif
         BlobRef = EntryUnderReview->MemoryBlob;
         LRUIter = EntryUnderReview->LRUEntry;
         CurrentFootprint = MoreEntriesIt->first;
@@ -674,6 +768,10 @@ namespace DiskCache {
         }
         if (!EntryUnderReview && MapPointer && MoreEntriesIt != MapPointer->end()) {
           EntryUnderReview = &MoreEntriesIt->second;
+#ifdef __APPLE__
+          Snapshot = *EntryUnderReview;
+          EntryUnderReview = &Snapshot;
+#endif
           BlobRef = EntryUnderReview->MemoryBlob;
           LRUIter = EntryUnderReview->LRUEntry;
           CurrentFootprint = MoreEntriesIt->first;
@@ -800,17 +898,40 @@ namespace DiskCache {
     }
     BlobFixedHeader Header;
     memcpy(&Header, HitData.Blob.data() + BlobOffset, sizeof(Header));
+#ifdef __APPLE__
+    const std::span<const uint8_t> BlobBody {HitData.Blob.data() + BlobOffset, EntrySizeWithoutGuestCode};
+#endif
     BlobOffset += sizeof(Header);
 
+#ifdef __APPLE__
+    // Computed in 64 bits: a damaged count must not wrap around to a matching size.
+    uint64_t SizeNeeded = sizeof(Header) + uint64_t(Header.HostSize) + uint64_t(Header.EntryPointCount) * (sizeof(uint64_t) + sizeof(uint32_t));
+    SizeNeeded += uint64_t(Header.SmallRelocCount) * sizeof(BlobSmallRelocation) + uint64_t(Header.ThunkRelocCount) * sizeof(BlobThunkRelocation);
+#else
     uint32_t SizeNeeded = sizeof(Header) + Header.HostSize + Header.EntryPointCount * (sizeof(uint64_t) + sizeof(uint32_t));
     SizeNeeded += Header.SmallRelocCount * sizeof(BlobSmallRelocation) + Header.ThunkRelocCount * sizeof(BlobThunkRelocation);
+#endif
     if (EntrySizeWithoutGuestCode != SizeNeeded) {
+#ifdef __APPLE__
+      RejectedCount.fetch_add(1, std::memory_order_relaxed);
+#endif
       return std::nullopt;
     }
 
     if (Entry.GuestSize != Header.GuestSize || !XXH128_isEqual(Header.GuestHash, Entry.GuestHash)) {
+#ifdef __APPLE__
+      RejectedCount.fetch_add(1, std::memory_order_relaxed);
+#endif
       return std::nullopt;
     }
+
+#ifdef __APPLE__
+    if (!ValidateHit(Header, BlobBody, LookupKey, Available, Entry.GuestExtents)) {
+      RejectedCount.fetch_add(1, std::memory_order_relaxed);
+      LogMan::Msg::EFmt("DiskCache: entry for guest code at {:#x} failed its integrity or sanity check; compiling instead", GuestRIP);
+      return std::nullopt;
+    }
+#endif
 
     bool StoreInMemory = !FoundInLRU;
     if (EntrySizeWithoutGuestCode > MemoryLRUMaxSize) {
@@ -853,6 +974,12 @@ namespace DiskCache {
     for (auto& EntryPointRip : HitData.EntryPointRIPs) {
       EntryPointRip += GuestRIP;
     }
+
+#ifdef __APPLE__
+    if (!MayUseCache(GuestRIP, Header.GuestSize, HitData.EntryPointRIPs)) {
+      return std::nullopt;
+    }
+#endif
 
     if (!CTX->CodeCache.ApplyPackedCodeRelocations(GuestRIP, std::as_writable_bytes(HitData.HostCode), SmallRelocs, ThunkRelocs)) {
       return std::nullopt;
@@ -938,6 +1065,11 @@ namespace DiskCache {
     void Run() override {
       struct MesaFOZ::mesa_index_db_file_entry IndexHeader;
       bool DiskSuccess = !StoreDisk || DB->StoreCacheBlob(UniqueKey, LookupKey, Blob, IndexHeader, IndexBlob);
+#ifdef __APPLE__
+      if (!DiskSuccess && !DB->Full()) {
+        LogMan::Msg::EFmt("DiskCache: could not write an entry to {} (the database is busy); it stays in memory only", DB->Name);
+      }
+#endif
 
       bool KeepEntryInMemory = true;
       // todo possible other lru condition here like entry size?
@@ -987,6 +1119,22 @@ namespace DiskCache {
     if (!DecodedBlockInfo) {
       return false;
     }
+#ifdef __APPLE__
+    {
+      // Code changed between decoding and now: the compiled code may not match the bytes
+      // that would be hashed below, so do not file it under them.
+      if (XXH3_64bits(GuestCode.data(), GuestCode.size()) != Thread->FrontendDecoder->DecodedBytesHash) {
+        return false;
+      }
+      fextl::vector<uint64_t> EntryRIPs;
+      for (auto [GuestAddr, HostAddr] : CompiledCode.EntryPoints) {
+        EntryRIPs.push_back(GuestAddr);
+      }
+      if (!MayUseCache(GuestRIP, GuestCode.size(), EntryRIPs)) {
+        return false;
+      }
+    }
+#endif
     // check for any reloc targets outside of our jurisdiction
     // todo what are they exactly? caching those blocks is great when it works, so need to figure this out and make finer-grained if we can
     if (RelocationFilter && Region) {
@@ -1187,11 +1335,20 @@ namespace DiskCache {
     uint64_t LookupKey =
       MakeLookupKey(Thread, GuestCodeKey, RangeInfo.Writable, GuestRIP == CTX->GetMonoBackPatcherBlock().load(std::memory_order_relaxed));
 
+#ifdef __APPLE__
+    // Seal the entry (the header already in the blob has the field zeroed).
+    Header.IntegrityHash = MacOS::EntryHash(BlobData, GuestCodeOffset, ExactGuestCodeExtents, LookupKey);
+    memcpy(BlobData + HeaderOffset, &Header, sizeof(Header));
+#endif
+
     // blob done, publish to index as in-memory for now, flush to disk below
     struct IndexEntry NewEntry {nullptr, 0, (uint32_t)TotalSize, Header.GuestSize, Header.GuestHash, BlobRef};
     NewEntry.GuestExtents = ExactGuestCodeExtents;
     {
       std::lock_guard Guard(IndexLock);
+#ifdef __APPLE__
+      ResolveLazyLocked(LookupKey);
+#endif
       auto It = Index.find(LookupKey);
       if (It == Index.end()) {
         Index.emplace(LookupKey, IndexCacheHead {std::move(NewEntry), GuestFootprint, nullptr});
@@ -1250,6 +1407,8 @@ namespace DiskCache {
     // hand the rest off to the writer thread
     Writer->QueueWork(fextl::make_unique<CacheStoreWorkItem>(this, RWCacheDB.get(), Key, LookupKey, std::span(BlobData, TotalSize),
                                                              std::move(IndexBlob), StoreDisk));
+    // Counted after it is queued; see Flush.
+    QueuedCount.fetch_add(1, std::memory_order_release);
     return true;
   }
 
@@ -1259,3 +1418,9 @@ namespace DiskCache {
 } // namespace DiskCache
 
 } // namespace FEXCore
+
+#ifdef __APPLE__
+// The macOS-specific parts, kept apart from upstream's code. They use the file-local
+// definitions above (FOZ layout, PruneStaleEntries).
+#include "Interface/Core/DiskCacheMacOS.inl"
+#endif

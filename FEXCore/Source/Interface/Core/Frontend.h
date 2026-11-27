@@ -75,6 +75,12 @@ public:
   }
 
   uint64_t DecodedMinAddress {};
+#ifdef __APPLE__
+  // macOS port: hash of [DecodedMinAddress, DecodedMaxAddress) taken right after decoding,
+  // when the disk cache is being written. DiskCache::Store only files a translation if the
+  // bytes are still the same (Core.cpp, GenerateIR).
+  uint64_t DecodedBytesHash {};
+#endif
   uint64_t DecodedMaxAddress {~0ULL};
 
   void SetExternalBranches(fextl::set<uint64_t>* v) {

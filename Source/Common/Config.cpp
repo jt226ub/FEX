@@ -734,7 +734,10 @@ fextl::string GetCacheDirectory() {
   }
 #endif
 
-#ifndef _WIN32
+#ifdef __APPLE__
+  // ~/Library/Caches is where macOS expects per-user data it may delete at any time.
+  return fextl::string {GetHomeDirectory()} + "/Library/Caches/fex-emu/";
+#elif !defined(_WIN32)
   auto HomeDir = GetHomeDirectory();
   const char* CacheXDG = getenv("XDG_CACHE_HOME");
   return (CacheXDG ? fextl::string {CacheXDG} : (fextl::string {HomeDir} + "/.cache")) + "/fex-emu/";

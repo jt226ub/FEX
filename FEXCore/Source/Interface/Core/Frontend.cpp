@@ -1497,7 +1497,16 @@ void Decoder::DetectDataMasks(uint64_t OpAddress, DecodedBlocks& Block) {
         if (DecodeInst->TableInfo->OpcodeDispatcher.OpDispatch == &IR::OpDispatchBuilder::NOPOp) {
           // if it's a nop disp, only mask data out, no other action required
           Type = DataMaskType::NOP;
-        } else if (OpToPatch->IsRIPRelative()) {
+        } else if (OpToPatch->IsRIPRelative()
+#ifdef __APPLE__
+                   // macOS port: the cache rebuilds the target as end-of-field plus the
+                   // live displacement, which is only right when the displacement is the
+                   // last field. For 3DNow! the opcode byte follows it, and a cached block
+                   // loaded with this patch read data one byte off (Test_3DNow/*, jit_1).
+                   // Such instructions are left unpatched, so their bytes are matched in full.
+                   && LastFieldReadOffset + LastFieldReadSize == DecodeInst->InstSize
+#endif
+        ) {
           Type = DataMaskType::DISP;
           OpToPatch->Data.RIPLiteral.PatchableDisp = true;
           OpToPatch->Data.RIPLiteral.DispOffset = LastFieldReadOffset;
@@ -1523,7 +1532,12 @@ void Decoder::DetectDataMasks(uint64_t OpAddress, DecodedBlocks& Block) {
   }
   // jmp/call branches that use a literal rip-relative offset
   // some of those may be inlined by multiblock and will be cleaned up at decode end
-  if (DecodeInst->TableInfo->Flags & X86Tables::InstFlags::FLAGS_SETS_RIP && DecodeInst->Src[0].IsLiteral() && DecodeInst->Src[0].Literal() != 0) {
+  if (DecodeInst->TableInfo->Flags & X86Tables::InstFlags::FLAGS_SETS_RIP && DecodeInst->Src[0].IsLiteral() && DecodeInst->Src[0].Literal() != 0
+#ifdef __APPLE__
+      // The same end-of-instruction assumption as for RIP-relative displacements above.
+      && LastFieldReadOffset + LastFieldReadSize == DecodeInst->InstSize
+#endif
+  ) {
     LiteralToPatch = &DecodeInst->Src[0];
     Type = DataMaskType::BRANCH;
   }
