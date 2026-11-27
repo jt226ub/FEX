@@ -189,6 +189,16 @@ jobs:
           echo "=== probe: hardened runtime"
           ./JITWriteProbe 2>&1 | tee probe-hardened.log
 
+      - name: Check the upstream sync script
+        if: always()
+        # Syntax, usage text and option checks only: these stop before any fetch. The
+        # fetch and merge themselves are run by hand (docs/macOS-upstream-sync.md).
+        run: |
+          bash -n Scripts/macos_sync_upstream.sh
+          Scripts/macos_sync_upstream.sh --help | grep -q 'macos/v1'
+          if Scripts/macos_sync_upstream.sh --here --branch x 2>/dev/null; then exit 1; fi
+          if Scripts/macos_sync_upstream.sh --bogus 2>/dev/null; then exit 1; fi
+
       - name: Summarise errors
         if: always()
         run: |

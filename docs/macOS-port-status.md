@@ -8,7 +8,9 @@ Related documents:
 - `docs/macOS-v1.0-plan.md`: what "1.0" means for this port and the work left to get there.
 - `docs/macOS-embedding-interface.md`: what a program hosting the core must provide.
 - `docs/macOS-code-cache-design.md`: design for loading cached translations on macOS.
-- `Scripts/macos_sync_upstream.sh`: brings a new upstream FEX release into the port.
+- `Scripts/macos_sync_upstream.sh` and `docs/macOS-upstream-sync.md`: bring new upstream FEX
+  commits into the port. Upstream merged so far: FEX-Emu/FEX `main` at `a92baf073`
+  (27 November 2026).
 - `Scripts/macos_asm_tests.py`: runs the instruction tests.
 
 ## Where it stands
@@ -20,7 +22,7 @@ Related documents:
   Homebrew has its own.
 - **Passes on a physical Mac.** On a Mac mini (Apple M4, macOS 27.0.1, 16K pages), as
   built and signed for the hardened runtime with only the JIT entitlement: the smoke and
-  multi-thread tests pass, and 2,254 of upstream's 2,291 instruction tests pass in each
+  multi-thread tests pass, and 2,255 of upstream's 2,292 instruction tests pass in each
   of upstream's three translator modes and in a fourth with x86 memory-ordering emulation
   switched on, with no unexpected failures. The rest are listed under "Tests".
 - **Write protection is enforced on real hardware and respected.** `JITWriteProbe` shows
@@ -157,7 +159,7 @@ All of these run in the Mac job on every push to a `macos/**` branch.
 |---|---|---|---|
 | `FEXCoreSmokeTest` | Translates and runs a 23-byte loop, as built and under the hardened runtime | pass, both | pass, both |
 | `FEXCoreThreadTest` | Eight host threads share a context, each summing a different count in a long guest loop | pass | pass, both |
-| `FEXCoreASMTestRunner` with `Scripts/macos_asm_tests.py` | Upstream's 2,291 assembly instruction tests, in four modes | 2,253 pass in each mode | 2,254 pass in each mode, both |
+| `FEXCoreASMTestRunner` with `Scripts/macos_asm_tests.py` | Upstream's 2,292 assembly instruction tests, in four modes | 2,253 pass in each mode (before the upstream sync added one test) | 2,255 pass in each mode, both |
 | `JITWriteProbe` | Reports how the machine treats executable memory, including writes from a fault handler | report only | see the facts above |
 | Linkage check | Fails if the core or a test tool links anything but `libSystem` and `libc++` (Homebrew's `fmt` is installed first) | | pass |
 | Low-memory probe | Shows that a program with a small page-zero reservation is killed | report only | same as hosted |
@@ -167,7 +169,7 @@ hardened, with either toolchain, the same):
 
 | Outcome | Count |
 |---|---|
-| Pass | 2,254 |
+| Pass (2,254 before the upstream sync at `a92baf073` added `FEX_bugs/shufps_single_source`) | 2,255 |
 | Skipped by the runner (host lacks a CPU feature the test needs, or it needs Linux system calls) | 8 |
 | Skipped by upstream's own lists | 6 |
 | Skipped because the test reaches low memory through a 32-bit operand | 5 |
