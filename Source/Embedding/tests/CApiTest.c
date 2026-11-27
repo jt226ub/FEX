@@ -1672,6 +1672,303 @@ static void TestSplitLocks(void) {
   CheckResult(fexmac_context_destroy(SplitContext), FEXMAC_OK, "context destroy");
 }
 
+/* ---- every emulated split form, with plain stores to the neighbouring bytes ---- */
+
+/* Each form runs `op` in a loop (counter r10; the xadd forms copy r8 to rax first, since
+ * xadd returns the old value in its register) from 8 threads on one operand that crosses
+ * 16 bytes, with operands that change both halves where the operation allows it. A host
+ * thread meanwhile writes the bytes that share the operand's compare-and-swap units but
+ * are not part of it (neighbouring data, written with plain stores, as a real program's
+ * neighbouring fields would be). The core then sees its second compare-and-swap fail
+ * because of bytes that are not its own; it must complete or retry the operation, never
+ * drop it or apply it twice. The final values are exact. */
+
+enum { FormIterations = 10000, FormMaxCode = 64 };
+
+struct Form {
+  const char* What;
+  uint8_t Code[FormMaxCode];
+  size_t CodeSize; /* 0: the op bytes below, wrapped in the r10 loop */
+  uint8_t Op[16];
+  size_t OpSize;
+  size_t Offset;      /* operand offset in the data area */
+  size_t OperandSize; /* bytes */
+  size_t Unit;        /* compare-and-swap unit of the emulation: 1, 4 or 8 */
+  size_t CounterOffset; /* for the lock forms: the counter the lock guards, else 0 */
+  uint64_t Initial;
+  uint64_t (*Want)(uint64_t Initial, uint64_t Total);
+  void (*Registers)(int Index, uint64_t* R8, uint64_t* R9);
+};
+
+static uint64_t WantAdd(uint64_t I, uint64_t N) { return I + N * 0x0000000100000001ULL; }
+static uint64_t WantSub(uint64_t I, uint64_t N) { return I - N * 0x0000000100000001ULL; }
+static uint64_t WantSame(uint64_t I, uint64_t N) { (void)N; return I; }
+static uint64_t WantInc(uint64_t I, uint64_t N) { return I + N; }
+static uint64_t WantDec(uint64_t I, uint64_t N) { return I - N; }
+static uint64_t WantAdd16(uint64_t I, uint64_t N) { return (uint16_t)(I + N * 0x0101); }
+static uint64_t WantAdd32(uint64_t I, uint64_t N) { return (uint32_t)(I + N * 0x00010001); }
+static uint64_t WantCounter(uint64_t I, uint64_t N) { (void)I; return N; }
+
+static void RegsIncrement(int Index, uint64_t* R8, uint64_t* R9) { (void)Index; *R8 = 0x0000000100000001ULL; *R9 = 0; }
+static void RegsInc16(int Index, uint64_t* R8, uint64_t* R9) { (void)Index; *R8 = 0x0101; *R9 = 0; }
+static void RegsInc32(int Index, uint64_t* R8, uint64_t* R9) { (void)Index; *R8 = 0x00010001; *R9 = 0; }
+static void RegsXor(int Index, uint64_t* R8, uint64_t* R9) { (void)Index; *R8 = 0x5A5A5A5AA5A5A5A5ULL; *R9 = 0; }
+/* or and and: each thread sets and clears its own bit in each half. */
+static void RegsBits(int Index, uint64_t* R8, uint64_t* R9) {
+  *R8 = (1ULL << Index) | (1ULL << (Index + 32));
+  *R9 = ~*R8;
+}
+
+/* clang-format off */
+static const struct Form Forms[] = {
+  {"lock xadd 16-bit across 16 bytes", {0}, 0, {0x4C, 0x89, 0xC0, 0x66, 0xF0, 0x0F, 0xC1, 0x07}, 8, 0x100 + 15, 2, 1, 0, 0, WantAdd16, RegsInc16},
+  {"lock xadd 32-bit across 16 bytes", {0}, 0, {0x4C, 0x89, 0xC0, 0xF0, 0x0F, 0xC1, 0x07}, 7, 0x200 + 14, 4, 4, 0, 0, WantAdd32, RegsInc32},
+  {"lock xadd 64-bit across 16 bytes", {0}, 0, {0x4C, 0x89, 0xC0, 0xF0, 0x48, 0x0F, 0xC1, 0x07}, 8, 0x280 + 12, 8, 8, 0, 0, WantAdd, RegsIncrement},
+  {"lock add", {0}, 0, {0xF0, 0x4C, 0x01, 0x07}, 4, 0x300 + 12, 8, 8, 0, 0, WantAdd, RegsIncrement},
+  {"lock sub", {0}, 0, {0xF0, 0x4C, 0x29, 0x07}, 4, 0x400 + 12, 8, 8, 0, 0, WantSub, RegsIncrement},
+  {"lock xor (even count)", {0}, 0, {0xF0, 0x4C, 0x31, 0x07}, 4, 0x500 + 12, 8, 8, 0, 0x1122334455667788ULL, WantSame, RegsXor},
+  {"lock inc (one byte below the boundary)", {0}, 0, {0xF0, 0x48, 0xFF, 0x07}, 4, 0x600 + 15, 8, 8, 0, 0, WantInc, RegsIncrement},
+  {"lock dec (one byte below the boundary)", {0}, 0, {0xF0, 0x48, 0xFF, 0x0F}, 4, 0x700 + 15, 8, 8, 0, 0, WantDec, RegsIncrement},
+  {"lock not (even count)", {0}, 0, {0xF0, 0x48, 0xF7, 0x17}, 4, 0x800 + 12, 8, 8, 0, 0x0123456789ABCDEFULL, WantSame, RegsIncrement},
+  {"lock neg (even count)", {0}, 0, {0xF0, 0x48, 0xF7, 0x1F}, 4, 0x900 + 12, 8, 8, 0, 0x0123456789ABCDEFULL, WantSame, RegsIncrement},
+  {"lock or then lock and of each thread's bits", {0}, 0, {0xF0, 0x4C, 0x09, 0x07, 0xF0, 0x4C, 0x21, 0x0F}, 8, 0xA00 + 12, 8, 8, 0, 0, WantSame, RegsBits},
+  {"lock cmpxchg8b increment loop", {
+     0x8B, 0x07,                   /*  0: mov eax, [rdi] */
+     0x8B, 0x57, 0x04,             /*  2: mov edx, [rdi + 4] */
+     0x8D, 0x58, 0x01,             /*  5: lea ebx, [rax + 1] */
+     0x8D, 0x4A, 0x01,             /*  8: lea ecx, [rdx + 1] */
+     0xF0, 0x0F, 0xC7, 0x0F,       /* 11: lock cmpxchg8b [rdi] */
+     0x75, 0xEF,                   /* 15: jnz 0 */
+     0x49, 0xFF, 0xCA,             /* 17: dec r10 */
+     0x75, 0xEA,                   /* 20: jnz 0 */
+     0xF4},                        /* 22: hlt */
+   23, {0}, 0, 0xB00 + 12, 8, 8, 0, 0, WantAdd, RegsIncrement},
+  {"cmpxchg8b spin lock, plain release", {
+     0x31, 0xC0,                   /*  0: xor eax, eax */
+     0x31, 0xD2,                   /*  2: xor edx, edx */
+     0xBB, 0x01, 0x00, 0x00, 0x00, /*  4: mov ebx, 1 */
+     0x31, 0xC9,                   /*  9: xor ecx, ecx */
+     0xF0, 0x0F, 0xC7, 0x0F,       /* 11: lock cmpxchg8b [rdi] */
+     0x75, 0xEF,                   /* 15: jnz 0 */
+     0x48, 0xFF, 0x06,             /* 17: inc qword [rsi] */
+     0x48, 0xC7, 0x07, 0, 0, 0, 0, /* 20: mov qword [rdi], 0 */
+     0x49, 0xFF, 0xCA,             /* 27: dec r10 */
+     0x75, 0xE0,                   /* 30: jnz 0 */
+     0xF4},                        /* 32: hlt */
+   33, {0}, 0, 0xC00 + 12, 8, 8, 0xD00, 0, WantCounter, RegsIncrement},
+  {"xchg spin lock changing both halves, xchg release", {
+     0x4C, 0x89, 0xC0,             /*  0: mov rax, r8 */
+     0x48, 0x87, 0x07,             /*  3: xchg [rdi], rax */
+     0x48, 0x85, 0xC0,             /*  6: test rax, rax */
+     0x75, 0xF5,                   /*  9: jnz 0 */
+     0x48, 0xFF, 0x06,             /* 11: inc qword [rsi] */
+     0x31, 0xC0,                   /* 14: xor eax, eax */
+     0x48, 0x87, 0x07,             /* 16: xchg [rdi], rax */
+     0x49, 0xFF, 0xCA,             /* 19: dec r10 */
+     0x75, 0xE8,                   /* 22: jnz 0 */
+     0xF4},                        /* 24: hlt */
+   25, {0}, 0, 0xE00 + 12, 8, 8, 0xF00, 0, WantCounter, RegsIncrement},
+};
+/* clang-format on */
+
+struct FormWorkerArgs {
+  int Index;
+  uint64_t Code;
+  uint64_t Operand;
+  uint64_t Counter;
+  const struct Form* F;
+};
+
+static void* FormWorker(void* Arg) {
+  const struct FormWorkerArgs* A = Arg;
+  fexmac_thread* Thread = CreateThreadAt(SplitContext, A->Code, 0);
+  fexmac_x86_state State = GetState(Thread);
+  State.gpr[RDI] = A->Operand;
+  State.gpr[RSI] = A->Counter;
+  State.gpr[10] = FormIterations;
+  A->F->Registers(A->Index, &State.gpr[8], &State.gpr[9]);
+  SetState(Thread, &State);
+  const fexmac_stop Stop = Run(Thread);
+  if (Stop.reason != FEXMAC_STOP_HALT) {
+    Shared[2] = 1;
+  }
+  fexmac_thread_destroy(Thread);
+  return NULL;
+}
+
+/* Plain stores to the bytes that share the operand's compare-and-swap units, spaced out
+ * so that most emulations still succeed at once. */
+static volatile uint8_t* NeighbourBytes[16];
+static int NeighbourCount;
+static atomic_int NeighbourStop;
+static atomic_long NeighbourStores;
+
+static void* NeighbourWriter(void* Arg) {
+  (void)Arg;
+  uint8_t Value = 1;
+  while (!atomic_load(&NeighbourStop)) {
+    for (int i = 0; i < NeighbourCount; ++i) {
+      NeighbourBytes[i][0] = Value;
+    }
+    ++Value;
+    atomic_fetch_add(&NeighbourStores, 1);
+    for (volatile int Spin = 0; Spin < 300; ++Spin) {
+    }
+  }
+  return NULL;
+}
+
+static void TestSplitLockForms(void) {
+  CheckResult(fexmac_install_fault_handlers(), FEXMAC_OK, "install fault handlers");
+  SplitContext = CreateContext(NULL, NULL);
+  uint8_t* Data = MapGuestMemory(0x8000);
+  const uint64_t Total = (uint64_t)SplitThreads * FormIterations;
+  for (size_t f = 0; f < sizeof(Forms) / sizeof(Forms[0]); ++f) {
+    const struct Form* F = &Forms[f];
+    uint8_t* Code = MapGuestMemory(0x10000);
+    if (F->CodeSize) {
+      memcpy(Code, F->Code, F->CodeSize);
+    } else {
+      /* op; dec r10; jnz op; hlt */
+      memcpy(Code, F->Op, F->OpSize);
+      const uint8_t Tail[] = {0x49, 0xFF, 0xCA, 0x75, (uint8_t)(-(int)(F->OpSize + 5)), 0xF4};
+      memcpy(Code + F->OpSize, Tail, sizeof(Tail));
+    }
+    uint8_t* Operand = Data + F->Offset;
+    memcpy(Operand, &F->Initial, F->OperandSize);
+
+    NeighbourCount = 0;
+    const size_t UnitBegin = F->Offset & ~(F->Unit - 1);
+    const size_t UnitEnd = (F->Offset + F->OperandSize + F->Unit - 1) & ~(F->Unit - 1);
+    for (size_t b = UnitBegin; b < UnitEnd; ++b) {
+      if ((b < F->Offset || b >= F->Offset + F->OperandSize) && NeighbourCount < 16) {
+        NeighbourBytes[NeighbourCount++] = Data + b;
+      }
+    }
+    atomic_store(&NeighbourStop, 0);
+    atomic_store(&NeighbourStores, 0);
+    pthread_t Writer;
+    pthread_create(&Writer, NULL, NeighbourWriter, NULL);
+
+    struct FormWorkerArgs Args[SplitThreads];
+    pthread_t Workers[SplitThreads];
+    for (int i = 0; i < SplitThreads; ++i) {
+      Args[i] = (struct FormWorkerArgs) {i, (uint64_t)(uintptr_t)Code, (uint64_t)(uintptr_t)Operand,
+                                         F->CounterOffset ? (uint64_t)(uintptr_t)(Data + F->CounterOffset) : 0, F};
+      pthread_create(&Workers[i], NULL, FormWorker, &Args[i]);
+    }
+    for (int i = 0; i < SplitThreads; ++i) {
+      pthread_join(Workers[i], NULL);
+    }
+    atomic_store(&NeighbourStop, 1);
+    pthread_join(Writer, NULL);
+
+    uint64_t Got = 0;
+    if (F->CounterOffset) {
+      memcpy(&Got, Data + F->CounterOffset, 8);
+    } else {
+      memcpy(&Got, Operand, F->OperandSize);
+    }
+    const uint64_t Want = F->Want(F->Initial, Total);
+    Check(Got == Want, "%s from %d threads, %ld neighbouring stores: 0x%" PRIx64 ", expected 0x%" PRIx64, F->What, SplitThreads,
+          atomic_load(&NeighbourStores), Got, Want);
+  }
+  Check(Shared[2] == 0, "every thread ran to its halt");
+  CheckResult(fexmac_context_destroy(SplitContext), FEXMAC_OK, "context destroy");
+}
+
+/* ---- split locked operations while asynchronous signals keep arriving ---- */
+
+/* The host owns the fault signals (way 2) with an empty mask, and a signal handler of its
+ * own keeps interrupting one guest thread. That handler waits until another thread's
+ * split locked operation has changed the shared word. If the signal arrived while the
+ * interrupted thread held the core's split-lock lock, nothing could change it and the
+ * wait times out: fexmac_handle_fault must keep asynchronous signals blocked while the
+ * core can hold its locks. The storm starts once every thread has translated its code
+ * (the word has moved well past its start), since a thread interrupted while it holds a
+ * lock of the translator would stall the others too, and stops at the first stall so
+ * that a failure ends quickly. */
+static volatile uint64_t* StormWord;
+static atomic_int StormFinished;
+static atomic_long StormSignals, StormStalls;
+
+static void StormHandler(int Signal) {
+  (void)Signal;
+  if (atomic_load(&StormFinished)) {
+    return;
+  }
+  atomic_fetch_add(&StormSignals, 1);
+  const uint64_t Before = *StormWord;
+  for (int Spin = 0; Spin < 20000; ++Spin) { /* about 20 ms */
+    if (*StormWord != Before || atomic_load(&StormFinished)) {
+      return;
+    }
+    usleep(1);
+  }
+  atomic_fetch_add(&StormStalls, 1);
+  atomic_store(&StormFinished, 1);
+}
+
+static void* StormWorker(void* Arg) {
+  pthread_t* Self = Arg;
+  *Self = pthread_self();
+  fexmac_thread* Thread = CreateThreadAt(SplitContext, SplitCode, 0);
+  fexmac_x86_state State = GetState(Thread);
+  State.gpr[RDI] = SplitRdi;
+  State.gpr[RCX] = SplitIterations;
+  State.gpr[8] = SplitIncrement;
+  SetState(Thread, &State);
+  const fexmac_stop Stop = Run(Thread);
+  if (Stop.reason != FEXMAC_STOP_HALT) {
+    Shared[2] = 1;
+  }
+  atomic_store(&StormFinished, 1);
+  fexmac_thread_destroy(Thread);
+  return NULL;
+}
+
+static void TestSplitLockSignalStorm(void) {
+  InstallHostHandler(HostForwardingHandler, SA_NODEFER);
+  struct sigaction Action;
+  memset(&Action, 0, sizeof(Action));
+  Action.sa_handler = StormHandler;
+  sigemptyset(&Action.sa_mask);
+  sigaction(SIGUSR1, &Action, NULL);
+
+  SplitContext = CreateContext(NULL, NULL);
+  uint8_t* Code = MapGuestMemory(0x10000);
+  memcpy(Code, SplitXaddProgram, sizeof(SplitXaddProgram));
+  uint8_t* Data = MapGuestMemory(0x8000);
+  SplitCode = (uint64_t)(uintptr_t)Code;
+  SplitRdi = (uint64_t)(uintptr_t)(Data + 0x100 + 12);
+  StormWord = (volatile uint64_t*)(Data + 0x100 + 8); /* aligned, covers the low half */
+  pthread_t Handles[SplitThreads];
+  pthread_t Workers[SplitThreads];
+  memset(Handles, 0, sizeof(Handles));
+  for (int i = 0; i < SplitThreads; ++i) {
+    pthread_create(&Workers[i], NULL, StormWorker, &Handles[i]);
+  }
+  while (!Handles[0] || *(volatile uint64_t*)SplitRdi < 4000 * SplitIncrement) {
+    usleep(100);
+  }
+  while (!atomic_load(&StormFinished)) {
+    pthread_kill(Handles[0], SIGUSR1);
+    usleep(300);
+  }
+  for (int i = 0; i < SplitThreads; ++i) {
+    pthread_join(Workers[i], NULL);
+  }
+  uint64_t Got;
+  memcpy(&Got, Data + 0x100 + 12, 8);
+  const uint64_t Want = (uint64_t)SplitThreads * SplitIterations * SplitIncrement;
+  Check(Got == Want, "lock xadd across 16 bytes from %d threads under a signal storm: %" PRIu64 " of %" PRIu64, SplitThreads, Got, Want);
+  Check(atomic_load(&StormStalls) == 0, "no signal interrupted a thread holding the split-lock lock (%ld signals, %ld stalls)",
+        atomic_load(&StormSignals), atomic_load(&StormStalls));
+  Check(atomic_load(&StormSignals) > 100, "the storm reached the guest thread (%ld signals)", atomic_load(&StormSignals));
+  Check(Shared[2] == 0, "every thread ran to its halt");
+  CheckResult(fexmac_context_destroy(SplitContext), FEXMAC_OK, "context destroy");
+}
+
 /* ---- driver ---- */
 
 #define GUEST_FAULT_TEXT "guest memory access fault in translated code at address 0x"
@@ -1721,6 +2018,8 @@ static const struct Subtest Subtests[] = {
   {"cache-fork", TestCacheFork, 0, NULL, NULL, 0},
   {"code-ranges", TestCodeRanges, 0, NULL, NULL, 0},
   {"split-locks-concurrent", TestSplitLocks, 0, NULL, NULL, 0},
+  {"split-locks-every-form", TestSplitLockForms, 0, NULL, NULL, 0},
+  {"split-locks-signal-storm", TestSplitLockSignalStorm, 0, NULL, NULL, 0},
 };
 
 int main(int argc, char** argv) {
