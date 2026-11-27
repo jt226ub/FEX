@@ -719,6 +719,40 @@ def main():
           second.get("loaded", 0) > 0 and second.get("rejected") == 0 and first.get("dropped") == 0,
           "%s / %s generations=%s sizes=%s" % (summary(first), summary(second), names, sizes))
 
+    # Six processes at once, each filling and rotating the same database, 72 runs: no false
+    # trust or damage event (a generation deleted by one process while another opens it is a
+    # race to retry, not an untrusted or damaged file), and every answer right.
+    target = os.path.join(work, "rotation-stress")
+    import concurrent.futures
+
+    def stress_run(index):
+        cmd = [cache_test, "--threads", "1", "--blocks", "60", "--distinct"] + (["--variant", "sub"] if index % 2 else [])
+        return run(cmd, target, {"FEX_DISKCACHEMAXFILESIZE": "12288"})
+    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
+        stress = list(pool.map(stress_run, range(72)))
+    bad = [summary(i) for i in stress if i["rc"] != 0 or "PASS" not in i["out"]]
+    replaced = sum(i.get("replaced", 0) for i in stress)
+    reset = sum(i.get("reset", 0) for i in stress)
+    rejected = sum(i.get("rejected", 0) for i in stress)
+    names = sorted(f for folder, _, files in os.walk(target) for f in files if f.endswith("_idx.foz"))
+    check("six processes rotating one database, 72 runs: all right, untrusted replaced %d, damaged reset %d, rejected %d" %
+          (replaced, reset, rejected), not bad and replaced == 0 and reset == 0 and rejected == 0 and len(names) <= 3,
+          "; ".join(bad[:3]) + " generations=%s" % names)
+
+    # A planted generation name far ahead is ignored: start-up stays quick and the real
+    # generations are neither skipped nor deleted.
+    target = os.path.join(work, "planted-generation")
+    run(gen_cmd, target)
+    (pcache, pindex), = db_files(target)
+    planted = pindex.replace("_idx.foz", "-2000000_idx.foz")
+    open(planted, "wb").close()
+    os.chmod(planted, 0o600)
+    started = time.monotonic()
+    info = run(gen_cmd, target)
+    elapsed = time.monotonic() - started
+    check("a planted generation -2000000 is ignored (%.2f s, the real one still loads)" % elapsed,
+          info["rc"] == 0 and info.get("compiled") == 0 and os.path.exists(pindex) and elapsed < 2, summary(info))
+
     # A database another process filled past this process's (smaller) limit is used read-only,
     # never emptied.
     target = os.path.join(work, "over-limit")

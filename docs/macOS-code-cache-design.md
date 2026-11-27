@@ -251,7 +251,18 @@ safe instead:
   still has one open keeps reading it). Processes find the newest generation by listing
   the bucket. A database larger than this process's limit (filled by a process with a
   larger one) is read but not written by this process, never emptied, so processes with
-  different limits do not destroy each other's data. Why 256MB: every process reads the
+  different limits do not destroy each other's data. Generations and other processes: a cache
+  file whose name was removed (link count 0) or now names another file, while it was
+  being opened or locked, is a race with a process deleting an old generation; the open
+  looks at the directory again instead of calling the file untrusted or damaged, a file
+  is removed only if its name still refers to the file that was judged, and a new
+  database's description is written before its locks are let go. Six processes
+  rotating one database 72 times report no untrusted or damaged file. A generation number
+  is believed only if it is the lowest found or its predecessor exists (at most 2^24), and
+  only generations found in the directory are deleted, so a planted name far ahead is
+  ignored. The next generation is opened outside the index lock and then swapped in; if
+  it is over this process's limit, saving stops for the run (read-only) instead of
+  rotating again. Why 256MB: every process reads the
   whole index of the generations it uses at start (about 40% of the cache file for the
   instruction tests' small blocks; less for real programs' larger ones), so the limit
   bounds start-up time and memory; the instruction tests use 59MB in all.

@@ -86,10 +86,19 @@ namespace {
   }
 
   // A cache file is trusted only if it is a regular file with one name, owned by this
-  // user, private to it (0600 or tighter) and without an ACL that grants write.
-  bool FileIsTrusted(int FD, std::string_view Name) {
+  // user, private to it (0600 or tighter) and without an ACL that grants write. No name
+  // at all (another process just deleted this generation) is a race, not a verdict.
+  enum class FileVerdict { Trusted, Untrusted, Race };
+  FileVerdict JudgeFile(int FD, std::string_view Name, ino_t& Ino, dev_t& Dev) {
     struct stat Info;
     const char* Why = nullptr;
+    if (fstat(FD, &Info) == 0) {
+      Ino = Info.st_ino;
+      Dev = Info.st_dev;
+    }
+    if (fstat(FD, &Info) == 0 && S_ISREG(Info.st_mode) && Info.st_nlink == 0) {
+      return FileVerdict::Race;
+    }
     if (fstat(FD, &Info) != 0 || !S_ISREG(Info.st_mode)) {
       Why = "is not a regular file";
     } else if (Info.st_uid != geteuid()) {
@@ -103,9 +112,9 @@ namespace {
     }
     if (Why) {
       LogMan::Msg::EFmt("DiskCache: {} {}; not using it", Name, Why);
-      return false;
+      return FileVerdict::Untrusted;
     }
-    return true;
+    return FileVerdict::Trusted;
   }
 
   // The build identity: the LC_UUID of the Mach-O image the core's code is in. The linker
@@ -293,17 +302,26 @@ namespace {
   }
 } // namespace
 
-bool FOZFile::OpenAt(int DirFD, const fextl::string& Leaf, bool ReadOnly, bool& Refused) {
+bool FOZFile::NameMatches(int DirFD) const {
+  struct stat Name, Open;
+  return FD && fstatat(DirFD, FileName.c_str(), &Name, AT_SYMLINK_NOFOLLOW) == 0 && fstat(FD->GetHandle(), &Open) == 0 &&
+         Name.st_ino == Open.st_ino && Name.st_dev == Open.st_dev && Open.st_nlink > 0;
+}
+
+bool FOZFile::OpenAt(int DirFD, const fextl::string& Leaf, bool ReadOnly, bool Create, bool& Refused, bool& Raced) {
   Refused = false;
+  Raced = false;
   FileName = Leaf;
   this->ReadOnly = ReadOnly;
   FD.reset();
 
   // O_NOFOLLOW: a symbolic link in place of the file is refused (ELOOP), never followed.
-  const int Flags = (ReadOnly ? O_RDONLY : (O_RDWR | O_CREAT)) | O_NOFOLLOW | O_CLOEXEC;
+  const int Flags = (ReadOnly ? O_RDONLY : (O_RDWR | (Create ? O_CREAT : 0))) | O_NOFOLLOW | O_CLOEXEC;
   const int Handle = OpenAtRetrying(DirFD, Leaf.c_str(), Flags);
   if (Handle < 0) {
-    if (errno == ELOOP) {
+    if (errno == ENOENT && !Create) {
+      Raced = true; // the generation is gone
+    } else if (errno == ELOOP) {
       LogMan::Msg::EFmt("DiskCache: {} is a symbolic link; not using it", Leaf);
       Refused = true;
     } else {
@@ -311,7 +329,13 @@ bool FOZFile::OpenAt(int DirFD, const fextl::string& Leaf, bool ReadOnly, bool& 
     }
     return false;
   }
-  if (!FileIsTrusted(Handle, Leaf)) {
+  switch (JudgeFile(Handle, Leaf, Ino, Dev)) {
+  case FileVerdict::Trusted: break;
+  case FileVerdict::Race:
+    close(Handle);
+    Raced = true;
+    return false;
+  case FileVerdict::Untrusted:
     close(Handle);
     Refused = true;
     return false;
@@ -368,7 +392,7 @@ bool FOZFile::Truncate(uint64_t NewSize) {
   return FD && ftruncate(FD->GetHandle(), NewSize) == 0;
 }
 
-IndexedDB::OpenResult IndexedDB::OpenAt(int DirFD, const fextl::string& Leaf, bool ReadOnly, bool& Replaced) {
+IndexedDB::OpenResult IndexedDB::OpenAt(int DirFD, const fextl::string& Leaf, bool ReadOnly, bool Create, bool& Replaced) {
   this->DirFD = DirFD;
   Name = Leaf;
   this->ReadOnly = ReadOnly;
@@ -376,13 +400,22 @@ IndexedDB::OpenResult IndexedDB::OpenAt(int DirFD, const fextl::string& Leaf, bo
   const auto CacheName = Leaf + ".foz";
   const auto IndexName = Leaf + "_idx.foz";
   for (int Attempt = 0; Attempt < 2; ++Attempt) {
-    bool CacheRefused = false;
-    bool IndexRefused = false;
-    if (CacheFOZ.OpenAt(DirFD, CacheName, ReadOnly, CacheRefused) && IndexFOZ.OpenAt(DirFD, IndexName, ReadOnly, IndexRefused)) {
-      return OpenResult::Opened;
+    bool CacheRefused = false, IndexRefused = false, CacheRaced = false, IndexRaced = false;
+    if (CacheFOZ.OpenAt(DirFD, CacheName, ReadOnly, Create, CacheRefused, CacheRaced) &&
+        IndexFOZ.OpenAt(DirFD, IndexName, ReadOnly, Create, IndexRefused, IndexRaced)) {
+      // Both names must still be the files opened: another process deleting this
+      // generation meanwhile could leave an old cache file paired with a new index.
+      if (NamesMatch()) {
+        return OpenResult::Opened;
+      }
+      CacheRaced = true;
     }
+    const ino_t CacheIno = CacheFOZ.Ino, IndexIno = IndexFOZ.Ino;
     CacheFOZ = FOZFile {};
     IndexFOZ = FOZFile {};
+    if (CacheRaced || IndexRaced) {
+      return OpenResult::Raced;
+    }
     if (!(CacheRefused || IndexRefused)) {
       return OpenResult::Failed;
     }
@@ -390,10 +423,18 @@ IndexedDB::OpenResult IndexedDB::OpenAt(int DirFD, const fextl::string& Leaf, bo
       return OpenResult::Untrusted;
     }
     // The directory is verified private, so removing names from it is safe. Both files
-    // go: one half of a database is no use without the other.
+    // go: one half of a database is no use without the other. A name is removed only if
+    // it is still the file that was judged, never one another process created since.
     LogMan::Msg::EFmt("DiskCache: removing {}, which may not be trusted, and starting it again", Leaf);
-    unlinkat(DirFD, CacheName.c_str(), 0);
-    unlinkat(DirFD, IndexName.c_str(), 0);
+    auto RemoveIfSame = [&](const fextl::string& FileName, ino_t Judged) {
+      struct stat Info;
+      // The file that was judged, or a symbolic link (refused without being opened).
+      if (fstatat(DirFD, FileName.c_str(), &Info, AT_SYMLINK_NOFOLLOW) == 0 && ((Judged && Info.st_ino == Judged) || S_ISLNK(Info.st_mode))) {
+        unlinkat(DirFD, FileName.c_str(), 0);
+      }
+    };
+    RemoveIfSame(CacheName, CacheIno);
+    RemoveIfSame(IndexName, IndexIno);
     Replaced = true;
   }
   return OpenResult::Untrusted;
@@ -601,12 +642,18 @@ bool IndexedDB::Reset() {
   // Replace the files rather than truncate them: another process may still be appending
   // to them and expects what it already wrote to stay where it is (see RepairIndexTail).
   // Its later writes go to the removed files and are lost, which is harmless.
-  unlinkat(DirFD, (Name + ".foz").c_str(), 0);
-  unlinkat(DirFD, (Name + "_idx.foz").c_str(), 0);
+  // Only names that are still these files (the caller holds their locks and checked).
+  if (CacheFOZ.NameMatches(DirFD)) {
+    unlinkat(DirFD, (Name + ".foz").c_str(), 0);
+  }
+  if (IndexFOZ.NameMatches(DirFD)) {
+    unlinkat(DirFD, (Name + "_idx.foz").c_str(), 0);
+  }
   CacheFOZ = FOZFile {};
   IndexFOZ = FOZFile {};
-  bool Refused = false;
-  if (!CacheFOZ.OpenAt(DirFD, Name + ".foz", false, Refused) || !IndexFOZ.OpenAt(DirFD, Name + "_idx.foz", false, Refused)) {
+  bool Refused = false, Raced = false;
+  if (!CacheFOZ.OpenAt(DirFD, Name + ".foz", false, true, Refused, Raced) ||
+      !IndexFOZ.OpenAt(DirFD, Name + "_idx.foz", false, true, Refused, Raced)) {
     return false;
   }
   CacheFOZSizeAtOpen = FOZ_REF_MAGIC_SIZE;
@@ -798,7 +845,7 @@ bool DiskCache::OpenCacheDBMacOS(const fextl::string& Leaf, bool ReadOnly) {
   }
   auto CurDB = fextl::make_unique<IndexedDB>();
   bool Replaced = false;
-  if (CurDB->OpenAt(BucketDirFD, Leaf, true, Replaced) != IndexedDB::OpenResult::Opened) {
+  if (CurDB->OpenAt(BucketDirFD, Leaf, true, false, Replaced) != IndexedDB::OpenResult::Opened) {
     LogMan::Msg::IFmt("DiskCache: could not open {}; translating without it", Leaf);
     return false;
   }
@@ -819,29 +866,40 @@ fextl::string DiskCache::GenerationName(uint32_t Generation) const {
 // Opens one generation of the read-write database (creating it when Write is set), checks
 // it and gives it its description. Returns null, with CurrentState set, if it cannot be
 // used.
-IndexedDB* DiskCache::OpenGeneration(uint32_t Generation, bool Write) {
+fextl::unique_ptr<IndexedDB> DiskCache::OpenGeneration(uint32_t Generation, bool Create, bool& Raced, State* FailState) {
+  Raced = false;
   auto DB = fextl::make_unique<IndexedDB>();
   DB->Generation = Generation;
   const auto Name = GenerationName(Generation);
   bool Replaced = false;
+  auto Fail = [&](State Reason) -> fextl::unique_ptr<IndexedDB> {
+    if (FailState) {
+      *FailState = Reason;
+    }
+    return nullptr;
+  };
   // The read-write files are opened writable even for an older generation: other
   // processes may still be appending to it, and its index is repaired under the locks.
-  const auto Result = DB->OpenAt(BucketDirFD, Name, false, Replaced);
+  const auto Result = DB->OpenAt(BucketDirFD, Name, false, Create, Replaced);
   if (Replaced) {
     UntrustedReplaced.fetch_add(1, std::memory_order_relaxed);
   }
+  if (Result == IndexedDB::OpenResult::Raced) {
+    Raced = true;
+    return nullptr;
+  }
   if (Result != IndexedDB::OpenResult::Opened) {
     LogMan::Msg::IFmt("DiskCache: could not open {}; translating without it", Name);
-    if (Write) {
-      CurrentState = Result == IndexedDB::OpenResult::Untrusted ? State::Untrusted : State::Unavailable;
-    }
-    return nullptr;
+    return Fail(Result == IndexedDB::OpenResult::Untrusted ? State::Untrusted : State::Unavailable);
   }
   if (!DB->LockForOpen(std::chrono::steady_clock::now() + std::chrono::milliseconds(STORE_DEADLINE_MS))) {
     LogMan::Msg::IFmt("DiskCache: {} is busy; translating without it", Name);
-    if (Write) {
-      CurrentState = State::Unavailable;
-    }
+    return Fail(State::Unavailable);
+  }
+  // Deleted (as an old generation) by another process between the open and the lock.
+  if (!DB->NamesMatch()) {
+    DB->UnlockAfterOpen();
+    Raced = true;
     return nullptr;
   }
   FEX_CONFIG_OPT(MaxSize, DISKCACHEMAXFILESIZE);
@@ -854,13 +912,12 @@ IndexedDB* DiskCache::OpenGeneration(uint32_t Generation, bool Write) {
     RejectedCount.fetch_add(1, std::memory_order_relaxed);
     // Damaged or made for something else under this name: the directory is disposable,
     // so start this database again (new files, so a process still appending to the old
-    // ones never sees what it wrote move).
+    // ones never sees what it wrote move). Under the locks, with both names checked, and
+    // with the description written before the locks are let go, a well-behaved process
+    // can never produce this.
     if (!DB->Reset()) {
       DB->UnlockAfterOpen();
-      if (Write) {
-        CurrentState = State::Unavailable;
-      }
-      return nullptr;
+      return Fail(State::Unavailable);
     }
     DamagedReset.fetch_add(1, std::memory_order_relaxed);
     LogMan::Msg::IFmt("DiskCache: emptied {} and starting it again", Name);
@@ -869,21 +926,64 @@ IndexedDB* DiskCache::OpenGeneration(uint32_t Generation, bool Write) {
     DB->WriteRefused = false;
   }
   if (!LocalFoundMetadata && !DB->WriteRefused) {
-    // A fresh database: its first record is the description.
+    // A fresh database: its first record is the description, written before the locks
+    // are released (StoreCacheBlobMacOS takes the locks it already holds and releases
+    // them), so no process can see entries without it.
     MesaFOZ::foz_payload_key MetadataKey;
     memset(MetadataKey.bytes, 0xFF, sizeof(MetadataKey));
     IndexExtraBlobHeader MetaDataHeader = {};
     MesaFOZ::mesa_index_db_file_entry IndexEntry = {};
-    DB->UnlockAfterOpen();
     DB->StoreCacheBlobMacOS(MetadataKey, ~0, {ExpectedMetadata.data(), ExpectedMetadata.size()}, IndexEntry,
                             {reinterpret_cast<uint8_t*>(&MetaDataHeader), sizeof(MetaDataHeader)},
                             std::chrono::steady_clock::now() + std::chrono::milliseconds(STORE_DEADLINE_MS));
   } else {
     DB->UnlockAfterOpen();
   }
-  auto* Raw = DB.get();
-  Generations.push_back(std::move(DB));
-  return Raw;
+  return DB;
+}
+
+// Generation numbers in the bucket. A number is believed only if it is the lowest found
+// or its predecessor is found too (a generation is started only from the one before it,
+// which is kept until the one after exists), and at most 2^24: a planted name far ahead
+// is ignored, not acted on.
+fextl::vector<uint32_t> DiskCache::ListGenerations() {
+  fextl::vector<uint32_t> Found;
+  if (DIR* Dir = fdopendir(dup(BucketDirFD))) {
+    while (const dirent* Entry = readdir(Dir)) {
+      std::string_view Name = Entry->d_name;
+      if (!Name.starts_with(GenerationBase) || !Name.ends_with("_idx.foz")) {
+        continue;
+      }
+      Name.remove_prefix(GenerationBase.size());
+      Name.remove_suffix(strlen("_idx.foz"));
+      uint32_t Generation = 0;
+      bool Valid = true;
+      if (!Name.empty()) {
+        Valid = Name[0] == '-' && Name.size() >= 2 && Name.size() <= 9 && Name[1] != '0';
+        for (char c : Name.substr(1)) {
+          Valid &= c >= '0' && c <= '9';
+          Generation = Generation * 10 + uint32_t(c - '0');
+        }
+      }
+      if (Valid && Generation <= (1U << 24)) {
+        Found.push_back(Generation);
+      }
+    }
+    closedir(Dir);
+  }
+  std::sort(Found.begin(), Found.end());
+  Found.erase(std::unique(Found.begin(), Found.end()), Found.end());
+  return Found;
+}
+
+uint32_t DiskCache::NewestGeneration(const fextl::vector<uint32_t>& Found) {
+  uint32_t Newest = Found.empty() ? 0 : Found.front();
+  for (uint32_t Generation : Found) {
+    if (Generation == Found.front() || std::binary_search(Found.begin(), Found.end(), Generation - 1)) {
+      Newest = std::max(Newest, Generation);
+    }
+  }
+  return Newest;
 }
 
 // The current generation is full: start the next one, keep reading the full one, and
@@ -892,19 +992,38 @@ IndexedDB* DiskCache::OpenGeneration(uint32_t Generation, bool Write) {
 // moves on too; deleting a generation other processes still have open only removes its
 // name.
 bool DiskCache::Rotate(IndexedDB* Full) {
-  std::lock_guard IndexGuard(IndexLock);
-  if (WriteDB.load() != Full) {
-    return true; // already moved on
+  if (WriteDB.load() != Full || WritesStopped.load()) {
+    return WriteDB.load() != Full;
   }
-  const uint32_t Next = Full->Generation + 1;
-  auto* NewDB = OpenGeneration(Next, false);
-  if (!NewDB || NewDB->WriteRefused) {
+  // Opened outside the index lock (it can wait for another process's lock), then swapped
+  // in. Only the writer thread rotates.
+  fextl::unique_ptr<IndexedDB> NewDB;
+  for (int Attempt = 0; Attempt < 8 && !NewDB; ++Attempt) {
+    // Another process may have moved on further already: continue in the newest one.
+    const uint32_t Next = std::max(Full->Generation + 1, NewestGeneration(ListGenerations()));
+    bool Raced = false;
+    NewDB = OpenGeneration(Next, true, Raced, nullptr);
+    if (!NewDB && !Raced) {
+      break;
+    }
+  }
+  if (!NewDB) {
     return false;
   }
-  LogMan::Msg::IFmt("DiskCache: {} is full; continuing in {}", Full->Name, NewDB->Name);
-  WriteDB = NewDB;
-  if (Next >= 2) {
-    const auto Old = GenerationName(Next - 2);
+  std::lock_guard IndexGuard(IndexLock);
+  auto* Raw = NewDB.get();
+  Generations.push_back(std::move(NewDB));
+  if (Raw->WriteRefused) {
+    // Another process with a larger limit filled it: read it, write nothing more.
+    WritesStopped = true;
+    CurrentState = State::ReadOnly;
+    LogMan::Msg::IFmt("DiskCache: {} is full and {} is over this process's limit; saving stops", Full->Name, Raw->Name);
+    return false;
+  }
+  LogMan::Msg::IFmt("DiskCache: {} is full; continuing in {}", Full->Name, Raw->Name);
+  WriteDB = Raw;
+  if (Raw->Generation >= 2) {
+    const auto Old = GenerationName(Raw->Generation - 2);
     unlinkat(BucketDirFD, (Old + ".foz").c_str(), 0);
     unlinkat(BucketDirFD, (Old + "_idx.foz").c_str(), 0);
   }
@@ -918,7 +1037,7 @@ bool DiskCache::StoreMacOS(const MesaFOZ::foz_payload_key& UniqueKey, uint64_t L
                            MesaFOZ::mesa_index_db_file_entry& IndexEntry, std::span<const uint8_t> IndexBlob, IndexedDB** Used) {
   for (int Attempt = 0; Attempt < 2; ++Attempt) {
     IndexedDB* DB = WriteDB.load();
-    if (!DB || StoresBusy.load(std::memory_order_relaxed) || InForkedChild()) {
+    if (!DB || StoresBusy.load(std::memory_order_relaxed) || WritesStopped.load(std::memory_order_relaxed) || InForkedChild()) {
       break;
     }
     const auto Result = DB->StoreCacheBlobMacOS(UniqueKey, LookupKey, Blob, IndexEntry, IndexBlob,
@@ -1015,43 +1134,45 @@ void DiskCache::InitMacOS(const fextl::vector<uint8_t>& BucketBytes, size_t Mach
   // The read-write database's generations: write the newest, also read the one before,
   // delete older ones.
   GenerationBase = fextl::fmt::format("RWCacheDB_{:016x}", ProcessBucketHash);
-  uint32_t Newest = 0;
-  if (DIR* Dir = fdopendir(dup(BucketDirFD))) {
-    while (const dirent* Entry = readdir(Dir)) {
-      std::string_view Name = Entry->d_name;
-      if (!Name.starts_with(GenerationBase) || !Name.ends_with("_idx.foz")) {
+  // Open the newest generation for writing and the one before for reading. A generation
+  // that disappears while it is being opened (another process rotated twice and deleted
+  // it) means the listing is stale: look again.
+  CurrentState = State::Unavailable;
+  for (int Attempt = 0; Attempt < 8; ++Attempt) {
+    const auto Found = ListGenerations();
+    const uint32_t Newest = NewestGeneration(Found);
+    // Delete only generations that were found, older than the one before the newest.
+    for (uint32_t Old : Found) {
+      if (Old + 2 <= Newest) {
+        unlinkat(BucketDirFD, (GenerationName(Old) + ".foz").c_str(), 0);
+        unlinkat(BucketDirFD, (GenerationName(Old) + "_idx.foz").c_str(), 0);
+      }
+    }
+    Generations.clear();
+    bool Raced = false;
+    fextl::unique_ptr<IndexedDB> Previous;
+    if (Newest >= 1 && std::binary_search(Found.begin(), Found.end(), Newest - 1)) {
+      Previous = OpenGeneration(Newest - 1, false, Raced, nullptr);
+      if (Raced) {
         continue;
       }
-      Name.remove_prefix(GenerationBase.size());
-      Name.remove_suffix(strlen("_idx.foz"));
-      uint32_t Generation = 0;
-      if (!Name.empty()) {
-        if (Name[0] != '-' || Name.size() > 10) {
-          continue;
-        }
-        for (char c : Name.substr(1)) {
-          if (c < '0' || c > '9') {
-            Generation = 0;
-            break;
-          }
-          Generation = Generation * 10 + (c - '0');
-        }
-      }
-      Newest = std::max(Newest, Generation);
     }
-    closedir(Dir);
-  }
-  for (uint32_t Old = 0; Newest >= 2 && Old + 2 <= Newest; ++Old) {
-    unlinkat(BucketDirFD, (GenerationName(Old) + ".foz").c_str(), 0);
-    unlinkat(BucketDirFD, (GenerationName(Old) + "_idx.foz").c_str(), 0);
-  }
-  if (Newest >= 1) {
-    OpenGeneration(Newest - 1, false);
-  }
-  CurrentState = State::Unavailable;
-  if (auto* Current = OpenGeneration(Newest, true)) {
-    WriteDB = Current;
-    CurrentState = Current->WriteRefused ? State::ReadOnly : State::Active;
+    State FailState = State::Unavailable;
+    auto Current = OpenGeneration(Newest, true, Raced, &FailState);
+    if (Raced) {
+      continue;
+    }
+    if (Previous) {
+      Generations.push_back(std::move(Previous));
+    }
+    if (Current) {
+      WriteDB = Current.get();
+      CurrentState = Current->WriteRefused ? State::ReadOnly : State::Active;
+      Generations.push_back(std::move(Current));
+    } else {
+      CurrentState = FailState;
+    }
+    break;
   }
 
   std::string_view RONames = RODBNames();

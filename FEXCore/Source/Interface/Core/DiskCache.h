@@ -172,7 +172,13 @@ namespace DiskCache {
     // Opens Leaf inside the directory DirFD without following a symbolic link, creating
     // it private to the user when read-write. Refused is set when the file exists but may
     // not be trusted (see DiskCacheMacOS.cpp).
-    bool OpenAt(int DirFD, const fextl::string& Leaf, bool ReadOnly, bool& Refused);
+    // Raced: the name was removed or replaced by another process while it was opened (a
+    // generation being deleted); retry rather than judge the file.
+    bool OpenAt(int DirFD, const fextl::string& Leaf, bool ReadOnly, bool Create, bool& Refused, bool& Raced);
+    // The name still refers to the file this object has open.
+    bool NameMatches(int DirFD) const;
+    ino_t Ino = 0;
+    dev_t Dev = 0;
     bool FlushToDisk();
     bool Truncate(uint64_t Size);
 #endif
@@ -208,10 +214,15 @@ namespace DiskCache {
     // macOS port (DiskCacheMacOS.cpp). The index is read once, at open, into IndexData;
     // only a table of (lookup key, record offset) is built, and records are parsed when
     // their key is first looked up.
-    enum class OpenResult { Opened, Untrusted, Failed };
-    // Opens Leaf.foz and Leaf_idx.foz in DirFD. An untrusted pair of a read-write database
-    // is removed and created again once; Replaced says it happened.
-    OpenResult OpenAt(int DirFD, const fextl::string& Leaf, bool ReadOnly, bool& Replaced);
+    enum class OpenResult { Opened, Untrusted, Failed, Raced };
+    // Opens Leaf.foz and Leaf_idx.foz in DirFD (creating them when Create is set). An
+    // untrusted pair of a read-write database is removed and created again once; Replaced
+    // says it happened. Raced: the names changed under it (another process deleting this
+    // generation); the caller looks at the directory again.
+    OpenResult OpenAt(int DirFD, const fextl::string& Leaf, bool ReadOnly, bool Create, bool& Replaced);
+    bool NamesMatch() const {
+      return CacheFOZ.NameMatches(DirFD) && IndexFOZ.NameMatches(DirFD);
+    }
     // false: the index is larger than MaxSize (WriteRefused is then set) or unreadable.
     bool LoadIndex(uint64_t MaxSize, bool& FoundMetadata);
     void ResolveKey(uint64_t LookupKey, Index& CacheIndex);
@@ -355,7 +366,7 @@ namespace DiskCache {
     // What the cache is doing in this process (fexmac reports it).
     enum class State : uint8_t { Off, Active, ReadOnly, Untrusted, Unavailable };
     State GetState() const {
-      return CurrentState;
+      return CurrentState.load(std::memory_order_relaxed);
     }
     uint64_t GetDroppedCount() const {
       return DroppedCount.load(std::memory_order_relaxed);
@@ -371,7 +382,9 @@ namespace DiskCache {
     static void AtForkChild();
 
   private:
-    State CurrentState = State::Off;
+    std::atomic<State> CurrentState = State::Off;
+    // Set when the next generation is over this process's limit: stop rotating, drop stores.
+    std::atomic<bool> WritesStopped {};
     std::atomic<uint64_t> DroppedCount {};
     std::atomic<uint32_t> UntrustedReplaced {};
     std::atomic<uint32_t> DamagedReset {};
@@ -383,7 +396,10 @@ namespace DiskCache {
     // Set after a lock wait timed out: further stores are dropped (counted), not waited for.
     std::atomic<bool> StoresBusy {};
     fextl::string GenerationName(uint32_t Generation) const;
-    IndexedDB* OpenGeneration(uint32_t Generation, bool Write);
+    fextl::unique_ptr<IndexedDB> OpenGeneration(uint32_t Generation, bool Create, bool& Raced, State* FailState);
+    // Generation numbers whose index file is in the bucket, believed (see the .inl).
+    fextl::vector<uint32_t> ListGenerations();
+    uint32_t NewestGeneration(const fextl::vector<uint32_t>& Found);
     bool StoreMacOS(const MesaFOZ::foz_payload_key& UniqueKey, uint64_t LookupKey, std::span<const uint8_t> Blob,
                     MesaFOZ::mesa_index_db_file_entry& IndexEntry, std::span<const uint8_t> IndexBlob, IndexedDB** Used);
     bool Rotate(IndexedDB* Full);
