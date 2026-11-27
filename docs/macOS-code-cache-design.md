@@ -23,7 +23,17 @@ cache that already works the way this port needs:
   (`Arm64JITCore::LoadCachedCode`, inside a `ScopedJITWrite`), applies the relocations,
   flushes the instruction cache and registers the block in the lookup cache, exactly like
   a freshly compiled block. On a miss it compiles and hands a copy of the result to a
-  writer thread that appends it to the database.
+  writer thread that appends it to the database. On macOS the writer appends in batches
+  (`WriteBatchMacOS`): stores collect until the queue holds no more of them (or 4096
+  entries or 4MB), then the batch is written with one lock taken and one write per file.
+  Per-entry appends (two `flock`s, five `fstat`s and seven `pwrite`s each) made a test
+  with 65,538 one-instruction blocks take 1.1 s alone and over 60 s when many processes
+  wrote at once on a busy machine, since every entry handed the lock to the next process
+  and the exit waited for the whole queue; batched, the same test takes 0.3 s alone and
+  0.6 s with six copies writing one database next to ten CPU-bound processes (139 s
+  before). While a flush waits for the writer (at exit), the writer runs at
+  `QOS_CLASS_USER_INITIATED` instead of its usual utility class. Compiling threads never
+  wait for a file lock: they only queue the entry.
 
 That is "load by copy into the live code buffer" with no file mapping and no `mremap`, so
 this port uses `DiskCache` and leaves the `FXCC` path alone. On macOS the `FXCC` path still
@@ -262,9 +272,20 @@ safe instead:
   their checks is looked at again before it is called damaged (an old cache file paired
   with a new index while a generation was being replaced looks the same). Six processes
   rotating one database 72 times report no untrusted or damaged file. A generation number
-  is believed only if it is the lowest found or its predecessor exists (at most 2^24), and
-  only generations found in the directory are deleted, so a planted name far ahead is
-  ignored. The next generation is opened outside the index lock and then swapped in; if
+  is believed only if it is the lowest found or its predecessor exists (at most 2^24); a
+  planted name far ahead is ignored. Which generations may exist: with N the newest
+  believed generation, processes write N and read N - 1; older ones are stale (left by a
+  process killed during a rotation, or one that recreated a name from an old listing).
+  Every open and every rotation removes the stale generations it finds, at most 16 per
+  call and each only while holding both of its locks without waiting (so never during
+  another process's write); an open that would create a generation already stale looks
+  again and removes it if empty; a process whose generation was removed notices before its
+  next write (the names no longer lead to its files) and moves to N. So once no process is
+  opening or rotating, any open leaves exactly N - 1 and N, whatever the gaps. (The
+  orphans the physical Mac job found came from listing the bucket twice in one process:
+  the listing used a duplicate of the bucket's descriptor, which shares its read position,
+  so every listing after the first saw nothing and a process restarted from generation 0.
+  Each listing now rewinds first.) The next generation is opened outside the index lock and then swapped in; if
   it is over this process's limit, saving stops for the run (read-only) instead of
   rotating again. Why 256MB: every process reads the
   whole index of the generations it uses at start (about 40% of the cache file for the

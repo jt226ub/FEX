@@ -367,9 +367,19 @@ namespace DiskCache {
       bool Done = false;
     };
     fextl::shared_ptr<State> Shared;
+#ifdef __APPLE__
+    DiskCache* Self = nullptr; // writes the pending batch first
+#endif
     explicit FlushWorkItem(fextl::shared_ptr<State> Shared)
       : Shared(std::move(Shared)) {}
     void Run() override {
+#ifdef __APPLE__
+      if (Self) {
+        Self->WriteBatchMacOS();
+        Self->FlushWaiters.fetch_sub(1, std::memory_order_acq_rel);
+        Self->SetWriterPriorityMacOS();
+      }
+#endif
       {
         std::lock_guard lk {Shared->Mutex};
         Shared->Done = true;
@@ -393,7 +403,13 @@ namespace DiskCache {
     // queued before the marker below, and the writer runs its queue in order.
     const uint64_t QueuedBefore = QueuedCount.load(std::memory_order_acquire);
     auto Shared = fextl::make_shared<FlushWorkItem::State>();
-    Writer->QueueWork(fextl::make_unique<FlushWorkItem>(Shared));
+    auto Marker = fextl::make_unique<FlushWorkItem>(Shared);
+#ifdef __APPLE__
+    Marker->Self = this;
+    // Someone now waits for the writer: it runs at the waiter's priority until the marker.
+    FlushWaiters.fetch_add(1, std::memory_order_acq_rel);
+#endif
+    Writer->QueueWork(std::move(Marker));
     {
       std::unique_lock lk {Shared->Mutex};
       Shared->CV.wait(lk, [&] { return Shared->Done; });
@@ -1070,13 +1086,13 @@ namespace DiskCache {
       , IndexBlob(std::move(IndexBlob))
       , StoreDisk(StoreDisk) {}
     void Run() override {
-      struct MesaFOZ::mesa_index_db_file_entry IndexHeader;
 #ifdef __APPLE__
-      // macOS port: into the current generation, with one lock wait per process at most.
-      bool DiskSuccess = StoreDisk && Self->StoreMacOS(UniqueKey, LookupKey, Blob, IndexHeader, IndexBlob, &DB);
+      // macOS port: added to the writer's batch (WriteBatchMacOS), which also does the
+      // bookkeeping below.
+      Self->AddPendingStoreMacOS({UniqueKey, LookupKey, Blob, std::move(IndexBlob)});
 #else
+      struct MesaFOZ::mesa_index_db_file_entry IndexHeader;
       bool DiskSuccess = !StoreDisk || DB->StoreCacheBlob(UniqueKey, LookupKey, Blob, IndexHeader, IndexBlob);
-#endif
 
       bool KeepEntryInMemory = true;
       // todo possible other lru condition here like entry size?
@@ -1114,6 +1130,7 @@ namespace DiskCache {
       if (KeepEntryInMemory && Self->MemoryLRUCurrentSize > Self->MemoryLRUMaxSize + Self->MemoryLRUEvictThreshold) {
         Self->Writer->QueueWork(fextl::make_unique<PruneMemoryLRUWorkItem>(Self));
       }
+#endif
     }
   };
 
@@ -1432,6 +1449,7 @@ namespace DiskCache {
     // hand the rest off to the writer thread
 #ifdef __APPLE__
     IndexedDB* TargetDB = nullptr; // chosen by the writer
+    StoresInQueue.fetch_add(1, std::memory_order_acq_rel); // before the item can run
 #else
     IndexedDB* TargetDB = RWCacheDB.get();
 #endif

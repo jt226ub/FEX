@@ -181,6 +181,8 @@ namespace DiskCache {
     dev_t Dev = 0;
     bool FlushToDisk();
     bool Truncate(uint64_t Size);
+    // Writes all of Data at Offset (retrying short writes).
+    bool PWriteAll(const uint8_t* Data, size_t Size, uint64_t Offset);
 #endif
     bool ReadBlob(uint64_t Offset, std::span<uint8_t> OutBlob);
     bool WriteBlob(const MesaFOZ::foz_payload_key& Key, std::span<const std::span<const uint8_t>> BlobChunks, uint64_t& OutBlobOffset);
@@ -238,7 +240,22 @@ namespace DiskCache {
     bool FlushToDisk();
     bool WithinSizeLimit(uint64_t BlobSize, uint64_t IndexRecordSize);
     bool RepairIndexTail();
-    enum class StoreResult { Stored, Busy, Full, Failed };
+    // Gone: the names now lead elsewhere (removed as a stale generation).
+    enum class StoreResult { Stored, Busy, Full, Gone, Failed };
+    void RemoveIfEmpty();
+    struct PendingStore {
+      MesaFOZ::foz_payload_key Key;
+      uint64_t LookupKey;
+      std::span<uint8_t> Blob;
+      fextl::vector<uint8_t> IndexBlob;
+    };
+    // Appends a prefix of Entries (as many as fit under the size limit) with one lock
+    // taken and one write per file. Offsets[i] gets entry i's blob offset; Count how many
+    // were written.
+    StoreResult StoreBatchMacOS(std::span<const PendingStore> Entries, std::span<uint64_t> Offsets,
+                                std::chrono::steady_clock::time_point Deadline, size_t& Count);
+    fextl::vector<uint8_t> CacheBatchBuffer;
+    fextl::vector<uint8_t> IndexBatchBuffer;
     StoreResult StoreCacheBlobMacOS(const MesaFOZ::foz_payload_key& UniqueKey, uint64_t LookupKey, std::span<const uint8_t> Blob,
                                     MesaFOZ::mesa_index_db_file_entry& IndexEntry, std::span<const uint8_t> IndexBlob,
                                     std::chrono::steady_clock::time_point Deadline);
@@ -408,9 +425,27 @@ namespace DiskCache {
     // Generation numbers whose index file is in the bucket, believed (see the .inl).
     fextl::vector<uint32_t> ListGenerations();
     uint32_t NewestGeneration(const fextl::vector<uint32_t>& Found);
-    bool StoreMacOS(const MesaFOZ::foz_payload_key& UniqueKey, uint64_t LookupKey, std::span<const uint8_t> Blob,
-                    MesaFOZ::mesa_index_db_file_entry& IndexEntry, std::span<const uint8_t> IndexBlob, IndexedDB** Used);
-    bool Rotate(IndexedDB* Full);
+    // Stores are written in batches by the writer thread: each store work item adds its
+    // entry to PendingStores (writer thread only) and the batch is written when the queue
+    // has no more stores, when it is large, or before a flush marker. One lock per batch
+    // instead of one per entry: many processes appending to one database otherwise spend
+    // their time handing the lock to each other.
+    void AddPendingStoreMacOS(IndexedDB::PendingStore&& Entry);
+    void WriteBatchMacOS();
+    void FinishBatchMacOS(std::span<IndexedDB::PendingStore> Entries, std::span<IndexedDB*> DBs, std::span<const uint64_t> Offsets);
+    fextl::vector<IndexedDB::PendingStore> PendingStores;
+    size_t PendingStoreBytes = 0;
+    std::atomic<uint64_t> StoresInQueue {};
+    // Flushes waiting for the writer thread; while there are any it does not run at low
+    // priority (a busy machine would otherwise keep the waiting thread waiting).
+    std::atomic<uint32_t> FlushWaiters {};
+    bool WriterBoosted = false;
+    void SetWriterPriorityMacOS();
+    static constexpr size_t MaxBatchEntries = 4096;
+    static constexpr size_t MaxBatchBytes = 4 << 20;
+    bool Rotate(IndexedDB* Full, bool Gone);
+    void RemoveStaleGenerations(const fextl::vector<uint32_t>& Found, uint32_t Newest);
+    static constexpr size_t MaxStaleRemovals = 16;
     void MarkRejectedLocked(uint64_t LookupKey, const IndexEntry& Entry);
 #endif
     struct CacheStoreWorkItem;

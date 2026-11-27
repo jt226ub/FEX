@@ -11,6 +11,7 @@
 #include <git_version.h>
 
 #include <dlfcn.h>
+#include <pthread.h>
 #include <fcntl.h>
 #include <mach-o/loader.h>
 #include <sys/acl.h>
@@ -302,6 +303,7 @@ namespace {
     if (!Dir) {
       return;
     }
+    rewinddir(Dir); // the duplicate shares BaseFD's read position
     fextl::vector<fextl::string> Stale;
     const time_t Now = time(nullptr);
     while (const dirent* Entry = readdir(Dir)) {
@@ -695,6 +697,15 @@ bool IndexedDB::Reset() {
   return true;
 }
 
+// With both locks held. Removes the names of a database with no records (only the magic).
+void IndexedDB::RemoveIfEmpty() {
+  if (ReadOnly || DirFD < 0 || CacheFOZ.Size() > FOZ_REF_MAGIC_SIZE || IndexFOZ.Size() > FOZ_REF_MAGIC_SIZE || !NamesMatch()) {
+    return;
+  }
+  unlinkat(DirFD, (Name + ".foz").c_str(), 0);
+  unlinkat(DirFD, (Name + "_idx.foz").c_str(), 0);
+}
+
 bool IndexedDB::RepairIndexTail() {
   // Called with both locks held, before appending. A process that died while appending
   // leaves a partial last index record; appending after it would hide every later record
@@ -744,6 +755,7 @@ IndexedDB::StoreResult IndexedDB::StoreCacheBlobMacOS(const MesaFOZ::foz_payload
     CacheFOZ.Unlock();
     return StoreResult::Busy;
   }
+
   auto Done = [&](StoreResult Result) {
     CacheFOZ.Unlock();
     IndexFOZ.Unlock();
@@ -936,6 +948,18 @@ fextl::unique_ptr<IndexedDB> DiskCache::OpenGeneration(uint32_t Generation, bool
     Raced = true;
     return nullptr;
   }
+  if (Create) {
+    // Chosen from a listing that is out of date: the generation is already stale (this
+    // open may just have recreated a name another process removed). Look again; remove it
+    // if it holds nothing.
+    const auto Found = ListGenerations();
+    if (Generation + 2 <= NewestGeneration(Found)) {
+      DB->RemoveIfEmpty();
+      DB->UnlockAfterOpen();
+      Raced = true;
+      return nullptr;
+    }
+  }
   FEX_CONFIG_OPT(MaxSize, DISKCACHEMAXFILESIZE);
   bool LocalFoundMetadata = false;
   bool Ok = DB->LoadIndex(MaxSize, LocalFoundMetadata);
@@ -995,6 +1019,10 @@ fextl::unique_ptr<IndexedDB> DiskCache::OpenGeneration(uint32_t Generation, bool
 fextl::vector<uint32_t> DiskCache::ListGenerations() {
   fextl::vector<uint32_t> Found;
   if (DIR* Dir = fdopendir(dup(BucketDirFD))) {
+    // The duplicate shares the directory's read position with BucketDirFD and every earlier
+    // listing: start from the beginning, or a second listing in this process finds nothing
+    // (and a process would start again from generation 0 next to the live ones).
+    rewinddir(Dir);
     while (const dirent* Entry = readdir(Dir)) {
       std::string_view Name = Entry->d_name;
       if (!Name.starts_with(GenerationBase) || !Name.ends_with("_idx.foz")) {
@@ -1032,12 +1060,51 @@ uint32_t DiskCache::NewestGeneration(const fextl::vector<uint32_t>& Found) {
   return Newest;
 }
 
-// The current generation is full: start the next one, keep reading the full one, and
-// delete the generation before it. Safe across processes: a process that finds the next
-// generation already started opens it; one still writing an older generation fills it and
-// moves on too; deleting a generation other processes still have open only removes its
-// name.
-bool DiskCache::Rotate(IndexedDB* Full) {
+// Which generations may exist. N is the newest believed generation (NewestGeneration).
+// Processes write N and read N - 1; anything older is stale. Stale generations come from
+// a process that started from an old listing (it recreated a name just deleted), lost a
+// race, or was killed. Every open (InitMacOS) and every rotation removes stale generations
+// it finds, up to MaxStaleRemovals per call, so with no process opening or rotating the
+// bucket holds N - 1 and N (or only N) after any open, whatever the gaps. A stale
+// generation is removed only while this process holds both of its locks, so never in the
+// middle of another process's write; a process whose generation has gone notices before
+// its next write (StoreBatchMacOS) and moves to N. Names that are not believed (ahead of
+// N with a gap before them) are ignored, not acted on.
+void DiskCache::RemoveStaleGenerations(const fextl::vector<uint32_t>& Found, uint32_t Newest) {
+  size_t Budget = MaxStaleRemovals;
+  for (uint32_t Old : Found) {
+    if (Old + 2 > Newest || Budget == 0) {
+      break; // sorted
+    }
+    --Budget;
+    const auto Name = GenerationName(Old);
+    const fextl::string Leaves[2] = {Name + ".foz", Name + "_idx.foz"};
+    int FDs[2] = {-1, -1};
+    bool Busy = false;
+    for (int k = 0; k < 2; ++k) {
+      FDs[k] = openat(BucketDirFD, Leaves[k].c_str(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+      if (FDs[k] >= 0 && flock(FDs[k], LOCK_EX | LOCK_NB) != 0) {
+        Busy = true; // another process (or this one's writer) is using it now; a later open removes it
+      }
+    }
+    if (!Busy) {
+      for (const auto& Leaf : Leaves) {
+        unlinkat(BucketDirFD, Leaf.c_str(), 0);
+      }
+    }
+    for (int FD : FDs) {
+      if (FD >= 0) {
+        close(FD);
+      }
+    }
+  }
+}
+
+// The current generation is full (or was removed as stale by another process): continue in
+// the newest one, starting the next generation if this one was the newest. Safe across
+// processes: a process that finds the next generation already started opens it; one still
+// writing an older generation fills it, or finds it gone, and moves on too.
+bool DiskCache::Rotate(IndexedDB* Full, bool Gone) {
   if (WriteDB.load() != Full || WritesStopped.load()) {
     return WriteDB.load() != Full;
   }
@@ -1045,8 +1112,8 @@ bool DiskCache::Rotate(IndexedDB* Full) {
   // in. Only the writer thread rotates.
   fextl::unique_ptr<IndexedDB> NewDB;
   for (int Attempt = 0; Attempt < 8 && !NewDB; ++Attempt) {
-    // Another process may have moved on further already: continue in the newest one.
-    const uint32_t Next = std::max(Full->Generation + 1, NewestGeneration(ListGenerations()));
+    const uint32_t Newest = NewestGeneration(ListGenerations());
+    const uint32_t Next = Gone ? std::max(Newest, Full->Generation) : std::max(Full->Generation + 1, Newest);
     bool Raced = false;
     NewDB = OpenGeneration(Next, true, Raced, nullptr);
     if (!NewDB && !Raced) {
@@ -1056,41 +1123,176 @@ bool DiskCache::Rotate(IndexedDB* Full) {
   if (!NewDB) {
     return false;
   }
-  std::lock_guard IndexGuard(IndexLock);
   auto* Raw = NewDB.get();
-  Generations.push_back(std::move(NewDB));
-  if (Raw->WriteRefused) {
-    // Another process with a larger limit filled it: read it, write nothing more.
-    WritesStopped = true;
-    CurrentState = State::ReadOnly;
-    LogMan::Msg::IFmt("DiskCache: {} is full and {} is over this process's limit; saving stops", Full->Name, Raw->Name);
-    return false;
+  {
+    std::lock_guard IndexGuard(IndexLock);
+    Generations.push_back(std::move(NewDB));
+    if (Raw->WriteRefused) {
+      // Another process with a larger limit filled it: read it, write nothing more.
+      WritesStopped = true;
+      CurrentState = State::ReadOnly;
+      LogMan::Msg::IFmt("DiskCache: {} is full and {} is over this process's limit; saving stops", Full->Name, Raw->Name);
+      return false;
+    }
+    LogMan::Msg::IFmt("DiskCache: {} is {}; continuing in {}", Full->Name, Gone ? "gone" : "full", Raw->Name);
+    WriteDB = Raw;
   }
-  LogMan::Msg::IFmt("DiskCache: {} is full; continuing in {}", Full->Name, Raw->Name);
-  WriteDB = Raw;
-  if (Raw->Generation >= 2) {
-    const auto Old = GenerationName(Raw->Generation - 2);
-    unlinkat(BucketDirFD, (Old + ".foz").c_str(), 0);
-    unlinkat(BucketDirFD, (Old + "_idx.foz").c_str(), 0);
+  const auto Found = ListGenerations();
+  RemoveStaleGenerations(Found, NewestGeneration(Found));
+  return true;
+}
+
+bool FOZFile::PWriteAll(const uint8_t* Data, size_t Size, uint64_t Offset) {
+  while (Size) {
+    const ssize_t Wrote = FD->PWrite(Data, Size, Offset);
+    if (Wrote <= 0) {
+      if (Wrote < 0 && errno == EINTR) {
+        continue;
+      }
+      return false;
+    }
+    Data += Wrote;
+    Size -= Wrote;
+    Offset += Wrote;
   }
   return true;
 }
 
-// The writer thread's store. One lock wait per process at most: after a timeout (another
-// process holds the database's lock, perhaps stopped) every later store is dropped and
-// counted, so a flush before exit never waits more than one deadline.
-bool DiskCache::StoreMacOS(const MesaFOZ::foz_payload_key& UniqueKey, uint64_t LookupKey, std::span<const uint8_t> Blob,
-                           MesaFOZ::mesa_index_db_file_entry& IndexEntry, std::span<const uint8_t> IndexBlob, IndexedDB** Used) {
-  for (int Attempt = 0; Attempt < 2; ++Attempt) {
+IndexedDB::StoreResult IndexedDB::StoreBatchMacOS(std::span<const PendingStore> Entries, std::span<uint64_t> Offsets,
+                                                  std::chrono::steady_clock::time_point Deadline, size_t& Count) {
+  Count = 0;
+  if (ReadOnly || WriteRefused) {
+    return StoreResult::Failed;
+  }
+  if (!CacheFOZ.LockUntil(Deadline)) {
+    return StoreResult::Busy;
+  }
+  if (!IndexFOZ.LockUntil(Deadline)) {
+    CacheFOZ.Unlock();
+    return StoreResult::Busy;
+  }
+  auto Done = [&](StoreResult Result) {
+    CacheFOZ.Unlock();
+    IndexFOZ.Unlock();
+    return Result;
+  };
+  // Removed as stale by another process (RemoveStaleGenerations holds these locks while it
+  // removes the names): write to the newest generation instead.
+  if (!NamesMatch()) {
+    return Done(StoreResult::Gone);
+  }
+  // Under the locks, so other processes' appends count.
+  if (!RepairIndexTail()) {
+    return Done(StoreResult::Failed);
+  }
+  const ssize_t CacheSize = CacheFOZ.Size();
+  const uint64_t IndexSize = IndexKnownEnd;
+  if (CacheSize < FOZ_REF_MAGIC_SIZE) {
+    return Done(StoreResult::Failed);
+  }
+  const uint64_t Max = std::min<uint64_t>(Limit ? Limit : uint64_t(MaxFileSize), ResolvedSlot);
+  CacheBatchBuffer.clear();
+  IndexBatchBuffer.clear();
+  auto Append = [](fextl::vector<uint8_t>& Buffer, const void* Data, size_t Size) {
+    Buffer.insert(Buffer.end(), static_cast<const uint8_t*>(Data), static_cast<const uint8_t*>(Data) + Size);
+  };
+  for (const auto& Entry : Entries) {
+    const uint64_t IndexRecord = FOZRecordHeaderSize + sizeof(MesaFOZ::mesa_index_db_file_entry) + Entry.IndexBlob.size();
+    if (uint64_t(CacheSize) + CacheBatchBuffer.size() + FOZRecordHeaderSize + Entry.Blob.size() > Max ||
+        IndexSize + IndexBatchBuffer.size() + IndexRecord > Max) {
+      break;
+    }
+    const MesaFOZ::foz_payload_header BlobHeader {.payload_size = (uint32_t)Entry.Blob.size(),
+                                                  .format = MesaFOZ::FOSSILIZE_COMPRESSION_NONE,
+                                                  .crc = 0,
+                                                  .uncompressed_size = (uint32_t)Entry.Blob.size()};
+    Append(CacheBatchBuffer, Entry.Key.bytes, sizeof(Entry.Key.bytes));
+    Append(CacheBatchBuffer, &BlobHeader, sizeof(BlobHeader));
+    Offsets[Count] = uint64_t(CacheSize) + CacheBatchBuffer.size();
+    Append(CacheBatchBuffer, Entry.Blob.data(), Entry.Blob.size());
+
+    const MesaFOZ::mesa_index_db_file_entry FileEntry {
+      .hash = Entry.LookupKey, .size = (uint32_t)Entry.Blob.size(), .last_access_time = 0, .cache_db_file_offset = Offsets[Count]};
+    const uint32_t IndexPayload = sizeof(FileEntry) + Entry.IndexBlob.size();
+    const MesaFOZ::foz_payload_header IndexHeader {
+      .payload_size = IndexPayload, .format = MesaFOZ::FOSSILIZE_COMPRESSION_NONE, .crc = 0, .uncompressed_size = IndexPayload};
+    Append(IndexBatchBuffer, Entry.Key.bytes, sizeof(Entry.Key.bytes));
+    Append(IndexBatchBuffer, &IndexHeader, sizeof(IndexHeader));
+    Append(IndexBatchBuffer, &FileEntry, sizeof(FileEntry));
+    Append(IndexBatchBuffer, Entry.IndexBlob.data(), Entry.IndexBlob.size());
+    ++Count;
+  }
+  if (Count == 0) {
+    MaxSizeReached = true;
+    return Done(StoreResult::Full);
+  }
+  // The cache records first: an index record is written only after what it points to. A
+  // torn index tail is repaired by the next writer (RepairIndexTail).
+  if (!CacheFOZ.PWriteAll(CacheBatchBuffer.data(), CacheBatchBuffer.size(), CacheSize) ||
+      !IndexFOZ.PWriteAll(IndexBatchBuffer.data(), IndexBatchBuffer.size(), IndexSize)) {
+    Count = 0;
+    return Done(StoreResult::Failed);
+  }
+  IndexKnownEnd = IndexSize + IndexBatchBuffer.size();
+  if (CacheBatchBuffer.capacity() > (8U << 20)) { // twice the batch limit: a rotation-sized batch
+    CacheBatchBuffer = {};
+    IndexBatchBuffer = {};
+  }
+  if (Count < Entries.size()) {
+    MaxSizeReached = true;
+    return Done(StoreResult::Full);
+  }
+  return Done(StoreResult::Stored);
+}
+
+// Writer thread only.
+void DiskCache::AddPendingStoreMacOS(IndexedDB::PendingStore&& Entry) {
+  PendingStoreBytes += Entry.Blob.size() + Entry.IndexBlob.size();
+  PendingStores.push_back(std::move(Entry));
+  const bool LastQueued = StoresInQueue.fetch_sub(1, std::memory_order_acq_rel) == 1;
+  if (LastQueued || PendingStores.size() >= MaxBatchEntries || PendingStoreBytes >= MaxBatchBytes) {
+    WriteBatchMacOS();
+  }
+}
+
+// Writer thread only.
+void DiskCache::SetWriterPriorityMacOS() {
+  const bool Boost = FlushWaiters.load(std::memory_order_acquire) != 0;
+  if (Boost != WriterBoosted) {
+    WriterBoosted = Boost;
+    pthread_set_qos_class_self_np(Boost ? QOS_CLASS_USER_INITIATED : QOS_CLASS_UTILITY, 0);
+  }
+}
+
+// Writes the pending stores into the current generation, rotating as it fills. One lock
+// wait per process at most: after a timeout (another process holds the database's lock,
+// perhaps stopped) every later store is dropped and counted, so a flush before exit never
+// waits more than one deadline.
+void DiskCache::WriteBatchMacOS() {
+  if (PendingStores.empty()) {
+    return;
+  }
+  SetWriterPriorityMacOS();
+  fextl::vector<IndexedDB::PendingStore> Batch;
+  Batch.swap(PendingStores);
+  PendingStoreBytes = 0;
+  fextl::vector<IndexedDB*> DBs(Batch.size(), nullptr);
+  fextl::vector<uint64_t> Offsets(Batch.size(), 0);
+  size_t Done = 0;
+  int FullWithNothingWritten = 0;
+  // Each turn writes, drops an entry or rotates; rotations are bounded too.
+  for (int Rotations = 0; Done < Batch.size() && Rotations <= 16;) {
     IndexedDB* DB = WriteDB.load();
     if (!DB || StoresBusy.load(std::memory_order_relaxed) || WritesStopped.load(std::memory_order_relaxed) || InForkedChild()) {
       break;
     }
-    const auto Result = DB->StoreCacheBlobMacOS(UniqueKey, LookupKey, Blob, IndexEntry, IndexBlob,
-                                                std::chrono::steady_clock::now() + std::chrono::milliseconds(STORE_DEADLINE_MS));
+    size_t Count = 0;
+    const auto Result = DB->StoreBatchMacOS(std::span(Batch).subspan(Done), std::span(Offsets).subspan(Done),
+                                            std::chrono::steady_clock::now() + std::chrono::milliseconds(STORE_DEADLINE_MS), Count);
+    std::fill(DBs.begin() + Done, DBs.begin() + Done + Count, DB);
+    Done += Count;
     if (Result == IndexedDB::StoreResult::Stored) {
-      *Used = DB;
-      return true;
+      break;
     }
     if (Result == IndexedDB::StoreResult::Busy) {
       if (!StoresBusy.exchange(true)) {
@@ -1098,12 +1300,74 @@ bool DiskCache::StoreMacOS(const MesaFOZ::foz_payload_key& UniqueKey, uint64_t L
       }
       break;
     }
-    if (Result != IndexedDB::StoreResult::Full || !Rotate(DB)) {
+    if (Result == IndexedDB::StoreResult::Gone) {
+      if (!Rotate(DB, true)) {
+        break;
+      }
+      ++Rotations;
+      continue;
+    }
+    if (Result != IndexedDB::StoreResult::Full) {
       break;
     }
+    FullWithNothingWritten = Count ? 0 : FullWithNothingWritten + 1;
+    if (FullWithNothingWritten == 2) {
+      // Too large even for a new generation: drop this entry, not the batch.
+      ++Done;
+      FullWithNothingWritten = 0;
+      continue;
+    }
+    if (!Rotate(DB, false)) {
+      break;
+    }
+    ++Rotations;
   }
-  DroppedCount.fetch_add(1, std::memory_order_relaxed);
-  return false;
+  DroppedCount.fetch_add(std::count(DBs.begin(), DBs.end(), nullptr), std::memory_order_relaxed);
+  FinishBatchMacOS(Batch, DBs, Offsets);
+}
+
+// What the store work item does after writing (upstream's CacheStoreWorkItem::Run), once
+// per batch: the entries move from memory-only to their place in the file, and stay in the
+// in-memory LRU while it has room.
+void DiskCache::FinishBatchMacOS(std::span<IndexedDB::PendingStore> Entries, std::span<IndexedDB*> DBs, std::span<const uint64_t> Offsets) {
+  fextl::vector<fextl::list<MemoryLRUKey>::iterator> LRUEntries(Entries.size());
+  fextl::vector<bool> Keep(Entries.size(), false);
+  {
+    std::lock_guard Guard(MemoryLRULock);
+    for (size_t i = 0; i < Entries.size(); ++i) {
+      if (Entries[i].Blob.size() > MemoryLRUMaxSize) {
+        continue;
+      }
+      Keep[i] = true;
+      MemoryLRUCurrentSize += Entries[i].Blob.size();
+      const auto* Extra = reinterpret_cast<const IndexExtraBlobHeader*>(Entries[i].IndexBlob.data());
+      MemoryLRU.push_front({Entries[i].LookupKey, Extra->GuestHash, Extra->GuestFootprint, (uint32_t)Entries[i].Blob.size()});
+      LRUEntries[i] = MemoryLRU.begin();
+    }
+  }
+  {
+    std::lock_guard Guard(IndexLock);
+    for (size_t i = 0; i < Entries.size(); ++i) {
+      const auto* Extra = reinterpret_cast<const IndexExtraBlobHeader*>(Entries[i].IndexBlob.data());
+      auto* Entry = LookupLocked(Entries[i].LookupKey, Extra->GuestHash, Extra->GuestFootprint);
+      LOGMAN_THROW_A_FMT(Entry != nullptr, "Stored Index entry not found?");
+      if (!Entry) {
+        continue;
+      }
+      if (DBs[i]) {
+        Entry->DB = DBs[i];
+        Entry->Offset = Offsets[i];
+      }
+      if (!Keep[i]) {
+        Entry->MemoryBlob.reset();
+      } else {
+        Entry->LRUEntry = LRUEntries[i];
+      }
+    }
+  }
+  if (MemoryLRUCurrentSize > MemoryLRUMaxSize + MemoryLRUEvictThreshold) {
+    Writer->QueueWork(fextl::make_unique<PruneMemoryLRUWorkItem>(this));
+  }
 }
 
 void DiskCache::InitMacOS(const fextl::vector<uint8_t>& BucketBytes, size_t MachineDataSize, uint64_t ProcessBucketHash) {
@@ -1187,13 +1451,7 @@ void DiskCache::InitMacOS(const fextl::vector<uint8_t>& BucketBytes, size_t Mach
   for (int Attempt = 0; Attempt < 8; ++Attempt) {
     const auto Found = ListGenerations();
     const uint32_t Newest = NewestGeneration(Found);
-    // Delete only generations that were found, older than the one before the newest.
-    for (uint32_t Old : Found) {
-      if (Old + 2 <= Newest) {
-        unlinkat(BucketDirFD, (GenerationName(Old) + ".foz").c_str(), 0);
-        unlinkat(BucketDirFD, (GenerationName(Old) + "_idx.foz").c_str(), 0);
-      }
-    }
+    RemoveStaleGenerations(Found, Newest);
     Generations.clear();
     bool Raced = false;
     fextl::unique_ptr<IndexedDB> Previous;

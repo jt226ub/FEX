@@ -30,6 +30,10 @@ FLUSH_LINE = re.compile(r"^flush took ([0-9.]+) s$", re.M)
 # fexmac_cache_state
 OFF, ACTIVE, READ_ONLY, UNTRUSTED, UNAVAILABLE = range(5)
 TIMEOUT = 60
+# DiskCache.h MaxStaleRemovals: stale generations one open may remove.
+MAX_STALE_REMOVALS = 16
+BURST_PROCESSES = 6
+BURST_BLOCKS = 60000
 
 # On-disk layout (see FEXCore/Source/Interface/Core/DiskCache.{h,cpp}).
 FOZ_MAGIC = 16
@@ -141,6 +145,29 @@ def hold_locks(cache_dir):
     holder = subprocess.Popen([sys.executable, "-c", code, cache_dir], stdout=subprocess.PIPE, text=True)
     holder.stdout.readline()
     return holder
+
+
+def hold_files(paths):
+    """A process that takes flock on the given files and keeps it."""
+    code = ("import fcntl,os,sys,time\nfds=[]\nfor p in sys.argv[1:]:\n fd=os.open(p,os.O_RDONLY); fcntl.flock(fd,fcntl.LOCK_EX); fds.append(fd)\n"
+            "print(len(fds),flush=True)\ntime.sleep(120)\n")
+    holder = subprocess.Popen([sys.executable, "-c", code] + list(paths), stdout=subprocess.PIPE, text=True)
+    holder.stdout.readline()
+    return holder
+
+
+GENERATION_NAME = re.compile(r"^(RWCacheDB_[0-9a-f]+)(?:-([1-9][0-9]*))?_idx\.foz$")
+
+
+def generation_sets(cache_dir):
+    """{database name: sorted generation numbers whose index file exists}."""
+    sets = {}
+    for folder, _, files in os.walk(cache_dir):
+        for file in files:
+            match = GENERATION_NAME.match(file)
+            if match:
+                sets.setdefault(match.group(1), []).append(int(match.group(2) or 0))
+    return {name: sorted(gens) for name, gens in sets.items()}
 
 
 def fresh_copy(source, work, name):
@@ -766,10 +793,77 @@ def main():
     replaced = sum(i.get("replaced", 0) for i in stress)
     reset = sum(i.get("reset", 0) for i in stress)
     rejected = sum(i.get("rejected", 0) for i in stress)
-    names = sorted(f for folder, _, files in os.walk(target) for f in files if f.endswith("_idx.foz"))
-    check("six processes rotating one database, 72 runs: all right, untrusted replaced %d, damaged reset %d, rejected %d" %
-          (replaced, reset, rejected), not bad and replaced == 0 and reset == 0 and rejected == 0 and len(names) <= 3,
-          "; ".join(bad[:3]) + " generations=%s" % names)
+    during = generation_sets(target)
+    # The invariant (DiskCacheMacOS.inl, RemoveStaleGenerations): once no process is opening
+    # or rotating, any open leaves only the newest generation N and N - 1 of each database.
+    settle = stress_run(0)
+    after = generation_sets(target)
+    settled = all(len(gens) <= 2 and gens == list(range(gens[-1] - len(gens) + 1, gens[-1] + 1)) for gens in after.values())
+    check("six processes rotating one database, 72 runs: all right, untrusted replaced %d, damaged reset %d, rejected %d; "
+          "then one open leaves only N - 1 and N (%s, then %s)" % (replaced, reset, rejected, list(during.values()), list(after.values())),
+          not bad and replaced == 0 and reset == 0 and rejected == 0 and settle["rc"] == 0 and after and settled,
+          "; ".join(bad[:3]) + " generations after the storm=%s, after one more open=%s" % (during, after))
+
+    # Stale generations with gaps (left by a killed process or one that lost a race) are
+    # removed by later opens, a bounded number per open, never one another process holds
+    # locked; the live pair stays.
+    target = os.path.join(work, "stale-generations")
+    run(gen_cmd, target)
+    (lcache, lindex), = db_files(target)
+    base = lindex[:-len("_idx.foz")]
+    for leaf in (".foz", "_idx.foz"):
+        shutil.copy2(base + leaf, base + "-40" + leaf)
+        shutil.copy2(base + leaf, base + "-41" + leaf)
+    orphans = [0] + list(range(1, 10)) + list(range(11, 31))  # 0 is the original pair
+    for n in orphans[1:] + [10]:
+        for leaf in (".foz", "_idx.foz"):
+            path = "%s-%d%s" % (base, n, leaf)
+            open(path, "wb").close()
+            os.chmod(path, 0o600)
+    holder = hold_files([base + "-10.foz", base + "-10_idx.foz"])
+    counts = []
+    first = run(gen_cmd, target)
+    counts.append(len(generation_sets(target)[os.path.basename(base)]))
+    second = run(gen_cmd, target)
+    counts.append(len(generation_sets(target)[os.path.basename(base)]))
+    held_kept = os.path.exists(base + "-10_idx.foz")
+    holder.kill()
+    holder.wait()
+    third = run(gen_cmd, target)
+    fourth = run(gen_cmd, target)
+    final = generation_sets(target)[os.path.basename(base)]
+    check("stale generations with gaps: at most %d removed per open, a locked one kept, then only N - 1 and N remain "
+          "(%s, then %s)" % (MAX_STALE_REMOVALS, counts, final),
+          all(i["rc"] == 0 and i.get("compiled") == 0 for i in (first, second, third, fourth)) and
+          counts[0] >= 33 - MAX_STALE_REMOVALS and counts[0] < 33 and held_kept and final == [40, 41],
+          "%s / %s / %s" % (summary(first), summary(third), counts))
+
+    # Several processes cold-compiling tens of thousands of different tiny blocks into the
+    # same database at once, on a machine kept busy (one CPU-bound process per core, like
+    # the instruction tests' parallel jobs): stores are written in batches, so the cache
+    # costs a small bounded factor over the same workload without it. (Storing entry by
+    # entry: 7.7 s against 2.5 s on an idle machine, 71 s against 2.4 s on a busy one.)
+    def burst(cache_dir):
+        cmd = [cache_test, "--threads", "1", "--blocks", str(BURST_BLOCKS), "--unique"]
+        started = time.monotonic()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=BURST_PROCESSES) as pool:
+            results = list(pool.map(lambda i: run(cmd + (["--variant", "sub"] if i % 2 else []), cache_dir), range(BURST_PROCESSES)))
+        return time.monotonic() - started, results
+    burners = [subprocess.Popen(["/usr/bin/yes"], stdout=subprocess.DEVNULL) for _ in range(os.cpu_count() or 8)]
+    try:
+        plain_seconds, plain = burst(None)
+        target = os.path.join(work, "store-burst")
+        cached_seconds, cached = burst(target)
+    finally:
+        for burner in burners:
+            burner.kill()
+            burner.wait()
+    bound = 2 * plain_seconds + 2
+    check("%d processes each cold-compiling %d different blocks into one database, machine busy: %.2f s with the cache, %.2f s without "
+          "(bound %.2f s), nothing dropped" % (BURST_PROCESSES, BURST_BLOCKS, cached_seconds, plain_seconds, bound),
+          all(i["rc"] == 0 for i in plain + cached) and sum(i.get("compiled", 0) for i in cached) >= BURST_BLOCKS and
+          all(i.get("dropped") == 0 for i in cached) and cached_seconds <= bound,
+          "; ".join(summary(i) for i in cached[:2]))
 
     # A planted generation name far ahead is ignored: start-up stays quick and the real
     # generations are neither skipped nor deleted.

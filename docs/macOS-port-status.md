@@ -583,7 +583,7 @@ warm and 2.7 ms uncached. The largest test (`FEX_bugs/XeSS_quadratic`, 65,538 bl
 jit_1) took 72 ms compiling and 79 ms loading. A benefit has to be shown with real
 programs (package G).
 
-`Scripts/macos_code_cache_tests.py` (93 checks, as built and hardened): 37 kinds of
+`Scripts/macos_code_cache_tests.py` (107 checks, as built and hardened): 37 kinds of
 damage to the files, 300 randomly damaged caches, re-sealed entries with bad entry
 points or tails, bad index records, a record torn by a dying process followed by
 appends, seven configuration changes, a database under another configuration's name or
@@ -639,18 +639,34 @@ minutes with the machine at load 20. Run URLs and the full level are in the umbr
 `docs/testing/physical-mac-job-report.md`.
 
 **Physical Mac, full level** (adds the Xcode 26.5 leg and the two-pass cache run in all
-four modes): the Xcode leg passes every step with the same counts. The default leg finds
-two code cache faults, both reproduced by hand outside the job, open for package F:
+four modes): the Xcode leg passes every step with the same counts. The default leg found
+two code cache faults, both reproduced by hand outside the job, fixed in package F:
 
 1. `macos_code_cache_tests.py`, "six processes rotating one database, 72 runs": every
    answer right, but four generations left on disk where at most three may be (for
-   example `-1`, `-2`, `-45`, `-46`): old generations survive when six processes rotate
-   at once. 2 of 8 runs by hand on `e513ada49`, as built and hardened.
-2. `--cache-passes 2` in all four modes: `FEX_bugs/XeSS_quadratic` in jit_1 times out
-   (60 s) in the cold pass and passes warm. Alone it takes 1.0 s cold (65,538 blocks);
-   with the four-mode cold pass sharing one cache directory it hit the limit in 4 of 5
-   tries, on `9018cb0c1` too. Without the cache the same four-mode run passes. The hosted
-   Mac's two-pass run (two modes, jit_1 on a subset) does not reach it.
+   example `-1`, `-2`, `-45`, `-46`), 2 of 8 runs by hand on `e513ada49`. Cause: the
+   bucket was listed through a duplicate of its descriptor, which shares the read
+   position, so every listing after a process's first saw nothing; a process retrying
+   its open started again from generation 0, and rotations never saw what others had
+   started. Fixed (each listing rewinds), and the cleanup now converges whatever the
+   gaps: every open and rotation removes stale generations (older than N - 1), at most 16
+   per call, each only under both of its locks; the test now checks that one more open
+   after the storm leaves exactly N - 1 and N, and a new test plants 31 stale generations
+   with gaps and one held locked. 16 of 16 script runs pass (8 as built, 8 hardened).
+2. `--cache-passes 2` in all four modes: `FEX_bugs/XeSS_quadratic` in jit_1 (65,538
+   one-instruction blocks) timed out (60 s) in the cold pass. Cause: the writer stored
+   entry by entry (two `flock`s, five `fstat`s, seven `pwrite`s each, about 15 µs alone),
+   so processes writing one database handed the lock to each other 65,538 times, the
+   low-priority writer was starved on a busy machine, and the exit flush waited for all
+   of it: six copies of the test into one database next to ten CPU-bound processes took
+   139 s each (0.1 s without the cache). Now the writer appends in batches (one lock and
+   one write per file per batch) and runs at the waiting thread's priority while a flush
+   waits: the same six copies take 0.4 to 0.6 s (0.15 s without the cache), the test
+   alone 0.33 s cold instead of 1.1 s. The four-mode two-pass run at the script's default
+   parallelism passes cold and warm, 5 of 5 runs (cold pass 40 to 58 s). A new cache-script check runs six processes each
+   cold-compiling 60,000 different blocks into one database on a busy machine and
+   requires at most twice the time without the cache plus 2 s: 2.2 to 6.3 s against 1.6
+   to 5.1 s (per-entry stores: 71 s against 2.4 s).
 
 **Hosted Mac job changes (this package).** The instruction-test steps now also fail on
 an expected failure that now passes (the script itself exits 0 for that); the old
@@ -701,7 +717,7 @@ All of these run in the Mac job on every push to a `macos/**` branch.
 | `FEXCoreSmokeTest` | Translates and runs a 23-byte loop, as built and under the hardened runtime | pass, both | pass, both |
 | `FEXCoreThreadTest` | Eight host threads share a context, each summing a different count in a long guest loop | pass | pass, both |
 | `FEXCoreCacheTest` | Eight threads run a chain of 200 blocks at once, with the code cache on; checks results that depend on every constant and on the code's address, and the cache counters | added in package F, not yet run there | pass, both; 150 of 150 runs after the mutex fix (hung about one run in 30 before it) |
-| `Scripts/macos_code_cache_tests.py` | Damaged, mismatched and moved caches, fuzzing, threads, fork (with and without the fexmac calls), stalled lock holders, superseded entries, generations and size limits, six processes rotating at once, a planted generation name, cache states, directory rules (see above) | added in package F, not yet run there | 103 of 103, both |
+| `Scripts/macos_code_cache_tests.py` | Damaged, mismatched and moved caches, fuzzing, threads, fork (with and without the fexmac calls), stalled lock holders, superseded entries, generations and size limits, six processes rotating at once (then exactly N - 1 and N after one open), stale generations with gaps and a locked one, six processes each storing 60,000 blocks into one database on a busy machine within twice the time without the cache, a planted generation name, cache states, directory rules (see above) | added in package F, not yet run there | 107 of 107, both, 8 runs each |
 | `fexmac_c_test` cache subtests | `cache-off`, `cache-cold-warm`, `cache-cross-process`, `cache-untrusted`, `cache-untrusted-file`, `cache-unavailable`, `cache-options`, `cache-fork`, `code-ranges` | added in package F, not yet run there | pass, both |
 | `Scripts/macos_asm_tests.py --cache-dir DIR --cache-passes 2` | The instruction tests cold then warm; fails if a warm result differs, a finished warm run compiled anything, or an entry was rejected | added in package F, not yet run there (two modes in the job) | pass, all four modes, both |
 | `FEXCoreASMTestRunner` with `Scripts/macos_asm_tests.py` | Upstream's 2,292 assembly instruction tests plus the port's four in `unittests/macOS/ASM`, in four modes | 2,253 pass in each mode (before the upstream sync added one test) | 2,265 of 2,296 pass in each mode, both |
