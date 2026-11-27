@@ -146,6 +146,19 @@ private:
   uint64_t PageSize;
   std::set<uint64_t> Mapped;
 };
+// This runner has no Linux system calls (tests that need them declare it and are
+// skipped). Every call fails with ENOSYS, as a Linux kernel answers an unknown number, and
+// the guest continues after the instruction. Without a callback the run would stop at the
+// first `syscall` and the test would fail although the instruction worked.
+fexmac_syscall_action SyscallHandler(fexmac_thread* Thread, void*) {
+  constexpr uint64_t LinuxENOSYS = 38;
+  fexmac_x86_state State;
+  fexmac_x86_state_init(&State);
+  fexmac_thread_get_state(Thread, &State);
+  State.gpr[0] = -LinuxENOSYS; // rax
+  fexmac_thread_set_state(Thread, &State);
+  return FEXMAC_SYSCALL_RESUME;
+}
 } // namespace
 
 int main(int argc, char** argv, char** const envp) {
@@ -189,8 +202,7 @@ int main(int argc, char** argv, char** const envp) {
   Config.options = OptionArray.data();
   Config.option_count = OptionArray.size();
   Config.log = LogHandler;
-  // No system call callback: the tests make none, and a system call would end the run
-  // and fail the test.
+  Config.syscall = SyscallHandler;
 
   fexmac_context* Context {};
   if (const auto Result = fexmac_context_create(&Config, &Context); Result != FEXMAC_OK) {
@@ -202,10 +214,6 @@ int main(int argc, char** argv, char** const envp) {
   // feature detection sees the same options the core does.
   auto HostFeatures = FEX::FetchHostFeatures(true);
   const bool SupportsAVX = HostFeatures.SupportsAVX();
-  bool TestUnsupported = (!SupportsAVX && Loader.RequiresAVX()) || (!HostFeatures.SupportsRAND && Loader.RequiresRAND()) ||
-                         (!HostFeatures.SupportsSHA && Loader.RequiresSHA()) || (!HostFeatures.SupportsCLZERO && Loader.RequiresCLZERO()) ||
-                         (!HostFeatures.SupportsAES256 && Loader.RequiresAES256()) || (!HostFeatures.SupportsAFP && Loader.RequiresAFP());
-  TestUnsupported |= !HostFeatures.SupportsBF16 && Loader.RequiresAVXNEConvert();
 
   FEX::X86::Features Feature {[Context](uint32_t Function, uint32_t Leaf) {
     uint32_t Regs[4] {};
@@ -215,24 +223,60 @@ int main(int argc, char** argv, char** const envp) {
   // FEX disables this by default; the tests exercise it anyway.
   const bool SupportsSSE4A = true;
 
-  TestUnsupported |= (!Feature.Feat_3dnow && Loader.Requires3DNow()) || (!SupportsSSE4A && Loader.RequiresSSE4A()) ||
-                     (!Feature.Feat_bmi1 && Loader.RequiresBMI1()) || (!Feature.Feat_bmi2 && Loader.RequiresBMI2()) ||
-                     (!Feature.Feat_clwb && Loader.RequiresCLWB()) || (!Feature.Feat_ssse3 && Loader.RequiresSSSE3()) ||
-                     (!Feature.Feat_sse4_1 && Loader.RequiresSSE4_1()) || (!Feature.Feat_sse4_2 && Loader.RequiresSSE4_2()) ||
-                     (!Feature.Feat_aes && Loader.RequiresAES()) || (!Feature.Feat_pclmulqdq && Loader.RequiresPCLMUL()) ||
-                     (!Feature.Feat_movbe && Loader.RequiresMOVBE()) || (!Feature.Feat_adx && Loader.RequiresADX()) ||
-                     (!Feature.Feat_xsave && Loader.RequiresXSAVE()) || (!Feature.Feat_rdpid && Loader.RequiresRDPID()) ||
-                     (!Feature.Feat_clflopt && Loader.RequiresCLFLOPT()) || (!Feature.Feat_fsgsbase && Loader.RequiresFSGSBase());
-  TestUnsupported |= !Feature.Feat_avx_vnni && Loader.RequiresAVXVNNI();
-  TestUnsupported |= !Feature.Feat_serialize && Loader.RequiresSerialize();
-  TestUnsupported |= !Feature.Feat_avx_ne_convert && Loader.RequiresAVXNEConvert();
-  TestUnsupported |= !Feature.Feat_sha512 && Loader.RequiresSHA512();
-  TestUnsupported |= !Feature.Feat_avx_ifma && Loader.RequiresAVXIFMA();
-  TestUnsupported |= !Feature.Feat_avx_vnni_int8 && Loader.RequiresAVXVNNIINT8();
-  TestUnsupported |= !Feature.Feat_avx_vnni_int16 && Loader.RequiresAVXVNNIINT16();
+  // Each feature a test may ask for, and whether this host and translator provide it. The
+  // first group is read from the host; the rest from the CPUID the translator shows the
+  // guest, which is what a guest program would check. A skipped test is reported with
+  // the names of the features it lacks, so nobody has to work out why it was skipped.
+  struct Requirement {
+    const char* Name;
+    bool Required;
+    bool Available;
+  };
+  const Requirement Requirements[] = {
+    {"AVX", Loader.RequiresAVX(), SupportsAVX},
+    // RDRAND and RDSEED: either the host's FEAT_RNG or FEX's software generator
+    // (FEX_SOFTWARERNG), which the guest CPUID then advertises.
+    {"RAND", Loader.RequiresRAND(), HostFeatures.SupportsRAND || Feature.Feat_rand},
+    {"SHA", Loader.RequiresSHA(), HostFeatures.SupportsSHA},
+    {"CLZERO", Loader.RequiresCLZERO(), HostFeatures.SupportsCLZERO},
+    {"AES256", Loader.RequiresAES256(), HostFeatures.SupportsAES256},
+    {"AFP", Loader.RequiresAFP(), HostFeatures.SupportsAFP},
+    {"AVX_NE_CONVERT (host BF16)", Loader.RequiresAVXNEConvert(), HostFeatures.SupportsBF16},
+    {"3DNOW", Loader.Requires3DNow(), Feature.Feat_3dnow},
+    {"SSE4A", Loader.RequiresSSE4A(), SupportsSSE4A},
+    {"BMI1", Loader.RequiresBMI1(), Feature.Feat_bmi1},
+    {"BMI2", Loader.RequiresBMI2(), Feature.Feat_bmi2},
+    {"CLWB", Loader.RequiresCLWB(), Feature.Feat_clwb},
+    {"SSSE3", Loader.RequiresSSSE3(), Feature.Feat_ssse3},
+    {"SSE4.1", Loader.RequiresSSE4_1(), Feature.Feat_sse4_1},
+    {"SSE4.2", Loader.RequiresSSE4_2(), Feature.Feat_sse4_2},
+    {"AES", Loader.RequiresAES(), Feature.Feat_aes},
+    {"PCLMUL", Loader.RequiresPCLMUL(), Feature.Feat_pclmulqdq},
+    {"MOVBE", Loader.RequiresMOVBE(), Feature.Feat_movbe},
+    {"ADX", Loader.RequiresADX(), Feature.Feat_adx},
+    {"XSAVE", Loader.RequiresXSAVE(), Feature.Feat_xsave},
+    {"RDPID", Loader.RequiresRDPID(), Feature.Feat_rdpid},
+    {"CLFLOPT", Loader.RequiresCLFLOPT(), Feature.Feat_clflopt},
+    {"FSGSBASE", Loader.RequiresFSGSBase(), Feature.Feat_fsgsbase},
+    {"AVX_VNNI", Loader.RequiresAVXVNNI(), Feature.Feat_avx_vnni},
+    {"SERIALIZE", Loader.RequiresSerialize(), Feature.Feat_serialize},
+    {"AVX_NE_CONVERT", Loader.RequiresAVXNEConvert(), Feature.Feat_avx_ne_convert},
+    {"SHA512", Loader.RequiresSHA512(), Feature.Feat_sha512},
+    {"AVX_IFMA", Loader.RequiresAVXIFMA(), Feature.Feat_avx_ifma},
+    {"AVX_VNNI_INT8", Loader.RequiresAVXVNNIINT8(), Feature.Feat_avx_vnni_int8},
+    {"AVX_VNNI_INT16", Loader.RequiresAVXVNNIINT16(), Feature.Feat_avx_vnni_int16},
+  };
 
-  if (TestUnsupported) {
-    fextl::fmt::print("Skipped: host lacks a CPU feature the test needs\n");
+  fextl::string Missing;
+  for (const auto& Item : Requirements) {
+    if (Item.Required && !Item.Available) {
+      Missing += Missing.empty() ? "" : ", ";
+      Missing += Item.Name;
+    }
+  }
+
+  if (!Missing.empty()) {
+    fextl::fmt::print("Skipped: the host or the translator lacks a CPU feature the test needs: {}\n", Missing);
     return ExitSkip;
   }
 
@@ -262,8 +306,8 @@ int main(int argc, char** argv, char** const envp) {
     return ExitFail;
   }
 
-  // The tests end with `hlt`. Anything else (a guest fault, a system call) means the
-  // test went wrong.
+  // The tests end with `hlt`. Anything else (a guest fault) means the test went wrong;
+  // system calls are answered by SyscallHandler and the run continues.
   fexmac_stop Stop;
   fexmac_stop_init(&Stop);
   const auto RunResult = fexmac_thread_run(Thread, &Stop);

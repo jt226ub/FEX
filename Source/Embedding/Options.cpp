@@ -57,6 +57,9 @@ namespace {
     OPTION(X87REDUCEDPRECISION, X87ReducedPrecision, Bool),
     OPTION(HIDEHYPERVISORBIT, HideHypervisorBit, Bool),
     OPTION(HOSTFEATURES, HostFeatures, HostFeatures),
+    // RDRAND and RDSEED from the host's random generator (arc4random_buf on macOS) when the
+    // CPU has no FEAT_RNG, as no Apple chip so far does; the guest CPUID then offers them.
+    OPTION(SOFTWARERNG, SoftwareRNG, Bool),
     // Diagnostics.
     OPTION(SILENTLOG, SilentLog, Bool),
     OPTION(DUMPGPRS, DumpGPRs, Bool),

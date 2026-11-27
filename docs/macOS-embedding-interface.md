@@ -126,6 +126,7 @@ hexadecimal; a leading 0 is refused rather than read as octal.
 | `SMCCHECKS` | `none`, `mtrack`, `full` (or 0, 1, 2) | `mtrack` needs page-protection tracking (package D); until then it detects nothing and the embedder calls `fexmac_invalidate` |
 | `X87REDUCEDPRECISION`, `HIDEHYPERVISORBIT` | 0, 1 | |
 | `HOSTFEATURES` | comma-separated core names, each known | |
+| `SOFTWARERNG` | 0, 1 | RDRAND and RDSEED from `arc4random_buf`; no Apple chip so far has FEAT_RNG, so without it the guest CPUID offers neither |
 | `SILENTLOG`, `DUMPGPRS`, `DISABLETELEMETRY` | 0, 1 | `DISABLETELEMETRY` defaults to 1 |
 | `IS64BIT_MODE` | 1 | 32-bit guests cannot have the memory they need on macOS |
 
