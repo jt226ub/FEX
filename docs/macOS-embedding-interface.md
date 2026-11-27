@@ -147,7 +147,7 @@ hexadecimal; a leading 0 is refused rather than read as octal.
 | `X87REDUCEDPRECISION`, `HIDEHYPERVISORBIT` | 0, 1 | |
 | `HOSTFEATURES` | `off`, or comma-separated `disable*` names the core knows | `enable*` names are refused: they force a feature on whether the host has it or not (`enablesve` dies with SIGILL on an M4) |
 | `SOFTWARERNG` | 0, 1 | RDRAND and RDSEED from `arc4random_buf`; no Apple chip so far has FEAT_RNG, so without it the guest CPUID offers neither |
-| `DISKCACHEMAXFILESIZE` | 1 to 2^63-1 | size limit of each code cache file (default 1GB); only with the cache on |
+| `DISKCACHEMAXFILESIZE` | 1 to 2^63-1 | size limit of each code cache file (default 256MB, set by the library); only with the cache on |
 | `DISKCACHEVALIDATION` | 0, 1 | compiles each cached block as well and logs differences; diagnosis only |
 | `SILENTLOG`, `DUMPGPRS`, `DISABLETELEMETRY` | 0, 1 | `DISABLETELEMETRY` defaults to 1 |
 | `IS64BIT_MODE` | 1 | 32-bit guests cannot have the memory they need on macOS |
@@ -367,16 +367,25 @@ The on-disk code cache (design, keys, checks and trust model:
   `code_cache_enabled` other than 0 or 1, a directory with the cache off, or an empty
   name give `FEXMAC_ERROR_BAD_CONFIG`. The core's `DISKCACHE` and `DISKCACHEPATH`
   options stay refused: the fields are the interface.
-- **Refusal is not an error:** a directory (or its cache files) not private to the user,
-  with an ACL entry granting write, or reached through a symbolic link, leaves the
-  context without a cache; it is still created and runs. `fexmac_context_get_counters`
-  then reports `FEXMAC_CACHE_REFUSED`, and the reason is logged.
+- **Problems are not errors:** whatever goes wrong with the cache, the context is
+  created and runs; `fexmac_context_get_counters` says what the cache is doing:
+  `ACTIVE`, `READ_ONLY` (a fork child, or a database another process filled past this
+  process's size limit), `UNTRUSTED` (the directory is not private to the user, has an ACL
+  entry granting write, or is a link), `UNAVAILABLE` (the database stayed locked at open,
+  the directory cannot be written, I/O error, no build identity). An untrusted cache file
+  in a trusted directory is removed and started again: the state stays `ACTIVE` and
+  `untrusted_files_replaced` counts it. The reason is always logged.
 - **Counters:** `fexmac_context_get_counters` fills `fexmac_translation_counters`
-  (versioned by `struct_size`): the cache state (`OFF`, `ACTIVE`, `READ_ONLY`, `REFUSED`),
-  blocks compiled, blocks loaded from the cache, entries rejected, entries queued.
+  (versioned by `struct_size`): the cache state, blocks compiled, blocks loaded from the
+  cache, entries rejected, entries queued, entries dropped (not saved: the database stayed
+  locked past one wait, or could not grow), untrusted files replaced, damaged databases
+  emptied.
+- **Size:** each cache file is limited by `DISKCACHEMAXFILESIZE`, 256MB by default; a full
+  file continues in a new generation, the previous one is still read, older ones are
+  deleted. See the design document for why.
 - **Flush:** `fexmac_context_flush_cache` waits for the cache writer and syncs the files
   (`F_FULLFSYNC`). Call it before exiting; `FEXMAC_ERROR_UNSUPPORTED` if the context does
-  not write a cache.
+  not write a cache. It waits for another process's lock at most once per process.
 - **Guest code ranges:** `fexmac_add_code_range` / `fexmac_remove_code_range` tell the
   library which memory holds guest code (and whether the guest can write it). With any
   range registered, the core's `QueryGuestExecutableRange` reports only registered
@@ -449,7 +458,9 @@ alarm kills it.
 | `cache-off` | without the cache: state `OFF`, blocks compiled, nothing loaded or queued, flush `UNSUPPORTED` |
 | `cache-cold-warm` | a cold run queues and flushes; a second context in the same process loads everything and compiles nothing (code at a different address) |
 | `cache-cross-process` | a child process fills the cache; the parent then loads everything and compiles nothing |
-| `cache-untrusted` | a directory writable by others: the context runs with state `REFUSED`, nothing loaded or queued, flush `UNSUPPORTED`, the directory untouched |
+| `cache-untrusted` | a directory writable by others: the context runs with state `UNTRUSTED`, nothing loaded or queued, flush `UNSUPPORTED`, the directory untouched |
+| `cache-untrusted-file` | an index file opened up to others: removed and started again, `untrusted_files_replaced` 1, state `ACTIVE` |
+| `cache-unavailable` | a directory that cannot be written, and a database another process keeps locked: state `UNAVAILABLE`, the context runs |
 | `cache-options` | `DISKCACHE` and `DISKCACHEPATH` refused; `DISKCACHEMAXFILESIZE` and `DISKCACHEVALIDATION` accepted with their rules |
 | `cache-fork` | `fexmac_before_fork` / `fexmac_after_fork`: a second `before` is `BUSY`; the child runs guest code with state `READ_ONLY` and flush refused; the parent carries on and flushes |
 | `code-ranges` | empty and wrapping ranges refused; jumping to an unregistered page stops with a guest fault there; registering it lets the program finish; removing it again (with its translations) faults again |
