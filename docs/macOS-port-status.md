@@ -189,37 +189,29 @@ are exercised now: see "Fault handling for an embedder".)
 
 ## Fault handling for an embedder (criterion 4)
 
-`docs/macOS-embedding-interface.md` has the contracts; this is the evidence, all from
-`fexmac_c_test` and `fexmac_hook_test` (C, public header only) on the M4, as built and
-under the hardened runtime.
+**Not met yet.** `docs/macOS-embedding-interface.md` has the contracts; this is the state
+after the package D review and rework, on the M4.
 
-| Fault path | Tests | Result |
+| Fault path | Tests | State |
 |---|---|---|
-| Misaligned atomics | `faults-installed`, `faults-chained`, `faults-hosted`, `split-locks-concurrent`, `split-lock-faults`, `guest-misaligned-atomic-prot-none`, `split-emulation-fault-dies`, `split-emulation-fault-hosted-dies` | pass; with the second half on a PROT_NONE or read-only page, four threads each stop with a page fault at the locked instruction, nothing written, and after the fix the totals are exact |
-| Scratch-buffer restart | `scratch-guard-disarmed-after-translation`; the instruction tests' `CodeBufferOverflow` | pass |
-| Self-modifying code by page protection | `smc-patch-loop`, `smc-self-patch`, `smc-data-on-code-page`, `smc-cross-thread`, `smc-misaligned-atomic`, `split-lock-on-code-page`, `smc-embedder-write`, `smc-embedder-write-unbracketed-dies`; the instruction tests' `SelfModifyingCode/*` with `--smc mtrack` in all four modes | pass; about 30 us per write to a page holding translated code (machine loaded) |
-| Stopping a thread from another thread | `stop-latency`, `stop-rep`, `stop-not-running`, `stop-during-callback`, `stop-many-threads` | pass; median 4 to 6 us from request to return with eight busy host threads; 99th percentile 30 to 130 us on a quiet machine, up to 1.2 ms with other builds running |
-| Guest fault with correct guest state | `fault-mid-block`, `fault-flags`, `fault-store-loop`, `fault-kinds`, `fault-rep`, `fault-vector`, `fault-stack`, `fault-fetch`, `guest-*`, `guest-load-callret-low-guard`, `guest-store-callret-high-guard` | pass |
+| Misaligned atomics | `faults-*`, `split-locks-concurrent`, `split-lock-faults`, `split-lock-unmap-race`, `guest-misaligned-atomic-prot-none`, `split-emulation-fault-*-dies` | pass; with the second half on an inaccessible page each thread stops with a page fault before anything is written, totals exact after the fix |
+| Scratch-buffer restart | `scratch-guard-disarmed-after-translation`; `CodeBufferOverflow` | pass |
+| Self-modifying code by page protection | `smc-*`, `split-lock-on-code-page`, `SelfModifyingCode/*` with `--smc mtrack` | works, but **opt-in** (`SMCCHECKS mtrack`): the default is `full`, because a code write is re-run with the same limits as a guest fault (below), and writes through aliases are not seen |
+| Stopping a thread from another thread | `stop-*` | pass; median 4 to 6 us request to return; requests are not lost under a storm of code-write resyncs; a request to a destroyed thread is refused safely |
+| Guest fault with correct guest state | `fault-*`, `guest-*`, `Scripts/macos_fault_diff.py` (54 programs x 4 modes x 3 ways) | **exact for loads, plain stores, register push/pop, call/ret, vector and x87 accesses, lock operations, rep lods/scas/cmps, including DF, MMX, AVX upper halves and x87 state; not exact for read-modify-write instructions on memory (flags, and CF-consuming forms compute wrong on resume), `pop [m]`, `leave`, split 32-byte stores, `rep movs`/`rep stos` part-way, and dead flags** (33 known differences, listed in `Source/Embedding/tests/fault_diff_known.txt`) |
 
-Core changes, all macOS-only (`#ifdef __APPLE__`): the interrupt check is always emitted
-(`Core.cpp`) and also on conditional back-edges (`BranchOps.cpp`, with a RIP entry for
-the stub, `JITClass.h`), and the flags are materialised in canonical form before every
-instruction with a memory operand (`OpcodeDispatcher.h`, `Core.cpp`), so a guest resumed
-at a faulting instruction sees the carry it had. Cost: one store per block entry and
-back-edge and possibly a `cfinv` or an NZCV write before a memory instruction; the
-instruction tests took 1:10 to 1:40 for all four modes in this branch, as before.
+The remaining items need changes to the core's code generation (the opcode dispatcher's
+handlers for every read-modify-write, stack and string form; the JIT's `MemCpy`/`MemSet`
+loops); see the package D report. 4K guest protections that disagree within a 16K host
+page are refused unless the embedder accepts them (`FEXMAC_PROT_ALLOW_UNENFORCED`).
 
-Limits, from the core: a `rep movs`/`rep stos` that faults part-way reports its registers
-from before the instruction (it is one host loop) and is not interrupted by a stop
-request; flags no later instruction reads may be stale at a fault; data sharing a 16K
-host page with translated code costs a fault per write. A hosted (virtual) Mac can show
-all three facilities (they use ordinary page protection, not the JIT write protection it
-does not enforce); its latencies are not meaningful.
-
-The 11 instruction tests that crashed at checked addresses: 8 of them were data aborts in
-translated code and are now guest page-fault stops at the same addresses, listed by
-outcome (`guest-fault signal=11 trap=14 si_code=1 at=<rip> fault=<address>`); the 3 whose
-fault is in host code (the translator reading guest code at `0x10028`) still crash.
+Core changes, all macOS-only: the interrupt check on block entries and back-edges, a full
+register-cache flush and x87 stack sync before every instruction with a memory operand,
+no code check for undecodable instructions (`SMCCHECKS full` looped on fetch faults
+before). Cost against `macos/v1` with `SMCCHECKS none` on the review's
+microbenchmarks: 0 to 4% on most loops, +18% (multiblock) to +50% (no multiblock) on a
+loop of two linked blocks with memory accesses (the entry check). The safe default
+`SMCCHECKS full` costs 2 to 6 times `none` on the same loops (as on `macos/v1`).
 
 ## x86 memory ordering between threads
 

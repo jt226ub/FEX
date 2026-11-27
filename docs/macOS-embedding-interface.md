@@ -168,7 +168,7 @@ hexadecimal; a leading 0 is refused rather than read as octal.
 | `MULTIBLOCK` | 0, 1 | |
 | `MAXINST` | 1 to 2^31-1 | instructions per block |
 | `TSOENABLED`, `VECTORTSOENABLED`, `MEMCPYSETTSOENABLED`, `HALFBARRIERTSOENABLED` | 0, 1 | x86 memory-ordering emulation (software; macOS has no hardware mode for ordinary processes) |
-| `SMCCHECKS` | `none`, `mtrack`, `full` (or 0, 1, 2) | `mtrack` (the default) write-protects translated pages once the embedder registers guest memory (see "Self-modifying code"); without registered memory it detects nothing and the embedder calls `fexmac_invalidate` |
+| `SMCCHECKS` | `none`, `mtrack`, `full` (or 0, 1, 2) | `full` is fexmac's default (a check of the guest bytes in every instruction; the core's own default, mtrack, is not used). `mtrack` opts into write protection of translated pages once guest memory is registered (see "Self-modifying code"); `none` detects nothing and the embedder calls `fexmac_invalidate` |
 | `X87REDUCEDPRECISION`, `HIDEHYPERVISORBIT` | 0, 1 | |
 | `HOSTFEATURES` | `off`, or comma-separated `disable*` names the core knows | `enable*` names are refused: they force a feature on whether the host has it or not (`enablesve` dies with SIGILL on an M4) |
 | `SOFTWARERNG` | 0, 1 | RDRAND and RDSEED from `arc4random_buf`; no Apple chip so far has FEAT_RNG, so without it the guest CPUID offers neither |
@@ -463,8 +463,16 @@ fault handler.
   executed by the host. The embedder must not `mprotect` registered memory itself (that
   would undo write protection without discarding code) and must report every guest
   `mmap`, `mprotect` and `munmap`. A 4K guest protection is enforced only where all four
-  guest pages of a host page agree: a PROT_NONE 4K guard page next to accessible pages
-  in the same 16K page is accessible.
+  guest pages of a host page agree. A change that would make them disagree is refused
+  (`FEXMAC_ERROR_UNSUPPORTED`, nothing changed) unless the protection carries
+  `FEXMAC_PROT_ALLOW_UNENFORCED`; then the host page gets the union (a PROT_NONE 4K guard
+  page next to accessible ones is accessible) and `fexmac_memory_unenforced_count` counts
+  it. A partial `fexmac_memory_unmap` of a host page is always done and counted. A sound
+  scheme (the most restrictive protection on the host page and the library completing
+  allowed accesses itself) is not done; see the package report.
+- **`fexmac_memory_unmap`** makes a host page with no mapped guest page left inaccessible
+  itself, waiting for misaligned-atomic emulations in progress, so the embedder's `munmap`
+  after it cannot land inside one (`split-lock-unmap-race`).
 - **Instruction fetch.** The core asks the library which ranges are executable
   (`QueryGuestExecutableRange`); with registered memory only pages with
   `FEXMAC_PROT_EXEC` are, so a jump to an unmapped or non-executable address stops with
@@ -499,28 +507,61 @@ Without registered memory the library goes by the host fault: macOS raises SIGSE
 unmapped address (reported as `SEGV_MAPERR`, not present) and SIGBUS for a protected page
 (`SEGV_ACCERR`, present for a permission fault, not present for PROT_NONE).
 
-The guest state is the state before the faulting instruction: registers the instructions
-before it wrote are written, those after it are not, vector registers likewise, and the
-flags are those of the last flag-setting instruction before it, as long as a later
-instruction reads them (`fault-mid-block`, `fault-flags`, `fault-vector`, `fault-stack`,
-with multiblock on and off and memory-ordering emulation on and off). For that, on macOS
-the core materialises the flags in NZCV, with the carry in its canonical inverted form,
-before every guest instruction with a memory operand (`MaterializeFlagsForFault` in
-`OpcodeDispatcher.h`, called from `Core.cpp`): before, a fault after an `add` reported
-CF inverted, and running again from the fault would have used the wrong carry. Two
-limits remain, both the core's:
+### Guest memory faults: what is exact
 
-- **Dead flags.** Flags that later instructions overwrite without reading are not
-  computed (the core's flag optimisation) and are reported as whatever NZCV held. Running
-  again is unaffected: nothing reads them.
-- **`rep movs` and `rep stos`** are one host loop each (`MemCpy`, `MemSet`) that updates
-  rcx, rsi and rdi only when it ends. A fault part-way reports the registers from before
-  the instruction, with part of the memory written; running again redoes it from the
-  start, which gives the right result except for a `rep movs` whose destination overlaps
-  its source ahead of it. `rep lods`, `rep scas` and `rep cmps` are loops of IR blocks and
-  report their progress (`fault-rep`). Precise progress for `movs`/`stos` needs the
-  core's `OpcodeDispatcher` to generate them as such loops (slower) or to record where
-  the loop keeps its counters; either is a code-generation change, not done.
+Checked by `Scripts/macos_fault_diff.py` (the package D review's differential harness,
+kept as a permanent test; tool `fexmac_fault_diff`): 54 programs, each with one marked
+instruction that faults on a test page, in all four multiblock/TSO combinations, each
+translated with `SMCCHECKS` full and none, comparing the complete guest state (all GPRs,
+rip, rflags, MXCSR, x87 control/status/tags and registers, MMX, XMM, YMM upper halves,
+FS/GS bases, a hash of the data pages) at the fault against a run where the marked
+instruction is `hlt`, the result after fixing the page and resuming against a clean run,
+and, for writes, the result through the write-protection path against `SMCCHECKS` full.
+Every difference fails the test unless `Source/Embedding/tests/fault_diff_known.txt`
+lists it; a listed difference that disappears fails it too.
+
+**Exact:** for an instruction whose only effect before its faulting access is that access
+(loads, plain stores, `push`/`pop` of registers, `call`/`ret`, `movs` single, vector loads
+and 16-byte stores, x87 loads and stores, `fxsave`, `lock` operations, `rep lods`/`scas`/
+`cmps` part-way), the reported state is the state before the instruction, including state
+the translator caches outside its static registers. For that, on macOS the core flushes
+its whole register cache (DF, MMX, the AVX upper halves, cached context values) and puts
+the flags in their canonical form before every instruction with a memory operand, and
+writes a virtual x87 stack back to the frame first (`Core.cpp`, `__APPLE__`). Before
+this, a fault after `std` reported DF clear (and a resumed `rep movsb` ran forward), after
+`movq mm0, rax` mm0 was 0, after `vpcmpeqb ymm0` the upper half was stale, and after
+`fld1; fldpi` the x87 stack was empty. (Memory operands of the `[reg]` form were not even
+recognised as such before; they now are, in every addressing form.)
+
+**Not exact (listed in `fault_diff_known.txt`; criterion 4 is not met while these
+remain):**
+
+- **Instructions that change guest state before their last faulting access** are not
+  restartable: read-modify-write instructions on memory set the flags before the store
+  (`add`, `neg`, `shl`, `btc`, `xadd`, `cmpxchg` report the post-instruction flags;
+  `adc`/`sbb`/`rcl`/`rcr [m]` also consume and rewrite CF, so running them again computes
+  a wrong result: `stc; sbb qword [m], 1` with 0x100 gives 0xff, x86 0xfe); `pop [m]`
+  adds 8 to rsp before the store (resuming pops the wrong value); `leave` sets rsp to rbp
+  before its load; a 32-byte `vmovdqu` store across a page writes its first 16 bytes
+  before the fault; `call` with a read-only stack leaves a different memory image after
+  resuming. Making them exact means reordering each such opcode handler in the core's
+  opcode dispatcher (commit registers and flags after the last access that can fault, or
+  record an undo the handler applies) for every read-modify-write, stack and string form
+  and the multi-part stores; see the package report for options and cost. Not done.
+- **`rep movs` / `rep stos`** run as one host loop (`MemCpy`/`MemSet` in the JIT) that
+  updates rcx/rsi/rdi only at the end: a fault part-way reports the registers from before
+  the instruction with part of the memory written, and running again redoes the copy,
+  which is wrong for an overlapping forward copy (the memmove pattern). They are also not
+  interruptible by a stop request. Fixing it means rewriting those JIT loops to keep
+  x86-exact progress in the guest registers and to check the interrupt page every N
+  chunks. Not done.
+- **Dead flags:** a flag that the rest of the block overwrites without reading (typically
+  PF and AF, when only CF or ZF is read later) is not computed and is reported as the
+  frame held it. Running again is unaffected; a handler that reads EFLAGS sees it.
+
+The embedder may still fix the cause and run again; for the instructions above the result
+can be wrong, so an embedder that resumes guest faults (demand paging, guard pages) must
+know its guest does not depend on them, or wait for the fix.
 
 The embedder may then fix the cause (map or unprotect the page) and run again, which runs
 the same instruction (`fault-mid-block`, `fault-store-loop`, the `guest-*` subtests), or
@@ -574,7 +615,17 @@ leaves the dispatcher; `fexmac_thread_run` returns `FEXMAC_STOP_REQUESTED`.
 
 ## Self-modifying code
 
-With `SMCCHECKS` `mtrack` (the core's default) and registered memory:
+**The default is `SMCCHECKS full`**: the translator checks the guest bytes of each
+instruction before running it. Write-protection detection (`mtrack`, below) is opt-in,
+because a write to translated code is re-run through the same path as a guest fault and
+inherits its limits ("Guest memory faults: what is exact"), and writes through an alias
+of the memory are not seen. The safe default costs: on loops of 3 to 8 instructions with
+memory accesses, 2 to 6 times the time of `none` (measured with the review's
+microbenchmarks, M4, machine loaded; the same with and without this package's core
+changes). `none` detects nothing (the embedder calls `fexmac_invalidate`).
+
+With `mtrack` explicitly chosen and registered memory:
+
 
 1. When the core translates code from a 4K guest page (`MarkGuestExecutableRange`, called
    with the core's invalidation lock held shared), the library removes write access from
@@ -600,6 +651,13 @@ With `SMCCHECKS` `mtrack` (the core's default) and registered memory:
    block entry or back-edge (the interrupt fault page with a "resync" flag), so a thread
    spinning in a loop of the old code leaves it. The next translation from the page
    protects it again.
+
+**Aliases.** Write protection covers the host page the code was translated from. A guest
+that runs code through one mapping and writes it through another of the same memory (a
+JIT's dual mapping, shared memory) is not detected: the embedder, which created the alias,
+must call `fexmac_invalidate` for the executable alias's range after such writes (or keep
+`SMCCHECKS full`). `smc-alias-needs-invalidate` shows the stale result without the call
+and the new code with it.
 
 Host pages are 16K and guest pages 4K, so data that shares a host page with code costs a
 fault per write (counted by `fexmac_memory_code_write_count`). Measured on the M4
@@ -724,6 +782,11 @@ alarm kills it.
 | `memory-arguments` | argument checks of the memory functions |
 | `stop-latency`, `stop-rep`, `stop-not-running`, `stop-during-callback`, `stop-many-threads` | see "Stopping a thread from another thread"; `stop-not-running` also requests from a signal handler |
 | `smc-*`, `split-lock-faults`, `split-lock-on-code-page` | see "Self-modifying code" and "Fault handler locks" |
+| `stop-resync-storm` | 3,000 stop requests (two at a time) to a spinning thread while four guest threads write code (each write resyncs it): none lost |
+| `split-lock-unmap-race` | four threads run misaligned `lock xadd` on a page the main thread unmaps (`fexmac_memory_unmap`, `munmap`) and maps again for 3 seconds: page faults, no death (died within seconds before) |
+| `stop-after-destroy` | a stop request for a destroyed thread returns `INVALID_HANDLE`; 2,000 destroys racing with requests from another thread |
+| `smc-alias-needs-invalidate` | see "Self-modifying code", aliases |
+| `code-ranges` | the memory map as the code registry: unregistered memory is a fetch fault with `SEGV_MAPERR`, a registered non-executable page `SEGV_ACCERR` with the present bit |
 | `callbacks` | from a callback: create a thread, destroy another stopped thread, invalidate; running another thread is `BUSY` |
 | `errors` | missing arguments; unsupported options (`DISKCACHE`, `DISKCACHEPATH`, `JITFEATURES`, `GDBSERVER`, `SINGLESTEP`, `ENABLECODECACHINGWIP`, `FORCESVEWIDTH`, `STRICTINPROCESSSPLITLOCKS`); bad values (`010`, `-5`, `0`, out of range, `true`, unknown names); a second context; destroy with threads; double destroy and use after destroy; a context created again |
 | `chained-retry` | a previous handler that returns without fixing the fault sees every retry (1,000) until it fixes the page |
@@ -785,11 +848,14 @@ mapped as a code range, flushes before exiting and prints the translation counte
 
 ## Not covered yet
 
-- Precise registers part-way through `rep movs`/`rep stos`, and dead flags at a guest
-  fault (see "Guest memory faults").
+- Exact state at a fault for the instructions listed in "Guest memory faults: what is
+  exact" (read-modify-write, `pop [m]`, `leave`, split 32-byte stores, `rep movs`/`stos`),
+  and dead flags.
 - Stopping a long `rep movs`/`rep stos` part-way (one host loop).
 - An adaptive fallback for host pages where data and code share a page and every write
   faults (see "Self-modifying code").
+- Enforcing 4K guest protections that differ within a 16K host page (refused unless
+  `FEXMAC_PROT_ALLOW_UNENFORCED`).
 - A misaligned atomic whose page the embedder changes with a raw `mprotect` during the
   emulation ends the process instead of being a guest fault (see "Fault handler locks").
 - The fault-handler contract does not say what happens when the library chains to a
