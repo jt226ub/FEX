@@ -679,9 +679,11 @@ step), and fail on anything else. Run time about 12 minutes.
 **Linux arm64.** On the port (with the fix below) and on its upstream base
 (`a92baf073`): instruction tests 2,285 raw passes, 1 known failure
 (`FEX_bugs/32bit_syscall`), 6 disabled by upstream's lists, in each of the three modes,
-CTest 6,876 of 6,876 as upstream's lists expect; unit tests 355 of 355 (the three
-`FutexSpin-Timed` tests are left out: they time wall-clock waits and failed on the
-upstream base too on these shared machines). Port against base: 0 tests differ. The
+CTest 6,876 of 6,876 as upstream's lists expect; unit tests 355 of 355 (the four
+`FutexSpin-Timed` tests, 8, 16, 32 and 64 bit, are left out: they time wall-clock waits
+and failed at random on the upstream base too on these shared machines). An empty
+comparison cannot pass: CTest runs with `--no-tests=error`, and the compare script fails
+on an empty table, a missing mode or different row counts on the two sides. Port against base: 0 tests differ. The
 core-only build and the full build have no warnings.
 
 Linux against the Mac (`Scripts/macos_linux_asm_compare.py`, modes jit_1, jit_500,
@@ -707,6 +709,26 @@ Upstream's own workflows (`ccpp.yml`, `glibc_fault.yml`, `hostrunner.yml`,
 requests to `main` and target upstream's self-hosted runners. They never run on `macos/**`
 pushes, and none has run on this fork (only `macOS core build` is registered), so they are
 left unchanged to keep upstream syncs clean.
+
+**Instruction-test floor.** `Scripts/macos_asm_floor.txt` holds the minimum counts (2,296
+tests found; 2,265 passes per mode on a physical Mac, 2,257 on the hosted VM) and
+`Scripts/macos_asm_check.py` checks a `macos_asm_tests.py` log against it, also failing on
+unprepared tests, a mode that ran nothing and expected failures that now pass. The hosted
+Mac job and the physical-Mac job both use it; raise the floor when tests are added or
+fixed. All actions in this repository's workflows are pinned to full commits.
+
+**Repository settings the owner should apply** (not changed by any package):
+
+- Settings, Actions, General: require approval for workflow runs from all outside
+  contributors (not only first-time ones), so a fork's pull request cannot start a job
+  unasked.
+- Allow only actions created by GitHub (and require them pinned to a full commit), since
+  the workflows use nothing else.
+- Never register a self-hosted runner on this public repository; the physical-Mac job
+  lives in the private umbrella repository and only reads this one.
+- Consider disabling upstream's own workflows on this fork (Actions, select the workflow,
+  Disable workflow): they cannot run usefully here, and disabling them in the settings
+  keeps the files identical to upstream's.
 
 ## Tests
 
