@@ -557,11 +557,17 @@ FEXMAC_EXPORT uint64_t fexmac_memory_code_write_count(fexmac_context* context);
  * FEXMAC_PF_USER. SIGBUS with BUS_ADRERR when the registered protection allows the access
  * but the host refused it (a file mapping past its end, for example). Without registered
  * memory the library goes by the host fault: SIGSEGV from the host is an unmapped page,
- * SIGBUS a protected one. The guest registers are those before the faulting instruction,
- * with two limits of the translator: a `rep movs` or `rep stos` that faults part-way
- * reports its registers from before the instruction (the core runs it as one host loop;
- * running it again redoes it from the start), and flags that the next instructions of the
- * block overwrite without reading may be stale.
+ * SIGBUS a protected one. The guest state (registers, flags, x87, MMX, XMM/YMM, MXCSR) is
+ * the state before the faulting instruction for instructions whose only effect before
+ * the faulting access is that access (loads, plain stores, register push/pop, call/ret,
+ * vector and x87 accesses, lock operations, rep lods/scas/cmps part-way). NOT for
+ * read-modify-write instructions on memory (their flags are already updated; adc, sbb,
+ * rcl and rcr also compute wrong when run again), pop [m] and leave (rsp already
+ * changed), a 32-byte store crossing into the faulting page (first half written), and
+ * rep movs / rep stos part-way (registers from before the instruction, memory partly
+ * written; an overlapping forward copy run again gives a different result). Flags the
+ * rest of the block overwrites without reading may be stale. See
+ * docs/macOS-embedding-interface.md, "Guest memory faults: what is exact".
  *
  * Two ways to connect it, pick one per process:
  *

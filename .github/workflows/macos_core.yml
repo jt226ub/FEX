@@ -60,7 +60,7 @@ jobs:
       - name: Build
         run: |
           set -o pipefail
-          ninja -C build -k 0 FEXCore FEXCore_shared Common CommonTools FEXCoreSmokeTest FEXCoreASMTestRunner FEXCoreThreadTest FEXCoreOrderingTest FEXCoreMutexWakeTest FEXCoreBench FEXCoreCacheTest fexmac fexmac_shared fexmac_testing fexmac_bundle fexmac_c_test fexmac_hook_test 2>&1 | tee build.log
+          ninja -C build -k 0 FEXCore FEXCore_shared Common CommonTools FEXCoreSmokeTest FEXCoreASMTestRunner FEXCoreThreadTest FEXCoreOrderingTest FEXCoreMutexWakeTest FEXCoreBench FEXCoreCacheTest fexmac fexmac_shared fexmac_testing fexmac_bundle fexmac_c_test fexmac_hook_test fexmac_fault_diff 2>&1 | tee build.log
 
       - name: Inspect what was built
         run: |
@@ -204,6 +204,13 @@ jobs:
           T="$(find build -name FEXCoreASMTestRunner -type f | head -1)"
           set -o pipefail
           python3 Scripts/macos_asm_tests.py --runner "$T" --out asm-out 2>&1 | tee asm-tests.log
+
+      - name: Run the differential guest-fault test
+        # Guest state at a page fault, after resuming, and through the write-protection
+        # path, compared with reference runs (Scripts/macos_fault_diff.py).
+        run: |
+          set -o pipefail
+          python3 Scripts/macos_fault_diff.py --tool build/Bin/fexmac_fault_diff 2>&1 | tee fault-diff.log
 
       - name: Run the self-modifying-code instruction tests with write protection
         # SMCCHECKS mtrack with the runner's memory registered with fexmac: translated
