@@ -658,8 +658,7 @@ The on-disk code cache (design, keys, checks and trust model:
   deleted. See the design document for why.
 - **Flush:** `fexmac_context_flush_cache` waits for the cache writer and syncs the files
   (`F_FULLFSYNC`). Call it before exiting; `FEXMAC_ERROR_UNSUPPORTED` if the context does
-<<<<<<< HEAD
-  not write a cache.
+  not write a cache. It waits for another process's lock at most once per process.
 - **Which memory is code** comes from the guest memory map (`fexmac_memory_map` with
   `FEXMAC_PROT_EXEC`; see "Guest memory"): the code cache hashes and patches guest bytes
   of executable registered pages only, and executing anything else stops with a fetch
@@ -667,16 +666,6 @@ The on-disk code cache (design, keys, checks and trust model:
   `fexmac_remove_code_range`, which package F added as a second registry, are replaced by
   it; there is one registry and "nothing registered" has one meaning: all memory is
   executable code.)
-=======
-  not write a cache. It waits for another process's lock at most once per process.
-- **Guest code ranges:** `fexmac_add_code_range` / `fexmac_remove_code_range` tell the
-  library which memory holds guest code (and whether the guest can write it). With any
-  range registered, the core's `QueryGuestExecutableRange` reports only registered
-  ranges: decoding stops at their ends, executing outside them stops with a guest fault,
-  and the code cache hashes and patches guest bytes inside them only. With none, every
-  address counts (the behaviour before). Register the guest's code when the cache is on.
-  Package D will use the writability for page-protection self-modifying-code detection.
->>>>>>> macos/v1
 - **fork:** `fexmac_before_fork` / `fexmac_after_fork` around `fork()`. They hold the
   library's and the core's locks (the cache's included) across it; the child loads from
   the cache but does not write it (state `READ_ONLY`), and must not run threads created
