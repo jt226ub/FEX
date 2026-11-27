@@ -30,6 +30,10 @@ FLUSH_LINE = re.compile(r"^flush took ([0-9.]+) s$", re.M)
 # fexmac_cache_state
 OFF, ACTIVE, READ_ONLY, UNTRUSTED, UNAVAILABLE = range(5)
 TIMEOUT = 60
+# DiskCache.h MaxStaleRemovals: stale generations one open may remove.
+MAX_STALE_REMOVALS = 16
+BURST_PROCESSES = 6
+BURST_BLOCKS = 60000
 
 # On-disk layout (see FEXCore/Source/Interface/Core/DiskCache.{h,cpp}).
 FOZ_MAGIC = 16
@@ -143,6 +147,29 @@ def hold_locks(cache_dir):
     return holder
 
 
+def hold_files(paths):
+    """A process that takes flock on the given files and keeps it."""
+    code = ("import fcntl,os,sys,time\nfds=[]\nfor p in sys.argv[1:]:\n fd=os.open(p,os.O_RDONLY); fcntl.flock(fd,fcntl.LOCK_EX); fds.append(fd)\n"
+            "print(len(fds),flush=True)\ntime.sleep(120)\n")
+    holder = subprocess.Popen([sys.executable, "-c", code] + list(paths), stdout=subprocess.PIPE, text=True)
+    holder.stdout.readline()
+    return holder
+
+
+GENERATION_NAME = re.compile(r"^(RWCacheDB_[0-9a-f]+)(?:-([1-9][0-9]*))?_idx\.foz$")
+
+
+def generation_sets(cache_dir):
+    """{database name: sorted generation numbers whose index file exists}."""
+    sets = {}
+    for folder, _, files in os.walk(cache_dir):
+        for file in files:
+            match = GENERATION_NAME.match(file)
+            if match:
+                sets.setdefault(match.group(1), []).append(int(match.group(2) or 0))
+    return {name: sorted(gens) for name, gens in sets.items()}
+
+
 def fresh_copy(source, work, name):
     target = os.path.join(work, name)
     if os.path.exists(target):
@@ -165,8 +192,19 @@ XXH_HELPER_SOURCE = r"""
 #include <stdlib.h>
 int main(int argc, char** argv) {
   unsigned long long seed = strtoull(argv[1], 0, 16);
-  static unsigned char buf[1 << 24];
-  size_t n = fread(buf, 1, sizeof buf, stdin);
+  /* All of standard input: crafted entries can be larger than any fixed buffer. */
+  size_t cap = 1 << 20, n = 0, got;
+  unsigned char* buf = malloc(cap);
+  while (buf && (got = fread(buf + n, 1, cap - n, stdin)) > 0) {
+    n += got;
+    if (n == cap) {
+      cap *= 2;
+      buf = realloc(buf, cap);
+    }
+  }
+  if (!buf) {
+    return 1;
+  }
   XXH128_hash_t h = XXH3_128bits_withSeed(buf, n, seed);
   fwrite(&h, 1, 16, stdout);
   return 0;
@@ -248,7 +286,7 @@ def craft_tests(work, cache_test, base):
     cold = run(cmd, pristine)
     warm = run(cmd, pristine)
 
-    def craft(name, change, expect_reject):
+    def craft(name, change, expect_reject, expect_text=None):
         target = fresh_copy(pristine, work, "craft-" + re.sub(r"\W+", "-", name))
         bucket = [os.path.join(target, d) for d in os.listdir(target) if os.path.isdir(os.path.join(target, d))][0]
         db = CraftDB(bucket, xxh)
@@ -260,7 +298,7 @@ def craft_tests(work, cache_test, base):
             # changed extents) or a rejection; the block is compiled.
             ok = info["rc"] == 0 and info.get("compiled", 0) > 0 and "PASS" in info["out"]
         elif expect_reject:
-            ok = info["rc"] == 0 and info.get("rejected", 0) >= 1 and "PASS" in info["out"]
+            ok = info["rc"] == 0 and info.get("rejected", 0) >= 1 and "PASS" in info["out"] and (not expect_text or expect_text in info["out"])
         else:
             ok = info["rc"] == 0 and info.get("rejected") == 0 and info.get("loaded") == warm.get("loaded") and info.get("compiled") == 0
         check(name, ok, summary(info) + " " + info["out"][-200:])
@@ -288,6 +326,23 @@ def craft_tests(work, cache_test, base):
         struct.pack_into("<Q", b["code"], tail, len(b["code"]) + 16)
         db.write(e, b)
 
+    def oversized(size):
+        # One entry only: code larger than the translator's 64MB cap (MaxBlockHostSize),
+        # consistent otherwise (block tail size matching, re-sealed). Above 128MB-16K such
+        # an entry could never be stored in a code buffer and loading it looped for ever,
+        # holding the invalidation lock.
+        done = []
+
+        def change(db, e, b):
+            if done:
+                return
+            done.append(True)
+            b["code"] += b"\0" * (size - len(b["code"]))
+            tail = struct.unpack_from("<I", b["code"], 0)[0]
+            struct.pack_into("<Q", b["code"], tail, len(b["code"]))
+            db.write(e, b)
+        return change
+
     def extents_unsealed(db, e, b):
         # Change the index's extents without re-sealing: the hash covers them.
         with open(db.index, "r+b") as handle:
@@ -301,6 +356,10 @@ def craft_tests(work, cache_test, base):
     craft("a host entry point on the block header is rejected", host_offset(lambda b: 0), True)
     craft("a block tail whose size disagrees is rejected", tail_size, True)
     craft("guest extents changed in the index (not re-sealed) are not used", extents_unsealed, "fallback")
+    craft("an entry with more code than one block may have (64MB + 16) is rejected", oversized(64 * 1024 * 1024 + 16), True,
+          "entry check 11 failed")
+    craft("an entry larger than the largest code buffer (128MB) is rejected, not loaded for ever", oversized(128 * 1024 * 1024), True,
+          "entry check 11 failed")
 
     # A process that died while appending leaves a partial index record. The next process
     # to store must cut it off first, or the records it appends after it are lost.
@@ -741,10 +800,77 @@ def main():
     replaced = sum(i.get("replaced", 0) for i in stress)
     reset = sum(i.get("reset", 0) for i in stress)
     rejected = sum(i.get("rejected", 0) for i in stress)
-    names = sorted(f for folder, _, files in os.walk(target) for f in files if f.endswith("_idx.foz"))
-    check("six processes rotating one database, 72 runs: all right, untrusted replaced %d, damaged reset %d, rejected %d" %
-          (replaced, reset, rejected), not bad and replaced == 0 and reset == 0 and rejected == 0 and len(names) <= 3,
-          "; ".join(bad[:3]) + " generations=%s" % names)
+    during = generation_sets(target)
+    # The invariant (DiskCacheMacOS.inl, RemoveStaleGenerations): once no process is opening
+    # or rotating, any open leaves only the newest generation N and N - 1 of each database.
+    settle = stress_run(0)
+    after = generation_sets(target)
+    settled = all(len(gens) <= 2 and gens == list(range(gens[-1] - len(gens) + 1, gens[-1] + 1)) for gens in after.values())
+    check("six processes rotating one database, 72 runs: all right, untrusted replaced %d, damaged reset %d, rejected %d; "
+          "then one open leaves only N - 1 and N (%s, then %s)" % (replaced, reset, rejected, list(during.values()), list(after.values())),
+          not bad and replaced == 0 and reset == 0 and rejected == 0 and settle["rc"] == 0 and after and settled,
+          "; ".join(bad[:3]) + " generations after the storm=%s, after one more open=%s" % (during, after))
+
+    # Stale generations with gaps (left by a killed process or one that lost a race) are
+    # removed by later opens, a bounded number per open, never one another process holds
+    # locked; the live pair stays.
+    target = os.path.join(work, "stale-generations")
+    run(gen_cmd, target)
+    (lcache, lindex), = db_files(target)
+    base = lindex[:-len("_idx.foz")]
+    for leaf in (".foz", "_idx.foz"):
+        shutil.copy2(base + leaf, base + "-40" + leaf)
+        shutil.copy2(base + leaf, base + "-41" + leaf)
+    orphans = [0] + list(range(1, 10)) + list(range(11, 31))  # 0 is the original pair
+    for n in orphans[1:] + [10]:
+        for leaf in (".foz", "_idx.foz"):
+            path = "%s-%d%s" % (base, n, leaf)
+            open(path, "wb").close()
+            os.chmod(path, 0o600)
+    holder = hold_files([base + "-10.foz", base + "-10_idx.foz"])
+    counts = []
+    first = run(gen_cmd, target)
+    counts.append(len(generation_sets(target)[os.path.basename(base)]))
+    second = run(gen_cmd, target)
+    counts.append(len(generation_sets(target)[os.path.basename(base)]))
+    held_kept = os.path.exists(base + "-10_idx.foz")
+    holder.kill()
+    holder.wait()
+    third = run(gen_cmd, target)
+    fourth = run(gen_cmd, target)
+    final = generation_sets(target)[os.path.basename(base)]
+    check("stale generations with gaps: at most %d removed per open, a locked one kept, then only N - 1 and N remain "
+          "(%s, then %s)" % (MAX_STALE_REMOVALS, counts, final),
+          all(i["rc"] == 0 and i.get("compiled") == 0 for i in (first, second, third, fourth)) and
+          counts[0] >= 33 - MAX_STALE_REMOVALS and counts[0] < 33 and held_kept and final == [40, 41],
+          "%s / %s / %s" % (summary(first), summary(third), counts))
+
+    # Several processes cold-compiling tens of thousands of different tiny blocks into the
+    # same database at once, on a machine kept busy (one CPU-bound process per core, like
+    # the instruction tests' parallel jobs): stores are written in batches, so the cache
+    # costs a small bounded factor over the same workload without it. (Storing entry by
+    # entry: 7.7 s against 2.5 s on an idle machine, 71 s against 2.4 s on a busy one.)
+    def burst(cache_dir):
+        cmd = [cache_test, "--threads", "1", "--blocks", str(BURST_BLOCKS), "--unique"]
+        started = time.monotonic()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=BURST_PROCESSES) as pool:
+            results = list(pool.map(lambda i: run(cmd + (["--variant", "sub"] if i % 2 else []), cache_dir), range(BURST_PROCESSES)))
+        return time.monotonic() - started, results
+    burners = [subprocess.Popen(["/usr/bin/yes"], stdout=subprocess.DEVNULL) for _ in range(os.cpu_count() or 8)]
+    try:
+        plain_seconds, plain = burst(None)
+        target = os.path.join(work, "store-burst")
+        cached_seconds, cached = burst(target)
+    finally:
+        for burner in burners:
+            burner.kill()
+            burner.wait()
+    bound = 2 * plain_seconds + 2
+    check("%d processes each cold-compiling %d different blocks into one database, machine busy: %.2f s with the cache, %.2f s without "
+          "(bound %.2f s), nothing dropped" % (BURST_PROCESSES, BURST_BLOCKS, cached_seconds, plain_seconds, bound),
+          all(i["rc"] == 0 for i in plain + cached) and sum(i.get("compiled", 0) for i in cached) >= BURST_BLOCKS and
+          all(i.get("dropped") == 0 for i in cached) and cached_seconds <= bound,
+          "; ".join(summary(i) for i in cached[:2]))
 
     # A planted generation name far ahead is ignored: start-up stays quick and the real
     # generations are neither skipped nor deleted.

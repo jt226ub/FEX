@@ -683,9 +683,11 @@ namespace {
 
   // The core keeps an inaccessible host page after each code buffer, so an access that
   // runs past a buffer's end faults instead of landing in whatever is mapped next. Every
-  // write into a code buffer is bounds-checked first, so this never happens in normal
-  // operation: it is a bug in the core, never the guest's doing, and nothing can be
-  // repaired. Reported whatever handles the fault next, then passed on like any other.
+  // write into a code buffer is bounds-checked first, so from the core's own code this is
+  // a core bug and nothing can be repaired. Reported whatever handles the fault next, then
+  // passed on like any other. From translated code or the dispatcher it is a guest access
+  // that happens to hit the page (guest addresses are host addresses): the guest's fault,
+  // reported as such elsewhere.
   void ReportCodeBufferOverrun(int Signal, siginfo_t* Info, ucontext_t* Context) {
     auto* Current = GetCurrentThread();
     if (!Current) {
@@ -693,7 +695,8 @@ namespace {
     }
     const auto Kind = ClassifyFault(Context);
     const auto Address = reinterpret_cast<uintptr_t>(Info->si_addr);
-    if (Kind.Kind != FaultKind::Access || !Current->Thread->CTX->IsAddressInCodeBufferGuard(Current->Thread, Address)) {
+    if (Kind.Kind != FaultKind::Access || !Current->Thread->CTX->IsAddressInCodeBufferGuard(Current->Thread, Address) ||
+        IsTranslatedOrDispatcher(Current, Context->uc_mcontext->__ss.__pc)) {
       return;
     }
     WriteRaw(Signal == SIGBUS ? "fexmac: SIGBUS" : "fexmac: SIGSEGV");

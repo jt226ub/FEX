@@ -20,10 +20,25 @@ struct GuestToHostMap;
 }
 
 namespace FEXCore::CPU {
+#ifdef __APPLE__
+// The largest code buffer (MAX_CODE_SIZE in SharedCodeBufferManager.cpp), and the most
+// host code one block may take: half of it, so a block within the limit always fits a
+// fresh largest buffer. The translator gives up on blocks that need more, the code cache
+// rejects entries that are larger, and allocating more than this from a code buffer
+// fails instead of replacing buffers for ever.
+inline constexpr size_t MaxCodeBufferSize = 128 * 1024 * 1024;
+inline constexpr size_t MaxBlockHostSize = MaxCodeBufferSize / 2;
+#endif
+
 struct CodeBuffer {
   fextl::unique_ptr<GuestToHostMap> LookupCache;
 
+#ifdef __APPLE__
+  // SimulateMapFailure (tests): behave as if mmap had failed with ENOMEM.
+  CodeBuffer(size_t Size, bool ShouldBeNamed, bool SimulateMapFailure = false);
+#else
   CodeBuffer(size_t Size, bool ShouldBeNamed);
+#endif
   CodeBuffer(const CodeBuffer&) = delete;
   CodeBuffer& operator=(const CodeBuffer&) = delete;
   CodeBuffer(CodeBuffer&& oth) = delete;
@@ -110,6 +125,19 @@ private:
 
   // Code buffer allocation information.
   std::atomic<uint8_t*> CodeBufferOffset {};
+
+#ifdef __APPLE__
+public:
+  // Tests: as if Used bytes had been allocated already.
+  void SetUsedForTesting(size_t Used) {
+    CodeBufferOffset = Ptr + Used;
+  }
+
+  // Set when the buffer could not be made (GetBufferBase() is then null): what failed
+  // and its errno.
+  const char* ErrorWhat {};
+  int Error {};
+#endif
 };
 
 /**
@@ -140,10 +168,19 @@ public:
 
   virtual void OnCodeBufferAllocated(const std::shared_ptr<CodeBuffer>&) {};
 
+#ifdef __APPLE__
+  // Makes the first code buffer if there is none yet, reporting failure instead of
+  // stopping the process, so the embedder can be told when a thread is created. Later
+  // buffers are made mid-translation, where a failure still stops the process.
+  bool TryAllocateFirst();
+  // Tests: the next Count code buffer allocations fail, as if mmap had failed.
+  int FailuresForTesting {};
+#endif
+
 private:
   fextl::shared_ptr<CodeBuffer> Latest;
 
-  fextl::shared_ptr<CodeBuffer> AllocateNew(size_t Size);
+  fextl::shared_ptr<CodeBuffer> AllocateNew(size_t Size, bool AllowFailure = false);
 
   bool NameJITBuffers {true};
 };

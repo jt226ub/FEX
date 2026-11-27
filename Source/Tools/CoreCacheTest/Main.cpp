@@ -104,7 +104,7 @@ constexpr uint64_t TrampolineResult = 0x5A5A'1234'5678'A5A5ULL;
 //   add rdx, rbx          (48 01 DA)
 //   jmp next              (E9 rel32)
 // After the chain: dec rcx; jnz start; hlt.
-Program BuildProgram(uint64_t Blocks, bool SubVariant, bool Distinct = false) {
+Program BuildProgram(uint64_t Blocks, bool SubVariant, bool Distinct = false, bool Unique = false) {
   Program P;
   P.BlockCount = Blocks;
   auto Emit = [&](std::initializer_list<uint8_t> B) {
@@ -123,6 +123,17 @@ Program BuildProgram(uint64_t Blocks, bool SubVariant, bool Distinct = false) {
       // --distinct: a different number of leading nops makes every block's bytes, and so
       // its cache entry, different.
       P.Bytes.insert(P.Bytes.end(), i % 61, 0x90);
+    }
+    if (Unique) {
+      // --unique: the block number's 16 bits spelled as one-byte (90) and two-byte (66 90)
+      // nops, so up to 65536 blocks all have different bytes.
+      for (int Bit = 0; Bit < 16; ++Bit) {
+        if ((i >> Bit) & 1) {
+          Emit({0x66, 0x90});
+        } else {
+          Emit({0x90});
+        }
+      }
     }
     if (i == 0) {
       // The first block starts with 70 nops, so its add/sub lies beyond the 64 bytes the
@@ -337,6 +348,7 @@ int main(int argc, char** argv) {
   bool TearIndex = false;
   bool ForkRaw = false;
   bool Distinct = false;
+  bool Unique = false;
   const char* StallLock = nullptr;
   std::string_view Expect = "any";
   for (int i = 1; i < argc; ++i) {
@@ -371,6 +383,8 @@ int main(int argc, char** argv) {
       TearIndex = true;
     } else if (Arg == "--distinct") {
       Distinct = true;
+    } else if (Arg == "--unique") {
+      Unique = true;
     } else if (Arg == "--fork-raw") {
       Fork = true;
       ForkRaw = true;
@@ -381,7 +395,7 @@ int main(int argc, char** argv) {
       fprintf(stderr,
               "usage: %s [--threads N] [--blocks N] [--base ADDRESS] [--variant add|sub] [--expect cold|warm|any]\n"
               "          [--trampoline] [--hardware-tso] [--force-tso] [--fork] [--fork-raw] [--race] [--tear-index]\n"
-              "          [--stall-lock hold|stop] [--distinct]\n",
+              "          [--stall-lock hold|stop] [--distinct] [--unique]\n",
               argv[0]);
       return 2;
     }
@@ -390,7 +404,7 @@ int main(int argc, char** argv) {
     return 2;
   }
 
-  const auto P = BuildProgram(Blocks, SubVariant, Distinct);
+  const auto P = BuildProgram(Blocks, SubVariant, Distinct, Unique);
   CodeSize = (P.Bytes.size() + 0x3FFF) & ~uint64_t {0x3FFF};
   void* Map = ::mmap(reinterpret_cast<void*>(FixedBase), CodeSize, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
   if (Map == MAP_FAILED || (FixedBase && reinterpret_cast<uint64_t>(Map) != FixedBase)) {

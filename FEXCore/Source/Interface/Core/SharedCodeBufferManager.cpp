@@ -19,10 +19,34 @@ namespace FEXCore::CPU {
 static constexpr size_t INITIAL_CODE_SIZE = 1024 * 1024 * 16;
 // We don't want to move above 128MB atm because that means we will have to encode longer jumps
 static constexpr size_t MAX_CODE_SIZE = 1024 * 1024 * 128;
+#ifdef __APPLE__
+static_assert(MAX_CODE_SIZE == MaxCodeBufferSize);
+#endif
 
+#ifdef __APPLE__
+CodeBuffer::CodeBuffer(size_t Size, bool ShouldBeNamed, bool SimulateMapFailure)
+  : AllocatedSize(Size) {
+  if (SimulateMapFailure) {
+    errno = ENOMEM;
+    Ptr = static_cast<uint8_t*>(MAP_FAILED);
+  } else {
+    Ptr = static_cast<uint8_t*>(FEXCore::Allocator::VirtualAlloc(Size, true));
+  }
+#else
 CodeBuffer::CodeBuffer(size_t Size, bool ShouldBeNamed)
   : AllocatedSize(Size) {
   Ptr = static_cast<uint8_t*>(FEXCore::Allocator::VirtualAlloc(Size, true));
+#endif
+#ifdef __APPLE__
+  // mmap reports failure as MAP_FAILED, not null. A buffer that cannot be made is
+  // reported to SharedCodeBufferManager::AllocateNew, which decides whether that is fatal.
+  if (Ptr == MAP_FAILED || !Ptr) {
+    Ptr = nullptr;
+    Error = errno;
+    ErrorWhat = "allocate the executable (MAP_JIT) memory";
+    return;
+  }
+#endif
   LOGMAN_THROW_A_FMT(!!Ptr, "Couldn't allocate code buffer");
 
 #ifndef __APPLE__
@@ -43,7 +67,11 @@ CodeBuffer::CodeBuffer(size_t Size, bool ShouldBeNamed)
   // page, so it cannot be stepped over by any single store.
   void* const Guard = Ptr + Size - FEXCore::Utils::FEX_HOST_PAGE_SIZE;
   if (::mmap(Guard, FEXCore::Utils::FEX_HOST_PAGE_SIZE, PROT_NONE, MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS, -1, 0) != Guard) {
-    ERROR_AND_DIE_FMT("Couldn't place the guard page after the code buffer: {}", errno);
+    Error = errno;
+    ErrorWhat = "place the guard page after it";
+    FEXCore::Allocator::VirtualFree(Ptr, AllocatedSize);
+    Ptr = nullptr;
+    return;
   }
 #endif
 
@@ -61,6 +89,11 @@ CodeBuffer::CodeBuffer(size_t Size, bool ShouldBeNamed)
 }
 
 CodeBuffer::~CodeBuffer() {
+#ifdef __APPLE__
+  if (!Ptr) {
+    return;
+  }
+#endif
   FEXCore::Allocator::VirtualFree(Ptr, AllocatedSize);
 }
 
@@ -75,7 +108,10 @@ SharedCodeBufferManager::SharedCodeBufferManager() {
   NameJITBuffers = !(GlobalJITNaming || LibraryJITNaming || BlockJITNaming);
 }
 
-fextl::shared_ptr<CodeBuffer> SharedCodeBufferManager::AllocateNew(size_t Size) {
+fextl::shared_ptr<CodeBuffer> SharedCodeBufferManager::AllocateNew(size_t Size, bool AllowFailure) {
+#ifndef __APPLE__
+  (void)AllowFailure;
+#endif
 #ifndef _WIN32
   // MDWE (Memory-Deny-Write-Execute) is a new Linux 6.3 feature.
   // It's equivalent to systemd's `MemoryDenyWriteExecute` but implemented entirely in the kernel.
@@ -98,7 +134,23 @@ fextl::shared_ptr<CodeBuffer> SharedCodeBufferManager::AllocateNew(size_t Size) 
   }
 #endif
 
+#ifdef __APPLE__
+  const bool SimulateMapFailure = FailuresForTesting > 0;
+  if (SimulateMapFailure) {
+    --FailuresForTesting;
+  }
+  auto Buffer = fextl::make_shared<CodeBuffer>(Size, NameJITBuffers, SimulateMapFailure);
+  if (!Buffer->GetBufferBase()) {
+    if (AllowFailure) {
+      LogMan::Msg::EFmt("Couldn't make a {} MiB code buffer: couldn't {} (errno {})", Size / 1024 / 1024, Buffer->ErrorWhat, Buffer->Error);
+      return nullptr;
+    }
+    // Mid-translation there is no way back to the embedder: stop, saying why.
+    ERROR_AND_DIE_FMT("Couldn't make a {} MiB code buffer: couldn't {} (errno {})", Size / 1024 / 1024, Buffer->ErrorWhat, Buffer->Error);
+  }
+#else
   auto Buffer = fextl::make_shared<CodeBuffer>(Size, NameJITBuffers);
+#endif
 
   Latest = Buffer;
 
@@ -106,6 +158,12 @@ fextl::shared_ptr<CodeBuffer> SharedCodeBufferManager::AllocateNew(size_t Size) 
 
   return Buffer;
 }
+
+#ifdef __APPLE__
+bool SharedCodeBufferManager::TryAllocateFirst() {
+  return Latest || AllocateNew(INITIAL_CODE_SIZE, true);
+}
+#endif
 
 fextl::shared_ptr<CodeBuffer> SharedCodeBufferManager::GetLatest() {
   if (!Latest) {

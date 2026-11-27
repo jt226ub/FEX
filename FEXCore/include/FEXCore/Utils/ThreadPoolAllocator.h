@@ -8,14 +8,18 @@
 #include <FEXCore/fextl/list.h>
 
 #include <atomic>
+#ifdef __APPLE__
 #include <cerrno>
+#endif
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <mutex>
 #include <optional>
 #include <type_traits>
+#ifdef __APPLE__
 #include <unistd.h>
+#endif
 
 namespace FEXCore::Utils {
 /**
@@ -419,17 +423,17 @@ public:
     FreeAllBuffers();
   }
 
+#ifdef __APPLE__
 private:
-  // Historically this class carved its guard page out of the caller-provided Size (usable ==
-  // Size - one page), matching callers that pad their request by exactly one guest page
+  // Upstream carves the guard page out of the caller-provided Size (usable == Size - one
+  // page), matching callers that pad their request by exactly one guest page
   // (FEX_PAGE_SIZE, 4KB) for that purpose (see JIT.cpp's DesiredBufferRange comment). That
-  // breaks on a host whose real mprotect/page granularity is larger than 4KB (confirmed on
-  // Darwin/Apple Silicon: 16KB): a caller-padded Size can be smaller than one host page, so
-  // carving a host-page-sized guard off the end can consume the *entire* buffer, leaving zero
-  // usable bytes (verified empirically: the JIT wrote past this into unmapped memory and
-  // SIGBUS'd). Instead, always over-allocate to guarantee at least `Size` usable bytes plus a
-  // full separate host-page guard after them; TotalAllocSize() is shared by Alloc/Free so the
-  // real mmap'd extent used to unmap always matches what was actually mapped.
+  // breaks on Apple silicon, whose real mprotect granularity is 16KB: a caller-padded Size
+  // can be smaller than one host page, so carving a host-page-sized guard off the end can
+  // consume the *entire* buffer (verified: the JIT wrote past this into unmapped memory and
+  // SIGBUS'd). Instead, over-allocate to guarantee at least `Size` usable bytes plus a full
+  // separate host-page guard after them; TotalAllocSize() is shared by Alloc/Free so the
+  // extent unmapped always matches what was mapped.
   static size_t TotalAllocSize(size_t Size) {
     return GuardOffset(Size) + HostPageSize();
   }
@@ -465,6 +469,25 @@ private:
   void Free(void* Ptr, size_t Size) override {
     FEXCore::Allocator::VirtualFree(Ptr, TotalAllocSize(Size));
   }
+#else
+private:
+  void* Alloc(size_t Size) override {
+    auto Ptr = FEXCore::Allocator::VirtualAlloc(Size);
+    uintptr_t LastPageAddr = AlignDown(reinterpret_cast<uintptr_t>(Ptr) + Size - 1, FEXCore::Utils::FEX_PAGE_SIZE);
+    if (!FEXCore::Allocator::VirtualProtect(reinterpret_cast<void*>(LastPageAddr), FEXCore::Utils::FEX_PAGE_SIZE,
+                                            FEXCore::Allocator::ProtectOptions::None)) {
+      LogMan::Msg::EFmt("Failed to mprotect last page of code buffer.");
+    }
+    if (Name) {
+      FEXCore::Allocator::VirtualName(Name, Ptr, Size);
+    }
+    return Ptr;
+  }
+
+  void Free(void* Ptr, size_t Size) override {
+    FEXCore::Allocator::VirtualFree(Ptr, Size);
+  }
+#endif
 
   const char* Name {};
 };

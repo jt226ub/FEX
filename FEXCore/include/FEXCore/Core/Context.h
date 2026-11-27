@@ -215,6 +215,26 @@ public:
    * currently writes to. For tests.
    */
   FEX_DEFAULT_VISIBILITY virtual uintptr_t GetCodeBufferGuard(FEXCore::Core::InternalThreadState* Thread) const = 0;
+
+  /**
+   * @brief Makes the first code buffer if there is none yet. Returns false (with a
+   * logged reason) if it cannot be made; creating a thread then would stop the process.
+   * Call it before CreateThread, serialised with it.
+   */
+  FEX_DEFAULT_VISIBILITY virtual bool PrepareCodeBuffer() = 0;
+
+  /**
+   * @brief Tests: the next Count code buffer allocations fail.
+   */
+  FEX_DEFAULT_VISIBILITY virtual void FailCodeBufferAllocationsForTesting(int Count) = 0;
+
+  /**
+   * @brief Tests: the bytes used and usable in the code buffer the thread writes to, and
+   * setting the bytes used (16-byte aligned, at most the usable size).
+   */
+  FEX_DEFAULT_VISIBILITY virtual void
+  GetCodeBufferUse(FEXCore::Core::InternalThreadState* Thread, uint64_t* Used, uint64_t* Usable) const = 0;
+  FEX_DEFAULT_VISIBILITY virtual void SetCodeBufferUsedForTesting(FEXCore::Core::InternalThreadState* Thread, uint64_t Used) = 0;
 #endif
 
   /**

@@ -415,6 +415,13 @@ void CodeCache::Validate(const ExecutableFileSectionInfo& Section, fextl::set<ui
   }
 
   auto NewCodeBuffer = ValidationCTX->GetLatest();
+#ifdef __APPLE__
+  // No code buffer is larger: the loop below would replace buffers for ever.
+  if (CachedCode.size_bytes() > CPU::MaxCodeBufferSize - FEXCore::Utils::FEX_HOST_PAGE_SIZE) {
+    LogMan::Msg::EFmt("Cache validation: {} bytes of cached code is more than a code buffer takes; not validated", CachedCode.size_bytes());
+    return;
+  }
+#endif
   while (CachedCode.size_bytes() > NewCodeBuffer->UsableSize()) {
     ValidationCTX->ClearCodeCache(ValidationThread.get());
     NewCodeBuffer = ValidationCTX->GetLatest();

@@ -136,6 +136,8 @@ namespace CPU {
     // The guard page after each code buffer IsAddressInCodeBuffer checks.
     bool IsAddressInCodeBufferGuard(uintptr_t Address) const;
     uintptr_t GetCodeBufferGuard() const;
+    void GetCodeBufferUse(uint64_t* Used, uint64_t* Usable) const;
+    void SetCodeBufferUsedForTesting(uint64_t Used);
 #endif
 
     // Updates the CodeBuffer if needed and returns a reference to the old one.
