@@ -197,7 +197,6 @@ private:
   uint64_t ExecutableRangeBase {};
   uint64_t ExecutableRangeEnd {};
   bool ExecutableRangeWritable {};
-  bool ExecutableRangeFullSMCChecks {};
   bool HitNonExecutableRange {};
   bool HitBadRelocation {};
   uint32_t HitBreakpoint {~0U};

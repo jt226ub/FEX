@@ -21,10 +21,6 @@ struct ExecutableRangeInfo {
   uint64_t Base;
   uint64_t Size;
   bool Writable;
-  // macOS: blocks decoded from this range check their guest bytes before every
-  // instruction, as with SMCCHECKS full (the frontend's ForceFullSMCDetection). Lets an
-  // embedder choose full checks for some memory only. Unused elsewhere.
-  bool FullSMCChecks {false};
 };
 
 class SyscallHandler;

@@ -404,8 +404,6 @@ FEXCore::HLE::ExecutableRangeInfo SyscallHandler::QueryGuestExecutableRange(FEXC
     End += GuestMemory::GuestPage;
   }
   FEXCore::HLE::ExecutableRangeInfo Info {Begin, End - Begin, Writable};
-  // Default policy for registered memory: full checks (see fexmac_context_create).
-  Info.FullSMCChecks = !Context->SMCExplicit;
   return Info;
 }
 

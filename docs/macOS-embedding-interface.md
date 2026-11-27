@@ -168,7 +168,7 @@ hexadecimal; a leading 0 is refused rather than read as octal.
 | `MULTIBLOCK` | 0, 1 | |
 | `MAXINST` | 1 to 2^31-1 | instructions per block |
 | `TSOENABLED`, `VECTORTSOENABLED`, `MEMCPYSETTSOENABLED`, `HALFBARRIERTSOENABLED` | 0, 1 | x86 memory-ordering emulation (software; macOS has no hardware mode for ordinary processes) |
-| `SMCCHECKS` | `none`, `mtrack`, `full` (or 0, 1, 2) | `full` is fexmac's default (a check of the guest bytes in every instruction; the core's own default, mtrack, is not used). `mtrack` opts into write protection of translated pages once guest memory is registered (see "Self-modifying code"); `none` detects nothing and the embedder calls `fexmac_invalidate` |
+| `SMCCHECKS` | `none`, `mtrack`, `full` (or 0, 1, 2) | default `mtrack`: with no guest memory registered nothing is detected (the embedder calls `fexmac_invalidate`, as on `macos/v1`); with memory registered, translated pages are write-protected (see "Self-modifying code"). `full`: a check of the guest bytes before every instruction, everywhere. `none`: nothing |
 | `X87REDUCEDPRECISION`, `HIDEHYPERVISORBIT` | 0, 1 | |
 | `HOSTFEATURES` | `off`, or comma-separated `disable*` names the core knows | `enable*` names are refused: they force a feature on whether the host has it or not (`enablesve` dies with SIGILL on an M4) |
 | `SOFTWARERNG` | 0, 1 | RDRAND and RDSEED from `arc4random_buf`; no Apple chip so far has FEAT_RNG, so without it the guest CPUID offers neither |
@@ -650,17 +650,26 @@ leaves the dispatcher; `fexmac_thread_run` returns `FEXMAC_STOP_REQUESTED`.
 
 ## Self-modifying code
 
-**The default is `SMCCHECKS full`**: the translator checks the guest bytes of each
-instruction before running it. Write-protection detection (`mtrack`, below) is opt-in,
-because a write to translated code is re-run through the same path as a guest fault and
-inherits its limits ("Guest memory faults: what is exact"), and writes through an alias
-of the memory are not seen. The safe default costs: on loops of 3 to 8 instructions with
-memory accesses, 2 to 6 times the time of `none` (measured with the review's
-microbenchmarks, M4, machine loaded; the same with and without this package's core
-changes). `none` detects nothing (the embedder calls `fexmac_invalidate`).
+**Defaults (no `SMCCHECKS` option):** the core's default, `mtrack`.
 
-With `mtrack` explicitly chosen and registered memory:
+- **No guest memory registered:** nothing is detected, exactly as on `macos/v1` before
+  this package: `mtrack` without memory tracking has nothing to protect, and the embedder
+  calls `fexmac_invalidate` after changing code.
+- **Memory registered (`fexmac_memory_map`):** write protection of translated pages
+  (below). A code write is re-run through the guest-fault path, which is exact for every
+  form the differential harness covers on the write-protection path
+  (`fault_diff_known.txt` has no write-protection entries left); before items 2 and 3 of
+  the package D review were fixed the default for registered memory was `full`, as an
+  interim. Host writes to such pages must be bracketed with
+  `fexmac_memory_write_begin`/`_end`. Not seen: writes through another mapping of the
+  memory (aliases, below) and writes to host pages registered with
+  `FEXMAC_PROT_ALLOW_UNENFORCED` mixed protections ("Granularity").
+- `SMCCHECKS full` (an option): the translator checks the guest bytes of each block
+  before every instruction, everywhere, aliases included; on loops of 3 to 8 instructions
+  with memory accesses it costs 2 to 6 times the time of `none` (the review's
+  microbenchmarks, M4). `none` detects nothing.
 
+With registered memory under `mtrack`:
 
 1. When the core translates code from a 4K guest page (`MarkGuestExecutableRange`, called
    with the core's invalidation lock held shared), the library removes write access from

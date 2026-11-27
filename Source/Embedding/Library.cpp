@@ -582,19 +582,12 @@ fexmac_result fexmac_context_create(const fexmac_config* config, fexmac_context*
     delete Context;
     return Fail(FEXMAC_ERROR_OUT_OF_MEMORY, true);
   }
-  // Self-modifying-code policy. Only an explicit SMCCHECKS mtrack switches on write
-  // protection of translated pages. Without the option the core keeps its own default
-  // (mtrack), which with no memory registered detects nothing, as on macos/v1 before
-  // package D (the embedder calls fexmac_invalidate); once memory is registered, code
-  // translated from it gets the full per-instruction check (QueryGuestExecutableRange).
-  Context->SMCExplicit = false;
-  for (size_t i = 0; i < config->option_count; ++i) {
-    const char* Name = config->options[i].name;
-    if (Name && (strcmp(Name, "SMCCHECKS") == 0 || strcmp(Name, "SMCChecks") == 0)) {
-      Context->SMCExplicit = true;
-    }
-  }
-  Context->WriteProtectCode = Context->SMCExplicit && FEXCore::Config::Get_SMCCHECKS() == FEXCore::Config::CONFIG_SMC_MTRACK;
+  // Self-modifying-code policy. Without the option the core keeps its own default,
+  // mtrack: with no memory registered that detects nothing, as on macos/v1 before
+  // package D (the embedder calls fexmac_invalidate); once memory is registered,
+  // translated pages of it are write-protected (mtrack). SMCCHECKS full or none
+  // explicitly chooses the core's per-instruction check or nothing.
+  Context->WriteProtectCode = FEXCore::Config::Get_SMCCHECKS() == FEXCore::Config::CONFIG_SMC_MTRACK;
   Context->SyscallFn = config->syscall;
   Context->SyscallUserData = config->syscall_user_data;
   Context->CacheRequested = config->code_cache_enabled != 0;

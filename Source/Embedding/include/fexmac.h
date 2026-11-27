@@ -450,18 +450,21 @@ FEXMAC_EXPORT fexmac_result fexmac_thread_request_stop(fexmac_thread* thread);
  *  - Instruction fetch: the translator only reads code from pages registered as
  *    executable. A jump to anything else stops with a page fault (access EXECUTE) at
  *    that address, instead of the translator crashing on unmapped memory.
- *  - Self-modifying code. DEFAULTS (no SMCCHECKS option given): with no memory
- *    registered, nothing is detected and the embedder calls fexmac_invalidate after
- *    changing code (the behaviour before guest memory registration existed); with memory
- *    registered, code translated from registered memory checks its guest bytes before
- *    every instruction (as SMCCHECKS full), which is correct but slower. SMCCHECKS full:
- *    that check everywhere. SMCCHECKS none: no detection anywhere. SMCCHECKS mtrack
- *    (opt-in): write protection of translated pages of registered memory: when code on
- *    a writable page is translated, the library removes host write access from that page;
- *    a guest write to it faults, the library discards the translations of that host page
- *    for every thread, gives write access back and lets the write happen. Writes through
- *    another mapping of the same memory are not seen (the embedder that made the alias
- *    calls fexmac_invalidate for it).
+ *  - Self-modifying code. DEFAULTS (no SMCCHECKS option given; the core's default,
+ *    mtrack): with no memory registered, nothing is detected and the embedder calls
+ *    fexmac_invalidate after changing code (the behaviour before guest memory
+ *    registration existed); with memory registered, write protection of translated
+ *    pages: when code on a writable page of registered memory is translated, the library
+ *    removes host write access from that 16K host page; a guest write to it faults, the
+ *    library discards the translations of that host page for every thread, gives write
+ *    access back and lets the write happen (exact at the faulting instruction, see "Guest
+ *    memory faults"). Host writes to such pages must be bracketed (see "Writes by the
+ *    embedder" below). NOT seen: writes through another mapping of the same memory (the
+ *    embedder that made the alias calls fexmac_invalidate for it) and writes to host
+ *    pages registered with FEXMAC_PROT_ALLOW_UNENFORCED mixed protections (see
+ *    "Granularity"). SMCCHECKS full (an option): the core checks the guest bytes of the
+ *    current block before every instruction, everywhere; correct for aliases too, 2 to 6
+ *    times slower on tight loops. SMCCHECKS none: no detection anywhere.
  *
  * Until the first fexmac_memory_map the library knows nothing about guest memory and
  * behaves as before: every address is executable, nothing is write-protected, and an

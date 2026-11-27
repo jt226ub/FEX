@@ -11,6 +11,7 @@
 #include <fcntl.h>
 #include <inttypes.h>
 #include <pthread.h>
+#include <sched.h>
 #include <signal.h>
 #include <stdatomic.h>
 #include <stdio.h>
@@ -1629,8 +1630,8 @@ static void TestSMCAliasNeedsInvalidate(void) {
 
 /* The self-modifying-code defaults (no SMCCHECKS option): with no memory registered the
  * patch in SelfPatch's block is not seen (eax -1: the stale instruction ran), as before
- * guest memory registration existed; with the code registered it is (eax 32), by the
- * per-instruction check, not by write protection (no code write handled). */
+ * guest memory registration existed; with the code registered it is (eax 32), by write
+ * protection (a code write handled). */
 static void TestSMCDefaultPolicy(void) {
   fexmac_install_fault_handlers();
   for (int Registered = 0; Registered < 2; ++Registered) {
@@ -1640,9 +1641,9 @@ static void TestSMCDefaultPolicy(void) {
     const fexmac_stop Stop = Run(Thread);
     const fexmac_x86_state State = GetState(Thread);
     if (Registered) {
-      Check(Stop.reason == FEXMAC_STOP_HALT && State.gpr[RAX] == 32 && fexmac_memory_code_write_count(Context) == 0,
-            "registered memory, default: the write is seen by the full check (eax 0x%" PRIx64 ", %" PRIu64 " code writes)", State.gpr[RAX],
-            fexmac_memory_code_write_count(Context));
+      Check(Stop.reason == FEXMAC_STOP_HALT && State.gpr[RAX] == 32 && fexmac_memory_code_write_count(Context) >= 1,
+            "registered memory, default: the write is seen by write protection (eax 0x%" PRIx64 ", %" PRIu64 " code writes)",
+            State.gpr[RAX], fexmac_memory_code_write_count(Context));
     } else {
       Check(Stop.reason == FEXMAC_STOP_HALT && (State.gpr[RAX] & 0xFFFFFFFF) == 0xFFFFFFFF,
             "nothing registered, default: nothing detected, as before (eax 0x%" PRIx64 ")", State.gpr[RAX]);
@@ -1669,8 +1670,9 @@ struct RepRun {
 static void* RequestEvery100us(void* Argument) {
   fexmac_thread* T = Argument;
   while (!atomic_load(&StormDone)) {
-    usleep(100);
+    /* Continuously: a chunked 32 MB copy takes only milliseconds. */
     fexmac_thread_request_stop(T);
+    sched_yield();
   }
   return NULL;
 }
