@@ -1,5 +1,10 @@
 // SPDX-License-Identifier: MIT
 //
+// SUPERSEDED by the fexmac library (Source/Embedding, fexmac.h), which owns this duty now.
+// No tool on this branch uses this header. It is kept only so that tools on branches
+// written before the library existed still build when merged; port them to fexmac.h
+// and delete this file.
+//
 // Host fault handling for programs that embed the translator core on macOS.
 //
 // The core does not install signal handlers itself; whatever embeds it must catch the
@@ -17,8 +22,6 @@
 //    is how it learns the buffer was too small: the embedder must resume the thread at
 //    the translator's restart point, which then retries with a larger buffer. macOS
 //    reports the write as SIGBUS (or SIGSEGV for an unmapped address).
-// Any other fault is reported on stdout with its address and program counter, then
-// allowed to crash the process as usual.
 #pragma once
 
 #if defined(__APPLE__) && defined(__aarch64__)
@@ -31,46 +34,12 @@
 
 #include <signal.h>
 #include <sys/ucontext.h>
-#include <unistd.h>
 
 namespace FEX::MacOSHostFaults {
 
 inline thread_local FEXCore::Core::InternalThreadState* CurrentThread {};
 inline struct sigaction PreviousBusAction {};
 inline struct sigaction PreviousSegvAction {};
-
-// Writes "Unhandled host fault: signal N at 0x... (pc 0x...)" to stdout. Only write(2)
-// is used: this runs inside a signal handler, where formatted printing is unsafe.
-inline void ReportUnhandled(int Signal, uint64_t Address, uint64_t PC) {
-  char Buffer[96];
-  size_t Length = 0;
-  auto Append = [&](const char* Text) {
-    while (*Text && Length < sizeof(Buffer)) {
-      Buffer[Length++] = *Text++;
-    }
-  };
-  auto AppendHex = [&](uint64_t Value) {
-    Append("0x");
-    for (int Shift = 60; Shift >= 0; Shift -= 4) {
-      if (Length < sizeof(Buffer)) {
-        Buffer[Length++] = "0123456789abcdef"[(Value >> Shift) & 0xF];
-      }
-    }
-  };
-  Append("Unhandled host fault: signal ");
-  if (Signal >= 10 && Length < sizeof(Buffer)) {
-    Buffer[Length++] = static_cast<char>('0' + Signal / 10);
-  }
-  if (Length < sizeof(Buffer)) {
-    Buffer[Length++] = static_cast<char>('0' + Signal % 10);
-  }
-  Append(" at ");
-  AppendHex(Address);
-  Append(" (pc ");
-  AppendHex(PC);
-  Append(")\n");
-  (void)!write(STDOUT_FILENO, Buffer, Length);
-}
 
 inline void FaultHandler(int Signal, siginfo_t* Info, void* RawContext) {
   auto* Context = static_cast<ucontext_t*>(RawContext);
@@ -100,7 +69,12 @@ inline void FaultHandler(int Signal, siginfo_t* Info, void* RawContext) {
     }
   }
 
-  if (Thread && Signal == SIGBUS && Info->si_code == BUS_ADRALN && Thread->CTX->IsAddressInCodeBuffer(Thread, PC)) {
+  // macOS reports a protection fault as SIGBUS with si_code BUS_ADRALN too, so only the
+  // data abort's fault status code (ESR DFSC 0x21) identifies an alignment fault. See
+  // Source/Embedding/Faults.cpp.
+  const uint32_t ESR = Context->uc_mcontext->__es.__esr;
+  const bool AlignmentFault = ((ESR >> 26) == 0x24 || (ESR >> 26) == 0x25) && (ESR & 0x3F) == 0x21;
+  if (Thread && Signal == SIGBUS && AlignmentFault && Thread->CTX->IsAddressInCodeBuffer(Thread, PC)) {
     const auto Result = FEXCore::ArchHelpers::Arm64::HandleUnalignedAccess(
       Thread, FEXCore::ArchHelpers::Arm64::UnalignedHandlerType::HalfBarrier, PC, &State.__x[0]);
     if (Result.has_value()) {
@@ -109,10 +83,8 @@ inline void FaultHandler(int Signal, siginfo_t* Info, void* RawContext) {
     }
   }
 
-  // Not ours: say where it happened, so a crashing test names the address it reached
-  // (for example a guest address cut to 32 bits), then put the previous behaviour back
-  // and return, so the fault happens again and is reported normally.
-  ReportUnhandled(Signal, reinterpret_cast<uint64_t>(Info->si_addr), PC);
+  // Not ours: put the previous behaviour back and return, so the fault happens again
+  // and is reported normally.
   sigaction(Signal, Signal == SIGBUS ? &PreviousBusAction : &PreviousSegvAction, nullptr);
 }
 

@@ -6,10 +6,13 @@
 # places the test's code at 0x100_0001_0000 instead of 0x1_0000. Guest addresses are host
 # addresses, so nothing can be mapped where an address cut to 32 bits lands.
 #
-# Every entry below was checked on an M4 by running it: the runner prints the faulting
-# address ("Unhandled host fault: ... at 0x..."), and each address is the moved address
-# cut to 32 bits, exactly as stated. None is a translator fault. results.tsv repeats the
-# reason next to each failure.
+# Every entry below was checked on an M4 by running it, and each faulting address is the
+# moved address cut to 32 bits, exactly as stated. None is a translator fault. For a guest
+# memory access the fexmac library prints the address ("fexmac: SIGSEGV: guest memory
+# access fault in translated code at address 0x..."), and results.tsv carries that line
+# with the reason below. The far jumps fault in host code instead (the translator reading
+# the guest instructions at the bad target), where the library prints nothing; their
+# address was read with a diagnostic fault handler during the check.
 
 # A 32-bit address-size override (0x67) cuts the address to 32 bits; the result is below
 # 4GB and cannot be mapped. Faults seen: a32_lods and a32_rep_lods at 0x80000 (RSI

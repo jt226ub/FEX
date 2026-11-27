@@ -17,14 +17,14 @@ bad=0
 dylibs=()
 while IFS= read -r f; do
   dylibs+=("$f")
-done < <(find "$build" -name 'libFEXCore*.dylib' -type f)
+done < <(find "$build" \( -name 'libFEXCore*.dylib' -o -name 'libfexmac.dylib' \) -type f)
 if [ "${#dylibs[@]}" -eq 0 ]; then
   echo "no libFEXCore dylib found under $build"
   bad=1
 fi
-files=(${dylibs[@]+"${dylibs[@]}"} "$build/Bin/FEXCoreSmokeTest" "$build/Bin/FEXCoreThreadTest" "$build/Bin/FEXCoreASMTestRunner")
+files=(${dylibs[@]+"${dylibs[@]}"} "$build/Bin/FEXCoreSmokeTest" "$build/Bin/FEXCoreThreadTest" "$build/Bin/FEXCoreASMTestRunner" "$build/Bin/FEXCoreOrderingTest" "$build/Bin/FEXCoreMutexWakeTest" "$build/Bin/fexmac_c_test" "$build/Bin/fexmac_hook_test")
 
-allowed='^[[:space:]]*(/usr/lib/libSystem\.B\.dylib|/usr/lib/libc\+\+\.1\.dylib|@rpath/libFEXCore\.dylib) '
+allowed='^[[:space:]]*(/usr/lib/libSystem\.B\.dylib|/usr/lib/libc\+\+\.1\.dylib|@rpath/libFEXCore\.dylib|@rpath/libfexmac\.dylib) '
 for f in "${files[@]}"; do
   [ -n "$f" ] || continue
   echo "--- $f"

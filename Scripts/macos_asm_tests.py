@@ -254,9 +254,15 @@ def run_one(runner, name, mode, binary, config, timeout):
         return "pass", ""
     if result.returncode == SKIP_CODE:
         return "skip", result.stdout.strip().splitlines()[-1][:160] if result.stdout.strip() else ""
-    tail = (result.stdout + result.stderr).strip().splitlines()[-6:]
+    lines = (result.stdout + result.stderr).strip().splitlines()
+    tail = lines[-6:]
     status = "crash(signal %d)" % -result.returncode if result.returncode < 0 else "fail"
-    return status, " | ".join(line[:160] for line in tail)
+    # For a crash, lead with what the fexmac library said about the fault (a guest memory
+    # access in translated code names its address), so the reason is in results.tsv.
+    library = [line for line in lines if line.startswith("fexmac:")]
+    if status.startswith("crash"):
+        tail = library[-1:] + [line for line in tail if line not in library[-1:]]
+    return status, " | ".join(line[:200] for line in tail)
 
 
 def main():

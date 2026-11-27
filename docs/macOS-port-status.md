@@ -29,6 +29,9 @@ Related documents:
   it; the branch without the runtime fixes dies at its first write to code memory.
   GitHub's hosted Mac is a virtual machine that does not enforce it.
 - **Runs eight guest threads at once** with correct, separate results.
+- **Keeps x86 memory ordering between threads** with the emulation on: multi-thread litmus
+  tests see no forbidden outcome in 100 million tries each, and see them by the million
+  with it off (physical Mac).
 - **Linux is unaffected.** The core-only Linux build passes with the same changes.
 
 Only the translator core is built on macOS. FEX's Linux process loader, syscall emulation,
@@ -74,15 +77,35 @@ Fixed in code on `macos/runtime-fixes`:
 
 Added for embedders (the core expects these from whatever hosts it):
 
-- `Source/Tools/CommonTools/MacOSHostFaults.h`: catches the alignment fault ARM64 raises
-  for a misaligned atomic operation and hands it to the core (53 instruction tests depend
-  on it), and restarts translation when the translator's scratch buffer fills.
-- The test runner implements the callback that discards stale translations when guest
-  code changes, holding the core's invalidation lock. The self-modifying-code tests
-  looped forever until it did both.
-- `Source/Tools/CommonTools/CoreThreadSetup.h`: allocates the per-thread call and return
-  stack and a full descriptor table. Every guest `call` and `ret` depends on the first.
-- `docs/macOS-embedding-interface.md` lists every such duty found so far.
+- **`fexmac`, a C embedding interface** (`Source/Embedding/`, header `fexmac.h`), built
+  as a static library, as a standalone prelinked archive that needs only `libSystem` and
+  `libc++` (`build/Lib/libfexmac_bundle.a`) and as a dylib. It owns context creation and
+  option checking, per-thread setup (call and return stack, descriptor tables, allocator
+  per-thread initialisation), guest state, running guest code, system calls, the host
+  fault handlers and stale-translation invalidation. All three test tools use it; the
+  smoke and thread tests use nothing else. `docs/macOS-embedding-interface.md` describes
+  it, the signal-handler contract and what the instruction-test runner still takes from
+  the core for harness work.
+- The fault handlers tell faults apart by the data abort's fault status code
+  (ESR_EL1.DFSC, which macOS passes in the signal context), because macOS reports a
+  protection fault and an alignment fault alike as SIGBUS with si_code 1. They hand
+  alignment faults in translated code to the core (53 instruction tests depend on it),
+  restart translation when the translator's scratch buffer fills, and reset the
+  call/return stack pointer when deep recursion or unmatched calls and returns run into
+  its guard pages. A guest access to a protected page is passed on, never claimed (it
+  used to be sent to the misaligned-access rewrite and loop). They can be installed by
+  the library (chaining to handlers installed before, honouring their mask and flags) or
+  called from the host's own handlers. They are installed with `SA_NODEFER`, so a fault
+  inside the handler crashes the process instead of hanging it (a reproducer hangs
+  without it on the M4).
+- Invalidation discards stale translations when guest code changes, holding the core's
+  invalidation lock, for every thread of the context. The self-modifying-code tests
+  looped forever until the runner did this. With many threads invalidating at once it
+  hung until package E's reader-writer lock fix; `fexmac_c_test invalidate-concurrent`
+  now passes.
+- `Source/Tools/CommonTools/MacOSHostFaults.h` and `CoreThreadSetup.h`, the previous
+  per-tool versions, are used only by `FEXCoreOrderingTest` (package E) and kept until it
+  is ported; `MacOSHostFaults.h` got the same fault-status check.
 
 Checked and found not to need a change:
 
@@ -127,6 +150,11 @@ with `JITWriteProbe`:
   stale code, which shows the test can detect it. Single thread, one address.
 - **Reading `ctr_el0`, `midr_el1` or `id_aa64isar0_el1` from user space faults**
   (SIGILL); the port uses `sysctl` for all of them. **`dc cvau` is allowed.**
+- **A protection fault and an alignment fault both arrive as SIGBUS with si_code 1**
+  (`BUS_ADRALN`); a sent SIGSEGV arrives with si_code 2 and a sent SIGBUS with 1. The
+  syndrome in the signal context tells them apart: DFSC 0x21 is an alignment fault,
+  0x04 to 0x0F a translation or permission fault, and a signal the thread sent itself
+  carries the SVC exception class. `JITWriteProbe --expect-enforced` asserts the cases.
 - Misaligned atomic loads fault only when they cross a 16-byte boundary: an 8-byte
   `ldar` at offset 4 of a 16-byte-aligned buffer runs, at offset 12 it raises SIGBUS.
 - GitHub's hosted Mac reports `pthread_jit_write_protect_supported_np` as 0 and lets a
@@ -134,13 +162,73 @@ with `JITWriteProbe`:
 
 Still unproven or open:
 
-1. **Memory-ordering emulation between threads.** The instruction tests pass with it
-   switched on, but they are single-threaded, so they show the code paths work, not that
-   ordering is preserved between threads.
-2. **The interrupt fault page and guest signals.** Not exercised.
-3. **Self-modifying code detected by write-protecting pages.** Only the
+1. **The interrupt fault page and guest signals.** Not exercised.
+2. **Self-modifying code detected by write-protecting pages.** Only the
    check-on-every-block kind is exercised.
-4. **Speed.** Nothing has been measured.
+3. **Speed.** Nothing has been measured.
+
+## x86 memory ordering between threads
+
+`FEXCoreOrderingTest` runs litmus tests: two guest threads (hand-assembled x86-64) make a
+few accesses to shared memory, many times over, meeting at a barrier in guest code before
+each try and waiting a small random time after it. Four such pairs run at once on the
+same translated code; each run copies the code to a fresh address so it is translated
+again. Outcomes are counted. Pinning threads to cores is not possible on macOS; the
+threads ask for the user-interactive quality of service and the tool relies on numbers.
+
+Results on the Mac mini (M4), hardened runtime, `--soak` (100 million tries per test):
+
+| Test | What it checks | Forbidden by x86, emulation off | Emulation on |
+|---|---|---|---|
+| SB | store buffering; allowed by x86, shows the threads race | relaxed outcome 27.8M | relaxed outcome 0.58M (allowed) |
+| MP, MP+spin | message passing, plain 64-bit moves | 14.3M, 0.52M | 0 |
+| S | store then store against load then store | 185,129 | 0 |
+| 2+2W | two threads each storing twice | 271,950 | 0 |
+| LB | load buffering | 0 | 0 |
+| MP-sse, MP-sse2 | 16-byte `movdqu` data, scalar or `movdqu` flag | 14.0M, 14.3M | 0 |
+| MP-movsb, MP-stosq, MP-movsb-read | data written or read by `rep movsb` / `rep stosq` | 18.6M, 15.2M, 8.6M | 0 |
+| MP-flag-stosq, MP-flag-movsb | flag written or read by a string instruction | 13.2M, 8.0M | 0 |
+| MP-split16, MP-splitline | misaligned data and flag across 16 bytes, across a 128-byte line | 13.4M, 21.2M | 0 |
+| MP-split4K | data across a 4K guest page, flag across a 16K host page | 21.2M | 0 |
+| MP-split16K | data across a 16K host page | 24 | 0 |
+
+So x86 ordering holds between threads with emulation on, and the same harness sees it
+broken with emulation off: Apple M-series cores reorder loads with loads and stores with
+stores. LB is never seen (the cores do not let a store pass an older load), and a load that
+crosses a 16K page almost never completes out of order, so `--expect weak` does not
+require those two. With emulation on, the misaligned tests take 6 to 9 alignment faults
+per run where 4 instructions are patched, so several threads fault on the same
+instruction at once and the back-patching under the block's spin lock is exercised
+concurrently.
+
+`--tso scalar` switches on only the general setting, as upstream's defaults do (vector
+and string-instruction ordering off). Then MP-sse2 (vector flag) and MP-flag-movsb (flag
+read by `rep movsb`) still break; the other tests hold because the release store or
+acquire load of the scalar access next to them orders them.
+
+The default run (`FEXCoreOrderingTest`, emulation on, 3.2 million tries per test) takes
+about 4 seconds; `--tso off` checks the weak side the same way. Both run in the Mac job.
+The hosted Mac is a virtual machine on Apple silicon with three processors: the ordering
+check with emulation on is meaningful there (one pair at a time), but whether the weak
+outcomes appear with emulation off depends on the host, so that run only warns. Only a
+physical Mac has shown the table above.
+
+Found by it and fixed:
+
+- **Lost wake-up in the core's reader-writer lock** (`WritePriorityMutex`, used for the
+  code invalidation lock). On macOS readers and writers wait on the same word with
+  `os_sync_wait_on_address`, which, unlike Linux futex bitsets, cannot wake only writers.
+  A writer's hand-off woke one waiter, which could be a reader; the reader went back to
+  sleep and the writer never woke. Threads that started translating together hung about
+  once in 300 to 1,500 runs of eight threads. A writer hand-off now wakes all waiters.
+  `FEXCoreMutexWakeTest` reproduces the hang deterministically (a reader and then a
+  writer queue behind a writer); 20,000 eight-thread starts ran clean after the fix.
+
+Not found, but noted: when the core back-patches a misaligned release store, it writes the
+barrier into the instruction slot before it and then the plain store. A thread that ran
+the old slot just before the patch and fetches the new store just after would make one
+store without its barrier, once. The window is a few instructions wide, once per patched
+instruction, and was not observed; it is upstream's design.
 
 ## Not implemented, by decision or for lack of a macOS method
 
@@ -170,6 +258,10 @@ All of these run in the Mac job on every push to a `macos/**` branch.
 | `FEXCoreSmokeTest` | Translates and runs a 23-byte loop, as built and under the hardened runtime | pass, both | pass, both |
 | `FEXCoreThreadTest` | Eight host threads share a context, each summing a different count in a long guest loop | pass | pass, both |
 | `FEXCoreASMTestRunner` with `Scripts/macos_asm_tests.py` | Upstream's 2,292 assembly instruction tests, in four modes | 2,253 pass in each mode (before the upstream sync added one test) | 2,264 pass in each mode, both |
+| `FEXCoreOrderingTest` | Multi-thread x86 memory-ordering litmus tests, emulation on (must hold) and off (must break); see above | not yet run | pass, both; off: all required weak outcomes seen |
+| `FEXCoreMutexWakeTest` | The core's reader-writer lock never loses a wake-up | not yet run | pass |
+| `fexmac_c_test` | A C program using only `fexmac.h`, linked as an outside project would be: 27 subtests covering system calls (prefixed, restarted), stops, state, guest faults, invalidation (also from 8 threads at once), misaligned atomics with each signal-handler arrangement, call/return stack overflow and underflow, guest accesses to protected pages, chained handlers and sent signals, lifetime races and error paths | not yet run | pass, both |
+| `fexmac_hook_test` | The same library built with test hooks: a fault inside the handler crashes with a message instead of hanging, the log callback is never called from a signal handler, a failed create leaves no log hook, invalidation leaves fault signals unblocked | not yet run | pass, both |
 | `JITWriteProbe` | Reports how the machine treats executable memory, including writes and switches from a fault handler and instruction-cache flushing | report only | see the facts above |
 | `JITWriteProbe --expect-enforced` | The same, but exits 1 unless every asserted case gives the result the port relies on with write protection enforced, or if a fault-handler case's handler never ran | not run: the hosted Mac does not enforce, so it would fail | pass, as built and hardened |
 | `Scripts/macos_check_linkage.sh` | Fails if the core or a test tool links anything but `libSystem` and `libc++`, if one of them is missing, or if the bundled `fmt` was not compiled. Homebrew's `fmt` is installed first. `otool` shows only that no fmt dylib is linked; the `build.ninja` check covers a static one | not yet run (added after the last hosted run) | pass, both toolchains |
@@ -192,13 +284,15 @@ Before package B the counts were pass 2,255, runner skips 8, low-memory skips 5 
 18 expected failures (crash 12, fail 5, timeout 1). Nine tests now pass:
 `FEX_bugs/cmpxchg8b`, `FEX_bugs/cmpxchg16b`, `TwoByte/0F_8B_16`, `FEX_bugs/o16_leave`,
 `FEX_bugs/SIBScaleTranspose` (the move of the tests' memory had broken their expected
-values, now moved too), `TwoByte/0F_02` (the runner's system call handler did not step
-past `syscall`), `Secondary/09_XX_06` and `09_XX_07` (RDRAND and RDSEED, through FEX's
+values, now moved too), `TwoByte/0F_02` (the runner had no answer for a system call; it now
+returns -ENOSYS through the fexmac system call callback and resumes), `Secondary/09_XX_06` and `09_XX_07` (RDRAND and RDSEED, through FEX's
 software generator) and `Primary/Primary_CF` (a `mov esp, <address>` is now written as
 `mov rsp`). None of the remaining failures is a translator or port fault.
 
-**Every test that does not pass, and why** (checked by running each one on the M4; the
-runner prints the faulting address of a crash, and results.tsv carries it):
+**Every test that does not pass, and why** (checked by running each one on the M4; for a
+guest memory access fault the fexmac library prints the address, and results.tsv carries
+that line; the far jumps and `32bit_syscall` fault in host code, where it prints nothing,
+and their addresses were read with a diagnostic handler during the check):
 
 - *Expected failures, 12, all crashes, in every mode.* Eleven take an address cut to
   32 bits, which lands below 4GB where macOS maps nothing:
@@ -235,7 +329,7 @@ sysctls and the CPUID the translator gives the guest. On the M4 it is right: no 
 AVX is translated as two 128-bit halves; the AVX tests run), FEAT_AFP, BF16, SHA3 and
 SHA512 present, and no FEAT_RNG (the M4 has no such sysctl and `mrs RNDR` raises SIGILL),
 so RDRAND and RDSEED are offered to the guest only with `FEX_SOFTWARERNG=1`, which the test
-script sets on macOS. x87 80-bit arithmetic is emulated in software and needs no host
+script sets on macOS (fexmac accepts `SOFTWARERNG` as a 0/1 option). x87 80-bit arithmetic is emulated in software and needs no host
 feature; the x87 tests run and pass.
 
 **How the script moves addresses.** Besides moving every constant that names a mapped

@@ -7,42 +7,39 @@
 // it maps the test's memory, runs the guest code until it halts, and compares the final
 // register state with the values the test file declares.
 //
+// Thread setup, running guest code, fault handling and invalidation go through the
+// fexmac interface (fexmac.h). What still uses the core's C++ headers is harness work
+// only: reading the test files and comparing registers (HarnessHelpers.h, which is laid
+// out on the core's CPUState), and the host-feature checks that decide whether a test
+// can run here (Common/HostFeatures.h, Common/X86Features.h).
+//
 // Usage: FEXCoreASMTestRunner <test.bin> <test.config.bin>
 // Exit code: 0 pass, 1 fail, 125 skipped (the test needs something this host lacks).
 
-#include "Common/Config.h"
 #include "Common/HostFeatures.h"
 #include "Common/X86Features.h"
-#include "CoreThreadSetup.h"
-#include "DummyHandlers.h"
 #include "HarnessHelpers.h"
-#include "MacOSHostFaults.h"
 
-#include <FEXCore/Config/Config.h>
-#include <FEXCore/Core/Context.h>
+#include <fexmac.h>
+
 #include <FEXCore/Core/CoreState.h>
 #include <FEXCore/Core/HostFeatures.h>
-#include <FEXCore/Core/X86Enums.h>
-#include <FEXCore/Debug/InternalThreadState.h>
-#include <FEXCore/HLE/SyscallHandler.h>
 #include <FEXCore/Utils/LogManager.h>
-#include <FEXCore/Utils/SignalScopeGuards.h>
 #include <FEXCore/fextl/fmt.h>
-#include <FEXCore/fextl/memory.h>
 #include <FEXCore/fextl/string.h>
-#include <FEXCore/fextl/unordered_map.h>
 #include <FEXCore/fextl/vector.h>
 #include <FEXHeaderUtils/Filesystem.h>
 
-#include <csetjmp>
+#include <cerrno>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
-#include <optional>
 #include <set>
-#include <cerrno>
+#include <string>
+#include <string_view>
 #include <sys/mman.h>
 #include <unistd.h>
+#include <vector>
 
 #ifdef __APPLE__
 #include <mach/mach.h>
@@ -54,112 +51,45 @@ constexpr int ExitPass = 0;
 constexpr int ExitFail = 1;
 constexpr int ExitSkip = 125;
 
-void MsgHandler(LogMan::DebugLevels Level, const char* Message) {
+void LogHandler(fexmac_log_level Level, const char* Message, void*) {
+  if (Level == FEXMAC_LOG_ASSERT) {
+    fextl::fmt::print("A {}\n", Message);
+    fflush(nullptr);
+    return;
+  }
   fextl::fmt::print("{} {}\n", LogMan::DebugLevelStr(Level), Message);
 }
 
-void AssertHandler(const char* Message) {
-  fextl::fmt::print("A {}\n", Message);
-  fflush(nullptr);
-}
-
-const fextl::vector<std::pair<const char*, FEXCore::Config::ConfigOption>> EnvConfigLookup = {{
-#define OPT_BASE(type, group, enum, json, default) {"FEX_" #enum, FEXCore::Config::ConfigOption::CONFIG_##enum},
-#include <FEXCore/Config/ConfigValues.inl>
-}};
-
-// Applies the options a test file asks for, as if they were environment variables.
-class TestEnvLoader final : public FEXCore::Config::Layer {
+// Options for the core, as fexmac takes them: the test file's own options first, then
+// FEX_* environment variables, which override them (the order of the core's
+// configuration layers that upstream's runner relies on). Names the core does not know
+// are ignored, as the core's own loaders ignore them.
+class OptionList {
 public:
-  explicit TestEnvLoader(fextl::vector<std::pair<std::string_view, std::string_view>> _Env)
-    : FEXCore::Config::Layer(FEXCore::Config::LayerType::LAYER_LOCAL_APP)
-    , Env {std::move(_Env)} {
-    Load();
+  void Add(std::string_view Key, std::string_view Value) {
+    if (!Key.starts_with("FEX_")) {
+      return;
+    }
+    std::string Name {Key.substr(4)};
+    if (!fexmac_option_known(Name.c_str())) {
+      return;
+    }
+    Names.emplace_back(std::move(Name));
+    Values.emplace_back(Value);
   }
 
-  void Load() override {
-    fextl::unordered_map<std::string_view, std::string> EnvMap;
-    for (auto& Option : Env) {
-      std::string_view Key = Option.first;
-      std::string_view Value_View = Option.second;
-      std::optional<fextl::string> Value;
-#define ENVLOADER
-#include <FEXCore/Config/ConfigOptions.inl>
-      if (Value) {
-        EnvMap.insert_or_assign(Key, *Value);
-      } else {
-        EnvMap.insert_or_assign(Key, Value_View);
-      }
+  std::vector<fexmac_option> Get() const {
+    std::vector<fexmac_option> Options;
+    for (size_t i = 0; i < Names.size(); ++i) {
+      Options.push_back({Names[i].c_str(), Values[i].c_str()});
     }
-
-    auto GetVar = [&](const std::string_view id) -> std::optional<std::string_view> {
-      const auto it = EnvMap.find(id);
-      if (it == EnvMap.end()) {
-        return std::nullopt;
-      }
-      return it->second;
-    };
-
-    for (auto& it : EnvConfigLookup) {
-      if (auto Value = GetVar(it.first); Value) {
-        Set(it.second, *Value);
-      }
-    }
+    return Options;
   }
 
 private:
-  fextl::vector<std::pair<std::string_view, std::string_view>> Env;
+  std::vector<std::string> Names;
+  std::vector<std::string> Values;
 };
-
-class RunnerSyscallHandler final : public FEXCore::HLE::SyscallHandler, public FEXCore::Allocator::FEXAllocOperators {
-public:
-  // This runner has no Linux system calls (tests that need them declare it and are
-  // skipped). Every call fails with ENOSYS, as a Linux kernel answers an unknown number.
-  // The core leaves RIP at the `syscall` instruction and expects the handler to step past
-  // it, as FEX's Linux handler does; without that the guest runs the same call forever.
-  void HandleSyscall(FEXCore::Core::CpuStateFrame* Frame) override {
-    constexpr uint64_t LinuxENOSYS = 38;
-    Frame->State.gregs[FEXCore::X86State::REG_RAX] = -LinuxENOSYS;
-    // `syscall` and `int 0x80` are both two bytes long.
-    Frame->State.rip += 2;
-  }
-
-  // The core calls this when translated code finds that the guest code it came from has
-  // changed. Discarding the stale translations is the embedder's job; without it the
-  // core finds the same stale block again and never makes progress.
-  void InvalidateGuestCodeRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Start, uint64_t Length) override {
-    auto Lock = FEXCore::GuardSignalDeferringSectionWithFallback(Thread->CTX->GetCodeInvalidationMutex(), Thread);
-    Thread->CTX->InvalidateCodeBuffersCodeRange(Start, Length);
-    Thread->CTX->InvalidateThreadCachedCodeRange(Thread, Start, Length);
-  }
-
-  std::optional<FEXCore::ExecutableFileSectionInfo> LookupExecutableFileSection(FEXCore::Core::InternalThreadState*, uint64_t) override {
-    return std::nullopt;
-  }
-
-  FEXCore::HLE::ExecutableRangeInfo QueryGuestExecutableRange(FEXCore::Core::InternalThreadState*, uint64_t) override {
-    return {0, UINT64_MAX, true};
-  }
-};
-
-// The tests end with `hlt`. The core reports that as a synchronous fault and calls this
-// function directly from the dispatcher, with guest state already written back to the
-// frame. No host signal is involved.
-jmp_buf LongJump {};
-bool DidFault {};
-
-[[noreturn]]
-void SynchronousExceptionHandler(FEXCore::Context::Context*, FEXCore::Core::CpuStateFrame* Frame) {
-  const auto& Fault = Frame->SynchronousFaultData;
-  // A halt is reported as a segmentation fault at a `hlt` instruction. Anything else
-  // means the test went wrong.
-  DidFault = !Fault.FaultToTopAndGeneratedException || Fault.Signal != FEXCore::Core::FAULT_SIGSEGV;
-  constexpr uint8_t HLT = 0xF4;
-  if (reinterpret_cast<const uint8_t*>(Frame->State.rip)[0] != HLT) {
-    DidFault = true;
-  }
-  longjmp(LongJump, 1);
-}
 
 // Maps guest memory at the exact address a test asks for. The tests assume 4K pages;
 // the host may use 16K pages, so requests are widened to host pages and pages already
@@ -216,17 +146,22 @@ private:
   uint64_t PageSize;
   std::set<uint64_t> Mapped;
 };
+// This runner has no Linux system calls (tests that need them declare it and are
+// skipped). Every call fails with ENOSYS, as a Linux kernel answers an unknown number, and
+// the guest continues after the instruction. Without a callback the run would stop at the
+// first `syscall` and the test would fail although the instruction worked.
+fexmac_syscall_action SyscallHandler(fexmac_thread* Thread, void*) {
+  constexpr uint64_t LinuxENOSYS = 38;
+  fexmac_x86_state State;
+  fexmac_x86_state_init(&State);
+  fexmac_thread_get_state(Thread, &State);
+  State.gpr[0] = -LinuxENOSYS; // rax
+  fexmac_thread_set_state(Thread, &State);
+  return FEXMAC_SYSCALL_RESUME;
+}
 } // namespace
 
 int main(int argc, char** argv, char** const envp) {
-  LogMan::Throw::InstallHandler(AssertHandler);
-  LogMan::Msg::InstallHandler(MsgHandler);
-
-  FEX::Config::InitializeConfigs(FEX::Config::PortableInformation {});
-  FEXCore::Config::Initialize();
-  FEXCore::Config::AddLayer(FEX::Config::CreateEnvironmentLayer(envp));
-  FEXCore::Config::Load();
-
   if (argc < 3) {
     fextl::fmt::print("Usage: {} <test.bin> <test.config.bin>\n", argv[0]);
     return ExitFail;
@@ -240,10 +175,6 @@ int main(int argc, char** argv, char** const envp) {
 
   FEX::HarnessHelper::HarnessCodeLoader Loader {Filename, ConfigFile};
 
-  FEXCore::Config::AddLayer(fextl::make_unique<TestEnvLoader>(Loader.GetEnvironmentOptions()));
-  FEXCore::Config::ReloadMetaLayer();
-  FEXCore::Config::Set(FEXCore::Config::CONFIG_IS64BIT_MODE, Loader.Is64BitMode() ? "1" : "0");
-
   if (!Loader.Is64BitMode()) {
     fextl::fmt::print("Skipped: 32-bit tests are not supported by this runner yet\n");
     return ExitSkip;
@@ -253,16 +184,42 @@ int main(int argc, char** argv, char** const envp) {
     return ExitSkip;
   }
 
-  auto HostFeatures = FEX::FetchHostFeatures(Loader.Is64BitMode());
-  auto CTX = FEXCore::Context::Context::CreateNewContext(HostFeatures);
+  OptionList Options;
+  for (const auto& [Key, Value] : Loader.GetEnvironmentOptions()) {
+    Options.Add(Key, Value);
+  }
+  for (char* const* Var = envp; Var && *Var; ++Var) {
+    const std::string_view Entry {*Var};
+    const auto Equals = Entry.find('=');
+    if (Equals != std::string_view::npos) {
+      Options.Add(Entry.substr(0, Equals), Entry.substr(Equals + 1));
+    }
+  }
+  const auto OptionArray = Options.Get();
 
+  fexmac_config Config;
+  fexmac_config_init(&Config);
+  Config.options = OptionArray.data();
+  Config.option_count = OptionArray.size();
+  Config.log = LogHandler;
+  Config.syscall = SyscallHandler;
+
+  fexmac_context* Context {};
+  if (const auto Result = fexmac_context_create(&Config, &Context); Result != FEXMAC_OK) {
+    fextl::fmt::print("Could not create the context: {}\n", fexmac_result_string(Result));
+    return ExitFail;
+  }
+
+  // Whether the test can run here. The core's configuration is set up by now, so host
+  // feature detection sees the same options the core does.
+  auto HostFeatures = FEX::FetchHostFeatures(true);
   const bool SupportsAVX = HostFeatures.SupportsAVX();
 
-#if !defined(VIXL_SIMULATOR) && defined(ARCHITECTURE_x86_64)
-  FEX::X86::Features Feature {};
-#else
-  FEX::X86::Features Feature {CTX.get()};
-#endif
+  FEX::X86::Features Feature {[Context](uint32_t Function, uint32_t Leaf) {
+    uint32_t Regs[4] {};
+    fexmac_cpuid(Context, Function, Leaf, Regs);
+    return FEXCore::CPUID::FunctionResults {.eax = Regs[0], .ebx = Regs[1], .ecx = Regs[2], .edx = Regs[3]};
+  }};
   // FEX disables this by default; the tests exercise it anyway.
   const bool SupportsSSE4A = true;
 
@@ -323,15 +280,6 @@ int main(int argc, char** argv, char** const envp) {
     return ExitSkip;
   }
 
-  auto SignalDelegation = FEX::DummyHandlers::CreateSignalDelegator();
-  auto SyscallHandler = fextl::make_unique<RunnerSyscallHandler>();
-  CTX->SetSignalDelegator(SignalDelegation.get());
-  CTX->SetSyscallHandler(SyscallHandler.get());
-  if (!CTX->InitCore()) {
-    fextl::fmt::print("InitCore failed\n");
-    return ExitFail;
-  }
-
   GuestMapper Mapper;
   auto DoMmap = [&](uint64_t Address, size_t Size) -> void* {
     return Mapper.Map(Address, Size);
@@ -341,55 +289,46 @@ int main(int argc, char** argv, char** const envp) {
     return ExitFail;
   }
 
-  auto Thread = CTX->CreateThread();
-  if (!Thread) {
+  fexmac_thread* Thread {};
+  if (const auto Result = fexmac_thread_create(Context, &Thread); Result != FEXMAC_OK) {
+    fextl::fmt::print("Could not create the thread: {}\n", fexmac_result_string(Result));
+    return ExitFail;
+  }
+  fexmac_x86_state GuestState;
+  fexmac_x86_state_init(&GuestState);
+  fexmac_thread_get_state(Thread, &GuestState);
+  GuestState.rip = Loader.DefaultRIP();
+  fexmac_thread_set_state(Thread, &GuestState);
+
+  // Misaligned atomics and the translator's scratch-buffer restart need these.
+  if (const auto Result = fexmac_install_fault_handlers(); Result != FEXMAC_OK) {
+    fextl::fmt::print("Could not install the fault handlers: {}\n", fexmac_result_string(Result));
     return ExitFail;
   }
 
-  if (!FEX::CoreThreadSetup::AllocateCallRetStack(Thread)) {
-    fextl::fmt::print("Could not allocate the call and return stack\n");
-    return ExitFail;
-  }
+  // The tests end with `hlt`. Anything else (a guest fault) means the test went wrong;
+  // system calls are answered by SyscallHandler and the run continues.
+  fexmac_stop Stop;
+  fexmac_stop_init(&Stop);
+  const auto RunResult = fexmac_thread_run(Thread, &Stop);
+  const bool DidFault = RunResult != FEXMAC_OK || Stop.reason != FEXMAC_STOP_HALT;
+  fexmac_thread_get_state(Thread, &GuestState);
 
-  auto* GDT = FEX::CoreThreadSetup::FullDescriptorTable();
-  {
-    auto Frame = Thread->CurrentFrame;
-    Frame->State.segment_arrays[FEXCore::Core::CPUState::SEGMENT_ARRAY_INDEX_GDT] = &GDT[0];
-    Frame->State.segment_arrays[FEXCore::Core::CPUState::SEGMENT_ARRAY_INDEX_LDT] = &GDT[0];
-    Frame->State.cs_idx = FEXCore::Core::CPUState::DEFAULT_USER_CS << 3;
-    auto CodeSegment = FEXCore::Core::CPUState::GetSegmentFromIndex(Frame->State, Frame->State.cs_idx);
-    FEXCore::Core::CPUState::SetGDTBase(CodeSegment, 0);
-    FEXCore::Core::CPUState::SetGDTLimit(CodeSegment, 0xF'FFFFU);
-    CodeSegment->L = 1;
-    CodeSegment->D = 0;
-    Frame->State.cs_cached = FEXCore::Core::CPUState::CalculateGDTBase(*CodeSegment);
-
-    Frame->Pointers.SynchronousExceptionHandler = reinterpret_cast<uintptr_t>(&SynchronousExceptionHandler);
-    Frame->State.rip = Loader.DefaultRIP();
-  }
-
-#if defined(__APPLE__) && defined(__aarch64__)
-  FEX::MacOSHostFaults::Install();
-  FEX::MacOSHostFaults::CurrentThread = Thread;
-#endif
-
-  if (!setjmp(LongJump)) {
-    CTX->ExecuteThread(Thread);
-  }
-
-  FEXCore::Core::CPUState State;
-  memcpy(&State, &Thread->CurrentFrame->State, sizeof(State));
-
-  if (SupportsAVX) {
-    __uint128_t XMM_Low[FEXCore::Core::CPUState::NUM_XMMS];
-    __uint128_t YMM_High[FEXCore::Core::CPUState::NUM_XMMS];
-    CTX->ReconstructXMMRegisters(Thread, XMM_Low, YMM_High);
-    for (size_t i = 0; i < FEXCore::Core::CPUState::NUM_XMMS; ++i) {
-      memcpy(&State.xmm.avx.data[i][0], &XMM_Low[i], sizeof(__uint128_t));
-      memcpy(&State.xmm.avx.data[i][2], &YMM_High[i], sizeof(__uint128_t));
+  // The harness compares registers laid out as the core's CPUState, with the vector
+  // registers in the layout it expects for this host.
+  FEXCore::Core::CPUState State {};
+  State.rip = GuestState.rip;
+  memcpy(State.gregs, GuestState.gpr, sizeof(State.gregs));
+  State.fs_cached = GuestState.fs_base;
+  State.gs_cached = GuestState.gs_base;
+  memcpy(State.mm, GuestState.mm, sizeof(State.mm));
+  for (size_t i = 0; i < FEXCore::Core::CPUState::NUM_XMMS; ++i) {
+    if (SupportsAVX) {
+      memcpy(&State.xmm.avx.data[i][0], GuestState.xmm[i], sizeof(GuestState.xmm[i]));
+      memcpy(&State.xmm.avx.data[i][2], GuestState.ymm_high[i], sizeof(GuestState.ymm_high[i]));
+    } else {
+      memcpy(&State.xmm.sse.data[i][0], GuestState.xmm[i], sizeof(GuestState.xmm[i]));
     }
-  } else {
-    CTX->ReconstructXMMRegisters(Thread, reinterpret_cast<__uint128_t*>(State.xmm.sse.data), nullptr);
   }
 
   const bool Passed = !DidFault && Loader.CompareStates(&State, nullptr, SupportsAVX);
