@@ -393,6 +393,9 @@ Rosetta 2 and as an arm64 program. `FEXCoreBench` (`Source/Tools/CoreBench/`,
   multiply 5x, FFT 4.3x), `rep movs` 4.2x (one ordered byte load and store per byte),
   the interpreter 1.9x (`ldapr`/`stlr` on every access). x87 (x86-64 builds only): FEX
   0.7x Rosetta 2's time. Thread kernels are reported with their spread and in no mean.
+  Blocks compiled and loaded come from `fexmac`'s translation counters; two code-cache
+  configurations (cold: a fresh private directory per launch; warm: a filled one) show
+  the cache's effect on this program (criterion 6), in the same generated tables.
 - **Rosetta 2 on this Mac** hangs, unkillably, at the launch of an unsigned x86-64
   program; the scripts sign the x86-64 builds, and every launch has a deadline.
 

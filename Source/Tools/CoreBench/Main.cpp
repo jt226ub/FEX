@@ -4,8 +4,8 @@
 // interface (fexmac.h only). Made for the benchmark in unittests/macOS/Bench, but it
 // runs any image built the same way.
 //
-//     FEXCoreBench [--option NAME=VALUE]... [--quick] [--literal [--expect-kernels N]]
-//                  [--reps N] [--only k1,k2] image
+//     FEXCoreBench [--option NAME=VALUE]... [--code-cache DIR] [--quick]
+//                  [--literal [--expect-kernels N]] [--reps N] [--only k1,k2] image
 //
 // The image is a static, non-position-independent x86-64 Mach-O executable linked at
 // a fixed address above 4GB (`ld -static -no_pie -image_base ...`), so it has no
@@ -25,6 +25,13 @@
 // may make one system call, exit, and nothing else; it reports the number of wrong
 // checksums and the number of kernels it ran. The loader requires 0 wrong, at least one
 // kernel run (exactly N with --expect-kernels), and no other system call.
+//
+// The image's executable segments are registered with fexmac_add_code_range (not
+// writable: the guest never writes its code). --code-cache DIR turns the code cache on
+// through fexmac's config fields (code_cache_enabled, code_cache_directory); the cache
+// is flushed before exit. The translation counters (fexmac_context_get_counters) are
+// printed on standard error at exit as
+//   FEXCoreBench: translation: compiled N loaded N rejected N queued N cache STATE
 //
 // The guest's exit report is printed on standard error. Exit status of this program:
 //   0    the guest exited normally and every checksum was right;
@@ -85,6 +92,8 @@ struct Image {
   uint64_t Entry {};
   uint64_t Low {};
   uint64_t High {};
+  // Executable segments, [address, address + size).
+  std::vector<std::pair<uint64_t, uint64_t>> Code;
 };
 
 [[noreturn]] void Die(const char* Format, const char* Detail = "") {
@@ -153,6 +162,9 @@ Image LoadImage(const char* Path) {
           Die("%s: segment outside the file or the address space", Path);
         }
         Segments.push_back({Seg.vmaddr, Seg.vmsize, Seg.fileoff, Seg.filesize});
+        if (Seg.initprot & VM_PROT_EXECUTE) {
+          Result.Code.emplace_back(Seg.vmaddr, Seg.vmsize);
+        }
       }
     } else if (Cmd.cmd == LC_UNIXTHREAD) {
       // thread_command (cmd, cmdsize), then flavor and count (in 32-bit words), then
@@ -176,8 +188,8 @@ Image LoadImage(const char* Path) {
     }
     Offset += Cmd.cmdsize;
   }
-  if (Segments.empty() || !HaveEntry) {
-    Die("%s has no segments or no entry point", Path);
+  if (Segments.empty() || !HaveEntry || Result.Code.empty()) {
+    Die("%s has no segments, no executable segment or no entry point", Path);
   }
 
   const uint64_t Page = static_cast<uint64_t>(getpagesize());
@@ -393,7 +405,7 @@ fexmac_syscall_action OnSyscall(fexmac_thread* Thread, void*) {
 }
 
 void Usage() {
-  fprintf(stderr, "usage: FEXCoreBench [--option NAME=VALUE]... [--quick] [--literal [--expect-kernels N]] [--reps N] "
+  fprintf(stderr, "usage: FEXCoreBench [--option NAME=VALUE]... [--code-cache DIR] [--quick] [--literal [--expect-kernels N]] [--reps N] "
                   "[--only k1,k2] image\n");
   exit(ExitLoaderFailure);
 }
@@ -405,11 +417,14 @@ int main(int argc, char** argv) {
   uint64_t Flags = 0, Reps = 5;
   long long ExpectKernels = -1;
   std::string Only;
+  const char* CacheDir = nullptr;
   const char* ImagePath = nullptr;
   for (int i = 1; i < argc; ++i) {
     const std::string Arg = argv[i];
     if (Arg == "--option" && i + 1 < argc) {
       OptionText.push_back(argv[++i]);
+    } else if (Arg == "--code-cache" && i + 1 < argc) {
+      CacheDir = argv[++i];
     } else if (Arg == "--quick") {
       Flags |= FlagQuick;
     } else if (Arg == "--literal") {
@@ -471,9 +486,18 @@ int main(int argc, char** argv) {
   Config.options = Options.data();
   Config.option_count = Options.size();
   Config.syscall = OnSyscall;
+  if (CacheDir) {
+    Config.code_cache_enabled = 1;
+    Config.code_cache_directory = CacheDir;
+  }
   if (const fexmac_result R = fexmac_context_create(&Config, &Context); R != FEXMAC_OK) {
     fprintf(stderr, "FEXCoreBench: cannot create the context: %s\n", fexmac_result_string(R));
     return ExitLoaderFailure;
+  }
+  for (const auto& [Address, Size] : Img.Code) {
+    if (fexmac_add_code_range(Context, Address, Size, 0) != FEXMAC_OK) {
+      Die("cannot register the image's code range");
+    }
   }
 
   if (fexmac_thread_create(Context, &MainThread) != FEXMAC_OK) {
@@ -510,6 +534,23 @@ int main(int argc, char** argv) {
   if (MainExited) {
     fprintf(stderr, "FEXCoreBench: guest exit: %llu wrong checksum(s), %llu kernel(s) run%s\n", static_cast<unsigned long long>(GuestFailures),
             static_cast<unsigned long long>(GuestKernels), Literal ? " (literal mode: no system call but exit)" : "");
+  }
+  // The translation counters, after the cache has written everything (when it is on).
+  if (CacheDir && Unjoined == 0) {
+    fexmac_context_flush_cache(Context);
+  }
+  fexmac_translation_counters Counters;
+  fexmac_translation_counters_init(&Counters);
+  if (fexmac_context_get_counters(Context, &Counters) == FEXMAC_OK) {
+    static const char* const States[] = {"off", "active", "read-only", "refused"};
+    fprintf(stderr, "FEXCoreBench: translation: compiled %llu loaded %llu rejected %llu queued %llu cache %s\n",
+            static_cast<unsigned long long>(Counters.blocks_compiled), static_cast<unsigned long long>(Counters.blocks_loaded),
+            static_cast<unsigned long long>(Counters.cache_entries_rejected), static_cast<unsigned long long>(Counters.cache_entries_queued),
+            Counters.cache_state <= FEXMAC_CACHE_REFUSED ? States[Counters.cache_state] : "?");
+    if (CacheDir && Counters.cache_state != FEXMAC_CACHE_ACTIVE) {
+      fprintf(stderr, "FEXCoreBench: the code cache in %s was not used\n", CacheDir);
+      ContractBroken = true;
+    }
   }
   bool Contract = Ok && !ContractBroken && Unjoined == 0;
   if (Contract && Literal) {

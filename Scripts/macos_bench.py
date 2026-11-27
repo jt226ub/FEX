@@ -109,8 +109,16 @@ CONFIGS = {
         "threads_lock": ANY
     }, "no ordering emulation: not correct for multi-threaded guests; an upper bound for guests known not to need it"),
 }
-DEFAULT_CONFIGS = ["tso_on", "tso_scalar", "tso_vector", "tso_memcpy", "tso_on_nomb", "tso_on_x87rp", "tso_off"]
-QUICK_CONFIGS = ["tso_on", "tso_off", "tso_on_nomb", "tso_on_x87rp"]
+CONFIGS["tso_on_cache_cold"] = (CONFIGS["tso_on"][0], {}, "as tso_on, with the code cache on in a fresh, empty directory "
+                                 "for every launch: everything is compiled and written to the cache")
+CONFIGS["tso_on_cache_warm"] = (CONFIGS["tso_on"][0], {}, "as tso_on, with the code cache on in a directory one run "
+                                 "with the same arguments filled first: translations are loaded, not compiled")
+# The code cache, through FEXCoreBench --code-cache (fexmac's code_cache_* fields), in a
+# private directory under --out; never the user's ~/Library/Caches.
+CACHE_MODE = {"tso_on_cache_cold": "cold", "tso_on_cache_warm": "warm"}
+DEFAULT_CONFIGS = ["tso_on", "tso_scalar", "tso_vector", "tso_memcpy", "tso_on_nomb", "tso_on_x87rp", "tso_off",
+                   "tso_on_cache_cold", "tso_on_cache_warm"]
+QUICK_CONFIGS = ["tso_on", "tso_off", "tso_on_nomb", "tso_on_x87rp", "tso_on_cache_cold", "tso_on_cache_warm"]
 STARTUP_CONFIG = "tso_on"
 
 
@@ -324,6 +332,11 @@ def check_run(label, r, want, allowed, size, problems, literal=False):
     """Checks one parsed run. Returns {kernel: True if its checksum is right (or the
     allowed alternative value)}."""
     ok = {}
+    for line in r["stderr"]:
+        f = line.split()
+        if line.startswith("FEXCoreBench: translation:") and len(f) >= 12:
+            r["counters"] = {"compiled": int(f[3]), "loaded": int(f[5]), "rejected": int(f[7]), "queued": int(f[9]),
+                             "cache": f[11]}
     if r["timed_out"]:
         problems.append(f"{label}: timed out after {r['seconds']:.0f} s" + (" and could not be killed" if r["unkillable"] else ""))
         return ok
@@ -411,10 +424,22 @@ def main():
              os.path.join(ROOT, "Data", "macOS", "jit.entitlements"), hardened])
         loader = hardened
 
+    cache_root = os.path.join(out, "code-cache")
+    if os.path.isdir(cache_root):
+        shutil.rmtree(cache_root)
+    os.makedirs(cache_root, mode=0o700)
+    cold_count = [0]
+
     def fex_cmd(c, extra):
         cmd = [loader]
         for name, value in CONFIGS[c][0].items():
             cmd += ["--option", f"{name}={value}"]
+        mode = CACHE_MODE.get(c)
+        if mode == "cold":
+            cold_count[0] += 1
+            cmd += ["--code-cache", os.path.join(cache_root, f"cold-{cold_count[0]}")]
+        elif mode == "warm":
+            cmd += ["--code-cache", os.path.join(cache_root, "warm")]
         return cmd + extra + [guest]
 
     have_rosetta = not args.no_rosetta and rosetta_available()
@@ -459,6 +484,12 @@ def main():
 
     # Interleaved launches: round i starts at build i (mod n).
     common = (["--quick"] if args.quick else []) + ["--reps", str(reps)] + (["--only", ",".join(only)] if only else [])
+    # Fill the warm cache with one run of exactly what the warm launches run.
+    for label, cmd_for, allowed in builds:
+        if CACHE_MODE.get(label[4:]) == "warm":
+            r = execute(cmd_for(common), timeout)
+            check_run(f"{label} (filling the cache)", r, want, allowed, size, problems)
+            print(f"{label}: cache filled; {r.get('counters')}", flush=True)
     results = {l: [] for l in labels}
     for i in range(launches):
         order = builds[i % len(builds):] + builds[:i % len(builds)]
@@ -466,6 +497,14 @@ def main():
             r = execute(cmd_for(common), timeout)
             r["ok"] = check_run(f"{label} launch {i + 1}", r, want, allowed, size, problems)
             r["launch"] = i + 1
+            mode = CACHE_MODE.get(label[4:])
+            c = r.get("counters")
+            if label.startswith("fex:") and not c:
+                problems.append(f"{label} launch {i + 1}: no translation counters reported")
+            elif mode == "warm" and (c["loaded"] == 0 or c["compiled"] > c["loaded"] // 20):
+                problems.append(f"{label} launch {i + 1}: warm cache compiled {c['compiled']}, loaded {c['loaded']}")
+            elif mode == "cold" and (c["compiled"] == 0 or c["queued"] == 0):
+                problems.append(f"{label} launch {i + 1}: cold cache compiled {c['compiled']}, queued {c['queued']}")
             results[label].append(r)
             bad = sorted(k for k, v in r["ok"].items() if not v)
             print(f"{label} launch {i + 1}: exit {r['exit']}, {len(r['ok'])} kernels" +
@@ -518,7 +557,8 @@ def main():
         "load_thresholds": {"max_mean_cores": args.max_mean_cores, "max_peak_cores": args.max_peak_cores},
         "load_samples": sampler.samples,
     }
-    slim = {l: [{k: r.get(k) for k in ("launch", "exit", "times", "sums", "verdicts", "ok", "stderr", "timed_out", "seconds")}
+    slim = {l: [{k: r.get(k) for k in ("launch", "exit", "times", "sums", "verdicts", "ok", "counters", "first_result_s",
+                                        "stderr", "timed_out", "seconds")}
                 for r in results[l]] for l in labels}
     name = "results-quick" if args.quick else "results"
     with open(os.path.join(out, name + ".json"), "w") as f:
@@ -584,12 +624,28 @@ def summarise(results, labels, startup, want):
         if label != "native-arm64":
             gx, usedx = geomean(label, [k for k in X87_KERNELS if k in want])
             means[label]["x87"] = gx
+    translation = {}
+    for label in labels:
+        if not label.startswith("fex:"):
+            continue
+        rs = results[label]
+
+        def stat(vals):
+            vals = [v for v in vals if v is not None]
+            return {"median": statistics.median(vals), "min": min(vals), "max": max(vals)} if vals else None
+
+        translation[label] = {
+            "compiled": stat([r.get("counters", {}).get("compiled") for r in rs]),
+            "loaded": stat([r.get("counters", {}).get("loaded") for r in rs]),
+            "first_result_s": stat([r.get("first_result_s") for r in rs]),
+            "launch_s": stat([r.get("seconds") for r in rs]),
+        }
     st = {}
     for l, v in startup.items():
         later = v["later"]
         st[l] = {"first_launch": v["first_launch"], "later_median": statistics.median(later) if later else None,
                  "later_min": min(later) if later else None, "later_max": max(later) if later else None}
-    return {"per_kernel": per, "means": means, "startup": st}
+    return {"per_kernel": per, "means": means, "startup": st, "translation": translation}
 
 
 def markdown(meta, s, labels):
@@ -681,6 +737,23 @@ def markdown(meta, s, labels):
         o.append("| first launch of the fresh build | " + " | ".join(f(st[l]["first_launch"]) for l in cols) + " |")
         o.append("| later launches, median [range] | " + " | ".join(
             f"{f(st[l]['later_median'])} [{f(st[l]['later_min'])}-{f(st[l]['later_max'])}]" for l in cols) + " |")
+        o.append("")
+    tr = s.get("translation") or {}
+    if tr:
+        o.append("#### Translation and the code cache (per launch of the full program; median [range])")
+        o.append("")
+        o.append("Blocks compiled and loaded come from `fexmac_context_get_counters`. First result: launch to the end of "
+                 "the first kernel's warm-up. Launch: the whole run, all kernels, every repetition.")
+        o.append("")
+        o.append("| configuration | blocks compiled | blocks loaded from the cache | first result, s | launch, s |")
+        o.append("|---|---|---|---|---|")
+
+        def fs(x, fmt):
+            return "-" if not x else f"{x['median']:{fmt}} [{x['min']:{fmt}}-{x['max']:{fmt}}]"
+
+        for l, v in tr.items():
+            o.append(f"| {short[l]} | {fs(v['compiled'], '.0f')} | {fs(v['loaded'], '.0f')} | {fs(v['first_result_s'], '.3f')} | "
+                     f"{fs(v['launch_s'], '.2f')} |")
         o.append("")
     o.append(DOC_END)
     return "\n".join(o) + "\n"
