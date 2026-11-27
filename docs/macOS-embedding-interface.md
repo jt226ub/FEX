@@ -481,9 +481,32 @@ fault handler.
   (`FEXMAC_ERROR_UNSUPPORTED`, nothing changed) unless the protection carries
   `FEXMAC_PROT_ALLOW_UNENFORCED`; then the host page gets the union (a PROT_NONE 4K guard
   page next to accessible ones is accessible) and `fexmac_memory_unenforced_count` counts
-  it. A partial `fexmac_memory_unmap` of a host page is always done and counted. A sound
-  scheme (the most restrictive protection on the host page and the library completing
-  allowed accesses itself) is not done; see the package report.
+  it. A partial `fexmac_memory_unmap` of a host page is always done and counted.
+
+  **This is the 1.0 behaviour and a real limit.** On such a host page the guest gets the
+  most permissive protection of its four guest pages for all of them. Not enforced there:
+  PROT_NONE guard pages (a stack guard, a red zone, an end-of-buffer guard next to
+  accessible memory) are readable and writable without a fault; read-only pages next to
+  writable ones are writable; non-executable pages next to executable ones execute.
+  Self-modifying-code write protection (`mtrack`) does not cover a guest page that is not
+  guest-writable but shares a host page with a writable one: a write to it goes through
+  the union unseen, so the embedder uses `SMCCHECKS full` or calls `fexmac_invalidate`.
+  Still enforced: mapped/unmapped reporting, instruction fetch only from guest-executable
+  4K pages (the translator checks the guest's EXEC bit itself), and all protections on
+  host pages whose four guest pages agree. An embedder that lays guest memory out on 16K
+  boundaries never meets the limit; `fexmac_memory_unenforced_count` says whether it did.
+
+  Future work, the sound scheme: give the host page the *most restrictive* protection of
+  its guest pages and have the library complete, in the fault handler, each access the
+  guest's own 4K protection allows: decode the faulting instruction, check the access
+  against the guest page, perform it (through a second, fully accessible mapping of the
+  memory) and step over it, or retranslate that instruction to go through the alias.
+  Cost: every allowed access to the more permissive pages of a mixed host page becomes a
+  signal round trip (several microseconds on the M4, against about a nanosecond), so a
+  hot data page next to a guard page runs thousands of times slower; and the handler
+  needs an emulator for every memory-accessing x86 form (vector, x87, string, atomic) or
+  a retranslation path per faulting instruction. Weeks of work and a test matrix of its
+  own; not done for 1.0.
 - **`fexmac_memory_unmap`** makes a host page with no mapped guest page left inaccessible
   itself, waiting for misaligned-atomic emulations in progress, so the embedder's `munmap`
   after it cannot land inside one (`split-lock-unmap-race`).
@@ -911,10 +934,10 @@ mapped as a code range, flushes before exiting and prints the translation counte
 
 ## Not covered yet
 
-- Exact state at a fault for the instructions listed in "Guest memory faults: what is
-  exact" (read-modify-write, `pop [m]`, `leave`, split 32-byte stores, `rep movs`/`stos`),
-  and dead flags.
-- Stopping a long `rep movs`/`rep stos` part-way (one host loop).
+- Exact state at the fault (running again is right) for the four entries left in
+  `fault_diff_known.txt` (see "Guest memory faults: what is exact"): dead flags, a 32-byte
+  store whose lower page faults, `fxsave` across a page; and `rep movs`/`stos` with a
+  segment-override prefix.
 - An adaptive fallback for host pages where data and code share a page and every write
   faults (see "Self-modifying code").
 - Enforcing 4K guest protections that differ within a 16K host page (refused unless

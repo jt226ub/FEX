@@ -477,10 +477,23 @@ FEXMAC_EXPORT fexmac_result fexmac_thread_request_stop(fexmac_thread* thread);
  * a host page agree (same protection, all mapped). fexmac_memory_map and
  * fexmac_memory_protect refuse (FEXMAC_ERROR_UNSUPPORTED, nothing changed) a change that
  * would leave a host page with guest pages that disagree, unless the protection carries
- * FEXMAC_PROT_ALLOW_UNENFORCED: then the host page gets the union and the guest can read
- * a PROT_NONE 4K page or write a read-only one next to a more permissive one, without a
- * fault (fexmac_memory_unenforced_count counts such changes). Lay guest memory out on
- * 16K boundaries to keep every protection enforced.
+ * FEXMAC_PROT_ALLOW_UNENFORCED: then the host page gets the union of the four.
+ *
+ *   !!! LIMIT OF THIS VERSION. On a host page whose four 4K guest pages disagree
+ *   (accepted with FEXMAC_PROT_ALLOW_UNENFORCED), the guest gets the MOST PERMISSIVE
+ *   protection of the four for all of them. NOT enforced on such a page: a PROT_NONE
+ *   guard page next to an accessible one is readable and writable by the guest without
+ *   a fault (stack guard pages, ASan-style red zones, end-of-buffer guards do not work);
+ *   a read-only page next to a writable one is writable; a non-executable page next to
+ *   an executable one is executable. Self-modifying-code write protection does not
+ *   cover a guest page that is not writable for the guest but shares a host page with
+ *   a writable one (a write to it through the union is not seen: run SMCCHECKS full or
+ *   call fexmac_invalidate). Still enforced: unmapped vs mapped reporting
+ *   (fexmac_memory_query), instruction-fetch checks against the guest's EXEC bit (the
+ *   translator reads code only from guest-executable 4K pages), and every protection
+ *   on host pages whose four guest pages agree. fexmac_memory_unenforced_count counts
+ *   the accepted changes. Lay guest memory out on 16K boundaries (or 16K-align every
+ *   protection change) to keep every protection enforced.
  *
  * After registering, the embedder must change protections only with these functions,
  * not with mprotect (which would undo the write protection without discarding

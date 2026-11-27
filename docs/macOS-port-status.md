@@ -237,28 +237,57 @@ are exercised now: see "Fault handling for an embedder".)
 
 ## Fault handling for an embedder (criterion 4)
 
-**Not met yet.** `docs/macOS-embedding-interface.md` has the contracts; this is the state
-after the package D review and rework, on the M4.
+`docs/macOS-embedding-interface.md` has the contracts; this is the state after the package
+D review and its second rework, on the M4. Criterion 4 is met except for the at-fault
+limits listed in the last row, where running again still gives x86's result.
 
 | Fault path | Tests | State |
 |---|---|---|
 | Misaligned atomics | `faults-*`, `split-locks-concurrent`, `split-lock-faults`, `split-lock-unmap-race`, `guest-misaligned-atomic-prot-none`, `split-emulation-fault-*-dies` | pass; with the second half on an inaccessible page each thread stops with a page fault before anything is written, totals exact after the fix |
-| Scratch-buffer restart | `scratch-guard-disarmed-after-translation`; `CodeBufferOverflow` | pass |
-| Self-modifying code by page protection | `smc-*`, `split-lock-on-code-page`, `SelfModifyingCode/*` with `--smc mtrack` | works, but **opt-in** (`SMCCHECKS mtrack`): the default is `full`, because a code write is re-run with the same limits as a guest fault (below), and writes through aliases are not seen |
-| Stopping a thread from another thread | `stop-*` | pass; median 4 to 6 us request to return; requests are not lost under a storm of code-write resyncs; a request to a destroyed thread is refused safely |
-| Guest fault with correct guest state | `fault-*`, `guest-*`, `Scripts/macos_fault_diff.py` (54 programs x 4 modes x 3 ways) | **exact for loads, plain stores, register push/pop, call/ret, vector and x87 accesses, lock operations, rep lods/scas/cmps, including DF, MMX, AVX upper halves and x87 state; not exact for read-modify-write instructions on memory (flags, and CF-consuming forms compute wrong on resume), `pop [m]`, `leave`, split 32-byte stores, `rep movs`/`rep stos` part-way, and dead flags** (33 known differences, listed in `Source/Embedding/tests/fault_diff_known.txt`) |
+| Scratch-buffer restart | `scratch-guard-disarmed-after-translation`, `scratch-overflow-*`; `CodeBufferOverflow` | pass |
+| Self-modifying code by page protection | `smc-*`, `split-lock-on-code-page`, `SelfModifyingCode/*` with `--smc mtrack`, the harness's write-protection path | pass; **the default once memory is registered** (no memory registered: nothing detected, as on `macos/v1`); writes through aliases and to non-writable guest pages sharing a host page with writable ones are not seen |
+| Stopping a thread from another thread | `stop-*`, `stop-rep-movs` | pass; median 4 to 6 us request to return; also inside a long `rep movs`/`stos` (32 MB, thousands of stops, registers exact at each, final memory x86's) |
+| Guest fault with correct guest state | `fault-*`, `guest-*`, `Scripts/macos_fault_diff.py` (319 programs x 4 modes x 3 ways) | **exact, and running again gives x86's result, for loads, stores, push/pop/call/ret, `pop [m]`, `leave`, `enter`, every read-modify-write form on memory, `xadd`/`cmpxchg`, vector and x87 accesses, 16- and 32-byte stores across a page, lock operations and every `rep` string form part-way**; 4 at-fault-only differences remain in `fault_diff_known.txt`: dead flags (2 programs), a 32-byte store whose lower page faults, `fxsave` across a page; also not exact: `rep movs`/`stos` with a segment-override prefix |
+| 4K protections within a 16K host page | `memory-arguments` | refused unless `FEXMAC_PROT_ALLOW_UNENFORCED`; accepted ones are counted and NOT enforced (guard pages, read-only next to writable, SMC protection of the non-writable page): the 1.0 limit, stated in `fexmac.h` and the embedding document with the sound scheme as future work |
 
-The remaining items need changes to the core's code generation (the opcode dispatcher's
-handlers for every read-modify-write, stack and string form; the JIT's `MemCpy`/`MemSet`
-loops); see the package D report. 4K guest protections that disagree within a 16K host
-page are refused unless the embedder accepts them (`FEXMAC_PROT_ALLOW_UNENFORCED`).
+How (all macOS-only, `__APPLE__`): a full register-cache flush and x87 stack sync before
+every instruction with a memory operand; an undo record (flags) for read-modify-write
+instructions on memory and for `pop` to an rsp-based address; `pop [m]` and `leave`
+reordered; 32-byte stores upper half first; `rep movs`/`stos` loops that use the guest's
+rcx/rsi/rdi as their induction variables, in page-bounded 32-byte chunk runs; interrupt
+checks on block entries, back-edges, conditional back-edges and inside `rep` loops; no
+code check for undecodable instructions. The code cache's port revision is 3.
 
-Core changes, all macOS-only: the interrupt check on block entries and back-edges, a full
-register-cache flush and x87 stack sync before every instruction with a memory operand,
-no code check for undecodable instructions (`SMCCHECKS full` looped on fetch faults
-before). Cost against `macos/v1` with `SMCCHECKS none` on the review's
-microbenchmarks: 0 to 4% on most loops, +18% (multiblock) to +50% (no multiblock) on a
-loop of two linked blocks with memory accesses (the entry check). The safe default
+Performance, the review's microbenchmarks (best of 5, `SMCCHECKS none`, M4, machine
+shared with other builds, so differences under about 5% are noise). Base: `macos/v1`;
+"before": this package before the second rework (no undo record, the core's rep loops);
+after: the tip.
+
+| Loop | Multiblock | Base | Before | After |
+|---|---|---|---|---|
+| counted `jnz` | off / on | 0.175 / 0.171 s | -5% / -3% | -2% / -2% |
+| memory mixed (ld/st/adc) | off / on | 0.106 / 0.106 s | +2% / +7% | +0% / -1% |
+| memory with carry | off / on | 0.138 / 0.133 s | +1% / +0% | +1% / +3% |
+| flags live across memory | off / on | 0.067 / 0.068 s | -1% / +2% | +2% / -3% |
+| `memjmp` (two linked blocks) | off / on | 0.051 / 0.036 s | +66% / +27% | +53% / +31% |
+| `add [m]; adc [m]; inc [m]` | off / on | 0.193 / 0.174 s | -1% / +1% | +121% / +123% |
+| `push; pop [m]` | on | 0.051 s | +11% | +11% |
+| `push rbp; mov rbp,rsp; store; leave` | on | 0.068 s | +5% | -25% |
+| `rep movsb` 4K | off / on | 0.034 / 0.032 s | +4% / +8% | +15% / +17% |
+| `rep movsq` 4K | off / on | 0.032 / 0.032 s | +7% / +8% | +17% / +17% |
+| `rep stosq` 4K | off / on | 0.032 / 0.032 s | +2% / +2% | +19% / +20% |
+| `rep movsb` 64 bytes | off / on | 0.025 / 0.025 s | +2% / +2% | +26% / +26% |
+
+The undo record costs about 3.5 cycles per read-modify-write instruction on memory; packing
+it into fewer stores or saving the flags without making them live was measured and is not
+cheaper (see the embedding document). The `memjmp` cost is the interrupt check at each
+block entry: the check is one store (`str xzr, [x28, #off]`), and a load or even a `nop`
+in its place costs the same, so there is no cheaper form; it is the extra instruction in a
+two-block loop. A prototype that checks only on exits to a lower or equal guest address
+(every cycle of direct jumps has one) brought `memjmp` without multiblock to the base time
+(0.049 s against 0.074); it needs the same check on indirect exits with the target's rip
+recovered at the stop, so it is proposed as follow-up work, not done. With multiblock the
+loop's own back-edge check is the cost (+18 to 31%) and is what makes the loop stoppable.
 `SMCCHECKS full` costs 2 to 6 times `none` on the same loops (as on `macos/v1`).
 
 ## x86 memory ordering between threads
