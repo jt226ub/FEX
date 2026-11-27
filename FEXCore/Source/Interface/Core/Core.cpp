@@ -727,9 +727,12 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
         // before the instruction and running it again computes the same result.
         uint32_t UndoMask = 0;
         if (MayFault && TableInfo->Name) {
-          static constexpr std::string_view FlagsRMW[] = {"ADD", "OR",  "ADC", "SBB",  "AND",  "SUB", "XOR", "INC", "DEC",
-                                                          "NEG", "ROL", "ROR", "RCL",  "RCR",  "SHL", "SAL", "SHR", "SAR",
-                                                          "SHLD", "SHRD", "BTS", "BTR", "BTC", "XADD", "CMPXCHG"};
+          // add/or/and/sub/xor/inc/dec/neg on memory store first and compute the flags
+          // after (OpcodeDispatcher.cpp; the lock forms compute them after the atomic
+          // operation), so they need no record. The rest consume incoming flags, keep some
+          // (zero counts, bit tests) or compute them before their store.
+          static constexpr std::string_view FlagsRMW[] = {"ADC", "SBB", "ROL",  "ROR",  "RCL", "RCR", "SHL", "SAL",
+                                                          "SHR", "SAR", "SHLD", "SHRD", "BTS", "BTR", "BTC", "XADD", "CMPXCHG"};
           const std::string_view Name {TableInfo->Name};
           const auto IsMemoryDest = [&] {
             using T = X86Tables::DecodedOperand::OpType;

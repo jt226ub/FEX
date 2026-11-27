@@ -3261,6 +3261,16 @@ void OpDispatchBuilder::INCOp(OpcodeArgs) {
 
   CalculateDeferredFlags();
 
+#ifdef __APPLE__
+  // Memory destination: store first, flags after (see ALUOp).
+  const bool StoreFirst = !IsLocked && !Op->Dest.IsGPR();
+  if (StoreFirst) {
+    StoreResultGPR(Op, Add(Size >= 32 ? OpSizeFromSrc(Op) : OpSize::i32Bit, Dest, 1));
+  }
+#else
+  const bool StoreFirst = false;
+#endif
+
   if (Size < 32 && CTX->HostFeatures.SupportsFlagM) {
     // Addition producing upper garbage
     Result = Add(OpSize::i32Bit, Dest, 1);
@@ -3278,7 +3288,7 @@ void OpDispatchBuilder::INCOp(OpcodeArgs) {
     Result = CalculateFlags_ADD(OpSizeFromSrc(Op), Dest, Constant(1), false);
   }
 
-  if (!IsLocked) {
+  if (!IsLocked && !StoreFirst) {
     StoreResultGPR(Op, Result);
   }
 }
@@ -3302,6 +3312,16 @@ void OpDispatchBuilder::DECOp(OpcodeArgs) {
 
   CalculateDeferredFlags();
 
+#ifdef __APPLE__
+  // Memory destination: store first, flags after (see ALUOp).
+  const bool StoreFirst = !IsLocked && !Op->Dest.IsGPR();
+  if (StoreFirst) {
+    StoreResultGPR(Op, Sub(Size >= 32 ? OpSizeFromSrc(Op) : OpSize::i32Bit, Dest, 1));
+  }
+#else
+  const bool StoreFirst = false;
+#endif
+
   if (Size < 32 && CTX->HostFeatures.SupportsFlagM) {
     // Subtraction producing upper garbage
     Result = Sub(OpSize::i32Bit, Dest, 1);
@@ -3319,7 +3339,7 @@ void OpDispatchBuilder::DECOp(OpcodeArgs) {
     Result = CalculateFlags_SUB(OpSizeFromSrc(Op), Dest, Constant(1), false);
   }
 
-  if (!IsLocked) {
+  if (!IsLocked && !StoreFirst) {
     StoreResultGPR(Op, Result);
   }
 }
@@ -3820,6 +3840,14 @@ void OpDispatchBuilder::NEGOp(OpcodeArgs) {
     CalculateFlags_SUB(Size, ZeroConst, Dest);
   } else {
     Ref Dest = LoadSourceGPR(Op, Op->Dest, Op->Flags, {.AllowUpperGarbage = true});
+#ifdef __APPLE__
+    if (!Op->Dest.IsGPR()) {
+      // Memory destination: store first, flags after (see ALUOp).
+      StoreResultGPR(Op, Sub(std::max(OpSize::i32Bit, Size), ZeroConst, Dest));
+      CalculateFlags_SUB(Size, ZeroConst, Dest);
+      return;
+    }
+#endif
     Ref Result = CalculateFlags_SUB(Size, ZeroConst, Dest);
 
     StoreResultGPR(Op, Result);
@@ -4889,6 +4917,48 @@ void OpDispatchBuilder::ALUOp(OpcodeArgs, FEXCore::IR::IROps ALUIROp, FEXCore::I
   }
 
   const auto OpSize = RoundedSize;
+#ifdef __APPLE__
+  // Store first, flags after (macOS embedding library: restartable guest faults). For a
+  // memory destination the flags are computed from Dest and Src, still in registers,
+  // after the store, so a store that faults leaves them as before the instruction. The
+  // result stored is the one the flag calculation gives.
+  const bool StoreFirst = !DestIsLockedMem(Op) && !DestRAX && !Op->Dest.IsGPR() &&
+                          (ALUIROp == IR::IROps::OP_ADD || ALUIROp == IR::IROps::OP_SUB || ALUIROp == IR::IROps::OP_XOR ||
+                           ALUIROp == IR::IROps::OP_AND || ALUIROp == IR::IROps::OP_OR || ALUIROp == IR::IROps::OP_ANDWITHFLAGS);
+  if (StoreFirst) {
+    Ref Plain {};
+    switch (ALUIROp) {
+    case IR::IROps::OP_ADD: Plain = Add(OpSize, Dest, Src); break;
+    case IR::IROps::OP_SUB: Plain = Sub(OpSize, Dest, Src); break;
+    case IR::IROps::OP_XOR: Plain = _Xor(OpSize, Dest, Src); break;
+    case IR::IROps::OP_OR: Plain = _Or(OpSize, Dest, Src); break;
+    default: Plain = _And(OpSize, Dest, Src); break;
+    }
+    StoreResultGPR_WithOpSize(Op, Op->Dest, Plain, ResultSize, OpSize::iInvalid, MemoryAccessType::DEFAULT);
+    switch (ALUIROp) {
+    case IR::IROps::OP_ADD: CalculateFlags_ADD(Size, Dest, Src); break;
+    case IR::IROps::OP_SUB: CalculateFlags_SUB(Size, Dest, Src); break;
+    case IR::IROps::OP_ANDWITHFLAGS: {
+      Ref Flags = _AndWithFlags(OpSize, Dest, Src);
+      HandleNZ00Write();
+      CalculatePF(Flags);
+      InvalidateAF();
+      AcidTestFlags(X86State::RFLAG_AF_RAW_LOC);
+      break;
+    }
+    default: {
+      // Recomputed rather than reusing Plain: PF takes its value, and the register
+      // allocator would otherwise compute Plain straight into the PF register, before
+      // the store (seen for byte and word forms).
+      Ref Again = ALUIROp == IR::IROps::OP_XOR ? _Xor(OpSize, Dest, Src) : ALUIROp == IR::IROps::OP_OR ? _Or(OpSize, Dest, Src) : _And(OpSize, Dest, Src);
+      CalculateFlags_Logical(Size, Again);
+      AcidTestFlags(X86State::RFLAG_AF_RAW_LOC);
+      break;
+    }
+    }
+    return;
+  }
+#endif
   uint64_t Mask = Size == OpSize::i64Bit ? ~0ull : ((1ull << IR::OpSizeAsBits(Size)) - 1);
   if (IsConst && Const == Mask && !DestIsLockedMem(Op) && ALUIROp == IR::IROps::OP_XOR && Size >= OpSize::i32Bit) {
     Result = _Not(OpSize, Dest);

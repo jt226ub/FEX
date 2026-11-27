@@ -89,7 +89,7 @@ addresses.
 A cache entry can only be found under the exact combination that produced it.
 
 - **Directory (machine bucket):** hash of the format version, upstream's host-feature
-  bits, and, added by this port, the port identity: a port cache revision (3), the git
+  bits, and, added by this port, the port identity: a port cache revision (4), the git
   hash the core was configured from, the **Mach-O UUID of the image the core's code is
   in** (the linker derives it from the code, so any rebuilt core gets a new one, even
   with uncommitted changes), the CPU brand string and the CPU MIDRs. If the image has no

@@ -594,27 +594,34 @@ copies ahead and behind by 1, 3, 8 and 31 bytes, a faulting source).
   from the incremented rsp) keeps the core's form and saves rsp in the undo record below.
   The reorder is also faster: `push; pop [m]` loops as before, a `leave` loop 25% faster
   than `macos/v1` (no read-modify-write handle).
-- **Read-modify-write instructions on memory** (`add`, `or`, `adc`, `sbb`, `and`, `sub`,
-  `xor`, `inc`, `dec`, `neg`, rotates and shifts, `shld`/`shrd`, `bts`/`btr`/`btc`, `xadd`,
-  `cmpxchg`, `lock` forms): these change the flags before their store. Design: an *undo
-  record*. Before such an instruction (chosen in
-  `Core.cpp` by opcode name and a memory destination) the translated code stores NZCV, the
-  raw PF and AF, and for the stack forms rsp, into `CPUState::UndoNZCV/UndoPF/UndoAF/
-  UndoRSP`, sets `CPUState::UndoMask` to the live slots, and clears it after the
-  instruction. The fault path (`Faults.cpp`, SpillGuestState) uses the saved values when
-  the mask is set. The mask lives in the thread frame rather than in the RIP-entry metadata
-  because the fault path then needs no lookup, and the code cache needs no format change
-  for it (its port revision is bumped anyway, to 3, for the new code). `xadd`/`cmpxchg`
-  write their register only after the store and x87 store-and-pop pops after the store
-  (checked; no record needed). Cost: four stores before and one after each such
-  instruction; on a loop of three of them (`add [m],1; adc [m],0; inc [m]`) 2.2 times the
-  time of `macos/v1`, on ordinary loops nothing (see the performance table in
-  `docs/macOS-port-status.md`). Saving the flags with a raw JIT op that does not make them
-  live, or packed into two stores, was measured and is not cheaper; the cost is in the
-  combination of the flag read with the stores around a memory access, not in their
-  number. A cheaper scheme would reorder each handler (store first, flags after). Before this,
-  `stc; sbb qword [m], 1` on 0x100 resumed to 0xff (x86 0xfe) and `pop [m]` resumed with
-  rsp off by 8.
+- **Read-modify-write instructions on memory** change the flags before their store in
+  the core's handlers. Two designs, chosen per handler:
+  - *Store first, flags after* (`OpcodeDispatcher.cpp`, `__APPLE__`): `add`, `or`, `and`,
+    `sub`, `xor`, `inc`, `dec`, `neg` on memory compute the result, store it, then
+    compute the flags from the operands still in registers (one extra ALU instruction;
+    the logical forms recompute the result for PF, since the register allocator would
+    otherwise compute the stored value straight into the PF register). Their `lock`
+    forms compute the flags after the atomic operation already. No cost measured: a
+    loop of `add [m]; sub [m]; inc [m]; or [m]` runs as on `macos/v1`.
+  - *Undo record* for the forms that consume incoming flags, keep some of them or
+    compute them before the store: `adc`, `sbb`, `rcl`, `rcr`, the shifts and rotates
+    (a zero count keeps every flag), `shld`/`shrd`, `bts`/`btr`/`btc`, `xadd`,
+    `cmpxchg`. Before such an instruction (chosen in `Core.cpp` by opcode name and a
+    memory destination) the translated code stores NZCV, the raw PF and AF, and for an
+    rsp-based `pop` rsp, into `CPUState::UndoNZCV/UndoPF/UndoAF/UndoRSP`, sets
+    `CPUState::UndoMask` to the live slots, and clears it after the instruction. The
+    fault path (`Faults.cpp`, SpillGuestState) uses the saved values when the mask is
+    set. The mask lives in the thread frame rather than in the RIP-entry metadata, so
+    the fault path needs no lookup. Cost: about 2 cycles each in isolation; in a loop of
+    `add [m]; adc [m]; inc [m]` +3% against `macos/v1` (it was +121% while every
+    read-modify-write had a record: the cost was not additive).
+  - The flags an instruction overwrites without reading are dead before it, so a block
+    that does not read them later does not compute them, and at the fault they are as
+    stale as any dead flag (below); the harness compares them at the fault with
+    `SMCCHECKS full`, where they are computed, and leaves the status flags out of the
+    at-fault comparison for those forms otherwise. `xadd`/`cmpxchg` write their register
+    only after the store and x87 store-and-pop pops after the store (checked; no record
+    needed). Before this, `stc; sbb qword [m], 1` on 0x100 resumed to 0xff (x86 0xfe).
 - **`rep movs` / `rep stos`** (JIT `MemCpy`/`MemSet`, `EmitRepStringInPlace` in
   `MemoryOps.cpp`): when the IR passes the guest's own rcx/rsi/rdi static registers (no
   segment base added), the loop uses them as its induction variables: one element is

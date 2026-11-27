@@ -22,6 +22,7 @@ review's harness.
 """
 
 import argparse
+import re
 import concurrent.futures
 import os
 import struct
@@ -209,6 +210,26 @@ def diff(a, b, pa, pb):
             a.get(pa + "." + k) != b.get(pb + "." + k)]
 
 
+# Cases whose marked instruction overwrites every status flag without reading one, and
+# computes them after its store (add/or/and/sub/xor/neg on memory, also locked): the
+# incoming status flags are dead there, so a block that does not read them does not
+# compute them, and at the fault they are as stale as any dead flag (the documented
+# dead-flags limit). For these the at-fault comparison leaves out the status flags
+# (CF, PF, AF, ZF, SF, OF); everything else, and the resumed result, is compared in full.
+# With SMCCHECKS full every instruction ends a block, so the flags are computed there and
+# the at-fault comparison is complete: it shows the reorder leaves them untouched.
+DEAD_STATUS_FLAGS_IN = re.compile(r"^(rmw-(add|or|and|sub|xor|neg|lock-add)-|carry-neg-)")
+STATUS_FLAGS = 0x8D5
+
+
+def without_status_flags(out, tag):
+    out = dict(out)
+    key = tag + ".rflags"
+    if key in out:
+        out[key] = "%x" % (int(out[key], 16) & ~STATUS_FLAGS)
+    return out
+
+
 def check_case(tool, name, src, prot, clean=True, ref_src=None):
     fault = assemble(src.replace("FAULT:", ""))
     # The reference replaces the marked instruction (and nothing else on its line, such
@@ -241,7 +262,10 @@ def check_case(tool, name, src, prot, clean=True, ref_src=None):
             continue
         if f.get("a.reason") != "3" or f.get("a.trap") != "14":
             found.setdefault("no-fault", []).append(tag + " reason " + str(f.get("a.reason")))
-        checks = [("at-fault", diff(f, r, "a", "a"))]
+        if DEAD_STATUS_FLAGS_IN.match(name) and smc != "full":
+            checks = [("at-fault", diff(without_status_flags(f, "a"), without_status_flags(r, "a"), "a", "a"))]
+        else:
+            checks = [("at-fault", diff(f, r, "a", "a"))]
         if clean:
             checks.append(("resume", diff(f, c, "b", "a")))
         for check, lines in checks:

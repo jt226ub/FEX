@@ -584,7 +584,8 @@ FEXMAC_EXPORT uint64_t fexmac_memory_code_write_count(fexmac_context* context);
  * SIGBUS a protected one. The guest state (registers, flags, x87, MMX, XMM/YMM, MXCSR) is
  * the state before the faulting instruction, and running it again after fixing the
  * cause gives x86's result. That includes read-modify-write instructions on memory
- * (their flags are put back from an undo record the translated code saves before them;
+ * (add/or/and/sub/xor/inc/dec/neg store first and compute the flags after; the others
+ * put the flags back from an undo record the translated code saves before them;
  * xadd/cmpxchg write their register only after the store), pop [m] and leave (reordered
  * to move rsp after the access; pop to an rsp-based address puts rsp back from the
  * record), x87 store-and-pop (the stack is popped after the store), push/call/enter
