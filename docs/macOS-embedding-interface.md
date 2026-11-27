@@ -965,6 +965,13 @@ mapped as a code range, flushes before exiting and prints the translation counte
   `fault_diff_known.txt` (see "Guest memory faults: what is exact"): dead flags, a 32-byte
   store whose lower page faults, `fxsave` across a page; and `rep movs`/`stos` with a
   segment-override prefix.
+- A cheaper stop check (future option, not done): today every block entry, back-edge and
+  `rep` loop writes the interrupt fault page; on a loop of two linked blocks without
+  multiblock that costs +50% (+18% with multiblock, where the loop's own back-edge check
+  is what makes it stoppable). Checking only on direct exits to a guest address at or
+  below the block start (every cycle of direct jumps has one) and on indirect exits,
+  with the target's rip recovered at the stop, measured at the base time for that loop
+  in a prototype. It would be an embedder setting, default the current check.
 - An adaptive fallback for host pages where data and code share a page and every write
   faults (see "Self-modifying code").
 - Enforcing 4K guest protections that differ within a 16K host page (refused unless

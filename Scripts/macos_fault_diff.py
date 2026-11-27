@@ -106,6 +106,10 @@ for d in (1, 3, 8, 31):
     REP_CASES.append(rep_case("rep-movsb-overlap-behind-%d" % d, "lea rdi, [r15-40]\nlea rsi, [rdi+%d]" % d, "rep movsb", 40, 128))
     REP_CASES.append(rep_case("rep-movsb-back-overlap-%d" % d, "std\nlea rdi, [r15+0x4000+39]\nlea rsi, [rdi+%d]" % d, "rep movsb", 40,
                               128))
+# Overlap by one byte forward (the fill path) running into the inaccessible page after
+# 33, 100 and 4000 bytes.
+for k in (33, 100, 4000):
+    REP_CASES.append(rep_case("rep-movsb-overlap1-%d" % k, "lea rdi, [r15-%d]\nlea rsi, [rdi-1]" % k, "rep movsb", k, k + 128))
 # The source runs into the inaccessible page part-way through a 32-byte chunk while the
 # destination is 32-byte aligned (the chunked path): progress is still x86's.
 for ins, size in (("rep movsb", 1), ("rep movsd", 4), ("rep movsq", 8)):

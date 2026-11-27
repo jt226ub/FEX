@@ -1980,6 +1980,7 @@ bool Arm64JITCore::EmitRepStringInPlace(bool Copy, bool IsAtomic, size_t Size, A
       (void)Bind(&SkipCheck);
     };
     ARMEmitter::ForwardLabel PureEntry;
+    ARMEmitter::ForwardLabel OverlapEntry;
     if (!IsAtomic && Copy) {
       // Source and destination less than 32 bytes apart (an overlapping copy): element by
       // element throughout, in x86's order. The distance does not change during the copy.
@@ -1989,7 +1990,7 @@ bool Arm64JITCore::EmitRepStringInPlace(bool Copy, bool IsAtomic, size_t Size, A
       neg(ARMEmitter::Size::i64Bit, TMP1, TMP1);
       (void)Bind(&Positive);
       sub(ARMEmitter::Size::i64Bit, TMP1, TMP1, 32);
-      (void)tbnz(TMP1, 63, &PureEntry);
+      (void)tbnz(TMP1, 63, &OverlapEntry);
     }
     (void)Bind(&ElementLoop);
     if (!IsAtomic) {
@@ -2065,6 +2066,66 @@ bool Arm64JITCore::EmitRepStringInPlace(bool Copy, bool IsAtomic, size_t Size, A
       EmitElement();
       (void)cbnz(ARMEmitter::Size::i64Bit, R, &ElementLoop);
       (void)b(&Finished);
+    }
+    // Overlapping copies (source and destination less than 32 bytes apart) come here.
+    (void)Bind(&OverlapEntry);
+    if (!IsAtomic && Copy && !Back && Size == 1) {
+      // rep movsb with rdi == rsi + 1 (run-length fill, LZ decoders): every byte copied is
+      // the first one. x86 reads each source byte after writing it, so after loading the
+      // first byte the copy is a fill with it; the source is the destination one byte
+      // behind, already written. Same page-bounded 32-byte runs as below, rsi kept one
+      // behind rdi, so progress stays exact.
+      ARMEmitter::ForwardLabel NotByOne;
+      ARMEmitter::BackwardLabel FillLoop;
+      ARMEmitter::BackwardLabel FillRun;
+      ARMEmitter::ForwardLabel FillOne;
+      sub(ARMEmitter::Size::i64Bit, TMP1, D, S);
+      sub(ARMEmitter::Size::i64Bit, TMP1, TMP1, 1);
+      (void)cbnz(ARMEmitter::Size::i64Bit, TMP1, &NotByOne);
+      ldrb(TMP4.W(), S, 0);
+      dup(ARMEmitter::SubRegSize::i8Bit, VTMP2.Q(), TMP4.W());
+      (void)Bind(&FillLoop);
+      sub(ARMEmitter::Size::i64Bit, TMP1, R, 32);
+      (void)tbnz(TMP1, 63, &FillOne);
+      // Whole chunks before the destination's page boundary, at most rcx / 32.
+      and_(ARMEmitter::Size::i64Bit, TMP1, D, 4095);
+      neg(ARMEmitter::Size::i64Bit, TMP1, TMP1);
+      add(ARMEmitter::Size::i64Bit, TMP1, TMP1, 4096);
+      lsr(ARMEmitter::Size::i64Bit, TMP1, TMP1, 5);
+      {
+        ARMEmitter::ForwardLabel Keep;
+        lsr(ARMEmitter::Size::i64Bit, TMP2, R, 5);
+        sub(ARMEmitter::Size::i64Bit, TMP3, TMP2, TMP1);
+        (void)tbz(TMP3, 63, &Keep);
+        mov(TMP1, TMP2);
+        (void)Bind(&Keep);
+      }
+      (void)cbz(ARMEmitter::Size::i64Bit, TMP1, &FillOne);
+      (void)Bind(&FillRun);
+      stp<ARMEmitter::IndexType::POST>(VTMP2.Q(), VTMP2.Q(), D, 32);
+      add(ARMEmitter::Size::i64Bit, S, S, 32);
+      sub(ARMEmitter::Size::i64Bit, R, R, 32);
+      sub(ARMEmitter::Size::i64Bit, TMP1, TMP1, 1);
+      (void)cbnz(ARMEmitter::Size::i64Bit, TMP1, &FillRun);
+      EmitSuspendInterruptCheck();
+      (void)cbz(ARMEmitter::Size::i64Bit, R, &Finished);
+      (void)b(&FillLoop);
+      (void)Bind(&FillOne);
+      {
+        // One byte (near a page boundary, or the tail).
+        ARMEmitter::ForwardLabel SkipFillCheck;
+        strb(TMP4.W(), D, 0);
+        add(ARMEmitter::Size::i64Bit, D, D, 1);
+        add(ARMEmitter::Size::i64Bit, S, S, 1);
+        sub(ARMEmitter::Size::i64Bit, R, R, 1);
+        and_(ARMEmitter::Size::i64Bit, TMP1, R, 63);
+        (void)cbnz(ARMEmitter::Size::i64Bit, TMP1, &SkipFillCheck);
+        EmitSuspendInterruptCheck();
+        (void)Bind(&SkipFillCheck);
+      }
+      (void)cbnz(ARMEmitter::Size::i64Bit, R, &FillLoop);
+      (void)b(&Finished);
+      (void)Bind(&NotByOne);
     }
     (void)Bind(&PureEntry);
     ARMEmitter::BackwardLabel PureLoop;

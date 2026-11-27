@@ -298,33 +298,39 @@ after: the tip.
 | memory with carry | off / on | 0.123 / 0.123 s | +0% / +0% | +0% / +0% |
 | flags live across memory | off / on | 0.063 / 0.064 s | -0% / -0% | -0% / -0% |
 | `memjmp` (two linked blocks) | off / on | 0.050 / 0.035 s | +50% / +18% | +50% / +18% |
-| `add [m]; adc [m]; inc [m]` | off / on | 0.172 / 0.171 s | +2% / +2% | +125% / +125% |
+| `add [m]; adc [m]; inc [m]` | off / on | 0.178 / 0.177 s | +1% / +1% | +3% / +2% |
+| `add [m]; sub [m]; inc [m]; or [m]` | off / on | 0.178 / 0.178 s | -0% / -0% | -0% / +0% |
 | `push; pop [m]` | off / on | 0.050 / 0.050 s | +10% / +10% | +11% / +10% |
 | `push rbp; mov rbp,rsp; store; leave` | off / on | 0.081 / 0.067 s | +0% / +21% | +14% / -25% |
 | `rep movsb` 4K | off / on | 0.033 / 0.032 s | +8% / +6% | +17% / +18% |
 | `rep movsq` 4K | off / on | 0.032 / 0.032 s | +6% / +8% | +17% / +19% |
 | `rep stosq` 4K | off / on | 0.032 / 0.031 s | +1% / +2% | +18% / +19% |
 | `rep movsb` 64 bytes | off / on | 0.025 / 0.025 s | +2% / +2% | +26% / +26% |
-| `rep movsb` 4K overlapping by 1 | off / on | 0.20 to 0.47 s | 0.20 s | 0.76 to 0.86 s |
+| `rep movsb` 4K overlapping by 1 | off / on | 0.20 to 0.47 s | 0.20 s | 0.013 s |
 
 `Scripts/macos_bench.py` `rep_movs` kernel (median of 3 launches x 5 runs, ms): `tso_on`
 331 before, 381 after (+15%); `tso_off` 17.8 before, 21.4 after (+20%); native 16.3.
 `copy_loop` unchanged (655 / 651 `tso_on`). The rep cost is the exactness: registers move
 after every 32-byte chunk and every element, the page-bounded run setup, and an element
-loop that counts elements for the interrupt check. An overlapping byte copy is bound by
-store-to-load forwarding (about 4 cycles a byte); the core's loop sometimes ran at 1 cycle
-a byte (unstable between runs, 0.20 to 0.47 s). Replicating the pattern for a forward
-overlap closer than 32 bytes would remove the chain; not done.
+loop that counts elements for the interrupt check. A forward byte copy overlapping by
+one (`rdi == rsi + 1`, run-length fills in LZ decoders) is a fill with the first byte:
+0.013 s, 16 times faster than `macos/v1`. Other overlaps closer than 32 bytes still go
+element by element, bound by store-to-load forwarding (about 4 cycles a byte); chunks
+smaller than the distance would keep x86's result and progress but are not done. A
+cheaper setup for short counts (one page test for the whole copy instead of the
+per-pointer page room) was measured and gave nothing, so it is not in.
 
-The undo record costs about 3.5 cycles per read-modify-write instruction on memory; packing
-it into fewer stores or saving the flags without making them live was measured and is not
-cheaper (see the embedding document). The `memjmp` cost is the interrupt check at each
+`add`/`or`/`and`/`sub`/`xor`/`inc`/`dec`/`neg` on memory store first and compute the flags
+after, at no measured cost; the undo record is kept for `adc`, `sbb`, rotates, shifts,
+`shld`/`shrd`, bit tests, `xadd` and `cmpxchg` (+2 to 3% on the loop above, which has one
+`adc`). With a record on every read-modify-write the same loop took +121 to 125%. The `memjmp` cost is the interrupt check at each
 block entry: the check is one store (`str xzr, [x28, #off]`), and a load or even a `nop`
 in its place costs the same, so there is no cheaper form; it is the extra instruction in a
 two-block loop. A prototype that checks only on exits to a lower or equal guest address
 (every cycle of direct jumps has one) brought `memjmp` without multiblock to the base time
 (0.049 s against 0.074); it needs the same check on indirect exits with the target's rip
-recovered at the stop, so it is proposed as follow-up work, not done. With multiblock the
+recovered at the stop. That is a documented future option (an embedder setting, default
+the current always-on check), not done. With multiblock the
 loop's own back-edge check is the cost (+18 to 31%) and is what makes the loop stoppable.
 `SMCCHECKS full` costs 2 to 6 times `none` on the same loops (as on `macos/v1`).
 
