@@ -6,6 +6,8 @@
     python3 Scripts/macos_linux_asm_compare.py --junit linux-asm.xml --out linux-asm-results.tsv
     # Afterwards, against a Mac run of Scripts/macos_asm_tests.py:
     python3 Scripts/macos_linux_asm_compare.py --linux linux-asm-results.tsv --mac asm-out/results.tsv
+    # The port's Linux results against the upstream commit it is based on, same machine kind:
+    python3 Scripts/macos_linux_asm_compare.py --linux port.tsv --base upstream-base.tsv
 
 On Linux the tests run through upstream's machinery (TestHarnessRunner, CTest, the ASM
 `Known_Failures` lists), where a known failure that fails counts as a CTest pass. This
@@ -17,7 +19,9 @@ the Mac's jit_500_tso has no Linux counterpart in upstream's CTest list).
 
 The comparison prints every test that passes on one platform and not on the other,
 except those the Mac skips or lists in Known_Failures_macOS (which the Mac's own run
-already accounts for). Exit status 1 if any such difference remains.
+already accounts for). With --base, every test whose raw outcome differs between the
+port and its upstream base on Linux is printed: a test that passes upstream and fails on
+the port is a Linux regression caused by the port. Exit status 1 if any difference remains.
 """
 
 import argparse
@@ -37,9 +41,9 @@ def read_list(path):
         return {line.strip() for line in handle if line.strip() and not line.startswith("#")}
 
 
-def from_junit(path):
-    known = read_list(os.path.join(ROOT, "unittests/ASM/Known_Failures")) | read_list(
-        os.path.join(ROOT, "unittests/ASM/Known_Failures_jit"))
+def from_junit(path, root):
+    known = read_list(os.path.join(root, "unittests/ASM/Known_Failures")) | read_list(
+        os.path.join(root, "unittests/ASM/Known_Failures_jit"))
     rows = []
     for case in ET.parse(path).getroot().iter("testcase"):
         full = case.get("name")
@@ -75,10 +79,12 @@ def main():
     ap.add_argument("--out")
     ap.add_argument("--linux")
     ap.add_argument("--mac")
+    ap.add_argument("--base", help="the same table from the upstream base commit")
+    ap.add_argument("--root", default=ROOT, help="source tree whose Known_Failures lists apply (default: this one)")
     args = ap.parse_args()
 
     if args.junit:
-        rows = from_junit(args.junit)
+        rows = from_junit(args.junit, args.root)
         if args.out:
             with open(args.out, "w") as handle:
                 handle.write("".join("%s\t%s\t%s\t%s\n" % row for row in rows))
@@ -92,6 +98,19 @@ def main():
         ctest_failed = sum(1 for r in rows if r[0] == mode and r[3] == "failed")
         print("linux %s: raw pass %d, fail %d, skip %d (CTest failures, i.e. not as upstream expects: %d)" %
               (mode, c["pass"], c["fail"], c["skip"], ctest_failed))
+    if args.base:
+        with open(args.base) as handle:
+            base = {tuple(parts[:2]): parts[2] for parts in (line.rstrip("\n").split("\t") for line in handle) if len(parts) >= 3}
+        port = {(r[0], r[1]): r[2] for r in rows}
+        diffs = 0
+        for key in sorted(set(base) | set(port)):
+            b, p = base.get(key, "absent"), port.get(key, "absent")
+            if b != p:
+                diffs += 1
+                print("   %s %s: upstream base %s, port %s%s" % (key[0], key[1], b, p,
+                      "  <-- REGRESSION" if b == "pass" and p == "fail" else ""))
+        print("\nport against upstream base: %d tests differ" % diffs)
+        return 1 if diffs else 0
     if not args.mac:
         return 0
 

@@ -81,20 +81,41 @@ jobs:
             build.log
           if-no-files-found: ignore
 
-  asm-tests:
+  linux-tests:
+    # The same job twice: on the port's commit, and on the upstream commit the port is
+    # based on (the merge base with FEX-Emu/FEX main, fetched read-only), so a Linux
+    # failure can be told apart: the port's fault if it fails only on the port.
+    name: linux-tests (${{ matrix.source }})
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        source: [port, upstream-base]
     steps:
       - uses: actions/checkout@v7
         with:
-          fetch-depth: 1
+          fetch-depth: ${{ matrix.source == 'port' && 1 || 0 }}
+          filter: ${{ matrix.source == 'port' && '' || 'blob:none' }}
           persist-credentials: false
+
+      - name: Go to the upstream base
+        if: matrix.source == 'upstream-base'
+        run: |
+          git fetch -q --no-tags --filter=blob:none https://github.com/FEX-Emu/FEX.git main:refs/remotes/upstream-ro/main
+          base="$(git merge-base HEAD upstream-ro/main)"
+          echo "port $(git rev-parse --short=9 HEAD), upstream base $base"
+          # Keep this run's comparison script: it is the port's, not upstream's.
+          cp Scripts/macos_linux_asm_compare.py "$RUNNER_TEMP/"
+          git checkout -q --detach "$base"
+          git log -1 --format='%h %ci %s'
 
       - name: Fetch third-party code (not the large test-binary repositories)
         run: |
           git submodule update --init --depth 1 Source/Common/cpp-optparse External/fmt External/xxhash \
             External/rpmalloc External/range-v3 External/unordered_dense External/jemalloc_glibc \
             External/Catch2 External/vixl External/drm-headers External/Vulkan-Headers External/tracy External/zydis
+          [ -f "$RUNNER_TEMP/macos_linux_asm_compare.py" ] || cp Scripts/macos_linux_asm_compare.py "$RUNNER_TEMP/"
 
       - name: Install tools
         run: |
@@ -109,10 +130,10 @@ jobs:
           cmake -G Ninja -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON -DENABLE_LTO=OFF \
             -DENABLE_CCACHE=OFF -DENABLE_ASSERTIONS=ON -DBUILD_FEXCONFIG=OFF -DUSE_LINKER=lld 2>&1 | tee configure.log
 
-      - name: Build TestHarnessRunner and the 64-bit test files
+      - name: Build everything (FEXLoader, FEXServer, TestHarnessRunner, unit tests, test files)
         run: |
           set -o pipefail
-          ninja -C build -k 0 TestHarnessRunner asm_files 2>&1 | tee build.log
+          ninja -C build -k 0 2>&1 | tee build.log
 
       - name: Run the 64-bit instruction tests through CTest
         # A red result here means a test did not behave as upstream's lists say on this
@@ -120,23 +141,56 @@ jobs:
         run: |
           cd build
           set +e
-          ctest --timeout 302 -j "$(nproc)" -R '64Bit.*\.asm$' --output-junit linux-asm.xml > ../ctest.log 2>&1
+          ctest --timeout 302 -j "$(nproc)" -R '64Bit.*\.asm$' --output-on-failure --output-junit linux-asm.xml > ../ctest.log 2>&1
           code=$?
           set -e
           tail -30 ../ctest.log
-          python3 ../Scripts/macos_linux_asm_compare.py --junit linux-asm.xml --out ../linux-asm-results.tsv | tee ../linux-asm-counts.log
-          grep -E '\(Failed\)|\(Timeout\)|\(SEGFAULT\)|\(Subprocess aborted\)' ../ctest.log | head -60 || true
+          python3 "$RUNNER_TEMP/macos_linux_asm_compare.py" --root .. --junit linux-asm.xml --out ../linux-asm-results.tsv | tee ../linux-asm-counts.log
           exit $code
+
+      - name: Run upstream's unit tests that need no root file system
+        # The same targets upstream's CI runs: Catch2 API tests of FEXCore and of the
+        # Linux front end, and the arm64 code emitter tests.
+        if: ${{ !cancelled() }}
+        run: |
+          set -o pipefail
+          bad=0
+          for t in fexcore_apitests api_tests emitter_tests; do
+            echo "=== $t"
+            cmake --build build --target "$t" > "unit-$t.log" 2>&1 || bad=1
+            grep -E 'tests passed|tests failed|Failed|\*\*\*' "unit-$t.log" | tail -20
+          done
+          exit $bad
 
       - uses: actions/upload-artifact@v7
         if: always()
         with:
-          name: linux-asm-tests
+          name: linux-tests-${{ matrix.source }}
           path: |
             configure.log
             build.log
             ctest.log
+            unit-*.log
             linux-asm-results.tsv
             linux-asm-counts.log
-            build/linux-asm.xml
           if-no-files-found: ignore
+
+  compare:
+    # Port against upstream base, test by test, on the same kind of machine.
+    needs: linux-tests
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+      - uses: actions/download-artifact@v7
+        with:
+          pattern: linux-tests-*
+      - name: Compare
+        run: |
+          ls -R linux-tests-* | head
+          python3 Scripts/macos_linux_asm_compare.py --linux linux-tests-port/linux-asm-results.tsv \
+            --base linux-tests-upstream-base/linux-asm-results.tsv
