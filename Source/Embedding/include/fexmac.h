@@ -269,6 +269,13 @@ typedef enum fexmac_stop_reason {
    * instruction (ud2), int3, int n, a privileged instruction and so on. The details are
    * in the stop record, using the signal numbering the core reports. */
   FEXMAC_STOP_GUEST_FAULT = 3,
+  /* The translator cannot translate the instruction at instruction_address, although
+   * x86 may define it: one FEX does not implement (`int 0x80` in 64-bit mode, `mov` to
+   * fs or gs, `o16 iret`, ...) or bytes it cannot decode. A real CPU might run it; this
+   * is not the guest's #UD. Filled like an invalid-opcode fault (signal SIGILL, trap 6,
+   * si_code 0, fault_address = instruction_address) so a host that only knows
+   * GUEST_FAULT can still deliver it as one. */
+  FEXMAC_STOP_UNSUPPORTED_INSTRUCTION = 4,
   /* Later versions add: a stop requested by another thread, and guest memory faults
    * caught as host faults. Until then a guest memory fault in translated code is passed
    * on as a host fault (see "Host fault handling"). */

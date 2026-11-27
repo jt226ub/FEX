@@ -221,6 +221,10 @@ namespace {
         *reinterpret_cast<const uint8_t*>(Frame->State.rip) == HLT) {
       Stop.reason = FEXMAC_STOP_HALT;
     }
+    // The core marks a block it could not translate at all (CompileBlockOrFault).
+    if (Fault.Untranslatable) {
+      Stop.reason = FEXMAC_STOP_UNSUPPORTED_INSTRUCTION;
+    }
     Thread->PendingStop = Stop;
     LeaveDispatcher(Thread, Frame);
   }
