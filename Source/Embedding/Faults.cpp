@@ -23,14 +23,33 @@
 // read-modify-write can report a read.
 //
 // fexmac_handle_fault runs a fixed sequence of checks. Each claims a fault only when it
-// is certain the fault is the core's; anything left over is the embedder's. Work that
-// later packages add goes into this sequence, at the point marked below:
-//  - Package D: the interrupt fault page (a write to Thread->InterruptFaultPage after it
-//    is made read-only, to stop a thread from another thread); write faults on pages
-//    protected for self-modifying-code detection; guest memory faults (ClassifyFault
-//    returns Access with the PC in translated code), which need the guest state
-//    reconstructed from the host context before they are reported as a stop.
-//  - Package F: nothing expected; cached code runs from the same code buffers.
+// is certain the fault is the core's or the guest's; anything left over is the
+// embedder's:
+//  1. the translator's scratch-buffer guard (restart the translation);
+//  2. the call/return stack's own push or pop into its guard pages (reset x25);
+//  3. a write to the thread's interrupt fault page, read-only because another thread
+//     asked this one to stop (leave the dispatcher at a block entry, or step over the
+//     write anywhere else);
+//  4. a misaligned atomic in translated code (rewritten by the core; first checked
+//     against write-protected code and inaccessible memory, which go to 5 and 6);
+//  5. a guest write to a page the library write-protected for self-modifying-code
+//     detection (Memory.cpp; the work is done after the signal returns);
+//  6. any other memory access fault with the PC in translated code: the guest's page
+//     fault, delivered as FEXMAC_STOP_GUEST_FAULT with the guest state written back.
+// Package F adds nothing here; cached code runs from the same code buffers.
+//
+// Leaving translated code from a signal handler. At a fault in translated code the guest
+// registers that the translator keeps in host registers (the static register
+// allocation: GPRs, the low halves of the vector registers, NZCV, the PF/AF registers,
+// the call/return stack pointer) are in the signal context. SpillGuestState writes them
+// to the thread's frame, as the core's own spill would, with rip taken from the block's
+// table of guest instruction starts (RestoreRIPFromHostPC). The handler then changes the
+// context so that the signal returns to the dispatcher's stop handler with the stack
+// pointer reset to where the dispatcher saved it on entry, which leaves the host stack
+// and the call/return stack consistent (the reset DEF_OP(Break) does, and the route from
+// ExitFunctionLink does not, is done by this). The advanced floating-point modes the
+// translator sets in FPCR are cleared first, since host code runs next. Nothing here
+// allocates, locks or logs.
 #include "Internal.h"
 #ifdef FEXMAC_TESTING
 #include "fexmac_testing.h"
@@ -45,6 +64,8 @@
 #include <atomic>
 #include <cstddef>
 #include <cstring>
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
 #include <pthread.h>
 #include <signal.h>
 #include <sys/mman.h>
@@ -53,6 +74,51 @@
 
 namespace fexmac {
 namespace {
+  struct ResumePoint {
+    uint64_t Frame;
+    uint64_t Target;
+  };
+} // namespace
+} // namespace fexmac
+
+// Called by CodeWriteTrampoline in ordinary context (the signal has returned): resolve
+// the write, then re-enter the dispatcher at its fill-state entry with the frame in x28
+// and the single-instruction flag (x1) set, so the storing instruction runs on its own.
+extern "C" __attribute__((visibility("hidden"))) fexmac::ResumePoint FexmacCodeWriteResume(fexmac_thread* Thread, uint64_t Address) {
+  fexmac::ResolveCodeWrite(Thread, Address);
+  return {reinterpret_cast<uint64_t>(Thread->Thread->CurrentFrame), Thread->Context->Delegator->GetConfig().AbsoluteLoopTopAddressFillSRA};
+}
+
+extern "C" __attribute__((visibility("hidden"))) fexmac::ResumePoint FexmacFinishCodeWriteResume(fexmac_thread* Thread) {
+  fexmac::FinishCodeWrite(Thread);
+  // Requests that arrived meanwhile keep the page read-only.
+  fexmac::ProtectInterruptPage(Thread, Thread->StopRequested.load() || Thread->ResyncRequested.load());
+  return {reinterpret_cast<uint64_t>(Thread->Thread->CurrentFrame), Thread->Context->Delegator->GetConfig().AbsoluteLoopTopAddressFillSRA};
+}
+
+namespace fexmac {
+namespace {
+  // Entered with sp at the dispatcher's saved stack location, x0 the fexmac_thread and
+  // x1 the address written. STATE is x28 and ENTRY_FILL_SRA_SINGLE_INST_REG is x1 in
+  // the core (Arm64Emitter.h).
+  __attribute__((naked)) void CodeWriteTrampoline() {
+    asm volatile("bl _FexmacCodeWriteResume\n\t"
+                 "mov x28, x0\n\t"
+                 "mov x2, x1\n\t"
+                 "mov x1, #1\n\t"
+                 "br x2\n\t");
+  }
+
+  // As CodeWriteTrampoline, after the store: x0 the fexmac_thread. Re-enters without the
+  // single-instruction flag.
+  __attribute__((naked)) void FinishCodeWriteTrampoline() {
+    asm volatile("bl _FexmacFinishCodeWriteResume\n\t"
+                 "mov x28, x0\n\t"
+                 "mov x2, x1\n\t"
+                 "mov x1, #0\n\t"
+                 "br x2\n\t");
+  }
+
   // Per host thread, kept in pthread keys rather than C++ thread_locals: on macOS the
   // first access to a thread_local on a thread may allocate memory, which must not
   // happen in a signal handler that may have interrupted malloc.
@@ -69,6 +135,10 @@ namespace {
     pthread_key_create(&OwnDepthKey, nullptr);
     pthread_key_create(&EmulatingKey, nullptr);
   }
+
+#ifdef FEXMAC_TESTING
+  std::atomic<void*> TestProtectBeforeEmulation {};
+#endif
 
   uintptr_t GetKey(pthread_key_t Key) {
     return reinterpret_cast<uintptr_t>(pthread_getspecific(Key));
@@ -87,20 +157,6 @@ namespace {
   // while waiting for the invalidation lock; every other signal is blocked in the
   // handler, so the only thing that can interrupt it on its thread is a fault it causes.
   constexpr int SynchronousSignals[] = {SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGTRAP, SIGSYS};
-
-  void WriteHex(uint64_t Value) {
-    char Buffer[19] = "0x";
-    int Digits = 1;
-    for (uint64_t V = Value >> 4; V; V >>= 4) {
-      ++Digits;
-    }
-    for (int i = 0; i < Digits; ++i) {
-      const unsigned Nibble = (Value >> (4 * (Digits - 1 - i))) & 0xF;
-      Buffer[2 + i] = static_cast<char>(Nibble < 10 ? '0' + Nibble : 'a' + Nibble - 10);
-    }
-    Buffer[2 + Digits] = '\0';
-    WriteRaw(Buffer);
-  }
 
   // ---- Classification ----
 
@@ -130,6 +186,150 @@ namespace {
       return {FaultKind::Access, Write, DFSC};
     }
     return {FaultKind::Other, Write, DFSC};
+  }
+
+  // Whether an ARM64 instruction writes memory: stores, store-pairs, store-exclusives
+  // and store-releases, and the read-modify-write atomics (LSE and CAS). The syndrome's
+  // WnR bit is not enough: an atomic on a PROT_NONE page reports the read.
+  bool IsWritingInstruction(uint32_t Inst) {
+    // Load/store exclusive and ordered, CAS and CASP: L (bit 22) clear is a store;
+    // o1 (bit 21) set is CAS/CASP.
+    if ((Inst & 0x3F000000) == 0x08000000) {
+      return !(Inst & (1U << 22)) || (Inst & (1U << 21));
+    }
+    // LDAPR/STLUR (unscaled, release-consistent): opc 00 is the store.
+    if ((Inst & 0x3F200C00) == 0x19000000) {
+      return ((Inst >> 22) & 3) == 0;
+    }
+    // LSE atomic memory operations (LDADD, SWP, ...); LDAPR (o3=1, opc=100) only loads.
+    if ((Inst & 0x3B200C00) == 0x38200000) {
+      return ((Inst >> 10) & 0x3F) != 0x30;
+    }
+    // Load/store pair: L (bit 22).
+    if ((Inst & 0x3A000000) == 0x28000000) {
+      return !(Inst & (1U << 22));
+    }
+    // Load/store register (immediate, unscaled, register offset): opc bits 23:22.
+    if ((Inst & 0x3A000000) == 0x38000000) {
+      const uint32_t Opc = (Inst >> 22) & 3;
+      const bool Vector = Inst & (1U << 26);
+      return Opc == 0 || (Vector && Opc == 2);
+    }
+    return false;
+  }
+
+  bool IsWriteFault(const Classification& Kind, uint64_t PC) {
+    return Kind.Write || IsWritingInstruction(*reinterpret_cast<const uint32_t*>(PC));
+  }
+
+  // Whether the host currently allows [Address, Address + Size) to be read, or written.
+  // Asked in the fault handler before the core rewrites a misaligned atomic, because the
+  // rewrite would fault inside the handler on memory the guest cannot access. User space
+  // has no non-faulting probe instruction; the kernel's region query is the native way.
+  bool HostAllows(uint64_t Address, uint64_t Size, bool Write) {
+    uint64_t Cursor = Address;
+    while (Cursor < Address + Size) {
+      mach_vm_address_t RegionAddress = Cursor;
+      mach_vm_size_t RegionSize = 0;
+      vm_region_basic_info_data_64_t Info {};
+      mach_msg_type_number_t Count = VM_REGION_BASIC_INFO_COUNT_64;
+      mach_port_t Object = MACH_PORT_NULL;
+      if (mach_vm_region(mach_task_self(), &RegionAddress, &RegionSize, VM_REGION_BASIC_INFO_64, reinterpret_cast<vm_region_info_t>(&Info),
+                         &Count, &Object) != KERN_SUCCESS ||
+          RegionAddress > Cursor) {
+        return false;
+      }
+      if (!(Info.protection & VM_PROT_READ) || (Write && !(Info.protection & VM_PROT_WRITE))) {
+        return false;
+      }
+      Cursor = RegionAddress + RegionSize;
+    }
+    return true;
+  }
+
+  // ---- Leaving translated code (see the top of this file) ----
+
+  // The static registers holding the raw PF and AF values (REG_PF, REG_AF in the core's
+  // Arm64Emitter.h).
+  constexpr unsigned PFRegister = 26;
+  constexpr unsigned AFRegister = 27;
+
+  void SpillGuestState(fexmac_thread* Current, ucontext_t* Context) {
+    auto* Thread = Current->Thread;
+    auto* Frame = Thread->CurrentFrame;
+    auto* CTX = Thread->CTX;
+    const auto& Config = Current->Context->Delegator->GetConfig();
+    auto& State = Context->uc_mcontext->__ss;
+    auto& Vector = Context->uc_mcontext->__ns;
+    // x0 to x31, see the static_asserts in fexmac_handle_fault.
+    const uint64_t* X = &State.__x[0];
+
+    Frame->State.rip = CTX->RestoreRIPFromHostPC(Thread, State.__pc);
+    // Registers the system call path has already written back are not in host registers.
+    const uint32_t AlreadySpilled = Frame->InSyscallInfo & 0xFFFF;
+    for (size_t i = 0; i < Config.SRAGPRCount; ++i) {
+      const uint8_t Register = Config.SRAGPRMapping[i];
+      if (!(AlreadySpilled & (1U << Register))) {
+        Frame->State.gregs[i] = X[Register];
+      }
+    }
+    // The static vector registers hold the low 128 bits (Apple silicon has no SVE, so
+    // the translator keeps the upper AVX halves in the frame already).
+    for (size_t i = 0; i < Config.SRAFPRCount; ++i) {
+      memcpy(&Frame->State.xmm.sse.data[i][0], &Vector.__v[Config.SRAFPRMapping[i]], sizeof(__uint128_t));
+    }
+    constexpr unsigned CallRetStackRegister = 25;
+    Frame->State.callret_sp = X[CallRetStackRegister];
+    // NZCV from PSTATE and PF/AF from their registers, written back in the frame's form.
+    // An instruction that changes them (or rsp) before its last access that can fault
+    // saved them first (the undo record, CPUState::UndoMask): use the saved values, the
+    // state before the instruction.
+    const uint32_t Undo = Frame->State.UndoMask;
+    uint64_t Registers[32];
+    memcpy(Registers, X, sizeof(Registers));
+    uint64_t PSTATE = State.__cpsr;
+    if (Undo & FEXCore::Core::CPUState::UNDO_FLAGS) {
+      PSTATE = Frame->State.UndoNZCV;
+    }
+    if (Undo & FEXCore::Core::CPUState::UNDO_PFAF) {
+      Registers[PFRegister] = Frame->State.UndoPF;
+      Registers[AFRegister] = Frame->State.UndoAF;
+    }
+    const uint32_t EFLAGS = CTX->ReconstructCompactedEFLAGS(Thread, true, Registers, PSTATE);
+    CTX->SetFlagsFromCompactedEFLAGS(Thread, EFLAGS);
+    if (Undo & FEXCore::Core::CPUState::UNDO_RSP) {
+      Frame->State.gregs[FEXCore::X86State::REG_RSP] = Frame->State.UndoRSP;
+    }
+    Frame->State.UndoMask = 0;
+    Frame->InSyscallInfo = 0;
+  }
+
+  void ClearTranslatorFPCR(ucontext_t* Context) {
+    // FPCR.NEP, AH and FIZ: set by the translator, wrong for host code.
+    Context->uc_mcontext->__ns.__fpcr &= ~0x7U;
+  }
+
+  // Makes the signal return into the dispatcher's stop handler, which returns from
+  // ExecuteThread to fexmac_thread_run. The guest state must be in the frame.
+  void LeaveDispatcherFromHandler(fexmac_thread* Current, ucontext_t* Context, const fexmac_stop& Stop) {
+    auto* Frame = Current->Thread->CurrentFrame;
+    Current->PendingStop = Stop;
+    Current->PendingStop.struct_size = sizeof(fexmac_stop);
+    auto& State = Context->uc_mcontext->__ss;
+    State.__sp = Frame->ReturningStackLocation;
+    State.__pc = Current->Context->Delegator->GetConfig().ThreadStopHandlerAddress;
+    ClearTranslatorFPCR(Context);
+  }
+
+  // Makes the signal return into CodeWriteTrampoline (below), on the dispatcher's stack.
+  void ResolveCodeWriteAfterHandler(fexmac_thread* Current, ucontext_t* Context, uint64_t Address) {
+    auto& State = Context->uc_mcontext->__ss;
+    State.__sp = Current->Thread->CurrentFrame->ReturningStackLocation;
+    State.__x[0] = reinterpret_cast<uint64_t>(Current);
+    State.__x[1] = Address;
+    State.__lr = 0;
+    State.__pc = reinterpret_cast<uint64_t>(&CodeWriteTrampoline);
+    ClearTranslatorFPCR(Context);
   }
 
   // ---- The core's faults ----
@@ -217,29 +417,94 @@ namespace {
   // multiple of the operand size where the access crosses 16 bytes; x86 allows it. The
   // core rewrites the instruction sequence and execution resumes after it.
 #ifdef FEXMAC_TESTING
-  // Called in HandleMisalignedAtomic with the core's handling about to start.
+  // Called in HandleMisalignedAtomic with the core's handling about to start (package E's
+  // test of the signal blocking), after the asynchronous signals are blocked.
   std::atomic<void (*)()> TestMisalignedHook {};
 #endif
 
-  bool HandleMisalignedAtomic(FEXCore::Core::InternalThreadState* Thread, const Classification& Kind, siginfo_t* Info, ucontext_t* Context) {
+  bool HandleMisalignedAtomic(fexmac_thread* Current, const Classification& Kind, siginfo_t* Info, ucontext_t* Context) {
+    auto* Thread = Current->Thread;
     auto& State = Context->uc_mcontext->__ss;
     const uint64_t PC = State.__pc;
     if (Kind.Kind != FaultKind::Alignment || !Thread->CTX->IsAddressInCodeBuffer(Thread, PC)) {
       return false;
     }
-    // The core may now take its per-block patch lock (with the thread switched to writing
-    // code) or its split-lock lock. Block asynchronous signals for that time: a host that
-    // owns the fault signals runs this with its own mask, and an asynchronous handler that
-    // left by a jump, or stopped the thread, would leave a lock held (and the thread in
-    // write mode). The library's own handler already blocks them; synchronous fault
-    // signals stay open as everywhere in the handler.
-    sigset_t Asynchronous, Previous;
-    sigfillset(&Asynchronous);
-    for (int Synchronous : SynchronousSignals) {
-      sigdelset(&Asynchronous, Synchronous);
+    // ARM64 checks alignment before permissions, so the memory may not allow the access
+    // at all. The core's rewrite (for a locked operation, an emulation under the core's
+    // process-wide split-lock lock) must never fault on it: a fault there is inside this
+    // handler, with the lock held and one half possibly written, and cannot be left. So
+    // the access is checked first and a guest fault is reported from this, the outer,
+    // context, with nothing written. The check is only valid if no protection is reduced
+    // between it and the emulation: the library's own changes (write protection of
+    // translated code, fexmac_memory_*) wait for emulations in progress and make new ones
+    // retry (GuestMemory::Emulations); a raw mprotect or munmap of the page by the
+    // embedder at that moment is outside the contract, and the nested fault then ends the
+    // process (it never hangs; see fexmac_handle_fault). The access is at most 16 bytes
+    // from the fault address.
+    const auto Address = reinterpret_cast<uint64_t>(Info->si_addr);
+    const bool Write = IsWriteFault(Kind, PC);
+    auto* Embedding = Current->Context;
+    auto& Memory = Embedding->Memory;
+    Memory.Emulations.fetch_add(1, std::memory_order_seq_cst);
+    struct EmulationGuard {
+      GuestMemory& Memory;
+      ~EmulationGuard() {
+        Memory.Emulations.fetch_sub(1, std::memory_order_seq_cst);
+      }
+    } Guard {Memory};
+    if (Memory.ProtectionChanges.load(std::memory_order_seq_cst) != 0) {
+      // A protection change is about to be applied: run the instruction again, which
+      // faults again once it is done.
+      return true;
     }
-    pthread_sigmask(SIG_BLOCK, &Asynchronous, &Previous);
+    if (Write && Embedding->WriteProtectCode && Memory.Tracking()) {
+      for (uint64_t Byte : {Address, Address + 15}) {
+        const uint8_t Page = Memory.Page(Byte);
+        if ((Page & GuestMemory::Mapped) && (Page & FEXMAC_PROT_WRITE) && Memory.CodeProtected(Byte)) {
+          // Translated code on the page: resolve that first; the atomic then runs again
+          // as a single instruction and is rewritten on writable memory.
+          SpillGuestState(Current, Context);
+          ResolveCodeWriteAfterHandler(Current, Context, Byte);
+          return true;
+        }
+      }
+    }
+    // The bytes the access touches: the size is in bits 31:30 of every load/store
+    // encoding; a pair (CASP, LDXP/STXP, LDP/STP) touches two.
+    const uint32_t Instruction = *reinterpret_cast<const uint32_t*>(PC);
+    const bool Pair = (Instruction & 0x3F200000) == 0x08200000 || (Instruction & 0x3A000000) == 0x28000000;
+    const uint64_t Size = (1ULL << (Instruction >> 30)) * (Pair ? 2 : 1);
+    if (!HostAllows(Address, Size, Write)) {
+      for (uint64_t Byte : {Address, (Address + Size - 1) & ~(GuestMemory::GuestPage - 1)}) {
+        if (Byte < Address) {
+          continue;
+        }
+        if (!HostAllows(Byte, 1, Write)) {
+          SpillGuestState(Current, Context);
+          fexmac_stop Stop {};
+          Stop.instruction_address = Thread->CurrentFrame->State.rip;
+          // Without registered memory: present (a protection fault) if the page is readable.
+          DescribePageFault(Embedding, &Stop, Byte, Write ? FEXMAC_ACCESS_WRITE : FEXMAC_ACCESS_READ, SIGBUS, Write && HostAllows(Byte, 1, false));
+          LeaveDispatcherFromHandler(Current, Context, Stop);
+          return true;
+        }
+      }
+    }
+    // Asynchronous signals stay blocked while the emulation holds the core's locks, also
+    // when the host owns the signals and installed its handler with a wider mask (an
+    // asynchronous handler that left with siglongjmp or suspended the thread would leave
+    // the lock and the thread's JIT write mode held). pthread_sigmask is
+    // async-signal-safe.
+    sigset_t Block, Old;
+    sigfillset(&Block);
+    for (int Synchronous : SynchronousSignals) {
+      sigdelset(&Block, Synchronous);
+    }
+    pthread_sigmask(SIG_BLOCK, &Block, &Old);
 #ifdef FEXMAC_TESTING
+    if (void* Page = TestProtectBeforeEmulation.load()) {
+      ::mprotect(Page, FEXCore::Utils::FEX_HOST_PAGE_SIZE, PROT_NONE);
+    }
     if (auto Hook = TestMisalignedHook.load()) {
       Hook();
     }
@@ -248,11 +513,165 @@ namespace {
     const auto Result = FEXCore::ArchHelpers::Arm64::HandleUnalignedAccess(
       Thread, FEXCore::ArchHelpers::Arm64::UnalignedHandlerType::HalfBarrier, PC, &State.__x[0]);
     SetKey(EmulatingKey, 0);
-    pthread_sigmask(SIG_SETMASK, &Previous, nullptr);
+    pthread_sigmask(SIG_SETMASK, &Old, nullptr);
     if (!Result.has_value()) {
       return false;
     }
     State.__pc = PC + *Result;
+    return true;
+  }
+
+  // Makes the interrupt fault page writable again, then checks for a request that arrived
+  // in between (its store and mprotect may both have come before the unprotect) and makes
+  // the page read-only again if so, so that no request is left with a writable page.
+  void UnprotectInterruptPageUnlessRequested(fexmac_thread* Current) {
+    ProtectInterruptPage(Current, false);
+    if (Current->StopRequested.load() || Current->ResyncRequested.load()) {
+      ProtectInterruptPage(Current, true);
+    }
+  }
+
+  // Another thread asked this one to stop (fexmac_thread_request_stop) and made its
+  // interrupt fault page read-only; this thread has just written to it. Translated code
+  // writes it only at block entries and loop back-edges, where the guest state is at an
+  // instruction boundary (or part-way through a rep loop, resumable), so the thread
+  // leaves the dispatcher there. The dispatcher writes it after its own calls, and the
+  // core's C++ code at the end of every signal-deferring section (a lock guard); there
+  // the store is stepped over (it has no other effect: nothing reads the page) and the
+  // page stays read-only, so the next block entry stops the thread.
+  bool HandleInterruptPage(fexmac_thread* Current, const Classification& Kind, siginfo_t* Info, ucontext_t* Context) {
+    const auto Address = reinterpret_cast<uint64_t>(Info->si_addr);
+    const auto Page = reinterpret_cast<uint64_t>(InterruptPage(Current));
+    if (Kind.Kind != FaultKind::Access || Address < Page || Address >= Page + FEXCore::Utils::FEX_HOST_PAGE_SIZE) {
+      return false;
+    }
+    auto& State = Context->uc_mcontext->__ss;
+    const bool StopWanted = Current->StopRequested.load() != 0;
+    if (!StopWanted && Current->ResyncRequested.load() == 0 && Current->PendingCodeWriteChecks == 0) {
+      // Stale: the request was answered between its store and its mprotect.
+      UnprotectInterruptPageUnlessRequested(Current);
+      return true;
+    }
+    if (!Current->Thread->CTX->IsAddressInCodeBuffer(Current->Thread, State.__pc)) {
+      State.__pc += 4;
+      return true;
+    }
+    if (Current->PendingCodeWriteChecks != 0) {
+      // A store to write-protected code is being run as a single instruction (Memory.cpp).
+      // The first check is that block's entry: the store is still to come. The second is
+      // after it: finish the write in ordinary context, then carry on from here.
+      if (--Current->PendingCodeWriteChecks != 0) {
+        State.__pc += 4;
+        return true;
+      }
+      SpillGuestState(Current, Context);
+      State.__sp = Current->Thread->CurrentFrame->ReturningStackLocation;
+      State.__x[0] = reinterpret_cast<uint64_t>(Current);
+      State.__lr = 0;
+      State.__pc = reinterpret_cast<uint64_t>(&FinishCodeWriteTrampoline);
+      ClearTranslatorFPCR(Context);
+      return true;
+    }
+    if (!StopWanted) {
+      // Code was discarded by another thread: re-enter the dispatcher at this guest
+      // instruction (the fill-state entry, not single-stepping), which looks it up anew.
+      Current->ResyncRequested.store(0);
+      UnprotectInterruptPageUnlessRequested(Current);
+      SpillGuestState(Current, Context);
+      State.__sp = Current->Thread->CurrentFrame->ReturningStackLocation;
+      State.__x[1] = 0;
+      State.__x[28] = reinterpret_cast<uint64_t>(Current->Thread->CurrentFrame);
+      State.__pc = Current->Context->Delegator->GetConfig().AbsoluteLoopTopAddressFillSRA;
+      return true;
+    }
+    Current->ResyncRequested.store(0);
+    // Consume first, then make the page writable: a request made in between is not lost
+    // (it leaves the flag set, so the next run answers it at once).
+    Current->StopRequested.store(0);
+    UnprotectInterruptPageUnlessRequested(Current);
+    SpillGuestState(Current, Context);
+    fexmac_stop Stop {};
+    Stop.reason = FEXMAC_STOP_REQUESTED;
+    Stop.instruction_address = Current->Thread->CurrentFrame->State.rip;
+    LeaveDispatcherFromHandler(Current, Context, Stop);
+    return true;
+  }
+
+  // A guest store to a page the library write-protected because code on it was
+  // translated (Memory.cpp). Only from translated code: a host write (the embedder) is
+  // not the guest's and is passed on; fexmac_memory_write_begin is the way for that.
+  bool HandleCodeWrite(fexmac_thread* Current, const Classification& Kind, siginfo_t* Info, ucontext_t* Context) {
+    auto* Embedding = Current->Context;
+    if (Kind.Kind != FaultKind::Access || !Embedding->WriteProtectCode || !Embedding->Memory.Tracking()) {
+      return false;
+    }
+    const auto Address = reinterpret_cast<uint64_t>(Info->si_addr);
+    const uint8_t Page = Embedding->Memory.Page(Address);
+    const uint64_t PC = Context->uc_mcontext->__ss.__pc;
+    if (!(Page & GuestMemory::Mapped) || !(Page & FEXMAC_PROT_WRITE) || !Current->Thread->CTX->IsAddressInCodeBuffer(Current->Thread, PC) ||
+        !IsWriteFault(Kind, PC)) {
+      return false;
+    }
+    if (!Embedding->Memory.CodeProtected(Address)) {
+      // Another thread gave the page its write access back after this store faulted:
+      // run it again. If the host still refuses the write, it is not ours.
+      return HostAllows(Address, 1, true);
+    }
+    SpillGuestState(Current, Context);
+    ResolveCodeWriteAfterHandler(Current, Context, Address);
+    return true;
+  }
+
+  // The address x86 reports (CR2) for a fault in rep movs/stos. The in-place loops move
+  // 32-byte chunks; the host reports some address of the faulting chunk (for a backward
+  // chunk its lowest byte), x86 the first inaccessible byte of the element at rdi (store)
+  // or at rsi plus the segment base (load), whose registers are exact here. Anything
+  // that is not such an instruction, or a host address too far from that element, is
+  // left as the host gave it.
+  uint64_t RepStringFaultAddress(const FEXCore::Core::CPUState& State, uint64_t HostAddress, bool Write) {
+    const auto* Bytes = reinterpret_cast<const uint8_t*>(State.rip);
+    bool Rep = false;
+    uint64_t SegmentBase = 0;
+    size_t i = 0;
+    for (; i < 15; ++i) {
+      const uint8_t B = Bytes[i];
+      if (B == 0xF2 || B == 0xF3) {
+        Rep = true;
+      } else if (B == 0x64) {
+        SegmentBase = State.fs_cached;
+      } else if (B == 0x65) {
+        SegmentBase = State.gs_cached;
+      } else if (B == 0x26 || B == 0x2E || B == 0x36 || B == 0x3E || B == 0x66 || B == 0x67 || B == 0xF0 || (B & 0xF0) == 0x40) {
+      } else {
+        break;
+      }
+    }
+    const uint8_t Opcode = i < 15 ? Bytes[i] : 0;
+    if (!Rep || (Opcode != 0xA4 && Opcode != 0xA5 && Opcode != 0xAA && Opcode != 0xAB) || (!Write && (Opcode & 0xFE) == 0xAA)) {
+      return HostAddress;
+    }
+    const uint64_t Element = Write ? State.gregs[FEXCore::X86State::REG_RDI] : State.gregs[FEXCore::X86State::REG_RSI] + SegmentBase;
+    if (HostAddress + 64 < Element || HostAddress > Element + 64) {
+      return HostAddress;
+    }
+    const uint64_t PageStart = HostAddress & ~uint64_t {0xFFF};
+    return Element > PageStart ? Element : PageStart;
+  }
+
+  // Any other memory access fault in translated code is the guest's own page fault.
+  bool HandleGuestMemoryFault(fexmac_thread* Current, int Signal, const Classification& Kind, siginfo_t* Info, ucontext_t* Context) {
+    const uint64_t PC = Context->uc_mcontext->__ss.__pc;
+    if (Kind.Kind != FaultKind::Access || !Current->Thread->CTX->IsAddressInCodeBuffer(Current->Thread, PC)) {
+      return false;
+    }
+    const bool Write = IsWriteFault(Kind, PC);
+    SpillGuestState(Current, Context);
+    fexmac_stop Stop {};
+    Stop.instruction_address = Current->Thread->CurrentFrame->State.rip;
+    const bool Permission = Kind.StatusCode >= 0x0C && Kind.StatusCode <= 0x0F;
+    const uint64_t Address = RepStringFaultAddress(Current->Thread->CurrentFrame->State, reinterpret_cast<uint64_t>(Info->si_addr), Write);
+    DescribePageFault(Current->Context, &Stop, Address, Write ? FEXMAC_ACCESS_WRITE : FEXMAC_ACCESS_READ, Signal, Permission);
+    LeaveDispatcherFromHandler(Current, Context, Stop);
     return true;
   }
 
@@ -291,24 +710,22 @@ namespace {
     sigaction(Signal, &Default, nullptr);
   }
 
-  // Says why a fault in translated code is passed on, so the crash that follows names it.
-  void ReportUnhandledGuestFault(int Signal, siginfo_t* Info, ucontext_t* Context) {
-    auto* Current = GetCurrentThread();
-    if (!Current || IsSentSignal(Info, Context)) {
+  // Says why a fault is passed on when the cause is a known misuse, so the crash that
+  // follows names it: host code writing a page the library write-protected for code.
+  void ReportUnhandledFault(int Signal, siginfo_t* Info, ucontext_t* Context) {
+    if (IsSentSignal(Info, Context)) {
       return;
     }
-    const auto Kind = ClassifyFault(Context);
-    const uint64_t PC = Context->uc_mcontext->__ss.__pc;
-    if (Kind.Kind != FaultKind::Access || !Current->Thread->CTX->IsAddressInCodeBuffer(Current->Thread, PC)) {
+    const auto Address = reinterpret_cast<uint64_t>(Info->si_addr);
+    auto* Context_ = ProcessContext.load();
+    if (!Context_ || !Context_->Memory.CodeProtected(Address)) {
       return;
     }
     WriteRaw(Signal == SIGBUS ? "fexmac: SIGBUS" : "fexmac: SIGSEGV");
-    WriteRaw(": guest memory access fault in translated code at address ");
-    WriteHex(reinterpret_cast<uint64_t>(Info->si_addr));
-    WriteRaw(Kind.Write ? " (write" : " (read");
-    WriteRaw(", fault status ");
-    WriteHex(Kind.StatusCode);
-    WriteRaw("); guest fault delivery is not implemented, passing it on\n");
+    WriteRaw(": host code wrote guest address ");
+    WriteHex(Address);
+    WriteRaw(", which holds translated code and is write-protected for self-modifying-code detection; "
+             "bracket such writes with fexmac_memory_write_begin and fexmac_memory_write_end\n");
   }
 
   // The core keeps an inaccessible host page after each code buffer, so an access that
@@ -393,12 +810,13 @@ namespace {
       const auto Emulating = GetKey(EmulatingKey);
       const auto Address = reinterpret_cast<uintptr_t>(Info->si_addr);
       if (Emulating && Address + 16 >= Emulating && Address < Emulating + 32) {
-        // The core was rewriting a misaligned atomic whose memory is not accessible:
-        // the guest's own fault, not a bug in the handler.
+        // The core was emulating a misaligned atomic and its memory became inaccessible
+        // under it (see HandleMisalignedAtomic), with the split-lock lock held: end the
+        // process rather than leave the emulation.
         WriteRaw(Signal == SIGBUS ? "fexmac: SIGBUS" : "fexmac: SIGSEGV");
-        WriteRaw(": guest memory access fault in translated code at address ");
+        WriteRaw(": fault while emulating a misaligned atomic at address ");
         WriteHex(Address);
-        WriteRaw(" (misaligned atomic on an inaccessible page); guest fault delivery is not implemented, passing it on\n");
+        WriteRaw(" (the page's protection changed under it); ending the process\n");
       } else {
         WriteRaw("fexmac: fault inside the fault handler; restoring the default action\n");
       }
@@ -437,7 +855,7 @@ namespace {
     }
     if (!HasHandler && !Sent) {
       // Written while still in the library's own code.
-      ReportUnhandledGuestFault(Signal, Info, static_cast<ucontext_t*>(RawContext));
+      ReportUnhandledFault(Signal, Info, static_cast<ucontext_t*>(RawContext));
     }
     LeaveOwnCode();
     if (HasHandler) {
@@ -493,15 +911,28 @@ int fexmac_handle_fault(int signal, siginfo_t* info, void* ucontext) {
   static_assert(offsetof(__darwin_arm_thread_state64, __sp) == 31 * sizeof(uint64_t));
 
   pthread_once(&fexmac::KeysOnce, fexmac::CreateKeys);
+  if (fexmac::GetKey(fexmac::EmulatingKey) != 0) {
+    // A fault inside the core's emulation of a misaligned atomic, with its split-lock
+    // lock held (only possible if the embedder changed the page's protection directly at
+    // that moment; see HandleMisalignedAtomic). It must not reach the host's handler,
+    // which might leave it with siglongjmp and the lock held: every later split locked
+    // operation would then spin forever. End the process instead: claim it and let it
+    // fault again with the default action.
+    fexmac::WriteRaw("fexmac: fault while emulating a misaligned atomic (the page's protection changed under it); "
+                     "ending the process\n");
+    fexmac::SetDefaultAction(signal);
+    return 1;
+  }
   fexmac::EnterOwnCode();
 
   const auto Kind = fexmac::ClassifyFault(Context);
   int Handled = 0;
   if (fexmac::HandleScratchBufferOverflow(Current, Kind, info, Context) || fexmac::HandleCallRetStackGuard(Current, Kind, info, Context) ||
-      fexmac::HandleMisalignedAtomic(Thread, Kind, info, Context)) {
+      fexmac::HandleInterruptPage(Current, Kind, info, Context) || fexmac::HandleMisalignedAtomic(Current, Kind, info, Context) ||
+      fexmac::HandleCodeWrite(Current, Kind, info, Context) || fexmac::HandleGuestMemoryFault(Current, signal, Kind, info, Context)) {
     Handled = 1;
   }
-  // Package D adds its checks here (see the top of this file).
+  (void)Thread;
 
   fexmac::LeaveOwnCode();
   return Handled;
@@ -542,6 +973,10 @@ void fexmac_testing_fault_inside_handler(int enable, volatile uint32_t* fired) {
   if (Page != MAP_FAILED) {
     fexmac::TestFaultPage.store(static_cast<volatile uint32_t*>(Page));
   }
+}
+
+void fexmac_testing_protect_before_emulation(void* page) {
+  fexmac::TestProtectBeforeEmulation.store(page);
 }
 
 void fexmac_testing_set_misaligned_hook(void (*hook)(void)) {

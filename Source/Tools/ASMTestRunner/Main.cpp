@@ -146,20 +146,18 @@ public:
     return reinterpret_cast<void*>(Address);
   }
 
-  bool Failed {};
-
-  // The mapped pages as [begin, end) ranges, for fexmac_add_code_range.
-  std::vector<std::pair<uint64_t, uint64_t>> Ranges() const {
-    std::vector<std::pair<uint64_t, uint64_t>> Out;
+  // Tells fexmac about every page mapped for the test (readable, writable and executable,
+  // as the tests use them).
+  bool Register(fexmac_context* Context) const {
     for (uint64_t Page : Mapped) {
-      if (!Out.empty() && Out.back().second == Page) {
-        Out.back().second += PageSize;
-      } else {
-        Out.emplace_back(Page, Page + PageSize);
+      if (fexmac_memory_map(Context, Page, PageSize, FEXMAC_PROT_READ | FEXMAC_PROT_WRITE | FEXMAC_PROT_EXEC) != FEXMAC_OK) {
+        return false;
       }
     }
-    return Out;
+    return true;
   }
+
+  bool Failed {};
 
 private:
   uint64_t PageSize;
@@ -215,6 +213,12 @@ fexmac_syscall_action SyscallHandler(fexmac_thread* Thread, void*) {
   if (RAX == LinuxSysTime) {
     // time(time_t* tloc): seconds since the epoch, also stored through tloc if non-null.
     const uint64_t Now = static_cast<uint64_t>(::time(nullptr));
+    // The page may hold translated code that fexmac write-protects (SMCCHECKS mtrack with
+    // registered memory); a host write to guest memory goes between write_begin and _end.
+    auto* Context = fexmac_thread_context(Thread);
+    if (RDI) {
+      fexmac_memory_write_begin(Context, RDI, sizeof(uint64_t));
+    }
     if (RDI && !IsWritable(RDI, sizeof(uint64_t))) {
       RAX = -LinuxEFAULT;
     } else {
@@ -222,6 +226,9 @@ fexmac_syscall_action SyscallHandler(fexmac_thread* Thread, void*) {
         memcpy(reinterpret_cast<void*>(RDI), &Now, sizeof(Now));
       }
       RAX = Now;
+    }
+    if (RDI) {
+      fexmac_memory_write_end(Context, RDI, sizeof(uint64_t));
     }
   } else {
     RAX = -LinuxENOSYS;
@@ -482,10 +489,12 @@ int main(int argc, char** argv, char** const envp) {
     return ExitFail;
   }
   // Everything this runner mapped may hold code, and tests write to it. Registering it
-  // makes the core treat only that memory as code (a jump elsewhere stops with a guest
-  // fault), and the code cache hashes and patches guest bytes only inside it.
-  for (const auto& [Begin, End] : Mapper.Ranges()) {
-    fexmac_add_code_range(Context, Begin, End - Begin, 1);
+  // (readable, writable, executable) makes the core treat only that memory as code (a
+  // jump elsewhere stops with a guest fault), the code cache hashes and patches guest
+  // bytes only inside it, and SMCCHECKS mtrack write-protects pages translated from it.
+  if (!Mapper.Register(Context)) {
+    fextl::fmt::print("Failed to register the test's memory with fexmac\n");
+    return ExitFail;
   }
 
   fexmac_thread* Thread {};

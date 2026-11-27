@@ -716,6 +716,15 @@
         "HasSideEffects": true,
         "DestSize": "OpSize::i64Bit"
       },
+      "GPR:$DstAddress, GPR:$SrcAddress = MemCpySrcBase OpSize:$Size, GPR:$Dest, GPR:$Src, GPR:$SrcBase, GPR:$Length, GPR:$Direction": {
+        "Desc": ["macOS: rep movs with a segment base added to every source address; Src,",
+                 "Dest and Length are the guest's rsi/rdi/rcx, which the loop keeps exact.",
+                 "Returns the final rdi and rsi (without the base)."
+                ],
+        "Inline": ["", "", "", "", "Any"],
+        "HasSideEffects": true,
+        "DestSize": "OpSize::i64Bit"
+      },
       "CacheLineClear GPR:$Addr, i1:$Serialize": {
         "Desc": ["Does a 64 byte cacheline clear at the address specified",
                  "Only clears the data cachelines. Doesn't do any zeroing",

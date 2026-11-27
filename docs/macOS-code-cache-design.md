@@ -89,7 +89,7 @@ addresses.
 A cache entry can only be found under the exact combination that produced it.
 
 - **Directory (machine bucket):** hash of the format version, upstream's host-feature
-  bits, and, added by this port, the port identity: a port cache revision (2), the git
+  bits, and, added by this port, the port identity: a port cache revision (4), the git
   hash the core was configured from, the **Mach-O UUID of the image the core's code is
   in** (the linker derives it from the code, so any rebuilt core gets a new one, even
   with uncommitted changes), the CPU brand string and the CPU MIDRs. If the image has no
@@ -382,7 +382,7 @@ Inside: `<machine bucket>/RWCacheDB_<process bucket>.foz` and `..._idx.foz`.
 Through `fexmac` (`docs/macOS-embedding-interface.md`, "Cached translations and guest
 code ranges"): `fexmac_config.code_cache_enabled` and `code_cache_directory` switch the
 cache on (the core's `DISKCACHE`/`DISKCACHEPATH` options stay refused);
-`fexmac_add_code_range` registers the guest's code so that the cache hashes and patches
+`fexmac_memory_map` registers the guest's code so that the cache hashes and patches
 only mapped bytes; `fexmac_context_flush_cache` before exiting;
 `fexmac_context_get_counters` for the counters and the cache state (a refused directory
 shows as `FEXMAC_CACHE_UNTRUSTED`, not as an error; see "What the cache reports"); `fexmac_before_fork` /

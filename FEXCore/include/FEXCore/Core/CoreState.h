@@ -231,6 +231,22 @@ struct alignas(64) CPUState {
   // Debug register 7 is the control register.
   uint64_t Dr7 {};
 
+#ifdef __APPLE__
+  // Undo record for restartable guest faults (macOS embedding library). Translated code
+  // writes the guest state an instruction will change before its last access that can
+  // fault (flags for read-modify-write on memory, rsp for pop to memory and leave) here at
+  // the instruction's start, sets UndoMask (UNDO_* bits), and clears UndoMask after the
+  // instruction. A fault while UndoMask is set restores the saved state.
+  static constexpr uint32_t UNDO_FLAGS = 1;
+  static constexpr uint32_t UNDO_RSP = 2;
+  static constexpr uint32_t UNDO_PFAF = 4; ///< PF and AF too (not for rotates, which keep them).
+  uint32_t UndoMask {};
+  uint32_t UndoNZCV {};
+  uint32_t UndoPF {};
+  uint32_t UndoAF {};
+  uint64_t UndoRSP {};
+#endif
+
   // PF/AF are statically mapped as-if they were r16/r17 (which do not exist in
   // x86 otherwise). This allows a straightforward mapping for SRA.
   static constexpr uint8_t PF_AS_GREG = 16;

@@ -10,6 +10,7 @@ $end_info$
 #include "Interface/Core/LookupCache.h"
 
 #include "Interface/Core/JIT/JITClass.h"
+#include "Interface/Core/JIT/DebugData.h"
 
 #include <FEXCore/Core/Thunks.h>
 #include <FEXCore/Core/X86Enums.h>
@@ -250,6 +251,65 @@ DEF_OP(CondJump) {
 
   auto TrueTargetLabel = JumpTarget(Op->TrueBlock);
 
+#ifdef __APPLE__
+  // A conditional branch back to an earlier block of this unit (a guest loop closed by a
+  // jcc in a multiblock, or a rep cmps/scas loop) bypasses the interrupt check that block
+  // entries and unconditional back-edges have, so a loop made of one could never be
+  // stopped through the interrupt fault page. When the check is wanted, the taken branch
+  // goes through a local stub that does the check first. At the stub the branch is
+  // decided, so the guest state is the state on entering the target. If the target
+  // begins an x86 instruction (an entry point), a RIP entry recorded for the stub names
+  // it, and one after the stub restores the current instruction's. Otherwise the target
+  // is inside the current instruction (a rep loop): its RIP entry already applies and
+  // its registers show the progress made, as x86 leaves them for an interrupted rep.
+  if (CTX->Config.NeedsPendingInterruptFaultCheck && TrueTargetLabel->Backward.Location) {
+    // Not taken: one branch, over the stub. Taken: the check and the branch back.
+    ARMEmitter::ForwardLabel l_NotTaken;
+    EmitCondJumpBranchInverted(Op, &l_NotTaken);
+    const auto TargetBlock = IR->GetOp<IR::IROp_CodeBlock>(Op->TrueBlock);
+    const bool TargetIsEntry = TargetBlock->EntryPoint && !DebugData->GuestOpcodes.empty();
+    const auto CurrentOffset = TargetIsEntry ? DebugData->GuestOpcodes.back().GuestEntryOffset : 0;
+    if (TargetIsEntry) {
+      DebugData->GuestOpcodes.push_back({TargetBlock->GuestEntryOffset, GetCursorAddress<uint8_t*>() - CodeData.BlockBegin});
+    }
+    EmitSuspendInterruptCheck();
+    b_OrRestart(TrueTargetLabel);
+    (void)Bind(&l_NotTaken);
+    if (TargetIsEntry) {
+      DebugData->GuestOpcodes.push_back({CurrentOffset, GetCursorAddress<uint8_t*>() - CodeData.BlockBegin});
+    }
+    PendingTargetLabel = JumpTarget(Op->FalseBlock);
+    return;
+  }
+#endif
+
+  EmitCondJumpBranch(Op, TrueTargetLabel);
+  PendingTargetLabel = JumpTarget(Op->FalseBlock);
+}
+
+#ifdef __APPLE__
+// The branch of a CondJump with its condition inverted, to a nearby label.
+void Arm64JITCore::EmitCondJumpBranchInverted(const IR::IROp_CondJump* Op, ARMEmitter::ForwardLabel* Label) {
+  if (Op->FromNZCV) {
+    (void)b(ARMEmitter::Emitter::InvertCondition(MapCC(Op->Cond)), Label);
+    return;
+  }
+  auto Reg = GetReg(Op->Cmp1);
+  const auto Size = Op->CompareSize == IR::OpSize::i32Bit ? ARMEmitter::Size::i32Bit : ARMEmitter::Size::i64Bit;
+  uint64_t Const {};
+  (void)IsInlineConstant(Op->Cmp2, &Const);
+  switch (Op->Cond) {
+  case IR::CondClass::EQ: (void)cbnz(Size, Reg, Label); break;
+  case IR::CondClass::NEQ: (void)cbz(Size, Reg, Label); break;
+  case IR::CondClass::TSTZ: (void)tbnz(Reg, Const, Label); break;
+  case IR::CondClass::TSTNZ: (void)tbz(Reg, Const, Label); break;
+  default: LOGMAN_THROW_A_FMT(false, "CondJump expected simple condition"); break;
+  }
+}
+#endif
+
+template<ARMEmitter::IsLabel T>
+void Arm64JITCore::EmitCondJumpBranch(const IR::IROp_CondJump* Op, T* TrueTargetLabel) {
   if (Op->FromNZCV) {
     b_OrRestart(MapCC(Op->Cond), TrueTargetLabel);
   } else {
@@ -278,8 +338,6 @@ DEF_OP(CondJump) {
       LOGMAN_THROW_A_FMT(false, "CondJump expected simple condition");
     }
   }
-
-  PendingTargetLabel = JumpTarget(Op->FalseBlock);
 }
 
 DEF_OP(Syscall) {

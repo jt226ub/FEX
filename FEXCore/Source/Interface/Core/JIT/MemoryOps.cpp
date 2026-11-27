@@ -1861,6 +1861,315 @@ DEF_OP(StoreMemTSO) {
   }
 }
 
+#ifdef __APPLE__
+// rep movs / rep stos with exact x86 progress (macOS). The guest's rcx, rsi and rdi live
+// in static registers; when the IR hands those registers to MemCpy/MemSet unchanged (no
+// segment base added), the loops below use them as the induction variables themselves,
+// so that at any fault or stop they say exactly which elements are done:
+//  - one element is loaded and stored, then rsi/rdi move and rcx drops: a fault on the
+//    load or the store leaves the registers before that element and nothing of it
+//    written (a single store of up to 8 bytes does not write partly on this hardware;
+//    the differential test checks a store across a page);
+//  - 32-byte chunks (ldp/stp of two q registers) in runs during which neither the source
+//    nor the destination chunk crosses a 4K page, so a chunk faults whole or not at all,
+//    exactly where x86 would stop; only when source and destination are at least 32
+//    bytes apart, so a chunk never reads bytes it writes (overlapping copies go element
+//    by element, which is x86's order);
+//  - the interrupt fault page is written after every run (at most a page) and every 64
+//    elements, so a stop request lands inside a long rep with the registers exact;
+//    running again continues.
+// NZCV is not touched (no flag-setting instruction). Direction comes from DF.
+// Returns false (and emits nothing) when the registers are not the guest's.
+bool Arm64JITCore::EmitRepStringInPlace(bool Copy, bool IsAtomic, size_t Size, ARMEmitter::Register Length, ARMEmitter::Register DestIn,
+                                        ARMEmitter::Register SrcIn, ARMEmitter::Register Value, bool DirectionIsInline,
+                                        uint64_t DirectionConstant, ARMEmitter::Register DirectionReg, ARMEmitter::Register OutDst,
+                                        ARMEmitter::Register OutSrc, ARMEmitter::Register SrcBase) {
+  const auto RCX = StaticRegisters[X86State::REG_RCX];
+  const auto RDI = StaticRegisters[X86State::REG_RDI];
+  const auto RSI = StaticRegisters[X86State::REG_RSI];
+  if (Length.Idx() != RCX.Idx() || DestIn.Idx() != RDI.Idx() || (Copy && SrcIn.Idx() != RSI.Idx())) {
+    return false;
+  }
+  if (Size != 1 && Size != 2 && Size != 4 && Size != 8) {
+    return false;
+  }
+  const auto R = RCX.X();
+  const auto D = RDI.X();
+  const auto S = RSI.X();
+  const uint32_t Log2 = FEXCore::ilog2(Size);
+  // A segment base (fs:/gs: on the source of rep movs) is added to rsi for every source
+  // access; rsi itself keeps counting x86's way.
+  const bool HasSrcBase = SrcBase != ARMEmitter::Reg::zr;
+  auto SrcAddress = [&](ARMEmitter::Register Temp) -> ARMEmitter::XRegister {
+    if (!HasSrcBase) {
+      return S;
+    }
+    add(ARMEmitter::Size::i64Bit, Temp.X(), S, SrcBase.X());
+    return Temp.X();
+  };
+  const uint32_t ChunkElements = 32 / Size;
+
+  auto LoadElement = [&](ARMEmitter::XRegister Base) {
+    if (IsAtomic) {
+      switch (Size) {
+      case 1: CTX->HostFeatures.SupportsRCPC ? ldaprb(TMP4.W(), Base) : ldarb(TMP4.W(), Base); break;
+      case 2: CTX->HostFeatures.SupportsRCPC ? ldaprh(TMP4.W(), Base) : ldarh(TMP4.W(), Base); break;
+      case 4: CTX->HostFeatures.SupportsRCPC ? ldapr(TMP4.W(), Base) : ldar(TMP4.W(), Base); break;
+      case 8: CTX->HostFeatures.SupportsRCPC ? ldapr(TMP4, Base) : ldar(TMP4, Base); break;
+      }
+      if (Size != 1) {
+        // Placeholders for backpatching barriers (one per load/store), as the copy below.
+        nop();
+        nop();
+      }
+    } else {
+      switch (Size) {
+      case 1: ldrb(TMP4.W(), Base, 0); break;
+      case 2: ldrh(TMP4.W(), Base, 0); break;
+      case 4: ldr(TMP4.W(), Base, 0); break;
+      case 8: ldr(TMP4, Base, 0); break;
+      }
+    }
+  };
+  auto StoreElement = [&](ARMEmitter::Register Data) {
+    if (IsAtomic) {
+      switch (Size) {
+      case 1: stlrb(Data.W(), D); break;
+      case 2: stlrh(Data.W(), D); break;
+      case 4: stlr(Data.W(), D); break;
+      case 8: stlr(Data.X(), D); break;
+      }
+    } else {
+      switch (Size) {
+      case 1: strb(Data.W(), D, 0); break;
+      case 2: strh(Data.W(), D, 0); break;
+      case 4: str(Data.W(), D, 0); break;
+      case 8: str(Data.X(), D, 0); break;
+      }
+    }
+  };
+
+  auto Emit = [&](int32_t Direction) {
+    ARMEmitter::BackwardLabel ElementLoop;
+    ARMEmitter::BackwardLabel ChunkLoop;
+    ARMEmitter::ForwardLabel ElementStep;
+    ARMEmitter::ForwardLabel Finished;
+    const bool Back = Direction < 0;
+
+    (void)cbz(ARMEmitter::Size::i64Bit, R, &Finished);
+    if (Value != ARMEmitter::Reg::zr && !Copy && !IsAtomic) {
+      dup(Size == 1 ? ARMEmitter::SubRegSize::i8Bit : Size == 2 ? ARMEmitter::SubRegSize::i16Bit :
+          Size == 4 ? ARMEmitter::SubRegSize::i32Bit : ARMEmitter::SubRegSize::i64Bit, VTMP2.Q(), Value);
+    } else if (!Copy && !IsAtomic) {
+      movi(ARMEmitter::SubRegSize::i64Bit, VTMP2.Q(), 0);
+    }
+
+    auto EmitElement = [&]() {
+      ARMEmitter::ForwardLabel SkipCheck;
+      if (Copy) {
+        LoadElement(SrcAddress(TMP2));
+        StoreElement(TMP4);
+      } else {
+        StoreElement(Value);
+      }
+      if (Back) {
+        sub(ARMEmitter::Size::i64Bit, D, D, Size);
+        if (Copy) {
+          sub(ARMEmitter::Size::i64Bit, S, S, Size);
+        }
+      } else {
+        add(ARMEmitter::Size::i64Bit, D, D, Size);
+        if (Copy) {
+          add(ARMEmitter::Size::i64Bit, S, S, Size);
+        }
+      }
+      sub(ARMEmitter::Size::i64Bit, R, R, 1);
+      and_(ARMEmitter::Size::i64Bit, TMP1, R, 63);
+      (void)cbnz(ARMEmitter::Size::i64Bit, TMP1, &SkipCheck);
+      EmitSuspendInterruptCheck();
+      (void)Bind(&SkipCheck);
+    };
+    ARMEmitter::ForwardLabel PureEntry;
+    ARMEmitter::ForwardLabel OverlapEntry;
+    if (!IsAtomic && Copy) {
+      // The destination 1 to 32 bytes ahead of the source in the direction of the copy
+      // (the copy reads what it wrote, x86 propagates it): element by element, in x86's
+      // order. A source ahead of the destination is never read after being written by
+      // the copy, so whole chunks (all loads before the stores) are right however close.
+      // The distance does not change during the copy.
+      if (Back) {
+        sub(ARMEmitter::Size::i64Bit, TMP1, SrcAddress(TMP1), D);
+      } else {
+        sub(ARMEmitter::Size::i64Bit, TMP1, D, SrcAddress(TMP1));
+      }
+      sub(ARMEmitter::Size::i64Bit, TMP1, TMP1, 1);
+      lsr(ARMEmitter::Size::i64Bit, TMP1, TMP1, 5);
+      (void)cbz(ARMEmitter::Size::i64Bit, TMP1, &OverlapEntry);
+    }
+    (void)Bind(&ElementLoop);
+    if (!IsAtomic) {
+      // A run of 32-byte chunks (ldp/stp of two q registers) when at least one chunk is
+      // left and (copies) source and destination are 32 bytes apart or more, so that a
+      // chunk never reads bytes it writes. The run is as long as neither the source nor
+      // the destination chunk crosses a 4K page: a chunk's access then either faults
+      // whole or not at all, at an element boundary x86 would also stop at, with the
+      // registers counting the chunks before it. Elements one at a time otherwise, until
+      // the page boundary is passed.
+      ARMEmitter::ForwardLabel NoChunk;
+      // Fewer elements than a chunk left: only single elements from here.
+      sub(ARMEmitter::Size::i64Bit, TMP1, R, ChunkElements);
+      (void)tbnz(TMP1, 63, &PureEntry);
+      // TMP1 = whole chunks before the page boundary, for one pointer.
+      auto Room = [&](ARMEmitter::Register Out, ARMEmitter::XRegister Pointer) {
+        and_(ARMEmitter::Size::i64Bit, Out, Pointer, 4095);
+        if (Back) {
+          add(ARMEmitter::Size::i64Bit, Out, Out, Size);
+        } else {
+          neg(ARMEmitter::Size::i64Bit, Out, Out);
+          add(ARMEmitter::Size::i64Bit, Out, Out, 4096);
+        }
+        lsr(ARMEmitter::Size::i64Bit, Out, Out, 5);
+      };
+      // Out = min(Out, Other), without flags.
+      auto Min = [&](ARMEmitter::Register Out, ARMEmitter::Register Other) {
+        ARMEmitter::ForwardLabel Keep;
+        sub(ARMEmitter::Size::i64Bit, TMP3, Other, Out);
+        (void)tbz(TMP3, 63, &Keep);
+        mov(Out.X(), Other.X());
+        (void)Bind(&Keep);
+      };
+      Room(TMP1, D);
+      if (Copy) {
+        Room(TMP2, SrcAddress(TMP2));
+        Min(TMP1, TMP2);
+      }
+      lsr(ARMEmitter::Size::i64Bit, TMP2, R, 5 - Log2);
+      Min(TMP1, TMP2);
+      (void)cbz(ARMEmitter::Size::i64Bit, TMP1, &NoChunk);
+      (void)Bind(&ChunkLoop);
+      if (Back) {
+        sub(ARMEmitter::Size::i64Bit, TMP2, D, 32 - Size);
+        if (Copy) {
+          sub(ARMEmitter::Size::i64Bit, TMP3, SrcAddress(TMP3), 32 - Size);
+          ldp<ARMEmitter::IndexType::OFFSET>(VTMP1.Q(), VTMP2.Q(), TMP3, 0);
+        }
+        stp<ARMEmitter::IndexType::OFFSET>(Copy ? VTMP1.Q() : VTMP2.Q(), VTMP2.Q(), TMP2, 0);
+        sub(ARMEmitter::Size::i64Bit, D, D, 32);
+        if (Copy) {
+          sub(ARMEmitter::Size::i64Bit, S, S, 32);
+        }
+      } else {
+        if (Copy) {
+          ldp<ARMEmitter::IndexType::OFFSET>(VTMP1.Q(), VTMP2.Q(), SrcAddress(TMP2), 0);
+        }
+        // Post-index: rdi moves only when the store is done.
+        stp<ARMEmitter::IndexType::POST>(Copy ? VTMP1.Q() : VTMP2.Q(), VTMP2.Q(), D, 32);
+        if (Copy) {
+          add(ARMEmitter::Size::i64Bit, S, S, 32);
+        }
+      }
+      sub(ARMEmitter::Size::i64Bit, R, R, ChunkElements);
+      sub(ARMEmitter::Size::i64Bit, TMP1, TMP1, 1);
+      (void)cbnz(ARMEmitter::Size::i64Bit, TMP1, &ChunkLoop);
+      // At most a page per run: the interrupt check, then the next run.
+      EmitSuspendInterruptCheck();
+      (void)cbz(ARMEmitter::Size::i64Bit, R, &Finished);
+      (void)b(&ElementLoop);
+      (void)Bind(&NoChunk);
+      // One element (a page boundary is near), then the chunk test again.
+      EmitElement();
+      (void)cbnz(ARMEmitter::Size::i64Bit, R, &ElementLoop);
+      (void)b(&Finished);
+    }
+    // Overlapping copies (source and destination less than 32 bytes apart) come here.
+    (void)Bind(&OverlapEntry);
+    if (!IsAtomic && Copy && !Back && Size == 1) {
+      // rep movsb with rdi == rsi + 1 (run-length fill, LZ decoders): every byte copied is
+      // the first one. x86 reads each source byte after writing it, so after loading the
+      // first byte the copy is a fill with it; the source is the destination one byte
+      // behind, already written. Same page-bounded 32-byte runs as below, rsi kept one
+      // behind rdi, so progress stays exact.
+      ARMEmitter::ForwardLabel NotByOne;
+      ARMEmitter::BackwardLabel FillLoop;
+      ARMEmitter::BackwardLabel FillRun;
+      ARMEmitter::ForwardLabel FillOne;
+      sub(ARMEmitter::Size::i64Bit, TMP1, D, SrcAddress(TMP1));
+      sub(ARMEmitter::Size::i64Bit, TMP1, TMP1, 1);
+      (void)cbnz(ARMEmitter::Size::i64Bit, TMP1, &NotByOne);
+      ldrb(TMP4.W(), SrcAddress(TMP1), 0);
+      dup(ARMEmitter::SubRegSize::i8Bit, VTMP2.Q(), TMP4.W());
+      (void)Bind(&FillLoop);
+      sub(ARMEmitter::Size::i64Bit, TMP1, R, 32);
+      (void)tbnz(TMP1, 63, &FillOne);
+      // Whole chunks before the destination's page boundary, at most rcx / 32.
+      and_(ARMEmitter::Size::i64Bit, TMP1, D, 4095);
+      neg(ARMEmitter::Size::i64Bit, TMP1, TMP1);
+      add(ARMEmitter::Size::i64Bit, TMP1, TMP1, 4096);
+      lsr(ARMEmitter::Size::i64Bit, TMP1, TMP1, 5);
+      {
+        ARMEmitter::ForwardLabel Keep;
+        lsr(ARMEmitter::Size::i64Bit, TMP2, R, 5);
+        sub(ARMEmitter::Size::i64Bit, TMP3, TMP2, TMP1);
+        (void)tbz(TMP3, 63, &Keep);
+        mov(TMP1, TMP2);
+        (void)Bind(&Keep);
+      }
+      (void)cbz(ARMEmitter::Size::i64Bit, TMP1, &FillOne);
+      (void)Bind(&FillRun);
+      stp<ARMEmitter::IndexType::POST>(VTMP2.Q(), VTMP2.Q(), D, 32);
+      add(ARMEmitter::Size::i64Bit, S, S, 32);
+      sub(ARMEmitter::Size::i64Bit, R, R, 32);
+      sub(ARMEmitter::Size::i64Bit, TMP1, TMP1, 1);
+      (void)cbnz(ARMEmitter::Size::i64Bit, TMP1, &FillRun);
+      EmitSuspendInterruptCheck();
+      (void)cbz(ARMEmitter::Size::i64Bit, R, &Finished);
+      (void)b(&FillLoop);
+      (void)Bind(&FillOne);
+      {
+        // One byte (near a page boundary, or the tail).
+        ARMEmitter::ForwardLabel SkipFillCheck;
+        strb(TMP4.W(), D, 0);
+        add(ARMEmitter::Size::i64Bit, D, D, 1);
+        add(ARMEmitter::Size::i64Bit, S, S, 1);
+        sub(ARMEmitter::Size::i64Bit, R, R, 1);
+        and_(ARMEmitter::Size::i64Bit, TMP1, R, 63);
+        (void)cbnz(ARMEmitter::Size::i64Bit, TMP1, &SkipFillCheck);
+        EmitSuspendInterruptCheck();
+        (void)Bind(&SkipFillCheck);
+      }
+      (void)cbnz(ARMEmitter::Size::i64Bit, R, &FillLoop);
+      (void)b(&Finished);
+      (void)Bind(&NotByOne);
+    }
+    (void)Bind(&PureEntry);
+    ARMEmitter::BackwardLabel PureLoop;
+    (void)Bind(&PureLoop);
+    EmitElement();
+    (void)cbnz(ARMEmitter::Size::i64Bit, R, &PureLoop);
+    (void)Bind(&Finished);
+    (void)Log2;
+  };
+
+  ARMEmitter::ForwardLabel Backward;
+  ARMEmitter::ForwardLabel Done;
+  if (DirectionIsInline) {
+    Emit(DirectionConstant == 1 ? 1 : -1);
+  } else {
+    (void)tbnz(DirectionReg, 1, &Backward);
+    Emit(1);
+    (void)b(&Done);
+    (void)Bind(&Backward);
+    Emit(-1);
+  }
+  (void)Bind(&Done);
+  mov(OutDst.X(), D);
+  if (Copy && OutSrc != ARMEmitter::Reg::zr) {
+    mov(OutSrc.X(), S);
+  }
+  return true;
+}
+#endif
+
 DEF_OP(MemSet) {
   const auto Op = IROp->C<IR::IROp_MemSet>();
 
@@ -1877,6 +2186,14 @@ DEF_OP(MemSet) {
   if (!DirectionIsInline) {
     DirectionReg = GetReg(Op->Direction);
   }
+
+#ifdef __APPLE__
+  if (Op->Prefix.IsInvalid() &&
+      EmitRepStringInPlace(false, IsAtomic, Size, Length, MemReg, ARMEmitter::Reg::zr, Value, DirectionIsInline, DirectionConstant,
+                           DirectionReg, Dst, ARMEmitter::Reg::zr, ARMEmitter::Reg::zr)) {
+    return;
+  }
+#endif
 
   // If Direction > 0 then:
   //   MemReg is incremented (by size)
@@ -2096,6 +2413,23 @@ DEF_OP(MemSet) {
   }
 }
 
+DEF_OP(MemCpySrcBase) {
+  // rep movs with fs:/gs: on the source (macOS): the in-place loop with the segment base
+  // added to every source address, so rcx/rsi/rdi stay exact at faults and stops.
+  const auto Op = IROp->C<IR::IROp_MemCpySrcBase>();
+  uint64_t DirectionConstant;
+  bool DirectionIsInline = IsInlineConstant(Op->Direction, &DirectionConstant);
+  ARMEmitter::Register DirectionReg = ARMEmitter::Reg::r0;
+  if (!DirectionIsInline) {
+    DirectionReg = GetReg(Op->Direction);
+  }
+  const bool Emitted = EmitRepStringInPlace(true, CTX->IsMemcpyAtomicTSOEnabled(), IR::OpSizeToSize(Op->Size), GetReg(Op->Length),
+                                            GetReg(Op->Dest), GetReg(Op->Src), ARMEmitter::Reg::zr, DirectionIsInline, DirectionConstant,
+                                            DirectionReg, GetReg(Op->OutDstAddress), GetReg(Op->OutSrcAddress), GetReg(Op->SrcBase));
+  LOGMAN_THROW_A_FMT(Emitted, "MemCpySrcBase needs the guest's rcx/rsi/rdi");
+  (void)Emitted;
+}
+
 DEF_OP(MemCpy) {
   const auto Op = IROp->C<IR::IROp_MemCpy>();
 
@@ -2114,6 +2448,12 @@ DEF_OP(MemCpy) {
 
   auto Dst0 = GetReg(Op->OutDstAddress);
   auto Dst1 = GetReg(Op->OutSrcAddress);
+#ifdef __APPLE__
+  if (EmitRepStringInPlace(true, IsAtomic, Size, Length, MemRegDest, MemRegSrc, ARMEmitter::Reg::zr, DirectionIsInline, DirectionConstant,
+                           DirectionReg, Dst0, Dst1, ARMEmitter::Reg::zr)) {
+    return;
+  }
+#endif
   // If Direction > 0 then:
   //   MemRegDest is incremented (by size)
   //   MemRegSrc is incremented (by size)

@@ -368,6 +368,13 @@ bool ContextImpl::InitCore() {
     // If gdbserver is enabled then this needs to be enabled.
     Config.NeedsPendingInterruptFaultCheck = true;
   }
+#ifdef __APPLE__
+  // The macOS embedding library (fexmac) stops a running thread from another thread by
+  // making the thread's interrupt fault page read-only: translated code then faults at
+  // the next block entry or loop back-edge, a point where the guest state can be
+  // reconstructed. Costs one store per block entry and back-edge.
+  Config.NeedsPendingInterruptFaultCheck = true;
+#endif
 
   if constexpr (BLOCK_DEBUGGING) {
     // If the developer wants to do any single-stepping points or watch points.
@@ -610,6 +617,10 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
     }
 #endif
 
+#ifdef __APPLE__
+    // Whether an x87 instruction was translated earlier in this unit (see below).
+    bool SawX87 = false;
+#endif
     for (size_t j = 0; j < CodeBlocks.size(); ++j) {
       const auto& Block = CodeBlocks[j];
 
@@ -681,13 +692,120 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
         // It is potentially correctness bearing in that sense, but that is a
         // side effect here and (if that behaviour is required) we should handle
         // that more explicitly later.
+#ifdef __APPLE__
+        // On macOS the embedding library resumes a guest at an instruction that faulted on
+        // memory, with the guest state it reconstructs from the host context and the
+        // thread's frame. Everything the register cache holds beyond the static registers
+        // (DF, MMX, the upper AVX halves, the x87 stack the x87 pass keeps virtual) would
+        // otherwise be written back only at the end of the block, and the flags could be
+        // pending in a temporary or have the carry inverted. So before an instruction that
+        // can access memory the whole cache is flushed and the flags put in canonical form
+        // (a full flush does both), and a virtual x87 stack is written to the frame.
+        // Register-only instructions keep the cheaper partial flush below.
+        bool MayFault = false;
+        if (TableInfo && TableInfo->OpcodeDispatcher.OpDispatch) {
+          // A memory operand: [reg] (GPRDirect), [reg+disp], [rip+disp], SIB, and the
+          // relocatable forms of each. GPR is a register operand.
+          const auto IsMemory = [](const X86Tables::DecodedOperand& Operand) {
+            using T = X86Tables::DecodedOperand::OpType;
+            switch (Operand.Type) {
+            case T::GPRDirect:
+            case T::GPRIndirect:
+            case T::GPRIndirectRelocation:
+            case T::RIPRelative:
+            case T::RIPRelativeRelocation:
+            case T::SIB:
+            case T::SIBRelocation: return true;
+            default: return false;
+            }
+          };
+          MayFault = (TableInfo->Flags & X86Tables::InstFlags::FLAGS_DEBUG_MEM_ACCESS) || IsMemory(DecodedInfo->Dest) ||
+                     IsMemory(DecodedInfo->Src[0]) || IsMemory(DecodedInfo->Src[1]) || IsMemory(DecodedInfo->Src[2]);
+        }
+        // Instructions that change guest state before their last access that can fault
+        // save it first (CPUState::UndoMask), so the fault path can give the state
+        // before the instruction and running it again computes the same result.
+        uint32_t UndoMask = 0;
+        if (MayFault && TableInfo->Name) {
+          // add/or/and/sub/xor/inc/dec/neg/adc/sbb on memory store first and compute the
+          // flags after (OpcodeDispatcher.cpp); their lock forms, and xadd and cmpxchg on
+          // memory (always atomic), compute them after the atomic operation, which is the
+          // only access that can fault. So none of them needs a record. The rest keep some
+          // flags (a zero count) or set CF before the store (bit tests).
+          // bts/btr/btc on memory store before setting CF already; shl/shr by an
+          // immediate or 1 store first too (OpcodeDispatcher.cpp). By cl (a zero count
+          // keeps every flag), rotates, sar, shld/shrd keep the record.
+          static constexpr std::string_view FlagsRMW[] = {"ROL", "ROR", "RCL", "RCR", "SHL", "SAL", "SHR", "SAR", "SHLD", "SHRD"};
+          const std::string_view Name {TableInfo->Name};
+          const auto IsMemoryDest = [&] {
+            using T = X86Tables::DecodedOperand::OpType;
+            switch (DecodedInfo->Dest.Type) {
+            case T::GPRDirect:
+            case T::GPRIndirect:
+            case T::GPRIndirectRelocation:
+            case T::RIPRelative:
+            case T::RIPRelativeRelocation:
+            case T::SIB:
+            case T::SIBRelocation: return true;
+            default: return false;
+            }
+          };
+          // By an immediate (C0/C1) or by 1 (D0/D1), not by cl (D2/D3): the opcode byte
+          // after the prefixes.
+          const auto ShiftOpcode = [&] {
+            const auto* Bytes = reinterpret_cast<const uint8_t*>(InstAddress);
+            size_t i = 0;
+            while (i < DecodedInfo->InstSize &&
+                   (Bytes[i] == 0x66 || Bytes[i] == 0x67 || Bytes[i] == 0xF0 || Bytes[i] == 0xF2 || Bytes[i] == 0xF3 || Bytes[i] == 0x26 ||
+                    Bytes[i] == 0x2E || Bytes[i] == 0x36 || Bytes[i] == 0x3E || Bytes[i] == 0x64 || Bytes[i] == 0x65 || (Bytes[i] & 0xF0) == 0x40)) {
+              ++i;
+            }
+            return i < DecodedInfo->InstSize ? Bytes[i] : uint8_t {0};
+          };
+          const bool ShiftByConstant = (Name == "SHL" || Name == "SHR") && (ShiftOpcode() & 0xFE) != 0xD2;
+          if (IsMemoryDest() && !ShiftByConstant && std::find(std::begin(FlagsRMW), std::end(FlagsRMW), Name) != std::end(FlagsRMW)) {
+            UndoMask |= Core::CPUState::UNDO_FLAGS;
+            // Rotates change only CF and OF (NZCV); the others also PF (and AF).
+            if (Name != "ROL" && Name != "ROR" && Name != "RCL" && Name != "RCR") {
+              UndoMask |= Core::CPUState::UNDO_PFAF;
+            }
+          }
+          // pop [m] and leave are reordered (OpcodeDispatcher.cpp) except pop to an
+          // address using rsp.
+          if (Name == "POP" && IsMemoryDest() && X86Tables::OperandUsesGPR(DecodedInfo->Dest, X86State::REG_RSP)) {
+            UndoMask |= Core::CPUState::UNDO_RSP;
+          }
+        }
+        if (MayFault) {
+          if (SawX87) {
+            Thread->OpDispatcher->_SyncStackToSlow();
+          }
+          Thread->OpDispatcher->FlushRegisterCache(false);
+        } else {
+          Thread->OpDispatcher->FlushRegisterCache(true);
+        }
+        if (TableInfo && ((TableInfo >= &X86Tables::X87F80Ops[0] && TableInfo < &X86Tables::X87F80Ops[0] + X86Tables::MAX_X87_TABLE_SIZE) ||
+                          (TableInfo >= &X86Tables::X87F64Ops[0] && TableInfo < &X86Tables::X87F64Ops[0] + X86Tables::MAX_X87_TABLE_SIZE))) {
+          SawX87 = true;
+        }
+#else
         Thread->OpDispatcher->FlushRegisterCache(true);
+#endif
 
         if (ExtendedDebugInfo || Thread->OpDispatcher->CanHaveSideEffects(TableInfo, DecodedInfo)) {
           Thread->OpDispatcher->_GuestOpcode(InstAddress - GuestRIP);
         }
 
-        if (Config.SMCChecks == FEXCore::Config::CONFIG_SMC_FULL || Block.ForceFullSMCDetection) {
+#ifdef __APPLE__
+        // No code check for an instruction that could not be decoded (no-exec memory,
+        // invalid bytes): its bytes were not read, so the check could never match, and the
+        // block would discard itself and be translated again for ever instead of raising
+        // the fault (SMCCHECKS full and a fetch from a non-executable page looped).
+        const bool CheckCode = TableInfo && TableInfo->OpcodeDispatcher.OpDispatch;
+#else
+        constexpr bool CheckCode = true;
+#endif
+        if (CheckCode && (Config.SMCChecks == FEXCore::Config::CONFIG_SMC_FULL || Block.ForceFullSMCDetection)) {
           auto ExistingCodePtr = reinterpret_cast<uint8_t*>(Block.Entry + BlockInstructionsLength);
           auto InstAddressReg = Thread->OpDispatcher->_EntrypointOffset(GPRSize, InstAddress - GuestRIP);
 
@@ -719,6 +837,14 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
           Thread->OpDispatcher->StartNewBlock();
         }
 
+#ifdef __APPLE__
+        // The undo record is saved after the self-modifying-code check above, which can
+        // leave the block for retranslation: a record left set there would be applied to
+        // whatever instruction faults next.
+        if (UndoMask) {
+          Thread->OpDispatcher->SaveUndoRecord(UndoMask);
+        }
+#endif
         if (TableInfo && TableInfo->OpcodeDispatcher.OpDispatch) {
           auto Fn = TableInfo->OpcodeDispatcher.OpDispatch;
           Thread->OpDispatcher->ResetHandledLock();
@@ -736,6 +862,11 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
 
           Thread->OpDispatcher->SetForceTSO(ForceTSO);
           std::invoke(Fn, Thread->OpDispatcher, DecodedInfo);
+#ifdef __APPLE__
+          if (UndoMask) {
+            Thread->OpDispatcher->ClearUndoRecord();
+          }
+#endif
           if (Thread->OpDispatcher->HadDecodeFailure()) {
             HadDispatchError = true;
           } else {

@@ -251,6 +251,15 @@ void OpDispatchBuilder::ADCOp(OpcodeArgs, uint32_t SrcIndex, bool DestRAX) {
   }
 
   Ref Result;
+#ifdef __APPLE__
+  if (!DestIsLockedMem(Op) && !DestRAX && !Op->Dest.IsGPR()) {
+    // Memory destination: the sum with the incoming carry first (reads CF, sets no
+    // flags), stored, then the flags (see ALUOp: restartable guest faults).
+    StoreResultGPR(Op, Add(OpSize, Before, IncrementByCarry(OpSize, Src)));
+    CalculateFlags_ADC(Size, Before, Src);
+    return;
+  }
+#endif
   if (!DestIsLockedMem(Op) && Op->Src[SrcIndex].IsLiteral() && Op->Src[SrcIndex].Literal() == 0 && Size >= OpSize::i32Bit) {
     HandleNZCV_RMW();
     RectifyCarryInvert(true);
@@ -291,6 +300,15 @@ void OpDispatchBuilder::SBBOp(OpcodeArgs, uint32_t SrcIndex, bool DestRAX) {
     Before = LoadSourceGPR(Op, Op->Dest, Op->Flags, {.AllowUpperGarbage = true});
   }
 
+#ifdef __APPLE__
+  if (!DestIsLockedMem(Op) && !DestRAX && !Op->Dest.IsGPR()) {
+    // Memory destination: the difference with the incoming borrow first, stored, then
+    // the flags (see ADCOp).
+    StoreResultGPR(Op, Sub(OpSize, Before, IncrementByCarry(OpSize, Src)));
+    CalculateFlags_SBB(Size, Before, Src);
+    return;
+  }
+#endif
   Result = CalculateFlags_SBB(Size, Before, Src);
 
   if (DestRAX) {
@@ -401,6 +419,20 @@ void OpDispatchBuilder::PUSHSegmentOp(OpcodeArgs, uint32_t SegmentReg) {
 }
 
 void OpDispatchBuilder::POPOp(OpcodeArgs) {
+#ifdef __APPLE__
+  // pop [m]: load, store, then move rsp, so that a fault on the store leaves rsp as before
+  // the instruction (macOS embedding library: restartable guest faults). Not when the
+  // address uses rsp, which x86 computes from the incremented rsp; those use the undo
+  // record (Core.cpp).
+  if (!Op->Dest.IsGPR() && !X86Tables::OperandUsesGPR(Op->Dest, X86State::REG_RSP)) {
+    const auto Size = OpSizeFromSrc(Op);
+    Ref OldSP = LoadGPRRegister(X86State::REG_RSP);
+    Ref Loaded = _LoadMemGPR(Size, OldSP, Size);
+    StoreResultGPR(Op, Loaded);
+    StoreGPRRegister(X86State::REG_RSP, Add(OpSize::i64Bit, OldSP, IR::OpSizeToSize(Size)));
+    return;
+  }
+#endif
   Ref Value = Pop(OpSizeFromSrc(Op));
   StoreResultGPR(Op, Value);
 }
@@ -464,6 +496,17 @@ void OpDispatchBuilder::LEAVEOp(OpcodeArgs) {
   const auto GPRSize = GetGPROpSize();
   const auto OperandSize = (Op->Flags & FEXCore::X86Tables::DecodeFlags::FLAG_OPERAND_SIZE) ? OpSize::i16Bit : GPRSize;
 
+#ifdef __APPLE__
+  // Load first, then set rsp and rbp, so that a fault on the load leaves rsp as before the
+  // instruction (macOS embedding library: restartable guest faults).
+  {
+    Ref RBP = LoadGPRRegister(X86State::REG_RBP);
+    Ref Loaded = _LoadMemGPR(OperandSize, RBP, OperandSize);
+    StoreGPRRegister(X86State::REG_RSP, Add(GPRSize, RBP, IR::OpSizeToSize(OperandSize)), GPRSize);
+    StoreGPRRegister(X86State::REG_RBP, Loaded, OperandSize);
+    return;
+  }
+#endif
   // First we move RBP in to RSP and then behave effectively like a pop
   auto SP = _RMWHandle(LoadGPRRegister(X86State::REG_RBP));
   auto NewGPR = Pop(OperandSize, SP);
@@ -1428,6 +1471,19 @@ void OpDispatchBuilder::SHLImmediateOp(OpcodeArgs, bool SHL1Bit) {
 
   Ref Result = _Lshl(Size == 64 ? OpSize::i64Bit : OpSize::i32Bit, Dest, Constant(Shift));
 
+#ifdef __APPLE__
+  if (!Op->Dest.IsGPR()) {
+    // Memory destination: store first, flags after (see ALUOp), from a recomputed
+    // result so that the register allocator cannot compute the stored value straight
+    // into the PF register before the store.
+    StoreResultGPR(Op, Result);
+    CalculateFlags_ShiftLeftImmediate(OpSizeFromSrc(Op), _Lshl(Size == 64 ? OpSize::i64Bit : OpSize::i32Bit, Dest, Constant(Shift)), Dest,
+                                      Shift);
+    CalculateDeferredFlags();
+    AcidTestFlags(X86State::RFLAG_AF_RAW_LOC);
+    return;
+  }
+#endif
   CalculateFlags_ShiftLeftImmediate(OpSizeFromSrc(Op), Result, Dest, Shift);
   CalculateDeferredFlags();
   StoreResultGPR(Op, Result);
@@ -1452,6 +1508,17 @@ void OpDispatchBuilder::SHRImmediateOp(OpcodeArgs, bool SHR1Bit) {
   uint64_t Shift = GetConstantShift(Op, SHR1Bit);
   auto ALUOp = _Lshr(Size == 64 ? OpSize::i64Bit : OpSize::i32Bit, Dest, Constant(Shift));
 
+#ifdef __APPLE__
+  if (!Op->Dest.IsGPR()) {
+    // Memory destination: store first, flags after (see SHLImmediateOp).
+    StoreResultGPR(Op, ALUOp);
+    CalculateFlags_ShiftRightImmediate(OpSizeFromSrc(Op), _Lshr(Size == 64 ? OpSize::i64Bit : OpSize::i32Bit, Dest, Constant(Shift)), Dest,
+                                       Shift);
+    CalculateDeferredFlags();
+    AcidTestFlags(X86State::RFLAG_AF_RAW_LOC);
+    return;
+  }
+#endif
   CalculateFlags_ShiftRightImmediate(OpSizeFromSrc(Op), ALUOp, Dest, Shift);
   CalculateDeferredFlags();
   StoreResultGPR(Op, ALUOp);
@@ -3236,6 +3303,16 @@ void OpDispatchBuilder::INCOp(OpcodeArgs) {
 
   CalculateDeferredFlags();
 
+#ifdef __APPLE__
+  // Memory destination: store first, flags after (see ALUOp).
+  const bool StoreFirst = !IsLocked && !Op->Dest.IsGPR();
+  if (StoreFirst) {
+    StoreResultGPR(Op, Add(Size >= 32 ? OpSizeFromSrc(Op) : OpSize::i32Bit, Dest, 1));
+  }
+#else
+  const bool StoreFirst = false;
+#endif
+
   if (Size < 32 && CTX->HostFeatures.SupportsFlagM) {
     // Addition producing upper garbage
     Result = Add(OpSize::i32Bit, Dest, 1);
@@ -3253,7 +3330,7 @@ void OpDispatchBuilder::INCOp(OpcodeArgs) {
     Result = CalculateFlags_ADD(OpSizeFromSrc(Op), Dest, Constant(1), false);
   }
 
-  if (!IsLocked) {
+  if (!IsLocked && !StoreFirst) {
     StoreResultGPR(Op, Result);
   }
 }
@@ -3277,6 +3354,16 @@ void OpDispatchBuilder::DECOp(OpcodeArgs) {
 
   CalculateDeferredFlags();
 
+#ifdef __APPLE__
+  // Memory destination: store first, flags after (see ALUOp).
+  const bool StoreFirst = !IsLocked && !Op->Dest.IsGPR();
+  if (StoreFirst) {
+    StoreResultGPR(Op, Sub(Size >= 32 ? OpSizeFromSrc(Op) : OpSize::i32Bit, Dest, 1));
+  }
+#else
+  const bool StoreFirst = false;
+#endif
+
   if (Size < 32 && CTX->HostFeatures.SupportsFlagM) {
     // Subtraction producing upper garbage
     Result = Sub(OpSize::i32Bit, Dest, 1);
@@ -3294,7 +3381,7 @@ void OpDispatchBuilder::DECOp(OpcodeArgs) {
     Result = CalculateFlags_SUB(OpSizeFromSrc(Op), Dest, Constant(1), false);
   }
 
-  if (!IsLocked) {
+  if (!IsLocked && !StoreFirst) {
     StoreResultGPR(Op, Result);
   }
 }
@@ -3372,6 +3459,16 @@ void OpDispatchBuilder::MOVSOp(OpcodeArgs) {
 
     Ref Result_Src = _AllocateGPR(false);
     Ref Result_Dst = _AllocateGPR(false);
+#ifdef __APPLE__
+    if (SrcSegment && !DstSegment) {
+      // fs:/gs: source: the in-place loop with the base added per access (exact progress).
+      _MemCpySrcBase(Size, DstAddr, LoadGPRRegister(X86State::REG_RSI), SrcSegment, Counter, LoadDir(1), Result_Dst, Result_Src);
+      StoreGPRRegister(X86State::REG_RCX, Constant(0));
+      StoreGPRRegister(X86State::REG_RDI, Result_Dst);
+      StoreGPRRegister(X86State::REG_RSI, Result_Src);
+      return;
+    }
+#endif
     _MemCpy(CTX->IsAtomicTSOEnabled(), Size, DstAddr, SrcAddr, Counter, LoadDir(1), Result_Dst, Result_Src);
 
     if (DstSegment) {
@@ -3795,6 +3892,14 @@ void OpDispatchBuilder::NEGOp(OpcodeArgs) {
     CalculateFlags_SUB(Size, ZeroConst, Dest);
   } else {
     Ref Dest = LoadSourceGPR(Op, Op->Dest, Op->Flags, {.AllowUpperGarbage = true});
+#ifdef __APPLE__
+    if (!Op->Dest.IsGPR()) {
+      // Memory destination: store first, flags after (see ALUOp).
+      StoreResultGPR(Op, Sub(std::max(OpSize::i32Bit, Size), ZeroConst, Dest));
+      CalculateFlags_SUB(Size, ZeroConst, Dest);
+      return;
+    }
+#endif
     Ref Result = CalculateFlags_SUB(Size, ZeroConst, Dest);
 
     StoreResultGPR(Op, Result);
@@ -4864,6 +4969,48 @@ void OpDispatchBuilder::ALUOp(OpcodeArgs, FEXCore::IR::IROps ALUIROp, FEXCore::I
   }
 
   const auto OpSize = RoundedSize;
+#ifdef __APPLE__
+  // Store first, flags after (macOS embedding library: restartable guest faults). For a
+  // memory destination the flags are computed from Dest and Src, still in registers,
+  // after the store, so a store that faults leaves them as before the instruction. The
+  // result stored is the one the flag calculation gives.
+  const bool StoreFirst = !DestIsLockedMem(Op) && !DestRAX && !Op->Dest.IsGPR() &&
+                          (ALUIROp == IR::IROps::OP_ADD || ALUIROp == IR::IROps::OP_SUB || ALUIROp == IR::IROps::OP_XOR ||
+                           ALUIROp == IR::IROps::OP_AND || ALUIROp == IR::IROps::OP_OR || ALUIROp == IR::IROps::OP_ANDWITHFLAGS);
+  if (StoreFirst) {
+    Ref Plain {};
+    switch (ALUIROp) {
+    case IR::IROps::OP_ADD: Plain = Add(OpSize, Dest, Src); break;
+    case IR::IROps::OP_SUB: Plain = Sub(OpSize, Dest, Src); break;
+    case IR::IROps::OP_XOR: Plain = _Xor(OpSize, Dest, Src); break;
+    case IR::IROps::OP_OR: Plain = _Or(OpSize, Dest, Src); break;
+    default: Plain = _And(OpSize, Dest, Src); break;
+    }
+    StoreResultGPR_WithOpSize(Op, Op->Dest, Plain, ResultSize, OpSize::iInvalid, MemoryAccessType::DEFAULT);
+    switch (ALUIROp) {
+    case IR::IROps::OP_ADD: CalculateFlags_ADD(Size, Dest, Src); break;
+    case IR::IROps::OP_SUB: CalculateFlags_SUB(Size, Dest, Src); break;
+    case IR::IROps::OP_ANDWITHFLAGS: {
+      Ref Flags = _AndWithFlags(OpSize, Dest, Src);
+      HandleNZ00Write();
+      CalculatePF(Flags);
+      InvalidateAF();
+      AcidTestFlags(X86State::RFLAG_AF_RAW_LOC);
+      break;
+    }
+    default: {
+      // Recomputed rather than reusing Plain: PF takes its value, and the register
+      // allocator would otherwise compute Plain straight into the PF register, before
+      // the store (seen for byte and word forms).
+      Ref Again = ALUIROp == IR::IROps::OP_XOR ? _Xor(OpSize, Dest, Src) : ALUIROp == IR::IROps::OP_OR ? _Or(OpSize, Dest, Src) : _And(OpSize, Dest, Src);
+      CalculateFlags_Logical(Size, Again);
+      AcidTestFlags(X86State::RFLAG_AF_RAW_LOC);
+      break;
+    }
+    }
+    return;
+  }
+#endif
   uint64_t Mask = Size == OpSize::i64Bit ? ~0ull : ((1ull << IR::OpSizeAsBits(Size)) - 1);
   if (IsConst && Const == Mask && !DestIsLockedMem(Op) && ALUIROp == IR::IROps::OP_XOR && Size >= OpSize::i32Bit) {
     Result = _Not(OpSize, Dest);

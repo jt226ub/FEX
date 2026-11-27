@@ -61,7 +61,7 @@ jobs:
       - name: Build
         run: |
           set -o pipefail
-          ninja -C build -k 0 FEXCore FEXCore_shared Common CommonTools FEXCoreSmokeTest FEXCoreASMTestRunner FEXCoreThreadTest FEXCoreOrderingTest FEXCoreMutexWakeTest FEXCoreBench FEXCoreCacheTest fexmac fexmac_shared fexmac_testing fexmac_bundle fexmac_c_test fexmac_hook_test 2>&1 | tee build.log
+          ninja -C build -k 0 FEXCore FEXCore_shared Common CommonTools FEXCoreSmokeTest FEXCoreASMTestRunner FEXCoreThreadTest FEXCoreOrderingTest FEXCoreMutexWakeTest FEXCoreBench FEXCoreCacheTest fexmac fexmac_shared fexmac_testing fexmac_bundle fexmac_c_test fexmac_hook_test fexmac_fault_diff 2>&1 | tee build.log
 
       - name: Inspect what was built
         run: |
@@ -220,6 +220,23 @@ jobs:
           # were not found or prepared, and on a pass count below the floor in
           # Scripts/macos_asm_floor.txt (pass_virtual: this VM lacks some CPU features).
           python3 Scripts/macos_asm_check.py asm-tests.log --modes 4 --full-virtual
+
+      - name: Run the differential guest-fault test
+        # Guest state at a page fault, after resuming, and through the write-protection
+        # path, compared with reference runs (Scripts/macos_fault_diff.py).
+        run: |
+          set -o pipefail
+          python3 Scripts/macos_fault_diff.py --tool build/Bin/fexmac_fault_diff 2>&1 | tee fault-diff.log
+
+      - name: Run the self-modifying-code instruction tests with write protection
+        # SMCCHECKS mtrack with the runner's memory registered with fexmac: translated
+        # pages are write-protected and a guest write discards their code. Uses ordinary
+        # page protection, so the hosted Mac can show it (as it can fexmac_c_test's
+        # guest-fault, stop-request and smc subtests; only their timings differ).
+        run: |
+          T="$(find build -name FEXCoreASMTestRunner -type f | head -1)"
+          set -o pipefail
+          python3 Scripts/macos_asm_tests.py --runner "$T" --out asm-smc --filter SelfModifyingCode --smc mtrack 2>&1 | tee asm-smc-tests.log
 
       - name: Run the code cache tests
         # Damaged and mismatched cache files, moving guest code, eight threads loading the

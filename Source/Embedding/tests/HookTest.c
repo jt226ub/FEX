@@ -8,6 +8,8 @@
  *        fexmac_hook_test <name>     run one subtest in this process
  */
 #include "TestSupport.h"
+
+#include <inttypes.h>
 #include "fexmac_testing.h"
 
 #include <inttypes.h>
@@ -166,9 +168,15 @@ static void GuestTouchesGuard(int Which, const uint8_t* Program, size_t Size) {
   Check(State.gpr[RDI] != 64, "found the guard page");
   SetState(GuardThread, &State);
   Shared[0] = 1;
-  fexmac_thread_run(GuardThread, NULL);
-  printf("  FAIL: survived a guest access to a guard page\n");
-  exit(1);
+  const fexmac_stop Stop = Run(GuardThread);
+  const fexmac_x86_state After = GetState(GuardThread);
+  /* Delivered as the guest's page fault at the guard address: no reset of the call/return
+   * stack pointer and no retry loop. */
+  Check(Stop.reason == FEXMAC_STOP_GUEST_FAULT && Stop.trap_number == 14 && Stop.fault_address == State.gpr[RDI] &&
+          After.rip == State.rip,
+        "the guest's access is its own page fault at the guard address (reason %d, address 0x%" PRIx64 ")", Stop.reason,
+        Stop.fault_address);
+  Shared[0] = 2;
 }
 
 static const uint8_t GuardLoad[] = {0x8B, 0x07, 0xF4};  /* mov eax,[rdi] ; hlt */
@@ -281,6 +289,53 @@ static void TestLogCallbackReentry(void) {
   CheckResult(fexmac_context_destroy(LogContext), FEXMAC_OK, "fexmac_context_destroy afterwards");
 }
 
+/* ---- a fault inside the split-lock emulation ends the process, in both arrangements ---- */
+
+/* The page is made inaccessible after the library checked it and before the core
+ * emulates the misaligned lock xadd (the race with a raw mprotect that the contract
+ * excludes): the nested fault, taken with the split-lock lock held, must not reach a
+ * host handler (which might leave it with siglongjmp) and must not hang; the process ends. */
+static void HostSawNested(int Signal, siginfo_t* Info, void* Context) {
+  if (fexmac_handle_fault(Signal, Info, Context)) {
+    return;
+  }
+  Shared[0] = 99; /* the host was given the fault */
+  _exit(3);
+}
+
+static void RunSplitEmulationFault(int Hosted) {
+  if (Hosted) {
+    struct sigaction Action;
+    memset(&Action, 0, sizeof(Action));
+    Action.sa_sigaction = HostSawNested;
+    Action.sa_flags = SA_SIGINFO | SA_NODEFER;
+    sigaction(SIGBUS, &Action, NULL);
+    sigaction(SIGSEGV, &Action, NULL);
+  } else {
+    fexmac_install_fault_handlers();
+  }
+  static const uint8_t LockXadd[] = {0xF0, 0x0F, 0xC1, 0x07, 0xF4}; /* lock xadd [rdi], eax ; hlt */
+  uint8_t* Code = MapGuestMemory(0x10000);
+  uint8_t* Data = MapGuestMemory(0x4000);
+  memcpy(Code, LockXadd, sizeof(LockXadd));
+  fexmac_context* Context = CreateContext(NULL, NULL);
+  fexmac_thread* Thread = CreateThreadAt(Context, (uint64_t)(uintptr_t)Code, 0);
+  fexmac_x86_state State = GetState(Thread);
+  State.gpr[RDI] = (uint64_t)(uintptr_t)Data + 64 + 14;
+  SetState(Thread, &State);
+  fexmac_testing_protect_before_emulation(Data);
+  Shared[0] = 1;
+  fexmac_thread_run(Thread, NULL);
+  Shared[0] = 98; /* survived */
+  exit(1);
+}
+
+static void TestSplitEmulationFaultInstalled(void) {
+  RunSplitEmulationFault(0);
+}
+static void TestSplitEmulationFaultHosted(void) {
+  RunSplitEmulationFault(1);
+}
 
 /* ---- the scratch buffer: overflows, restarts and the limit ---- */
 
@@ -288,8 +343,8 @@ static void TestLogCallbackReentry(void) {
  * offset in the guard page. Each overflow restarts the translation from the restart
  * point with a buffer twice as generous; the block must then run correctly, the thread
  * must be back in executable state (or the translated code would fault), and the guard
- * must be disarmed. With the core's default first size, a long run of rep movsq
- * overflows once; starting from 1 byte per IR node, blocks overflow up to 6 times. */
+ * must be disarmed. From a suitable first size a long run of rep movsq overflows
+ * once; starting from 1 byte per IR node, blocks overflow up to 6 times. */
 static uint64_t OverflowsForBlock(size_t Count, size_t Every, uint32_t Start, uint8_t* Data, int* Wrong) {
   fexmac_context* Context = CreateContextWithOptions(BigBlockOptions, 2, NULL, NULL);
   fexmac_thread* Thread = CreateThreadAt(Context, 0, (uint64_t)(uintptr_t)Data + 0x8000);
@@ -317,12 +372,28 @@ static void TestScratchOverflowMany(void) {
   uint8_t* Data = MapGuestMemory(0x10000);
   int Wrong = 0;
 
-  /* The default first size: the premise of fexmac_c_test scratch-overflow-sizes, whose
-   * sweep runs from a block that fits to one that overflows. */
-  const uint64_t Smallest = OverflowsForBlock(96, 32, 0, Data, &Wrong);
-  const uint64_t Largest = OverflowsForBlock(416, 32, 0, Data, &Wrong);
-  Check(Wrong == 0 && Smallest == 0 && Largest >= 1,
-        "with the default first size, 96 rep movsq fit (%" PRIu64 " overflows) and 416 overflow (%" PRIu64 ")", Smallest, Largest);
+  /* A first size per IR node at which a block of 96 rep movsq fits and one of 416
+   * overflows. It depends on how much host code the rep loop makes per IR node, which
+   * changes with the JIT (package D's exact rep loops moved it), so it is searched for
+   * rather than assumed; the core's default (24) is reported. Then every size between,
+   * one instruction apart, runs correctly at that start, so the guard is hit at offsets
+   * across its page. */
+  uint32_t Start = 0;
+  for (uint32_t Try = 48; Try >= 8 && !Start; Try -= 2) {
+    if (OverflowsForBlock(96, 32, Try, Data, &Wrong) == 0 && OverflowsForBlock(416, 32, Try, Data, &Wrong) >= 1) {
+      Start = Try;
+    }
+  }
+  const int DefaultSplits = OverflowsForBlock(96, 32, 0, Data, &Wrong) == 0 && OverflowsForBlock(416, 32, 0, Data, &Wrong) >= 1;
+  printf("  info: 96 fit and 416 overflow from %u bytes per IR node; with the core's default first size: %s\n", Start,
+         DefaultSplits ? "yes" : "no (the default is generous enough for both)");
+  Check(Wrong == 0 && Start != 0, "a first size exists at which 96 rep movsq fit and 416 overflow (%u bytes per node)", Start);
+  int Swept = 0, SweptOverflowing = 0;
+  for (size_t Count = 96; Start && Count <= 416; ++Count, ++Swept) {
+    SweptOverflowing += OverflowsForBlock(Count, 32, Start, Data, &Wrong) > 0;
+  }
+  Check(Wrong == 0 && SweptOverflowing > 0, "%d blocks of 96 to 416 rep movsq at that start ran correctly (%d overflowed)", Swept,
+        SweptOverflowing);
 
   /* A thread keeps its scratch buffer between translations and only claims a larger
    * one when a translation needs it, so each translation gets a fresh context, and with
@@ -522,7 +593,8 @@ static void CodeBufferSwitch(int Cache) {
   uint64_t Expected = 0;
   const size_t Length = WriteBigBlock(Code, 1024, 8, &Expected);
   if (Cache) {
-    CheckResult(fexmac_add_code_range(Context, (uint64_t)(uintptr_t)Code, 0x4000, 0), FEXMAC_OK, "registering the guest code");
+    CheckResult(fexmac_memory_map(Context, (uint64_t)(uintptr_t)Code, 0x4000, FEXMAC_PROT_READ | FEXMAC_PROT_EXEC), FEXMAC_OK,
+                "registering the guest code");
   }
   uint8_t* Data = MapGuestMemory(0x10000);
   fexmac_thread* Thread = CreateThreadAt(Context, 0, (uint64_t)(uintptr_t)Data + 0x8000);
@@ -673,8 +745,8 @@ static void TestCodeBufferLaterFailsDies(void) {
 }
 
 /* A guest access from translated code that happens to hit a code buffer's guard page
- * (guest addresses are host addresses) is the guest's memory fault, not reported as an
- * overrun of the code buffer. */
+ * (guest addresses are host addresses) is the guest's memory fault, delivered as a page
+ * fault stop (package D), not reported as an overrun of the code buffer. */
 static void TestGuestTouchesCodeBufferGuard(void) {
   fexmac_install_fault_handlers();
   GuardCode = MapGuestMemory(0x10000);
@@ -689,9 +761,13 @@ static void TestGuestTouchesCodeBufferGuard(void) {
   State.gpr[RDI] = fexmac_testing_code_buffer_guard(GuardThread) + 64;
   SetState(GuardThread, &State);
   Shared[0] = 1;
-  fexmac_thread_run(GuardThread, NULL);
-  printf("  FAIL: survived a guest store to a code buffer's guard page\n");
-  exit(1);
+  const fexmac_stop Stop = Run(GuardThread);
+  const fexmac_x86_state After = GetState(GuardThread);
+  Check(Stop.reason == FEXMAC_STOP_GUEST_FAULT && Stop.trap_number == 14 && Stop.fault_address == State.gpr[RDI] &&
+          After.rip == State.rip,
+        "a guest store to a code buffer's guard page is the guest's page fault there (reason %d, address 0x%" PRIx64 ")", Stop.reason,
+        Stop.fault_address);
+  Shared[0] = 2;
 }
 
 /* ---- asynchronous signals are blocked while the core handles a misaligned access ---- */
@@ -765,13 +841,12 @@ static void TestMisalignedBlocksSignals(void) {
   fexmac_context_destroy(Context);
 }
 
-#define GUARD_TEXT "guest memory access fault in translated code at address 0x"
 #define MAP_FAILED_TEXT(MiB) "Couldn't make a " MiB " MiB code buffer: couldn't allocate the executable (MAP_JIT) memory (errno 12)"
 #define OVERRUN_TEXT "fexmac: SIGBUS: write past the end of a code buffer, at address 0x"
 
 static const struct Subtest Subtests[] = {
-  {"guest-load-callret-low-guard-dies", TestGuestLoadCallRetLowGuard, SIGBUS, GUARD_TEXT, "fault inside", 1},
-  {"guest-store-callret-high-guard-dies", TestGuestStoreCallRetHighGuard, SIGBUS, GUARD_TEXT, "fault inside", 1},
+  {"guest-load-callret-low-guard", TestGuestLoadCallRetLowGuard, 0, NULL, "fexmac:", 2},
+  {"guest-store-callret-high-guard", TestGuestStoreCallRetHighGuard, 0, NULL, "fexmac:", 2},
   {"scratch-guard-disarmed-after-translation", TestScratchGuardDisarmed, 0, NULL, NULL, 0},
   {"callback-callret-guard-passed-on", TestCallbackCallRetGuard, 0, NULL, "fexmac:", 2},
   {"log-callback-reentry", TestLogCallbackReentry, 0, NULL, NULL, 0},
@@ -780,13 +855,15 @@ static const struct Subtest Subtests[] = {
    NULL, 7},
   {"log-restored-after-failed-create", TestLogRestoredAfterFailedCreate, 0, NULL, NULL, 0},
   {"invalidation-mask", TestInvalidationMask, 0, NULL, NULL, 0},
+  {"split-emulation-fault-dies", TestSplitEmulationFaultInstalled, SIGBUS, "misaligned atomic", NULL, 1},
+  {"split-emulation-fault-hosted-dies", TestSplitEmulationFaultHosted, SIGBUS, "fault while emulating a misaligned atomic", NULL, 1},
   {"misaligned-blocks-async-signals", TestMisalignedBlocksSignals, 0, NULL, NULL, 0},
   {"scratch-overflow-many", TestScratchOverflowMany, 0, NULL, NULL, 0},
   {"scratch-limit-stops", TestScratchLimitStops, 0, "still overflows its translation buffer", NULL, 1},
   {"code-buffer-guard-pages", TestCodeBufferGuardPages, 0, NULL, NULL, 0},
   {"code-buffer-overrun-dies", TestCodeBufferOverrunDies, SIGBUS, OVERRUN_TEXT, "fault inside", 1},
   {"code-buffer-overrun-chained", TestCodeBufferOverrunChained, 0, OVERRUN_TEXT, "fault inside", 2},
-  {"guest-store-code-buffer-guard-dies", TestGuestTouchesCodeBufferGuard, SIGBUS, GUARD_TEXT, "past the end of a code buffer", 1},
+  {"guest-store-code-buffer-guard", TestGuestTouchesCodeBufferGuard, 0, NULL, "past the end of a code buffer", 2},
   {"code-buffer-switch", TestCodeBufferSwitch, 0, NULL, NULL, 0},
   {"code-buffer-switch-cached", TestCodeBufferSwitchCached, 0, NULL, NULL, 0},
   {"code-buffer-fill-exact", TestCodeBufferFillExact, 0, NULL, NULL, 0},

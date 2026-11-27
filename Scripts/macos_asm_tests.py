@@ -38,7 +38,10 @@ MODES = {
     "jit_500_tso": {"FEX_MAXINST": "500", "FEX_MULTIBLOCK": "1", "FEX_TSOENABLED": "1", "FEX_VECTORTSOENABLED": "1",
                     "FEX_MEMCPYSETTSOENABLED": "1"},
 }
-COMMON_ENV = {"FEX_SILENTLOG": "0", "FEX_DUMPGPRS": "1", "FEX_TSOENABLED": "0"}
+# The self-modifying-code mode is stated: none for every test but the SelfModifyingCode
+# ones (full, or mtrack with --smc), so results do not follow fexmac's default (which
+# gives registered memory, as the runner's is, full checks).
+COMMON_ENV = {"FEX_SILENTLOG": "0", "FEX_DUMPGPRS": "1", "FEX_TSOENABLED": "0", "FEX_SMCCHECKS": "none"}
 if sys.platform == "darwin":
     # No Apple chip so far implements FEAT_RNG (the M4 has no hw.optional.arm.FEAT_RNG and
     # `mrs RNDR` raises SIGILL), so RDRAND and RDSEED exist for a guest on a Mac only
@@ -222,9 +225,9 @@ def read_outcomes(path):
     `crash fault=<address> signal=SIGSEGV|SIGBUS where=host|translated`: the process dies
     of a host fault at that address, as the runner reports it, with the pc in host code
     or in translated code. `fault=` is required: a bare `crash` would match any crash.
-    `guest-fault` or `unsupported-instruction`, with `signal=<n> trap=<n> si_code=<n> at=<rip>`: the
-    run stops with that fexmac stop reason (a guest exception, or code the translator
-    cannot translate) and the given details.
+    `guest-fault` or `unsupported-instruction`, with `signal=<n> trap=<n> si_code=<n> at=<rip>`
+    and optionally `fault=<address>`: the run stops with that fexmac stop reason (a guest
+    exception, a page fault, or code the translator cannot translate) and the given details.
     """
     outcomes = {}
     if os.path.exists(path):
@@ -260,6 +263,7 @@ def observed_outcome(status, detail):
             seen["kind"] = STOP_KINDS.get(match.group(1), "stop-reason-" + match.group(1))
             seen["signal"], seen["trap"], seen["si_code"] = match.group(2), match.group(3), match.group(4)
             seen["at"] = hex(int(match.group(5), 16))
+            seen["fault"] = hex(int(match.group(6), 16))
     return seen
 
 
@@ -316,13 +320,16 @@ def prepare(root, asm_dir, source, out_dir):
     return binary, config
 
 
-def run_one(runner, name, mode, binary, config, timeout, cache_env=None):
+def run_one(runner, name, mode, binary, config, timeout, cache_env=None, smc="full"):
     """Returns (status, detail, cache) where cache is None or a dict of the runner's counters."""
     env = dict(os.environ)
     env.update(COMMON_ENV)
     env.update(MODES[mode])
     if "SelfModifyingCode" in name:
-        env["FEX_SMCCHECKS"] = "full"
+        # full: the translator checks the code before every instruction. mtrack: fexmac
+        # write-protects pages it has translated code from (the runner registers the
+        # test's memory) and discards that code when the guest writes them.
+        env["FEX_SMCCHECKS"] = smc
     if cache_env:
         env.update(cache_env)
     try:
@@ -363,13 +370,13 @@ def directory_bytes(path):
     return total
 
 
-def run_pass(runner, tests, modes, jobs, timeout, cache_env):
+def run_pass(runner, tests, modes, jobs, timeout, cache_env, smc="full"):
     results = {}
     with concurrent.futures.ThreadPoolExecutor(max_workers=jobs) as pool:
         futures = {}
         for mode in modes:
             for name, binary, config in tests:
-                futures[pool.submit(run_one, runner, name, mode, binary, config, timeout, cache_env)] = (mode, name)
+                futures[pool.submit(run_one, runner, name, mode, binary, config, timeout, cache_env, smc)] = (mode, name)
         for future in concurrent.futures.as_completed(futures):
             results[futures[future]] = future.result()
     return results
@@ -388,6 +395,9 @@ def main():
                         help="2: empty the cache directory, run cold, then run warm and compare")
     parser.add_argument("--cache-validate", action="store_true",
                         help="in the warm pass, also compile every block and compare it with the cached code")
+    parser.add_argument("--smc", choices=["full", "mtrack"], default="full",
+                        help="how the SelfModifyingCode tests detect changed code: checks in every block (full) "
+                             "or write protection of translated pages (mtrack)")
     args = parser.parse_args()
 
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -456,7 +466,7 @@ def main():
         cache_env = {"FEX_DISKCACHE": "1", "FEX_DISKCACHEPATH": cache_dir}
 
     started = time.monotonic()
-    results = run_pass(runner, tests, modes, args.jobs, args.timeout, cache_env)
+    results = run_pass(runner, tests, modes, args.jobs, args.timeout, cache_env, args.smc)
     first_seconds = time.monotonic() - started
     cold = None
     if cache_env and args.cache_passes == 2:
@@ -466,7 +476,7 @@ def main():
         if args.cache_validate:
             warm_env["FEX_DISKCACHEVALIDATION"] = "1"
         started = time.monotonic()
-        results = run_pass(runner, tests, modes, args.jobs, args.timeout, warm_env)
+        results = run_pass(runner, tests, modes, args.jobs, args.timeout, warm_env, args.smc)
         warm_seconds = time.monotonic() - started
     full_results = results
     results = {key: value[:2] for key, value in full_results.items()}

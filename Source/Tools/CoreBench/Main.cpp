@@ -26,8 +26,9 @@
 // checksums and the number of kernels it ran. The loader requires 0 wrong, at least one
 // kernel run (exactly N with --expect-kernels), and no other system call.
 //
-// The image's executable segments are registered with fexmac_add_code_range (not
-// writable: the guest never writes its code). --code-cache DIR turns the code cache on
+// The image is registered with fexmac_memory_map: its executable segments readable and
+// executable (not writable: the guest never writes its code), the rest and the stack
+// readable and writable. --code-cache DIR turns the code cache on
 // through fexmac's config fields (code_cache_enabled, code_cache_directory); the cache
 // is flushed before exit. The translation counters (fexmac_context_get_counters) are
 // printed on standard error at exit as
@@ -458,9 +459,25 @@ int main(int argc, char** argv) {
     Names.push_back(T.substr(0, Eq));
     Values.push_back(T.substr(Eq + 1));
   }
+  // The self-modifying-code mode is stated, not left to fexmac's default (which differs
+  // with and without registered memory), so measured figures do not change with it:
+  // none, as the benchmark never writes its code and as macos/v1 measured it.
+  bool HaveSMC = false;
+  for (const auto& Name : Names) {
+    HaveSMC |= Name == "SMCCHECKS" || Name == "SMCChecks";
+  }
+  if (!HaveSMC) {
+    Names.push_back("SMCCHECKS");
+    Values.push_back("none");
+  }
   std::vector<fexmac_option> Options;
   for (size_t i = 0; i < Names.size(); ++i) {
     Options.push_back({Names[i].c_str(), Values[i].c_str()});
+  }
+  for (size_t i = 0; i < Names.size(); ++i) {
+    if (Names[i] == "SMCCHECKS" || Names[i] == "SMCChecks") {
+      fprintf(stderr, "FEXCoreBench: SMCCHECKS %s\n", Values[i].c_str());
+    }
   }
 
   const Image Img = LoadImage(ImagePath);
@@ -494,9 +511,20 @@ int main(int argc, char** argv) {
     fprintf(stderr, "FEXCoreBench: cannot create the context: %s\n", fexmac_result_string(R));
     return ExitLoaderFailure;
   }
+  // The guest memory map: the image's code segments executable, the rest of the image
+  // and the stack readable and writable. Host pages are 16K and take the union of their
+  // 4K pages' protections, so code and data sharing a host page stay writable.
+  if (fexmac_memory_map(Context, Img.Low, Img.High - Img.Low, FEXMAC_PROT_READ | FEXMAC_PROT_WRITE) != FEXMAC_OK ||
+      fexmac_memory_map(Context, reinterpret_cast<uint64_t>(Stack), MainStackSize, FEXMAC_PROT_READ | FEXMAC_PROT_WRITE) != FEXMAC_OK) {
+    Die("cannot register the image's memory");
+  }
   for (const auto& [Address, Size] : Img.Code) {
-    if (fexmac_add_code_range(Context, Address, Size, 0) != FEXMAC_OK) {
-      Die("cannot register the image's code range");
+    const uint64_t Begin = Address & ~uint64_t {0xFFF};
+    const uint64_t End = (Address + Size + 0xFFF) & ~uint64_t {0xFFF};
+    // Segments are 4K-aligned and may share a 16K host page with data: accept the host
+    // page's union protection there (the guest never relies on it).
+    if (fexmac_memory_protect(Context, Begin, End - Begin, FEXMAC_PROT_READ | FEXMAC_PROT_EXEC | FEXMAC_PROT_ALLOW_UNENFORCED) != FEXMAC_OK) {
+      Die("cannot register the image's code");
     }
   }
 

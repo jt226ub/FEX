@@ -81,6 +81,10 @@ typedef enum fexmac_result {
   FEXMAC_ERROR_UNSUPPORTED = 7,
   /* The core returned without a recorded stop reason. Indicates a bug in the library. */
   FEXMAC_ERROR_INTERNAL = 8,
+  /* Not an error: fexmac_memory_unmap did what was asked, but the unmapped 4K guest pages
+   * share a 16K host page with guest pages still mapped and accessible, so the guest can
+   * still read (and maybe write) them without a fault (see "Granularity"). */
+  FEXMAC_DONE_UNENFORCED = 9,
 } fexmac_result;
 
 /* A short English description of a result, never NULL. */
@@ -177,8 +181,8 @@ typedef struct fexmac_config {
    * generations it uses when it starts (about 40% of the cache file for small blocks),
    * which is what the default bounds.
    *
-   * With the cache on, register the guest's code with fexmac_add_code_range: cached code
-   * is matched against the guest bytes inside the registered ranges only.
+   * With the cache on, register the guest's memory with fexmac_memory_map: cached code
+   * is matched against the guest bytes of executable registered pages only.
    *
    * The core's own options for this (DISKCACHE, DISKCACHEPATH) are refused; these fields
    * are the interface. DISKCACHEMAXFILESIZE and DISKCACHEVALIDATION are accepted options. */
@@ -218,23 +222,14 @@ FEXMAC_EXPORT fexmac_result fexmac_cpuid(fexmac_context* context, uint32_t funct
 FEXMAC_EXPORT fexmac_result fexmac_invalidate(fexmac_context* context, uint64_t address, uint64_t size);
 
 /* ---------------------------------------------------------------------------------
- * Guest code ranges and the code cache
+ * The code cache
+ *
+ * Which guest memory is code comes from the guest memory map (fexmac_memory_map with
+ * FEXMAC_PROT_EXEC, below): with the cache on, cached code is matched against the guest
+ * bytes of executable registered pages only. (The 2.x development branch had
+ * fexmac_add_code_range / fexmac_remove_code_range for this; they are replaced by the
+ * memory map, which is the one registry of guest memory.)
  * --------------------------------------------------------------------------------- */
-
-/* Tells the library that [address, address + size) holds guest code the guest may
- * execute (its mapped executable memory). writable: 1 if the guest can also write it
- * (self-modifying or JIT-generated code), 0 if not. Once any range is registered, the
- * core treats only registered ranges as executable: decoding stops at their ends and
- * code outside them stops with a guest fault, and the code cache hashes and patches
- * only bytes inside them. With no range registered every address counts as executable
- * and writable (the behaviour without this call). Overlapping or adjacent ranges with the
- * same writability merge. Returns FEXMAC_ERROR_INVALID_ARGUMENT for size 0 or a range
- * that wraps. */
-FEXMAC_EXPORT fexmac_result fexmac_add_code_range(fexmac_context* context, uint64_t address, uint64_t size, int writable);
-
-/* Removes [address, address + size) from the registered ranges (splitting a range that
- * covers more) and discards translations of code in it, as fexmac_invalidate does. */
-FEXMAC_EXPORT fexmac_result fexmac_remove_code_range(fexmac_context* context, uint64_t address, uint64_t size);
 
 typedef enum fexmac_cache_state {
   /* code_cache_enabled was 0. */
@@ -308,7 +303,11 @@ FEXMAC_EXPORT fexmac_result fexmac_after_fork(fexmac_context* context, int child
  * the process with a core message. */
 FEXMAC_EXPORT fexmac_result fexmac_thread_create(fexmac_context* context, fexmac_thread** out_thread);
 
-/* Destroys a thread that is not running. */
+/* Destroys a thread that is not running. Its translator state, stacks and code are freed;
+ * the small handle itself is kept until fexmac_context_destroy, so that a late
+ * fexmac_thread_request_stop on it is refused (FEXMAC_ERROR_INVALID_HANDLE) instead of
+ * touching freed memory. A context that creates and destroys threads without end grows
+ * by one small handle per destroyed thread. */
 FEXMAC_EXPORT fexmac_result fexmac_thread_destroy(fexmac_thread* thread);
 
 FEXMAC_EXPORT fexmac_context* fexmac_thread_context(fexmac_thread* thread);
@@ -369,9 +368,11 @@ typedef enum fexmac_stop_reason {
   FEXMAC_STOP_SYSCALL = 1,
   /* The guest executed `hlt`. rip and instruction_address point at the `hlt`. */
   FEXMAC_STOP_HALT = 2,
-  /* The guest raised an exception the core detects without a host fault: an invalid
-   * instruction (ud2), int3, int n, a privileged instruction and so on. The details are
-   * in the stop record, using the signal numbering the core reports. */
+  /* The guest raised an exception: an invalid instruction (ud2), int3, int n, a
+   * privileged instruction and so on, which the core detects itself, or a page fault: a
+   * load, store or instruction fetch the guest's memory does not allow (see
+   * "Guest memory faults" below). The details are in the stop record. Signal numbers are
+   * the host's (<signal.h> on macOS; SIGBUS is 10 here, 7 on Linux). */
   FEXMAC_STOP_GUEST_FAULT = 3,
   /* The translator cannot translate the instruction at instruction_address, although
    * x86 may define it: one FEX does not implement (`int 0x80` in 64-bit mode, `mov` to
@@ -382,10 +383,23 @@ typedef enum fexmac_stop_reason {
    * block's start and a core message saying why, for a block the translator gives up
    * on because its code keeps overflowing the translator's buffer (an emitter bug). */
   FEXMAC_STOP_UNSUPPORTED_INSTRUCTION = 4,
-  /* Later versions add: a stop requested by another thread, and guest memory faults
-   * caught as host faults. Until then a guest memory fault in translated code is passed
-   * on as a host fault (see "Host fault handling"). */
+  /* fexmac_thread_request_stop asked the thread to stop. The guest state is at an
+   * instruction boundary (or part-way through a rep cmps/scas/lods, with rcx, rsi and rdi
+   * showing the progress made, as x86 leaves them when it interrupts one); rip and
+   * instruction_address are where running again continues. */
+  FEXMAC_STOP_REQUESTED = 5,
 } fexmac_stop_reason;
+
+/* Access kinds of a guest page fault (fexmac_stop.access). */
+#define FEXMAC_ACCESS_READ 1u
+#define FEXMAC_ACCESS_WRITE 2u
+#define FEXMAC_ACCESS_EXECUTE 4u
+
+/* x86 page-fault error code bits (fexmac_stop.error_code for trap_number 14). */
+#define FEXMAC_PF_PRESENT 1u /* the page is mapped with some access: a protection violation */
+#define FEXMAC_PF_WRITE 2u
+#define FEXMAC_PF_USER 4u
+#define FEXMAC_PF_INSTRUCTION 16u
 
 typedef struct fexmac_stop {
   uint32_t struct_size;
@@ -393,12 +407,16 @@ typedef struct fexmac_stop {
   /* The guest address of the instruction that stopped the run (the `syscall`, the `hlt`
    * or the faulting instruction). */
   uint64_t instruction_address;
-  /* For FEXMAC_STOP_GUEST_FAULT and FEXMAC_STOP_HALT, as the core reports them: */
-  int32_t signal;       /* host signal number the fault maps to (SIGILL, SIGTRAP, SIGSEGV) */
-  uint32_t trap_number; /* x86 exception vector, e.g. 6 for #UD, 3 for #BP, 13 for #GP */
+  /* For FEXMAC_STOP_GUEST_FAULT and FEXMAC_STOP_HALT: */
+  int32_t signal;       /* host signal number to deliver (SIGILL, SIGTRAP, SIGSEGV, SIGBUS) */
+  uint32_t trap_number; /* x86 exception vector, e.g. 6 for #UD, 3 for #BP, 13 for #GP, 14 for #PF */
   int32_t si_code;
   uint32_t error_code;
   uint64_t fault_address;
+  /* For a page fault (trap_number 14): FEXMAC_ACCESS_READ, _WRITE or _EXECUTE. 0 for
+   * other stops. */
+  uint32_t access;
+  uint32_t reserved;
 } fexmac_stop;
 
 /* Sets struct_size and zeroes the rest. */
@@ -407,8 +425,145 @@ FEXMAC_EXPORT void fexmac_stop_init(fexmac_stop* stop);
 /* Runs guest code on the calling host thread, from the thread's rip, until it stops.
  * `stop` may be NULL. Returns FEXMAC_ERROR_BUSY if the thread is already running or the
  * call comes from a system call callback. Translated code relies on the fault handlers
- * (see below): install them or forward faults to fexmac_handle_fault before running. */
+ * (see below): install them or forward faults to fexmac_handle_fault before running.
+ *
+ * After any stop the thread's state is consistent and the host stack is back where
+ * fexmac_thread_run started: run again to continue from rip, or set a new state first
+ * (for example a signal frame the embedder built for a guest handler). */
 FEXMAC_EXPORT fexmac_result fexmac_thread_run(fexmac_thread* thread, fexmac_stop* stop);
+
+/* Asks a thread to stop. May be called from any host thread, including from a signal
+ * handler (it is async-signal-safe: an atomic store and an mprotect), and any number of
+ * times. The thread must stay alive for the duration of the call (this function takes no
+ * lock and cannot check the handle; it returns FEXMAC_ERROR_INVALID_ARGUMENT only for
+ * NULL).
+ *
+ * Every request is answered by one FEXMAC_STOP_REQUESTED stop; requests made before it
+ * is delivered are merged into it.
+ *  - Running translated code: the thread stops at the next block entry or loop back-edge
+ *    (translated code writes the thread's interrupt fault page there, which this call
+ *    makes read-only). Within a block code runs straight through, so the wait is at
+ *    most one block of up to MAXINST instructions, or one `rep movs`/`rep stos`, which is
+ *    a single host loop over rcx elements. A system call callback in progress finishes
+ *    first; if it returns RESUME the thread stops at the next block entry.
+ *  - Not running, or the run ends for another reason first (a system call stop, a guest
+ *    fault): the request stays pending and the next fexmac_thread_run returns
+ *    FEXMAC_STOP_REQUESTED at once, before any guest instruction runs. */
+FEXMAC_EXPORT fexmac_result fexmac_thread_request_stop(fexmac_thread* thread);
+
+/* ---------------------------------------------------------------------------------
+ * Guest memory
+ *
+ * Guest addresses are host addresses and the embedder maps guest memory itself. These
+ * functions tell the library what the guest's view of that memory is, which it needs for
+ * three things:
+ *  - Guest page faults: whether an address is mapped (x86 #PF present bit, SEGV_MAPERR
+ *    vs SEGV_ACCERR) and whether the guest was allowed the access.
+ *  - Instruction fetch: the translator only reads code from pages registered as
+ *    executable. A jump to anything else stops with a page fault (access EXECUTE) at
+ *    that address, instead of the translator crashing on unmapped memory.
+ *  - Self-modifying code. DEFAULTS (no SMCCHECKS option given; the core's default,
+ *    mtrack): with no memory registered, nothing is detected and the embedder calls
+ *    fexmac_invalidate after changing code (the behaviour before guest memory
+ *    registration existed); with memory registered, write protection of translated
+ *    pages: when code on a writable page of registered memory is translated, the library
+ *    removes host write access from that 16K host page; a guest write to it faults, the
+ *    library discards the translations of that host page for every thread, gives write
+ *    access back and lets the write happen (exact at the faulting instruction, see "Guest
+ *    memory faults"). Host writes to such pages must be bracketed (see "Writes by the
+ *    embedder" below). NOT seen: writes through another mapping of the same memory (the
+ *    embedder that made the alias calls fexmac_invalidate for it) and writes to host
+ *    pages registered with FEXMAC_PROT_ALLOW_UNENFORCED mixed protections (see
+ *    "Granularity"). SMCCHECKS full (an option): the core checks the guest bytes of the
+ *    current block before every instruction, everywhere; correct for aliases too, 2 to 6
+ *    times slower on tight loops. SMCCHECKS none: no detection anywhere.
+ *
+ * Until the first fexmac_memory_map the library knows nothing about guest memory and
+ * behaves as before: every address is executable, nothing is write-protected, and an
+ * embedder that changes code must call fexmac_invalidate.
+ *
+ * Granularity. Guest pages are 4K; addresses and sizes must be multiples of 4K. Host
+ * pages are 16K and carry one protection: the library sets each host page to the union
+ * of what its four guest pages need from the host (minus write access while it holds
+ * translated code). A guest page needs no access (unmapped or PROT_NONE), read (R, X or
+ * R+X: x86 has no execute-only pages, and EXEC is checked by the library per 4K page from
+ * its own table, not by the host), or read and write (any W). THE RULE: a change is
+ * enforced exactly when, after it, the four guest pages of every host page it touches
+ * need the same. So R next to R+X (.text next to .rodata), W next to RW, and PROT_NONE
+ * next to unmapped are accepted and enforced, executable or not per 4K page. Any other
+ * change (R next to RW, a mapped readable page next to unmapped ones, PROT_NONE next to
+ * accessible) is refused by fexmac_memory_map and fexmac_memory_protect
+ * (FEXMAC_ERROR_UNSUPPORTED, nothing changed) unless the protection carries
+ * FEXMAC_PROT_ALLOW_UNENFORCED; this includes a 4K mapping into an otherwise unmapped
+ * host page, which would make its unmapped neighbours accessible. fexmac_memory_unmap of
+ * part of a host page whose other guest pages stay accessible is done (the library
+ * records the pages as unmapped and reports them so) but returns FEXMAC_DONE_UNENFORCED.
+ * Accepted and partial-unmap cases are counted by fexmac_memory_unenforced_count.
+ *
+ *   !!! LIMIT OF THIS VERSION. On a host page whose guest pages need different host
+ *   protections (accepted with FEXMAC_PROT_ALLOW_UNENFORCED, or left by a partial unmap
+ *   that returned FEXMAC_DONE_UNENFORCED), the guest gets the MOST PERMISSIVE of them
+ *   for all four. NOT enforced on such a page: a PROT_NONE guard page or an unmapped
+ *   4K page next to an accessible one is readable (and writable, next to a writable
+ *   one) without a fault (stack guard pages, ASan-style red zones, end-of-buffer guards
+ *   do not work there); a read-only page next to a writable one is writable.
+ *   Self-modifying-code write protection does not cover a guest page that is not
+ *   writable for the guest but shares a host page with a writable one (a write to it is
+ *   not seen: run SMCCHECKS full or call fexmac_invalidate). Still enforced everywhere:
+ *   mapped/unmapped and protection reporting (fexmac_memory_query and the fault
+ *   details), and instruction fetch only from guest-executable 4K pages. Lay guest
+ *   memory out on 16K boundaries, or keep each host page's guest pages to one of the
+ *   three needs, to keep every protection enforced.
+ *
+ * After registering, the embedder must change protections only with these functions,
+ * not with mprotect (which would undo the write protection without discarding
+ * translations). It maps and unmaps memory itself (mmap/munmap) and reports it here.
+ *
+ * Writes by the embedder. A write by host code (the embedder, or a kernel call it makes
+ * for the guest, such as read() into guest memory) to a write-protected page would fault
+ * (or fail with EFAULT) and is not handled. Bracket such writes with
+ * fexmac_memory_write_begin and fexmac_memory_write_end, from any host thread: between
+ * them the host pages in the range are writable and are not write-protected again, and
+ * _end discards translations made from the range meanwhile. Without memory tracking or
+ * with SMCCHECKS other than mtrack both return at once.
+ * --------------------------------------------------------------------------------- */
+
+#define FEXMAC_PROT_NONE 0u
+#define FEXMAC_PROT_READ 1u
+#define FEXMAC_PROT_WRITE 2u
+#define FEXMAC_PROT_EXEC 4u
+/* Accept a protection the host cannot enforce (see "Granularity"); without it such a
+ * fexmac_memory_map or fexmac_memory_protect is refused. Not a protection: never
+ * stored, never reported by fexmac_memory_query. */
+#define FEXMAC_PROT_ALLOW_UNENFORCED 0x100u
+
+/* Records that [address, address + size) is mapped with the guest protection `prot`
+ * (FEXMAC_PROT_* bits) and sets the host protection of the host pages it covers (see
+ * "Granularity"). Discards translations of those host pages. Also used for a guest
+ * mprotect. FEXMAC_ERROR_INVALID_ARGUMENT for unaligned or out-of-range arguments
+ * (addresses must be below 2^47), FEXMAC_ERROR_UNSUPPORTED if the host refuses the
+ * protection. */
+FEXMAC_EXPORT fexmac_result fexmac_memory_map(fexmac_context* context, uint64_t address, uint64_t size, uint32_t prot);
+/* As fexmac_memory_map for a range that is already registered as mapped (a guest
+ * mprotect); FEXMAC_ERROR_INVALID_ARGUMENT if any page of it is not. */
+FEXMAC_EXPORT fexmac_result fexmac_memory_protect(fexmac_context* context, uint64_t address, uint64_t size, uint32_t prot);
+/* Records that the range is no longer mapped and discards translations of its host pages.
+ * Call it before mapping something else there; the library does not munmap. Returns
+ * FEXMAC_DONE_UNENFORCED (done) when part of a host page stays mapped and accessible, so
+ * the unmapped pages stay reachable by the guest (see "Granularity"). */
+FEXMAC_EXPORT fexmac_result fexmac_memory_unmap(fexmac_context* context, uint64_t address, uint64_t size);
+/* The registered guest protection of the page holding `address`, and whether it is
+ * mapped (out values may be NULL). */
+FEXMAC_EXPORT fexmac_result fexmac_memory_query(fexmac_context* context, uint64_t address, uint32_t* prot, int* mapped);
+/* See "Writes by the embedder". Calls must pair up with the same range; they nest. */
+FEXMAC_EXPORT fexmac_result fexmac_memory_write_begin(fexmac_context* context, uint64_t address, uint64_t size);
+FEXMAC_EXPORT fexmac_result fexmac_memory_write_end(fexmac_context* context, uint64_t address, uint64_t size);
+/* Number of changes so far that left a host page with guest pages of different
+ * protections (accepted with FEXMAC_PROT_ALLOW_UNENFORCED, or a partial unmap): on those
+ * host pages the guest's 4K protections are not enforced. */
+FEXMAC_EXPORT uint64_t fexmac_memory_unenforced_count(fexmac_context* context);
+/* Number of guest writes to write-protected code the library has handled. */
+FEXMAC_EXPORT uint64_t fexmac_memory_code_write_count(fexmac_context* context);
 
 /* ---------------------------------------------------------------------------------
  * Host fault handling
@@ -420,15 +575,52 @@ FEXMAC_EXPORT fexmac_result fexmac_thread_run(fexmac_thread* thread, fexmac_stop
  *    page after it, and must be resumed at its restart point.
  *  - The core's call/return stack overflows or underflows into its guard pages (deep
  *    recursion, unmatched call or ret); its pointer is reset to the middle.
+ *  - A thread asked to stop (fexmac_thread_request_stop) writes its read-only interrupt
+ *    fault page at the next block entry; the library leaves the dispatcher there.
+ *  - A guest write to a page the library write-protected for self-modifying-code
+ *    detection (see "Guest memory").
+ *  - A guest memory access fault in translated code: the library reconstructs the guest
+ *    state as it was before the faulting instruction (registers from the host context,
+ *    rip from the block's instruction map, flags) and fexmac_thread_run returns
+ *    FEXMAC_STOP_GUEST_FAULT with trap_number 14 (see "Guest memory faults").
  * Faults are told apart by the data abort's fault status code (ESR_EL1.DFSC, which macOS
  * passes in the signal context), not by si_code: macOS reports a protection fault and
  * an alignment fault alike as SIGBUS with si_code 1. The library claims only faults from
  * a host thread that is running guest code, and among those only the cases above. Every
- * other fault, including a guest load or store to an unmapped or protected page in
- * translated code, is not the library's. One of them is a core bug: the core's own code
- * running past the end of a code buffer into the inaccessible page after it; with the
- * library's handlers installed (fexmac_install_fault_handlers) the library writes a
- * "fexmac:" line naming it before passing the fault on.
+ * other fault (a bug in host code, the embedder's callback touching bad memory, a host
+ * write to a write-protected code page outside fexmac_memory_write_begin/_end) is not
+ * the library's.
+ *
+ * Guest memory faults. signal, si_code and error_code are what an x86 kernel would
+ * report: SIGSEGV with SEGV_MAPERR and no FEXMAC_PF_PRESENT for an unmapped page,
+ * SEGV_ACCERR for a page whose protection forbids the access (FEXMAC_PF_PRESENT unless
+ * the page is PROT_NONE, as Linux reports it), FEXMAC_PF_WRITE for a write (an atomic
+ * read-modify-write counts as a write), FEXMAC_PF_INSTRUCTION for a fetch, and always
+ * FEXMAC_PF_USER. SIGBUS with BUS_ADRERR when the registered protection allows the access
+ * but the host refused it (a file mapping past its end, for example). Without registered
+ * memory the library goes by the host fault: SIGSEGV from the host is an unmapped page,
+ * SIGBUS a protected one. The guest state (registers, flags, x87, MMX, XMM/YMM, MXCSR) is
+ * the state before the faulting instruction, and running it again after fixing the
+ * cause gives x86's result. That includes read-modify-write instructions on memory
+ * (add/or/and/sub/xor/inc/dec/neg/adc/sbb and shl/shr by a constant store first and
+ * compute the flags after; lock forms, xadd, cmpxchg and bit tests change state only
+ * after their single faulting access; rotates, sar, shifts by cl and shld/shrd put the
+ * flags back from an undo record saved before them), pop [m] and leave (reordered to
+ * move rsp after the access; pop to an rsp-based address puts rsp back from the record),
+ * x87 store-and-pop (the stack is popped after the store), push/call/enter and 16- and
+ * 32-byte stores across a page (nothing written when the higher page faults), and rep
+ * movs / stos / lods / scas / cmps, also with fs:/gs: on the source, which stop part-way
+ * with rcx, rsi and rdi counting exactly the elements done, as x86 does, with the fault
+ * address of the faulting element. Not exact, at the fault only (running again is
+ * right): a 32-byte store whose LOWER page faults has already written its upper half,
+ * fxsave/xsave across a page may be partly written (as on x86), and flags the rest of
+ * the block overwrites without reading (PF and AF most often, and the incoming flags an
+ * instruction overwrites) may be stale. See
+ * docs/macOS-embedding-interface.md, "Guest memory faults: what is exact".
+ *
+ * One fault outside these is always a core bug: an access past the end of a code buffer,
+ * which ends in the inaccessible page after it; with the library's handlers installed it
+ * writes a "fexmac:" line naming it before passing the fault on.
  *
  * Two ways to connect it, pick one per process:
  *
@@ -494,10 +686,14 @@ FEXMAC_EXPORT fexmac_result fexmac_install_fault_handlers(void);
  * switched off). While the core may hold either, this function blocks asynchronous
  * signals itself (everything but SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGTRAP and SIGSYS) and
  * restores the caller's mask afterwards, so a host's asynchronous handler cannot run
- * then. The split-lock lock is held while guest memory is accessed: if that access
- * faults, the fault reaches the host's handler with the lock held, so a host using way 2
- * must not leave such a fault with siglongjmp (every later such operation in the process
- * would wait forever); dying or returning after fixing the cause is fine. If the core meets an atomic instruction it cannot rewrite
+ * then. The split-lock lock is held while guest memory is accessed. The library checks
+ * that memory first and reports an inaccessible page as the guest's page fault before
+ * the emulation starts, and keeps its own protection changes out of the way of an
+ * emulation in progress, so no fault is taken with the lock held. If one is anyway (the
+ * embedder changed the page with a raw mprotect or munmap at that moment, which the
+ * "Guest memory" contract excludes), this function claims it, writes a message and
+ * restores the default action: the process ends, and the fault never reaches the host's
+ * handler with the lock held. If the core meets an atomic instruction it cannot rewrite
  * (which would be a core bug), the core formats an error message, which allocates; the
  * library writes it with write(2) and the fault is not claimed. */
 FEXMAC_EXPORT int fexmac_handle_fault(int signal, siginfo_t* info, void* ucontext);

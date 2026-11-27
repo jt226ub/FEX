@@ -638,6 +638,15 @@ private:
                   ARMEmitter::Register Divisor);
 
   void EmitSuspendInterruptCheck();
+  template<ARMEmitter::IsLabel T>
+  void EmitCondJumpBranch(const IR::IROp_CondJump* Op, T* TrueTargetLabel);
+#ifdef __APPLE__
+  bool EmitRepStringInPlace(bool Copy, bool IsAtomic, size_t Size, ARMEmitter::Register Length, ARMEmitter::Register DestIn,
+                            ARMEmitter::Register SrcIn, ARMEmitter::Register Value, bool DirectionIsInline, uint64_t DirectionConstant,
+                            ARMEmitter::Register DirectionReg, ARMEmitter::Register OutDst, ARMEmitter::Register OutSrc,
+                            ARMEmitter::Register SrcBase);
+  void EmitCondJumpBranchInverted(const IR::IROp_CondJump* Op, ARMEmitter::ForwardLabel* Label);
+#endif
 
   void EmitEntryPoint(ARMEmitter::BackwardLabel& HeaderLabel, bool CheckTF);
 

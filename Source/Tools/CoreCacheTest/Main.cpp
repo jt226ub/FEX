@@ -34,6 +34,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <algorithm>
 #include <cstring>
 #include <dirent.h>
 #include <execinfo.h>
@@ -428,6 +429,12 @@ int main(int argc, char** argv) {
       Values.emplace_back(Entry.substr(Equals + 1));
     }
   }
+  // The self-modifying-code mode is stated (FEX_SMCCHECKS, default none), not left to
+  // fexmac's default, because it is part of the cache key.
+  if (std::find(Names.begin(), Names.end(), "SMCCHECKS") == Names.end()) {
+    Names.push_back("SMCCHECKS");
+    Values.push_back("none");
+  }
   std::vector<fexmac_option> Options;
   for (size_t i = 0; i < Names.size(); ++i) {
     Options.push_back({Names[i].c_str(), Values[i].c_str()});
@@ -454,7 +461,7 @@ int main(int argc, char** argv) {
     return 1;
   }
   // Only the guest code mapping is code: the cache hashes and patches nothing beyond it.
-  fexmac_add_code_range(Context, CodeBase, CodeSize, 1);
+  fexmac_memory_map(Context, CodeBase, CodeSize, FEXMAC_PROT_READ | FEXMAC_PROT_WRITE | FEXMAC_PROT_EXEC);
 
   // Code generation state that is not in the configuration: each must keep cached code
   // made without it from being used (and the reverse).
@@ -548,7 +555,7 @@ int main(int argc, char** argv) {
       return 1;
     }
     memcpy(ChildMap, ChildProgram.Bytes.data(), ChildProgram.Bytes.size());
-    fexmac_add_code_range(Context, reinterpret_cast<uint64_t>(ChildMap), CodeSize, 1);
+    fexmac_memory_map(Context, reinterpret_cast<uint64_t>(ChildMap), CodeSize, FEXMAC_PROT_READ | FEXMAC_PROT_WRITE | FEXMAC_PROT_EXEC);
     // --fork-raw: fork without fexmac_before_fork / fexmac_after_fork. No other host
     // thread is inside the library here, so its own locks are free; the cache must notice
     // the fork by itself and turn read-only in the child instead of waiting for the

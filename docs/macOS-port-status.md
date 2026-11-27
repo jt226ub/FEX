@@ -42,6 +42,12 @@ Related documents:
   under Rosetta 2 and natively on arm64. Speed is measured (criterion 8): the generated
   summary in "Guest program and benchmark" below gives the figures and says whether they
   are provisional or final.
+- **Fault handling for an embedder** (criterion 4, met apart from at-fault-only limits: see
+  "Fault handling for an embedder" below): misaligned atomics,
+  scratch-buffer restart, self-modifying code detected by write-protecting translated
+  pages, stopping a thread from another thread at a safe point, and guest page faults
+  delivered as stops with the guest state reconstructed, each tested through the C
+  interface as built and hardened. See "Fault handling for an embedder" below.
 - **Linux is unaffected, and this is now checked on every push.** A hosted arm64 Ubuntu
   job builds the core-only configuration and the whole ordinary Linux build, and runs
   upstream's 64-bit instruction tests and unit tests there, on the port and on the
@@ -97,8 +103,8 @@ Fixed in code on `macos/runtime-fixes`:
    past the end of a code buffer, at address ... (its guard page) from host pc ...`
    and passes the fault on, and the process dies (`fexmac_hook_test
    code-buffer-overrun-dies`, `-chained`). A guest access from translated code or the
-   dispatcher that happens to hit the page is the guest's fault and reported as one
-   (`guest-store-code-buffer-guard-dies`). A buffer that cannot be made (its `MAP_JIT`
+   dispatcher that happens to hit the page is the guest's fault, a page-fault stop at that address
+   (`guest-store-code-buffer-guard`). A buffer that cannot be made (its `MAP_JIT`
    `mmap` fails, now checked against `MAP_FAILED`, or the guard cannot be placed) is
    reported with what failed and its errno: for the context's first buffer, made with
    its first thread, `fexmac_thread_create` returns `FEXMAC_ERROR_OUT_OF_MEMORY`
@@ -252,10 +258,87 @@ with `JITWriteProbe`:
 
 Still unproven or open:
 
-1. **The interrupt fault page and guest signals.** Not exercised.
-2. **Self-modifying code detected by write-protecting pages.** Only the
-   check-on-every-block kind is exercised.
-3. **Speed.** Nothing has been measured.
+1. **Speed.** Nothing has been measured.
+
+(The interrupt fault page and self-modifying code by write protection, open here before,
+are exercised now: see "Fault handling for an embedder".)
+
+## Fault handling for an embedder (criterion 4)
+
+`docs/macOS-embedding-interface.md` has the contracts; this is the state after the package
+D review and its second rework, on the M4. Criterion 4 is met except for the at-fault
+limits listed in the last row, where running again still gives x86's result.
+
+| Fault path | Tests | State |
+|---|---|---|
+| Misaligned atomics | `faults-*`, `split-locks-concurrent`, `split-lock-faults`, `split-lock-unmap-race`, `guest-misaligned-atomic-prot-none`, `split-emulation-fault-*-dies` | pass; with the second half on an inaccessible page each thread stops with a page fault before anything is written, totals exact after the fix |
+| Scratch-buffer restart | `scratch-guard-disarmed-after-translation`, `scratch-overflow-*`; `CodeBufferOverflow` | pass |
+| Self-modifying code by page protection | `smc-*`, `split-lock-on-code-page`, `SelfModifyingCode/*` with `--smc mtrack`, the harness's write-protection path | pass; **the default once memory is registered** (no memory registered: nothing detected, as on `macos/v1`); writes through aliases and to non-writable guest pages sharing a host page with writable ones are not seen |
+| Stopping a thread from another thread | `stop-*`, `stop-rep-movs` | pass; median 4 to 6 us request to return; also inside a long `rep movs`/`stos` (32 MB, thousands of stops, registers exact at each, final memory x86's) |
+| Guest fault with correct guest state | `fault-*`, `guest-*`, `Scripts/macos_fault_diff.py` (368 programs x 4 modes x 3 ways) | **exact, and running again gives x86's result, for loads, stores, push/pop/call/ret, `pop [m]`, `leave`, `enter`, every read-modify-write form on memory (also locked and misaligned), `xadd`/`cmpxchg`, vector and x87 accesses, 16- and 32-byte stores across a page, and every `rep` string form part-way (also with fs:/gs:), with x86's fault address**; 4 at-fault-only differences remain in `fault_diff_known.txt`: dead flags (2 programs), a 32-byte store whose lower page faults, `fxsave` across a page; the incoming flags an instruction overwrites unread are dead flags too |
+| 4K protections within a 16K host page | `memory-arguments` | refused unless `FEXMAC_PROT_ALLOW_UNENFORCED`; accepted ones are counted and NOT enforced (guard pages, read-only next to writable, SMC protection of the non-writable page): the 1.0 limit, stated in `fexmac.h` and the embedding document with the sound scheme as future work |
+
+How (all macOS-only, `__APPLE__`): a full register-cache flush and x87 stack sync before
+every instruction with a memory operand; an undo record (flags) for read-modify-write
+instructions on memory and for `pop` to an rsp-based address; `pop [m]` and `leave`
+reordered; 32-byte stores upper half first; `rep movs`/`stos` loops that use the guest's
+rcx/rsi/rdi as their induction variables, in page-bounded 32-byte chunk runs; interrupt
+checks on block entries, back-edges, conditional back-edges and inside `rep` loops; no
+code check for undecodable instructions. The code cache's port revision is 3.
+
+Performance, the review's microbenchmarks (best of 5, `SMCCHECKS none`, M4, machine
+shared with other builds, so differences under about 5% are noise). Base: `macos/v1`;
+"before": this package before the second rework (no undo record, the core's rep loops);
+after: the tip.
+
+| Loop | Multiblock | Base (`macos/v1`) | Previous tip `995572564` | Tip |
+|---|---|---|---|---|
+| counted `jnz` | off / on | 0.153 / 0.150 s | +3% / -1% | +3% / -1% |
+| memory mixed (ld/st/adc) | off / on | 0.099 / 0.099 s | +2% / +2% | +2% / +2% |
+| memory with carry | off / on | 0.127 / 0.127 s | +0% / -0% | -0% / -0% |
+| `memjmp` (two linked blocks) | off / on | 0.051 / 0.036 s | +50% / +21% | +50% / +20% |
+| `add [m]; adc [m]; inc [m]` | off / on | 0.185 / 0.174 s | +118% / +123% | -5% / +0% |
+| `add/sub/inc/or [m]` | off / on | 0.178 / 0.177 s | +131% / +132% | -0% / +1% |
+| `lock add [m]; lock xadd [m]` | off / on | 0.182 / 0.183 s | +70% / +60% | +0% / -2% |
+| `adc/sbb/add [m]` | off / on | 0.178 / 0.178 s | +122% / +132% | +2% / +1% |
+| `shl [m],1; ror [m],3; bts [m],5` | off / on | 0.176 / 0.183 s | +130% / +130% | +4% / -0% |
+| `rol [m],cl; rcl [m],1; sar [m],3` (undo record) | off / on | 0.205 / 0.204 s | +78% / +78% | +16% / +15% |
+| `push; pop [m]` | off / on | 0.055 / 0.051 s | +19% / +11% | +16% / +11% |
+| `rep movsb` / `movsq` 4K | off / on | 0.034 / 0.035 s | +12 to 16% | +12 to 19% |
+| `rep stosq` 4K | off / on | 0.033 / 0.033 s | +23% / +18% | +25% / +32% |
+| `rep movsb` 64 bytes | off / on | 0.025 / 0.025 s | +27% / +27% | +27% / +27% |
+| `rep movsb` 4K, rdi = rsi + 1 | off / on | 0.21 / 0.24 s | +159% / +131% | -94% / -95% |
+| `rep movsb` 4K, rdi = rsi + 8 | off / on | 0.21 / 0.22 s | +128% / +135% | +129% / +131% |
+| `rep movsb` 4K, rsi = rdi + 8 | off / on | 0.21 / 0.21 s | +127% / +129% | -95% / -95% |
+
+`Scripts/macos_bench.py` `rep_movs` kernel (median of 3 launches x 5 runs, ms): `tso_on`
+331 before, 381 after (+15%); `tso_off` 17.8 before, 21.4 after (+20%); native 16.3.
+`copy_loop` unchanged (655 / 651 `tso_on`). The rep cost is the exactness: registers move
+after every 32-byte chunk and every element, the page-bounded run setup, and an element
+loop that counts elements for the interrupt check. A forward byte copy overlapping by
+one (`rdi == rsi + 1`, run-length fills in LZ decoders) is a fill with the first byte,
+and an overlap with the source ahead in the direction of the copy uses whole chunks:
+both about 16 times faster than `macos/v1`. A destination 2 to 32 bytes ahead of the
+source still goes element by element, bound by store-to-load forwarding (about 4 cycles
+a byte); chunks narrower than the distance would keep x86's result and progress but are
+not done. A
+cheaper setup for short counts (one page test for the whole copy instead of the
+per-pointer page room) was measured and gave nothing, so it is not in.
+
+Read-modify-writes: `add`/`or`/`and`/`sub`/`xor`/`inc`/`dec`/`neg`/`adc`/`sbb` and
+`shl`/`shr` by a constant store first and compute the flags after; lock forms, `xadd`,
+`cmpxchg` and bit tests need nothing; only rotates, `sar`, shifts by `cl` and
+`shld`/`shrd` keep the undo record (NZCV only for rotates). The record's cost was mostly
+in reading PF and AF, which makes them live. The `memjmp` cost is the interrupt check at each
+block entry: the check is one store (`str xzr, [x28, #off]`), and a load or even a `nop`
+in its place costs the same, so there is no cheaper form; it is the extra instruction in a
+two-block loop. A prototype that checks only on exits to a lower or equal guest address
+(every cycle of direct jumps has one) brought `memjmp` without multiblock to the base time
+(0.049 s against 0.074); it needs the same check on indirect exits with the target's rip
+recovered at the stop. That is a documented future option (an embedder setting, default
+the current always-on check), not done. With multiblock the
+loop's own back-edge check is the cost (+18 to 31%) and is what makes the loop stoppable.
+`SMCCHECKS full` costs 2 to 6 times `none` on the same loops (as on `macos/v1`).
 
 ## x86 memory ordering between threads
 
@@ -588,7 +671,7 @@ jit_500, jit_500_m, jit_500_tso); every result identical to the cold pass and to
 without the cache; no entry rejected. 59 MB on disk. Also a jit_1 two-pass over `3DNow`,
 `TwoByte`, `SelfModifyingCode` and `FEX_bugs` (regression run for the 3DNow! fix).
 
-The runner registers the memory it maps as guest code (`fexmac_add_code_range`), with or
+The runner registers the memory it maps as guest code (`fexmac_memory_map`, read/write/execute), with or
 without the cache. Three expected failures (`PrimaryGroup/5_FF_05`, `_03_o64`,
 `_03_o64_imm`, which jump to an address cut to 32 bits) therefore now stop with a guest
 page fault at that address instead of dying of a host fault while the translator read
@@ -788,10 +871,10 @@ reason; the script also prints each skip with its reason.
 | Skipped by the runner | 6 |
 | Skipped by upstream's own lists | 6 |
 | Skipped because the test reaches low memory through a 32-bit operand | 4 |
-| Expected failures: 11 crashes and 1 stop (`32bit_syscall`) | 12 |
+| Expected failures: 3 crashes, 8 guest page-fault stops and 1 stop (`32bit_syscall`) | 12 |
 | Port tests whose correct result is a stop (`ud2`, `mov_fs`, `tf_int80`) | 3 |
 
-The script counts the last two rows together as 15 expected failures (11 crash, 4 fail).
+The script counts the last two rows together as 15 expected failures (3 crash, 12 fail).
 
 Before package B, on the merged base (the fexmac runner), the counts were pass 2,255,
 runner skips 8, low-memory skips 5 and 18 expected failures (12 crash, 6 fail). Nine

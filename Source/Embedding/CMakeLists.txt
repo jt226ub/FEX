@@ -14,7 +14,7 @@
 #  - libfexmac.dylib (target fexmac_shared): the same interface as a dylib exporting only
 #    fexmac_*, for an embedder that signs it and itself with the same Team ID.
 
-set(FEXMAC_SRCS Library.cpp Options.cpp Faults.cpp)
+set(FEXMAC_SRCS Library.cpp Options.cpp Faults.cpp Memory.cpp)
 set(FEXMAC_EXPORTS "${CMAKE_CURRENT_SOURCE_DIR}/exports.txt")
 
 function(fexmac_setup Target)
@@ -78,7 +78,7 @@ add_custom_target(fexmac_bundle ALL DEPENDS "${FEXMAC_BUNDLE}")
 
 # Tests that use the public header only, written in C, linked the way an outside
 # project would link: the standalone archive plus libc++.
-add_executable(fexmac_c_test tests/CApiTest.c tests/TestSupport.c tests/NoFramePointer.c)
+add_executable(fexmac_c_test tests/CApiTest.c tests/FaultHandlingTest.c tests/TestSupport.c tests/NoFramePointer.c)
 set_source_files_properties(tests/NoFramePointer.c PROPERTIES COMPILE_OPTIONS "-fomit-frame-pointer;-O2")
 set_target_properties(fexmac_c_test PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED ON)
 target_include_directories(fexmac_c_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR})
@@ -87,6 +87,15 @@ add_dependencies(fexmac_c_test fexmac_bundle)
 target_link_libraries(fexmac_c_test PRIVATE "${FEXMAC_BUNDLE}" c++)
 set_property(TARGET fexmac_c_test APPEND PROPERTY LINK_DEPENDS "${FEXMAC_BUNDLE}")
 target_link_libraries(fexmac_c_test PRIVATE Threads::Threads)
+
+# The state-comparison tool driven by Scripts/macos_fault_diff.py.
+add_executable(fexmac_fault_diff tests/FaultDiffTool.c)
+set_target_properties(fexmac_fault_diff PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED ON)
+target_include_directories(fexmac_fault_diff PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_compile_options(fexmac_fault_diff PRIVATE -Wall -Wextra -Werror)
+add_dependencies(fexmac_fault_diff fexmac_bundle)
+target_link_libraries(fexmac_fault_diff PRIVATE "${FEXMAC_BUNDLE}" c++)
+set_property(TARGET fexmac_fault_diff APPEND PROPERTY LINK_DEPENDS "${FEXMAC_BUNDLE}")
 
 # Tests of behaviour that needs the test-only hooks: a fault inside the library's
 # handler, and where core messages go. Linked against the fexmac_testing build.

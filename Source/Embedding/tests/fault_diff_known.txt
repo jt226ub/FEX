@@ -1,0 +1,19 @@
+# Differences Scripts/macos_fault_diff.py knows about and does not fail on: case, check.
+# Each is a limit of the translator that package D did not fix, at the fault only: running
+# again gives x86's result in every case. See
+# docs/macOS-embedding-interface.md, "Guest memory faults: what is exact".
+#
+# Every restartable-fault entry (read-modify-write flags, pop [m], leave, rep movs/stos,
+# the 32-byte store, the call stack) is fixed: undo records and in-place rep loops.
+#
+# Dead flags: PF and AF (or any flag) that the rest of the block overwrites without reading
+# are not computed and are reported as whatever the frame held. Running again is not
+# affected. With SMCCHECKS full the extra per-instruction block split computes them.
+sub-carry-then-load-adc   at-fault
+flags-multiblock-edge     at-fault
+#
+# Multi-part stores that can leave part of their data written before a fault (running
+# again writes the same data, so the resumed result is right; only the memory seen at the
+# fault differs from x86's):
+ystore-cross-low-ro    at-fault   # 32-byte store whose LOWER page faults: the upper half is stored first
+fxsave-cross-ro        at-fault   # fxsave across a page: written in parts (x86 too may leave it partly written)

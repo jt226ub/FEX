@@ -28,7 +28,12 @@ namespace FEXCore::DiskCache {
 namespace {
   // Bump when this port changes the cache's contents or checks.
   // 2: guest extents in the integrity hash; entry-point bounds; lazy index.
-  constexpr uint32_t PortCacheRevision = 2;
+  // 3: package D's code generation: register-cache flush before memory instructions,
+  //    interrupt checks on conditional back-edges, rep movs/stos with exact progress,
+  //    undo records for restartable faults.
+  // 4: package D's store-first read-modify-writes and rep loop tuning; package F's
+  //    batched writer (merged from macos/v1) without its own bump.
+  constexpr uint32_t PortCacheRevision = 4;
 
   constexpr size_t FOZRecordHeaderSize = sizeof(MesaFOZ::foz_payload_key) + sizeof(MesaFOZ::foz_payload_header);
   constexpr size_t IndexRecordMinPayload = sizeof(MesaFOZ::mesa_index_db_file_entry) + sizeof(IndexExtraBlobHeader);

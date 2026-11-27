@@ -45,7 +45,7 @@ non-position-independent x86-64 Mach-O at a fixed address (`-static -no_pie
 ranges). It has no imports and no relocations; `FEXCoreBench` checks every size and
 offset in it without overflow, maps its segments at their link addresses (refusing if
 the range is taken: macOS has no `MAP_FIXED_NOREPLACE`, so it asks with a hint and
-checks), copies them, registers the executable ones with `fexmac_add_code_range` and starts at
+checks), copies them, registers the image with `fexmac_memory_map` (executable segments R+X) and starts at
 the `LC_UNIXTHREAD` entry. No tool beyond the command
 line tools is needed.
 
@@ -249,7 +249,7 @@ system call, which is inside an already translated block), the entry the cache w
 has stored meanwhile is found. The literal mode, which makes no system call until exit,
 loads none on a cold cache; the timed mode loads a few, and many more with multiblock
 off, where blocks are short and every system call return is a new entry.
-`FEXCoreBench` registers the image's executable segments with `fexmac_add_code_range`
+`FEXCoreBench` registers the image's executable segments with `fexmac_memory_map`
 in every configuration.
 
 ### Results
