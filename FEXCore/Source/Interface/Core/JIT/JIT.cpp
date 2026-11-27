@@ -566,7 +566,9 @@ uint64_t Arm64JITCore::ExitFunctionLink(FEXCore::Core::CpuStateFrame* Frame, FEX
 #ifdef __APPLE__
       HostCode = static_cast<Context::ContextImpl*>(Thread->CTX)->CompileBlockOrFault(Frame, GuestRip, 0);
       // An untranslatable target gives the fault entry, which must not be linked: the
-      // guest code there may become valid later.
+      // guest code there may become valid later. The host stack is not reset on this
+      // route (see UntranslatableFault in Core.cpp): fine while the exception handler
+      // never returns.
       if (HostCode == Frame->Pointers.GuestSignal_SynchronousFault) {
         return HostCode;
       }

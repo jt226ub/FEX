@@ -462,7 +462,11 @@ struct CpuStateFrame {
     uint8_t TrapNo;
     uint8_t si_code;
     uint16_t err_code;
-    uint16_t _pad : 16;
+    // Set (macOS only) when the translator could not translate the guest instruction at
+    // all, as opposed to an instruction that faults on x86: lets the embedder tell
+    // "the translator cannot" from "the CPU would not". Always 0 on other hosts.
+    uint16_t Untranslatable : 1;
+    uint16_t _pad : 15;
     // Fault address can be different from the FaultRIP so need to distinguish.
     uint64_t FaultAddress;
   } SynchronousFaultData;

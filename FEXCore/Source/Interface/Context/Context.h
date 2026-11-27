@@ -432,6 +432,7 @@ public:
   // CompileBlock for the two places that branch to its result (the dispatcher and block
   // linking): a block that cannot be translated gives a guest fault instead of 0.
   uintptr_t CompileBlockOrFault(FEXCore::Core::CpuStateFrame* Frame, uint64_t GuestRIP, uint64_t MaxInst = 0);
+  uintptr_t CompileSingleStepOrFault(FEXCore::Core::CpuStateFrame* Frame, uint64_t GuestRIP);
 #endif
   uintptr_t CompileSingleStep(FEXCore::Core::CpuStateFrame* Frame, uint64_t GuestRIP);
 

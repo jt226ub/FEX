@@ -729,7 +729,12 @@ void Dispatcher::EmitDispatcher() {
   dc64(PMFCompileBlock.GetConvertedPointer());
   (void)Bind(&l_CompileSingleStep);
 
+#ifdef __APPLE__
+  // Never 0: see CompileSingleStepOrFault.
+  FEXCore::Utils::MemberFunctionToPointerCast PMFCompileSingleStep(&FEXCore::Context::ContextImpl::CompileSingleStepOrFault);
+#else
   FEXCore::Utils::MemberFunctionToPointerCast PMFCompileSingleStep(&FEXCore::Context::ContextImpl::CompileSingleStep);
+#endif
   dc64(PMFCompileSingleStep.GetConvertedPointer());
 
   Start = reinterpret_cast<uint64_t>(DispatchPtr);
