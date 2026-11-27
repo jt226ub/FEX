@@ -76,6 +76,11 @@ jobs:
         # any of them is missing, or if the bundled fmt was not compiled.
         run: bash Scripts/macos_check_linkage.sh build
 
+      - name: Check that the non-Apple side of the changed core files compiles
+        # Strips the __APPLE__ blocks from the core files the port changes and compiles
+        # them (syntax only): catches macOS-only declarations used outside a guard.
+        run: bash Scripts/macos_check_nonapple.sh build
+
       - name: Run the smoke test
         run: |
           set -o pipefail

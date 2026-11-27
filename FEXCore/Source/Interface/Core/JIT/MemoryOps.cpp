@@ -2415,7 +2415,9 @@ DEF_OP(MemSet) {
 
 DEF_OP(MemCpySrcBase) {
   // rep movs with fs:/gs: on the source (macOS): the in-place loop with the segment base
-  // added to every source address, so rcx/rsi/rdi stay exact at faults and stops.
+  // added to every source address, so rcx/rsi/rdi stay exact at faults and stops. Only
+  // the macOS opcode dispatcher emits it (MOVSOp, under __APPLE__).
+#ifdef __APPLE__
   const auto Op = IROp->C<IR::IROp_MemCpySrcBase>();
   uint64_t DirectionConstant;
   bool DirectionIsInline = IsInlineConstant(Op->Direction, &DirectionConstant);
@@ -2428,6 +2430,9 @@ DEF_OP(MemCpySrcBase) {
                                             DirectionReg, GetReg(Op->OutDstAddress), GetReg(Op->OutSrcAddress), GetReg(Op->SrcBase));
   LOGMAN_THROW_A_FMT(Emitted, "MemCpySrcBase needs the guest's rcx/rsi/rdi");
   (void)Emitted;
+#else
+  LOGMAN_MSG_A_FMT("MemCpySrcBase is only emitted on macOS");
+#endif
 }
 
 DEF_OP(MemCpy) {
