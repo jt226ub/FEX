@@ -216,6 +216,11 @@ namespace {
   // ARM64 atomic instructions raise an alignment fault on an address that is not a
   // multiple of the operand size where the access crosses 16 bytes; x86 allows it. The
   // core rewrites the instruction sequence and execution resumes after it.
+#ifdef FEXMAC_TESTING
+  // Called in HandleMisalignedAtomic with the core's handling about to start.
+  std::atomic<void (*)()> TestMisalignedHook {};
+#endif
+
   bool HandleMisalignedAtomic(FEXCore::Core::InternalThreadState* Thread, const Classification& Kind, siginfo_t* Info, ucontext_t* Context) {
     auto& State = Context->uc_mcontext->__ss;
     const uint64_t PC = State.__pc;
@@ -234,6 +239,11 @@ namespace {
       sigdelset(&Asynchronous, Synchronous);
     }
     pthread_sigmask(SIG_BLOCK, &Asynchronous, &Previous);
+#ifdef FEXMAC_TESTING
+    if (auto Hook = TestMisalignedHook.load()) {
+      Hook();
+    }
+#endif
     SetKey(EmulatingKey, reinterpret_cast<uintptr_t>(Info->si_addr));
     const auto Result = FEXCore::ArchHelpers::Arm64::HandleUnalignedAccess(
       Thread, FEXCore::ArchHelpers::Arm64::UnalignedHandlerType::HalfBarrier, PC, &State.__x[0]);
@@ -532,6 +542,10 @@ void fexmac_testing_fault_inside_handler(int enable, volatile uint32_t* fired) {
   if (Page != MAP_FAILED) {
     fexmac::TestFaultPage.store(static_cast<volatile uint32_t*>(Page));
   }
+}
+
+void fexmac_testing_set_misaligned_hook(void (*hook)(void)) {
+  fexmac::TestMisalignedHook.store(hook);
 }
 
 void fexmac_testing_log_from_fault_handler(int enable) {

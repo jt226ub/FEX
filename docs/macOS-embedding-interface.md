@@ -294,10 +294,14 @@ Why holding them cannot deadlock or hang, from the code (`HandleUnalignedAccess`
   own handlers they were already blocked; with way 2 the host's handler runs with the
   host's mask, and an asynchronous handler that left by a jump, or stopped the thread,
   while a lock was held would have left it held (and the thread in write mode).
-  `fexmac_c_test split-locks-signal-storm` interrupts a guest thread doing split locked
-  operations with a signal handler that waits for another thread's progress: with the
-  blocking removed it stalls in 3 of 3 runs, with it never. A signal that arrives while
-  blocked is delivered when the mask is restored, after the locks are released.
+  `fexmac_hook_test misaligned-blocks-async-signals` checks it deterministically: a test
+  hook sends the thread a signal at the point where the core is about to take its locks,
+  and that signal's handler must not run before the handling ends (without the blocking
+  it runs inside every time). `fexmac_c_test split-locks-signal-storm` is the stress
+  version; it rarely catches the missing blocking, since a signal sent to a running thread
+  is mostly delivered at its next fault, before the core's handling starts. A signal that
+  arrives while blocked is delivered when the mask is restored, after the locks are
+  released.
 - The holder cannot need the same lock again: the emulation's own accesses are aligned
   atomics, which cannot take an alignment fault, and the patch path touches only code.
 - The one fault possible while a lock is held is the split-lock emulation's access to
@@ -499,7 +503,7 @@ alarm kills it.
 | `invalidate-concurrent` | 8 guest threads invalidating in every one of 20,000 system calls each while the main thread invalidates in a loop, at least 12 runs; a progress watchdog fails it within 5 seconds of a hang. It hung in each of 3 runs before package E's reader-writer lock fix and passed 6 of 6 after it |
 | `split-locks-concurrent` | 8 threads at once run 30,000 `lock xadd` each on one qword crossing 16 bytes, a 128-byte line and the 16K page, a `lock cmpxchg` increment loop across 16 bytes (each adding 0x100000001, which changes both halves), and a spin lock taken with `xchg` across 16 bytes and released by a plain store; every total must be exact. With the split-lock lock switched off in a scratch build, the three `lock xadd` totals came out short in 3 of 3 runs |
 | `split-locks-every-form` | every form the core emulates across 16 bytes, from 8 threads at once, 10,000 operations each: `lock xadd` of 16, 32 and 64 bits, `lock add`, `sub`, `xor`, `inc`, `dec`, `not`, `neg`, `or` then `and`, a `cmpxchg8b` increment loop, a `cmpxchg8b` spin lock with a plain release and an `xchg` spin lock whose value spans both halves; operands change both halves where the operation allows it; a host thread meanwhile writes the neighbouring bytes that share the operand's compare-and-swap units with plain stores. Every result exact. Before the split-lock fixes of package E's third round, 7 of the 13 forms came out wrong in each of 2 runs |
-| `split-locks-signal-storm` | the host owns the fault signals with an empty mask and a signal handler keeps interrupting one of 8 threads doing split `lock xadd`; the handler waits for another thread's progress, which cannot come if the interrupted thread holds the split-lock lock. No stall, exact total. With `fexmac_handle_fault`'s signal blocking removed: a stall in 3 of 3 runs |
+| `split-locks-signal-storm` | the host owns the fault signals with an empty mask; 8 threads run split `lock xadd` until 3,000 signals sent to one of them have landed inside its fault handling, while a host thread writes the neighbouring bytes; at each landing the signal handler waits for another thread's progress, which cannot come if the interrupted thread holds the split-lock lock. No stall, exact total. A stress test: it rarely catches missing signal blocking (see `misaligned-blocks-async-signals`) |
 | `lifetime-races` | runs racing with destroys of the same thread; context destroy racing with CPUID, invalidation and thread creation |
 | `cache-off` | without the cache: state `OFF`, blocks compiled, nothing loaded or queued, flush `UNSUPPORTED` |
 | `cache-cold-warm` | a cold run queues and flushes; a second context in the same process loads everything and compiles nothing (code at a different address) |
@@ -534,6 +538,7 @@ buffer is used, and make the next code buffer allocations fail):
 | `log-callback-reentry` | fexmac calls from inside the log callback return `BUSY`; afterwards they work |
 | `fault-inside-handler-dies` | the hook fired exactly once, the process died with SIGBUS, the message was written |
 | `no-log-callback-in-handler`, `log-restored-after-failed-create`, `invalidation-mask` | as named |
+| `misaligned-blocks-async-signals` | a hook sends the thread a signal where the core is about to handle a misaligned access (and may take its locks), in the host-owns-signals arrangement with an empty mask, 1000 times: the signal must be handled only after the handling (0 of 1000 inside; without `fexmac_handle_fault`'s blocking, 1000 of 1000, in 10 of 10 runs) |
 
 The tools: `FEXCoreSmokeTest` and `FEXCoreThreadTest` use only `fexmac.h` and link only
 `fexmac`. `FEXCoreASMTestRunner` uses `fexmac.h` for the context, threads, state,
