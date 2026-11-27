@@ -1304,6 +1304,117 @@ static void TestLifetimeRaces(void) {
         BusyContext);
 }
 
+/* ---- concurrency: locked operations on words that cross 16 bytes ---- */
+
+/* ARM64 atomics fault on these; the library hands them to the core, which emulates them
+ * with two compare-and-swaps under its process-wide split-lock spin lock. Eight threads
+ * hammer one word at once and the total must be exact. The increment, 0x100000001,
+ * changes both halves of the word every time, so that the two compare-and-swaps of one
+ * emulation can interleave with another's: without the lock (the core's default elsewhere)
+ * the counts come out short. The xchg lock word only ever changes its lower half, as a
+ * real lock's 0/1 does, so a release store landing between the two compare-and-swaps must
+ * be retried rather than reported as a tear. */
+
+/* clang-format off */
+static const uint8_t SplitXaddProgram[] = {
+  0x4C, 0x89, 0xC0,                         /*  0: mov rax, r8 */
+  0xF0, 0x48, 0x0F, 0xC1, 0x07,             /*  3: lock xadd [rdi], rax */
+  0x48, 0xFF, 0xC9,                         /*  8: dec rcx */
+  0x75, 0xF3,                               /* 11: jnz 0 */
+  0xF4,                                     /* 13: hlt */
+};
+static const uint8_t SplitCmpxchgProgram[] = {
+  0x48, 0x8B, 0x07,                         /*  0: mov rax, [rdi] */
+  0x4A, 0x8D, 0x14, 0x00,                   /*  3: lea rdx, [rax + r8] */
+  0xF0, 0x48, 0x0F, 0xB1, 0x17,             /*  7: lock cmpxchg [rdi], rdx */
+  0x75, 0xF2,                               /* 12: jnz 0 (lost the race: retry) */
+  0x48, 0xFF, 0xC9,                         /* 14: dec rcx */
+  0x75, 0xED,                               /* 17: jnz 0 */
+  0xF4,                                     /* 19: hlt */
+};
+/* A spin lock taken with xchg on a word crossing 16 bytes and released with a plain
+ * store, as x86 code does, guarding a plain increment of an aligned counter. */
+static const uint8_t SplitXchgLockProgram[] = {
+  0xB8, 0x01, 0x00, 0x00, 0x00,             /*  0: mov eax, 1 */
+  0x48, 0x87, 0x06,                         /*  5: xchg [rsi], rax */
+  0x48, 0x85, 0xC0,                         /*  8: test rax, rax */
+  0x75, 0xF3,                               /* 11: jnz 0 (lock taken: spin) */
+  0x48, 0xFF, 0x07,                         /* 13: inc qword [rdi] */
+  0x48, 0xC7, 0x06, 0x00, 0x00, 0x00, 0x00, /* 16: mov qword [rsi], 0 */
+  0x48, 0xFF, 0xC9,                         /* 23: dec rcx */
+  0x75, 0xE4,                               /* 26: jnz 0 */
+  0xF4,                                     /* 28: hlt */
+};
+/* clang-format on */
+
+enum { SplitThreads = 8, SplitIterations = 30000 };
+
+static fexmac_context* SplitContext;
+static uint64_t SplitCode, SplitRdi, SplitRsi;
+static const uint64_t SplitIncrement = 0x100000001ULL;
+
+static void* SplitWorker(void* Arg) {
+  (void)Arg;
+  fexmac_thread* Thread = CreateThreadAt(SplitContext, SplitCode, 0);
+  fexmac_x86_state State = GetState(Thread);
+  State.gpr[RDI] = SplitRdi;
+  State.gpr[RSI] = SplitRsi;
+  State.gpr[RCX] = SplitIterations;
+  State.gpr[8] = SplitIncrement; /* r8 */
+  SetState(Thread, &State);
+  const fexmac_stop Stop = Run(Thread);
+  if (Stop.reason != FEXMAC_STOP_HALT) {
+    Shared[2] = 1;
+  }
+  fexmac_thread_destroy(Thread);
+  return NULL;
+}
+
+static uint64_t RunSplit(const uint8_t* Program, size_t Size, uint8_t* Rdi, uint8_t* Rsi) {
+  uint8_t* Code = MapGuestMemory(0x10000);
+  memcpy(Code, Program, Size);
+  SplitCode = (uint64_t)(uintptr_t)Code;
+  SplitRdi = (uint64_t)(uintptr_t)Rdi;
+  SplitRsi = (uint64_t)(uintptr_t)Rsi;
+  pthread_t Workers[SplitThreads];
+  for (int i = 0; i < SplitThreads; ++i) {
+    pthread_create(&Workers[i], NULL, SplitWorker, NULL);
+  }
+  for (int i = 0; i < SplitThreads; ++i) {
+    pthread_join(Workers[i], NULL);
+  }
+  uint64_t Value;
+  memcpy(&Value, Rdi, sizeof(Value));
+  return Value;
+}
+
+static void TestSplitLocks(void) {
+  CheckResult(fexmac_install_fault_handlers(), FEXMAC_OK, "install fault handlers");
+  SplitContext = CreateContext(NULL, NULL);
+  const uint64_t Want = (uint64_t)SplitThreads * SplitIterations * SplitIncrement;
+  /* Two 16K pages, so that a word can cross the page boundary. */
+  uint8_t* Data = MapGuestMemory(0x8000);
+  struct {
+    const char* What;
+    size_t Offset;
+  } Xadds[] = {{"across 16 bytes", 0x100 + 12}, {"across a 128-byte line", 0x200 + 124}, {"across the 16K page", 0x4000 - 4}};
+  for (size_t i = 0; i < sizeof(Xadds) / sizeof(Xadds[0]); ++i) {
+    const uint64_t Got = RunSplit(SplitXaddProgram, sizeof(SplitXaddProgram), Data + Xadds[i].Offset, NULL);
+    Check(Got == Want, "lock xadd %s from %d threads: %" PRIu64 " of %" PRIu64, Xadds[i].What, SplitThreads, Got, Want);
+  }
+  {
+    const uint64_t Got = RunSplit(SplitCmpxchgProgram, sizeof(SplitCmpxchgProgram), Data + 0x1000 + 12, NULL);
+    Check(Got == Want, "lock cmpxchg loop across 16 bytes from %d threads: %" PRIu64 " of %" PRIu64, SplitThreads, Got, Want);
+  }
+  {
+    const uint64_t Got = RunSplit(SplitXchgLockProgram, sizeof(SplitXchgLockProgram), Data + 0x2000, Data + 0x2400 + 12);
+    const uint64_t WantLocked = (uint64_t)SplitThreads * SplitIterations;
+    Check(Got == WantLocked, "xchg spin lock across 16 bytes from %d threads: %" PRIu64 " of %" PRIu64, SplitThreads, Got, WantLocked);
+  }
+  Check(Shared[2] == 0, "every thread ran to its halt");
+  CheckResult(fexmac_context_destroy(SplitContext), FEXMAC_OK, "context destroy");
+}
+
 /* ---- driver ---- */
 
 
@@ -1342,6 +1453,7 @@ static const struct Subtest Subtests[] = {
   {"unclaimed-fault-dies", TestUnclaimedFaultDies, SIGBUS, NULL, "fexmac:", 1},
   {"invalidate-concurrent", TestConcurrentInvalidation, 0, NULL, NULL, 0},
   {"lifetime-races", TestLifetimeRaces, 0, NULL, NULL, 0},
+  {"split-locks-concurrent", TestSplitLocks, 0, NULL, NULL, 0},
 };
 
 /* FaultHandlingTest.c */

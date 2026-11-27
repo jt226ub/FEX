@@ -149,10 +149,9 @@ jobs:
       - name: Run the memory-ordering test
         # x86 ordering between guest threads with the emulation on, as built and under the
         # hardened runtime (the misaligned tests take alignment faults that back-patch
-        # translated code). Then with it off: on a physical Mac the forbidden outcomes must
-        # appear, which shows the test can tell the two apart. The hosted Mac is a virtual
-        # machine with few processors, so that run only warns here; the physical-Mac
-        # results are recorded in docs/macOS-port-status.md.
+        # translated code). Then with it off and with only the general setting on: on a
+        # physical Mac the forbidden outcomes must appear, which shows the test can tell
+        # the settings apart. The physical-Mac results are in docs/macOS-port-status.md.
         run: |
           set -o pipefail
           T="$(find build -name FEXCoreOrderingTest -type f | head -1)"
@@ -163,13 +162,27 @@ jobs:
           # Many short runs: eight threads start translating together each time, which is
           # what hung on the lost mutex wake-up.
           time ./FEXCoreOrderingTest-hardened --tso on --only SB --runs 1000 --iterations 200 2>&1 | tail -3
-          set +e
-          ./FEXCoreOrderingTest-hardened --tso off 2>&1 | tee ordering-off.log
-          code=${PIPESTATUS[0]}
-          set -e
-          if [ "$code" -ne 0 ]; then
-            echo "::warning::with emulation off the expected weak behaviour was not all seen on this machine (exit $code)"
-          fi
+          # With emulation off, and with only the general setting on, the tests that must
+          # break depend on the hardware: on the hosted virtual machine a test that does
+          # not break (exit 1) only warns. A stall (exit 3), a crash, a guest thread that
+          # did not finish (BROKEN), threads that never overlapped (NOT RACING) or a test
+          # that must hold but broke still fail the job.
+          for mode in off scalar; do
+            set +e
+            ./FEXCoreOrderingTest-hardened --tso "$mode" > "ordering-$mode.log" 2>&1
+            code=$?
+            set -e
+            cat "ordering-$mode.log"
+            if [ "$code" -eq 0 ]; then
+              continue
+            fi
+            if [ "$code" -eq 1 ] && ! grep -q -E 'BROKEN|NOT RACING|FAIL \(TSO-forbidden outcome seen\)' "ordering-$mode.log"; then
+              echo "::warning::with --tso $mode a forbidden outcome that an M4 shows was not seen on this machine"
+            else
+              echo "ordering test with --tso $mode failed (exit $code)"
+              exit 1
+            fi
+          done
 
       - name: Run the assembly instruction tests
         run: |
@@ -275,6 +288,7 @@ jobs:
             ordering-on.log
             ordering-on-hardened.log
             ordering-off.log
+            ordering-scalar.log
             mutex-wake.log
             asm-out/results.tsv
             probe-hardened.log
