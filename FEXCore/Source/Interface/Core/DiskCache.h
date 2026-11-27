@@ -16,6 +16,8 @@
 #include <FEXCore/fextl/map.h>
 #include <FEXCore/fextl/vector.h>
 #include <stdint.h>
+#include <sys/types.h>
+#include <chrono>
 #include <mutex>
 #include <optional>
 #include <span>
@@ -66,6 +68,11 @@ namespace DiskCache {
     fextl::shared_ptr<fextl::vector<uint8_t>> MemoryBlob;
     fextl::vector<uint32_t> GuestExtents;
     std::optional<fextl::list<MemoryLRUKey>::iterator> LRUEntry;
+#ifdef __APPLE__
+    // Failed its checks in this process: never served again, and not counted as a
+    // duplicate when the block is compiled and stored afresh.
+    bool Rejected = false;
+#endif
   };
 
   struct IndexCacheHead {
@@ -151,6 +158,11 @@ namespace DiskCache {
       }
       return FD->Unlock();
     }
+#ifdef __APPLE__
+    bool LockUntil(std::chrono::steady_clock::time_point Deadline) {
+      return FD && FD->LockUntil(Deadline);
+    }
+#endif
     File::File::FileHandleType GetHandle() {
       return FD ? FD->GetHandle() : (File::File::FileHandleType)-1;
     }
@@ -196,25 +208,35 @@ namespace DiskCache {
     // macOS port (DiskCacheMacOS.cpp). The index is read once, at open, into IndexData;
     // only a table of (lookup key, record offset) is built, and records are parsed when
     // their key is first looked up.
-    bool OpenAt(int DirFD, const fextl::string& Leaf, bool ReadOnly, uint64_t MaxFileSize);
-    bool LoadIndex(uint64_t MaxFileSize, bool& FoundMetadata);
+    enum class OpenResult { Opened, Untrusted, Failed };
+    // Opens Leaf.foz and Leaf_idx.foz in DirFD. An untrusted pair of a read-write database
+    // is removed and created again once; Replaced says it happened.
+    OpenResult OpenAt(int DirFD, const fextl::string& Leaf, bool ReadOnly, bool& Replaced);
+    // false: the index is larger than MaxSize (WriteRefused is then set) or unreadable.
+    bool LoadIndex(uint64_t MaxSize, bool& FoundMetadata);
     void ResolveKey(uint64_t LookupKey, Index& CacheIndex);
-    bool LockForOpen();
+    bool LockForOpen(std::chrono::steady_clock::time_point Deadline);
     void UnlockAfterOpen();
     bool Reset();
     bool FlushToDisk();
     bool WithinSizeLimit(uint64_t BlobSize, uint64_t IndexRecordSize);
     bool RepairIndexTail();
-    void NoteAppended() {
-      IndexKnownEnd = IndexFOZ.Size();
-    }
+    enum class StoreResult { Stored, Busy, Full, Failed };
+    StoreResult StoreCacheBlobMacOS(const MesaFOZ::foz_payload_key& UniqueKey, uint64_t LookupKey, std::span<const uint8_t> Blob,
+                                    MesaFOZ::mesa_index_db_file_entry& IndexEntry, std::span<const uint8_t> IndexBlob,
+                                    std::chrono::steady_clock::time_point Deadline);
     bool IsReadOnly() const {
       return ReadOnly;
     }
     fextl::string Name;
+    uint32_t Generation = 0;
     uint64_t MetadataOffset = 0;
     uint32_t MetadataSize = 0;
     uint64_t DataRecords = 0;
+    uint64_t Limit = 0;
+    // Larger than this process's size limit when opened (another process, with a larger
+    // limit, filled it): read, but never written by this process.
+    bool WriteRefused = false;
 
   private:
     struct LazySlot {
@@ -254,6 +276,9 @@ namespace DiskCache {
 
   class DiskCache {
   public:
+#ifdef __APPLE__
+    ~DiskCache();
+#endif
     void Init(FEXCore::Context::ContextImpl* CTX);
 
     std::optional<CodeHitData> Lookup(Core::InternalThreadState* Thread, std::optional<ExecutableFileSectionInfo> Region, uint64_t GuestRIP,
@@ -322,6 +347,47 @@ namespace DiskCache {
     uint64_t FlushedQueuedCount = 0;
     bool ForkedChild = false;
     bool ForkLocksHeld = false;
+    pid_t OwnerPid = 0;
+    void BecomeReadOnlyAfterFork();
+    bool InForkedChild();
+
+  public:
+    // What the cache is doing in this process (fexmac reports it).
+    enum class State : uint8_t { Off, Active, ReadOnly, Untrusted, Unavailable };
+    State GetState() const {
+      return CurrentState;
+    }
+    uint64_t GetDroppedCount() const {
+      return DroppedCount.load(std::memory_order_relaxed);
+    }
+    uint32_t GetUntrustedReplacedCount() const {
+      return UntrustedReplaced.load(std::memory_order_relaxed);
+    }
+    uint32_t GetDamagedResetCount() const {
+      return DamagedReset.load(std::memory_order_relaxed);
+    }
+    static void AtForkPrepare();
+    static void AtForkParent();
+    static void AtForkChild();
+
+  private:
+    State CurrentState = State::Off;
+    std::atomic<uint64_t> DroppedCount {};
+    std::atomic<uint32_t> UntrustedReplaced {};
+    std::atomic<uint32_t> DamagedReset {};
+    // Generations of the read-write database: the newest is written; the one before is
+    // still read; older ones are deleted when a new one starts.
+    fextl::string GenerationBase;
+    fextl::vector<fextl::unique_ptr<IndexedDB>> Generations;
+    std::atomic<IndexedDB*> WriteDB {};
+    // Set after a lock wait timed out: further stores are dropped (counted), not waited for.
+    std::atomic<bool> StoresBusy {};
+    fextl::string GenerationName(uint32_t Generation) const;
+    IndexedDB* OpenGeneration(uint32_t Generation, bool Write);
+    bool StoreMacOS(const MesaFOZ::foz_payload_key& UniqueKey, uint64_t LookupKey, std::span<const uint8_t> Blob,
+                    MesaFOZ::mesa_index_db_file_entry& IndexEntry, std::span<const uint8_t> IndexBlob, IndexedDB** Used);
+    bool Rotate(IndexedDB* Full);
+    void MarkRejectedLocked(uint64_t LookupKey, const IndexEntry& Entry);
 #endif
     struct CacheStoreWorkItem;
 

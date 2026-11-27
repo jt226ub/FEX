@@ -120,11 +120,19 @@ code at the same address with different bytes misses, and stale code is never us
 guest code changes. In a running process, self-modifying code is still handled by the
 usual invalidation; a block recompiled after a change is looked up by its new bytes.
 
-Upstream hashed the live guest bytes at store time, not the bytes the decoder read, so a
-write between decoding and storing filed the old translation under the new bytes for
-good. The decoded range is now hashed right after decoding, and the store is skipped if
-the bytes have changed since (`FEXCoreCacheTest --race` changes the code at exactly that
-point; without the check its later runs give wrong answers).
+Upstream hashed and copied the live guest bytes at store time, not the bytes the decoder
+read, so a write between decoding and storing filed the old translation under the new
+bytes for good. The decoder now copies every byte it consumes as it reads it
+(`Decoder::RecordByte`, in `ReadByte` and `ReadData`), and the store hashes and saves that
+copy: the guest hash is of exactly the bytes the translation was made from. A byte the
+decoder reads twice with different values (the guest wrote it during decoding) marks the
+copy unusable and nothing is stored. (`FEXCoreCacheTest --race` changes the code between
+decoding and storing; with the live re-read its later runs gave wrong answers.)
+
+A cache entry that fails its checks is marked rejected in the process (never tried
+again, and not a duplicate when the block is compiled and stored afresh), and in later
+processes a newer record for the same guest code replaces an older one, so a damaged
+entry is superseded once and the next run loads cleanly.
 
 ### Patchable fields: a correction found by the tests
 
@@ -234,10 +242,25 @@ safe instead:
 - A database is emptied by replacing its two files (`unlinkat` and create), never by
   truncating them, so a process still appending to the old files never sees records it
   wrote move.
-- **Size limit:** `DiskCacheMaxFileSize` (default 1GB) applies to each file. Upstream
-  only enforced it with a file mapper, which macOS embedders do not install; here each
-  append checks both files' real sizes under the locks and stops storing at the limit,
-  and a database found larger than the limit at open is emptied and started again.
+- **Size limit and generations:** `DiskCacheMaxFileSize` applies to each file; fexmac sets
+  it to 256MB unless the embedder passes the option. Upstream enforced it only with a file
+  mapper (macOS embedders install none) and then stopped storing for good; here each
+  append checks both files' real sizes under the locks, and when the current file is full
+  the cache continues in the next generation (`RWCacheDB_<hash>-<n>`), still reads the
+  previous generation and deletes the ones before it (their names only: a process that
+  still has one open keeps reading it). Processes find the newest generation by listing
+  the bucket. A database larger than this process's limit (filled by a process with a
+  larger one) is read but not written by this process, never emptied, so processes with
+  different limits do not destroy each other's data. Why 256MB: every process reads the
+  whole index of the generations it uses at start (about 40% of the cache file for the
+  instruction tests' small blocks; less for real programs' larger ones), so the limit
+  bounds start-up time and memory; the instruction tests use 59MB in all.
+- **A stalled lock holder:** a store waits for another process's lock at most once per
+  process (5 s, measured against the clock, not counted in sleeps). After a timeout every
+  later store of the run is dropped and counted (`CacheEntriesDropped`), so a flush at exit
+  returns after about one wait however many entries were queued. Tested with a process
+  that holds the locks sleeping, and one stopped with SIGSTOP while holding them: 59
+  entries dropped, flush 5.0 s.
 - A torn or damaged blob that an index record does point to fails the integrity check.
 - `Context::FlushDiskCache()` waits for the writer thread to finish every queued store and
   then calls `fcntl(F_FULLFSYNC)` (the macOS way through the drive cache) on both files,
@@ -268,20 +291,34 @@ rotation (it limits the cost by throwing away entries a long-running program wou
 
 ### fork
 
-`Context::LockBeforeFork` / `UnlockAfterFork` (which an embedder calls around `fork`) now
-also take the disk cache's index and in-memory-cache locks, after the code invalidation
-lock, so no thread is in a lookup or store and the writer thread is not inside the index
-at the moment of the fork. In the child, which has no writer thread and shares the
-parent's open files (and so their `flock` locks), writing is switched off: the child
-keeps loading from the cache but stores nothing, `FlushDiskCache` returns at once, and a
-fresh work queue replaces the abandoned one. `FEXCoreCacheTest --fork` forks with a warm
-and with a cold cache; the child runs guest code and exits.
+`pthread_atfork` handlers (registered once; they look after the context's cache) take the
+disk cache's index and in-memory-cache locks across every fork, so the child never
+inherits one held by the writer thread. `Context::LockBeforeFork` / `UnlockAfterFork`
+(fexmac's `fexmac_before_fork` / `fexmac_after_fork`) take them too, after the code
+invalidation lock, and the handlers then leave them. In the child, which has no writer
+thread and shares the parent's open files (and so their `flock` locks), writing is
+switched off: the child keeps loading from the cache but stores nothing, `FlushDiskCache`
+returns at once, and a fresh work queue replaces the abandoned one. A process id check at
+flush and store catches a fork the handlers did not see. `FEXCoreCacheTest --fork` and
+`--fork-raw` (without the fexmac calls) fork with a warm and a cold cache; the child runs
+guest code and exits.
+
+### What the cache reports
+
+`fexmac_cache_state`: `OFF` (not requested); `ACTIVE`; `READ_ONLY` (a fork child, or the
+database is over this process's limit); `UNTRUSTED` (the directory or bucket is not
+private to the user, has an ACL entry granting write, or is a link; the cache is off);
+`UNAVAILABLE` (the database stayed locked at open, the directory cannot be created or
+written, an I/O error, or no build identity; the cache is off). Counters besides: entries
+dropped, untrusted cache files removed and started again (the cache is still `ACTIVE`
+after that), damaged databases emptied.
 
 
 - Several processes and threads can use one database at once: this is what the
   instruction-test run does (six processes per mode, four modes, one directory). Lock
   waits are 5 s on macOS (upstream: 0.1 s to open, 1 s to store): on a busy machine a
-  lock holder can be descheduled, and a timeout silently costs a cold start or an entry.
+  lock holder can be descheduled. A timeout at open leaves the cache `UNAVAILABLE`; at a
+  store it drops that and every later store of the run (above).
 - Workaround, with no native alternative: when several processes create the same new
   file at once, APFS can fail a loser's `openat(O_CREAT)` with ENOENT although the
   directory exists (a ten-line C program shows it about one round in five with six
@@ -294,7 +331,9 @@ tests set host features per test) they deleted each other's caches mid-run. On m
 bucket directory is only removed if it is named like a bucket (16 hex digits, so a cache
 path that holds other things is safe) and it has not been used for seven days. Use, not
 writes: a process that opens a bucket touches its `last-used` file (one `futimens` per
-start), so a cache in daily read-only use is kept.
+start), so a cache in daily read-only use is kept. Pruning lists, checks and removes
+through the verified base directory's descriptor (`fdopendir`, `fstatat`, `openat`,
+`unlinkat`), never by path.
 
 ## Where files live
 
@@ -310,7 +349,7 @@ cache on (the core's `DISKCACHE`/`DISKCACHEPATH` options stay refused);
 `fexmac_add_code_range` registers the guest's code so that the cache hashes and patches
 only mapped bytes; `fexmac_context_flush_cache` before exiting;
 `fexmac_context_get_counters` for the counters and the cache state (a refused directory
-shows as `FEXMAC_CACHE_REFUSED`, not as an error); `fexmac_before_fork` /
+shows as `FEXMAC_CACHE_UNTRUSTED`, not as an error; see "What the cache reports"); `fexmac_before_fork` /
 `fexmac_after_fork` around `fork()`. Under it, the core's `Context::FlushDiskCache`,
 `GetTranslationCounters`, `LockBeforeFork`/`UnlockAfterFork` and the syscall handler's
 `QueryGuestExecutableRange`. The core's writer thread uses the core's default pthread

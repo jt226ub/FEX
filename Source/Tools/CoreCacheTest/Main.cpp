@@ -42,6 +42,8 @@
 #include <signal.h>
 #include <string>
 #include <string_view>
+#include <fcntl.h>
+#include <sys/file.h>
 #include <sys/mman.h>
 #include <sys/wait.h>
 #include <thread>
@@ -101,7 +103,7 @@ constexpr uint64_t TrampolineResult = 0x5A5A'1234'5678'A5A5ULL;
 //   add rdx, rbx          (48 01 DA)
 //   jmp next              (E9 rel32)
 // After the chain: dec rcx; jnz start; hlt.
-Program BuildProgram(uint64_t Blocks, bool SubVariant) {
+Program BuildProgram(uint64_t Blocks, bool SubVariant, bool Distinct = false) {
   Program P;
   P.BlockCount = Blocks;
   auto Emit = [&](std::initializer_list<uint8_t> B) {
@@ -116,6 +118,11 @@ Program BuildProgram(uint64_t Blocks, bool SubVariant) {
     // Values of at least 0x10000 so the frontend treats them as patchable data.
     const uint32_t Imm = static_cast<uint32_t>(((i + 1) * 2654435761ULL) & 0x3FFFFFFF) | 0x10000;
     const bool Sub = SubVariant && i == 0;
+    if (Distinct && i != 0) {
+      // --distinct: a different number of leading nops makes every block's bytes, and so
+      // its cache entry, different.
+      P.Bytes.insert(P.Bytes.end(), i % 61, 0x90);
+    }
     if (i == 0) {
       // The first block starts with 70 nops, so its add/sub lies beyond the 64 bytes the
       // anonymous-code key is computed from: changing it keeps the key and changes only
@@ -275,7 +282,8 @@ void PrintCounters(const char* Who, const fexmac_translation_counters& C) {
   printf("%sCode cache: compiled %llu loaded %llu rejected %llu queued %llu\n", Who, static_cast<unsigned long long>(C.blocks_compiled),
          static_cast<unsigned long long>(C.blocks_loaded), static_cast<unsigned long long>(C.cache_entries_rejected),
          static_cast<unsigned long long>(C.cache_entries_queued));
-  printf("%scache state %d\n", Who, static_cast<int>(C.cache_state));
+  printf("%sCode cache state: %d dropped %llu replaced %u reset %u\n", Who, static_cast<int>(C.cache_state),
+         static_cast<unsigned long long>(C.cache_entries_dropped), C.untrusted_files_replaced, C.damaged_databases_reset);
 }
 
 // As if another process died while appending to the index, after this one opened it: a
@@ -326,6 +334,9 @@ int main(int argc, char** argv) {
   bool Fork = false;
   bool Race = false;
   bool TearIndex = false;
+  bool ForkRaw = false;
+  bool Distinct = false;
+  const char* StallLock = nullptr;
   std::string_view Expect = "any";
   for (int i = 1; i < argc; ++i) {
     std::string_view Arg = argv[i];
@@ -357,10 +368,19 @@ int main(int argc, char** argv) {
       Race = true;
     } else if (Arg == "--tear-index") {
       TearIndex = true;
+    } else if (Arg == "--distinct") {
+      Distinct = true;
+    } else if (Arg == "--fork-raw") {
+      Fork = true;
+      ForkRaw = true;
+    } else if (Arg == "--stall-lock" && Next) {
+      StallLock = Next;
+      ++i;
     } else {
       fprintf(stderr,
               "usage: %s [--threads N] [--blocks N] [--base ADDRESS] [--variant add|sub] [--expect cold|warm|any]\n"
-              "          [--trampoline] [--hardware-tso] [--force-tso] [--fork] [--race] [--tear-index]\n",
+              "          [--trampoline] [--hardware-tso] [--force-tso] [--fork] [--fork-raw] [--race] [--tear-index]\n"
+              "          [--stall-lock hold|stop] [--distinct]\n",
               argv[0]);
       return 2;
     }
@@ -369,7 +389,7 @@ int main(int argc, char** argv) {
     return 2;
   }
 
-  const auto P = BuildProgram(Blocks, SubVariant);
+  const auto P = BuildProgram(Blocks, SubVariant, Distinct);
   CodeSize = (P.Bytes.size() + 0x3FFF) & ~uint64_t {0x3FFF};
   void* Map = ::mmap(reinterpret_cast<void*>(FixedBase), CodeSize, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
   if (Map == MAP_FAILED || (FixedBase && reinterpret_cast<uint64_t>(Map) != FixedBase)) {
@@ -441,6 +461,52 @@ int main(int argc, char** argv) {
     TearIndexes(CachePath);
   }
 
+  // --stall-lock: another process takes the database's locks after this one opened it and
+  // keeps them (hold: sleeping; stop: stopped with SIGSTOP while holding them). The run's
+  // stores must then be dropped after one wait, so the flush below returns promptly.
+  pid_t LockHolder = -1;
+  if (StallLock) {
+    int Ready[2];
+    if (pipe(Ready) != 0) {
+      return 1;
+    }
+    LockHolder = fork();
+    if (LockHolder == 0) {
+      std::vector<int> Held;
+      if (DIR* Base = opendir(CachePath ? CachePath : ".")) {
+        while (auto* Bucket = readdir(Base)) {
+          if (Bucket->d_name[0] == '.' || Bucket->d_type != DT_DIR) {
+            continue;
+          }
+          const std::string BucketPath = std::string(CachePath) + "/" + Bucket->d_name;
+          if (DIR* Files = opendir(BucketPath.c_str())) {
+            while (auto* File = readdir(Files)) {
+              const std::string_view Name = File->d_name;
+              if (Name.size() > 4 && Name.substr(Name.size() - 4) == ".foz") {
+                const int FD = open((BucketPath + "/" + File->d_name).c_str(), O_RDONLY);
+                if (FD >= 0 && flock(FD, LOCK_EX) == 0) {
+                  Held.push_back(FD);
+                }
+              }
+            }
+            closedir(Files);
+          }
+        }
+        closedir(Base);
+      }
+      const char Count = static_cast<char>(Held.size());
+      (void)!write(Ready[1], &Count, 1);
+      if (std::string_view {StallLock} == "stop") {
+        raise(SIGSTOP);
+      }
+      sleep(120);
+      _exit(0);
+    }
+    char Count = 0;
+    (void)!read(Ready[0], &Count, 1);
+    printf("lock holder %d holds %d files\n", static_cast<int>(LockHolder), Count);
+  }
+
   if (Race) {
     // The first block's bytes change after it was compiled and before it is stored. The
     // results of this run are meaningless; what matters is that the translation is not
@@ -469,13 +535,19 @@ int main(int argc, char** argv) {
     }
     memcpy(ChildMap, ChildProgram.Bytes.data(), ChildProgram.Bytes.size());
     fexmac_add_code_range(Context, reinterpret_cast<uint64_t>(ChildMap), CodeSize, 1);
-    if (fexmac_before_fork(Context) != FEXMAC_OK) {
+    // --fork-raw: fork without fexmac_before_fork / fexmac_after_fork. No other host
+    // thread is inside the library here, so its own locks are free; the cache must notice
+    // the fork by itself and turn read-only in the child instead of waiting for the
+    // parent's writer thread.
+    if (!ForkRaw && fexmac_before_fork(Context) != FEXMAC_OK) {
       fprintf(stderr, "FAIL: fexmac_before_fork\n");
       return 1;
     }
     const pid_t Child = fork();
     if (Child == 0) {
-      fexmac_after_fork(Context, 1);
+      if (!ForkRaw) {
+        fexmac_after_fork(Context, 1);
+      }
       CodeBase = reinterpret_cast<uint64_t>(ChildMap);
       const int ChildFailures = RunAndCheck(Context, 2, ChildProgram, CodeBase, false);
       const auto Flush = fexmac_context_flush_cache(Context);
@@ -487,7 +559,9 @@ int main(int argc, char** argv) {
       fflush(stdout);
       _exit(ChildFailures == 0 && StateOk ? 0 : 1);
     }
-    fexmac_after_fork(Context, 0);
+    if (!ForkRaw) {
+      fexmac_after_fork(Context, 0);
+    }
     if (Child < 0) {
       fprintf(stderr, "FAIL: fork failed\n");
       return 1;
@@ -512,8 +586,15 @@ int main(int argc, char** argv) {
     Failures += RunAndCheck(Context, 2, P, CodeBase, Trampoline);
   }
 
+  const auto FlushStart = std::chrono::steady_clock::now();
   fexmac_context_flush_cache(Context);
+  const double FlushSeconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - FlushStart).count();
   const auto Counters = GetCounters(Context);
+  if (LockHolder > 0) {
+    kill(LockHolder, SIGKILL);
+    waitpid(LockHolder, nullptr, 0);
+  }
+  printf("flush took %.2f s\n", FlushSeconds);
 
   printf("guest code at 0x%llx, %llu blocks, %u threads\n", static_cast<unsigned long long>(CodeBase),
          static_cast<unsigned long long>(Blocks), ThreadCount);

@@ -1415,13 +1415,77 @@ static void TestCacheUntrusted(void) {
   fexmac_context* Context = CreateCacheContext(CacheDir);
   RunCacheProgram(Context, "untrusted directory");
   fexmac_translation_counters C = Counters(Context);
-  Check(C.cache_state == FEXMAC_CACHE_REFUSED && C.blocks_loaded == 0 && C.cache_entries_queued == 0,
-        "a directory writable by others: state REFUSED, nothing loaded or queued");
+  Check(C.cache_state == FEXMAC_CACHE_UNTRUSTED && C.blocks_loaded == 0 && C.cache_entries_queued == 0,
+        "a directory writable by others: state UNTRUSTED, nothing loaded or queued");
   CheckResult(fexmac_context_flush_cache(Context), FEXMAC_ERROR_UNSUPPORTED, "flush with the cache refused");
   struct stat Info;
   Check(stat(CacheDir, &Info) == 0 && (Info.st_mode & 0777) == 0777, "and the directory was left as it was");
   fexmac_context_destroy(Context);
   chmod(CacheDir, 0700);
+  RemoveCacheDir();
+}
+
+/* A cache file others may write is removed and started again: the cache stays usable
+ * (ACTIVE) and the replacement is counted. */
+static void TestCacheUntrustedFile(void) {
+  MakeCacheDir();
+  fexmac_context* Context = CreateCacheContext(CacheDir);
+  RunCacheProgram(Context, "cold");
+  fexmac_context_flush_cache(Context);
+  fexmac_context_destroy(Context);
+  char Command[256];
+  snprintf(Command, sizeof(Command), "chmod 666 %s/*/RWCacheDB_*_idx.foz", CacheDir);
+  (void)!system(Command);
+  Context = CreateCacheContext(CacheDir);
+  RunCacheProgram(Context, "after the file was opened up");
+  fexmac_translation_counters C = Counters(Context);
+  Check(C.cache_state == FEXMAC_CACHE_ACTIVE && C.untrusted_files_replaced == 1 && C.blocks_loaded == 0,
+        "an index file writable by others: replaced (counted %u), state ACTIVE, nothing loaded from it", C.untrusted_files_replaced);
+  fexmac_context_destroy(Context);
+  RemoveCacheDir();
+}
+
+/* Not a matter of trust: a directory that cannot be written, and a database another
+ * process keeps locked, give UNAVAILABLE, and the context runs. */
+static void TestCacheUnavailable(void) {
+  MakeCacheDir();
+  chmod(CacheDir, 0500);
+  fexmac_context* Context = CreateCacheContext(CacheDir);
+  RunCacheProgram(Context, "read-only directory");
+  fexmac_translation_counters C = Counters(Context);
+  Check(C.cache_state == FEXMAC_CACHE_UNAVAILABLE, "a directory that cannot be written: state UNAVAILABLE (%d)", C.cache_state);
+  CheckResult(fexmac_context_flush_cache(Context), FEXMAC_ERROR_UNSUPPORTED, "flush with the cache unavailable");
+  fexmac_context_destroy(Context);
+  chmod(CacheDir, 0700);
+
+  /* Fill it, then hold its locks from another process while a new context opens it. */
+  Context = CreateCacheContext(CacheDir);
+  RunCacheProgram(Context, "cold");
+  fexmac_context_flush_cache(Context);
+  fexmac_context_destroy(Context);
+  int Ready[2];
+  if (pipe(Ready) != 0) {
+    exit(2);
+  }
+  const pid_t Holder = fork();
+  if (Holder == 0) {
+    char Command[512];
+    snprintf(Command, sizeof(Command),
+             "exec python3 -c 'import fcntl,glob,os,sys,time\nfds=[os.open(f,os.O_RDONLY) for f in glob.glob(\"%s/*/*.foz\")]\n"
+             "[fcntl.flock(fd,fcntl.LOCK_EX) for fd in fds]\nos.write(%d,b\"x\")\ntime.sleep(60)'",
+             CacheDir, Ready[1]);
+    execl("/bin/sh", "sh", "-c", Command, (char*)NULL);
+    _exit(1);
+  }
+  char Byte;
+  (void)!read(Ready[0], &Byte, 1);
+  Context = CreateCacheContext(CacheDir);
+  RunCacheProgram(Context, "database locked by another process");
+  C = Counters(Context);
+  Check(C.cache_state == FEXMAC_CACHE_UNAVAILABLE, "a database another process keeps locked: state UNAVAILABLE (%d)", C.cache_state);
+  fexmac_context_destroy(Context);
+  kill(Holder, SIGKILL);
+  waitpid(Holder, NULL, 0);
   RemoveCacheDir();
 }
 
@@ -1651,6 +1715,8 @@ static const struct Subtest Subtests[] = {
   {"cache-cold-warm", TestCacheColdWarm, 0, NULL, NULL, 0},
   {"cache-cross-process", TestCacheCrossProcess, 0, NULL, NULL, 0},
   {"cache-untrusted", TestCacheUntrusted, 0, NULL, NULL, 0},
+  {"cache-untrusted-file", TestCacheUntrustedFile, 0, NULL, NULL, 0},
+  {"cache-unavailable", TestCacheUnavailable, 0, NULL, NULL, 0},
   {"cache-options", TestCacheOptions, 0, NULL, NULL, 0},
   {"cache-fork", TestCacheFork, 0, NULL, NULL, 0},
   {"code-ranges", TestCodeRanges, 0, NULL, NULL, 0},

@@ -76,12 +76,45 @@ public:
 
   uint64_t DecodedMinAddress {};
 #ifdef __APPLE__
-  // macOS port: hash of [DecodedMinAddress, DecodedMaxAddress) taken right after decoding,
-  // when the disk cache is being written. DiskCache::Store only files a translation if the
-  // bytes are still the same (Core.cpp, GenerateIR).
-  uint64_t DecodedBytesHash {};
+  // macOS port, for the disk cache: while RecordBytes is set, every guest byte the decoder
+  // consumes is copied here (at its offset from RecordBase), so DiskCache::Store hashes and
+  // stores exactly the bytes the translation was made from, not memory read again later.
+  // A byte read twice with different values (the guest changed it mid-decode) clears
+  // DecodedBytesConsistent, and the translation is not stored.
+  void BeginRecordingBytes(uint64_t Base);
+  void EndRecordingBytes();
+  fextl::vector<uint8_t> DecodedBytes;
+  bool DecodedBytesConsistent {};
 #endif
   uint64_t DecodedMaxAddress {~0ULL};
+#ifdef __APPLE__
+  bool RecordBytes {};
+  uint64_t RecordBase {};
+  fextl::vector<bool> RecordKnown;
+  void RecordByte(uint64_t Address, uint8_t Value) {
+    if (!RecordBytes) {
+      return;
+    }
+    if (Address < RecordBase) {
+      DecodedBytesConsistent = false;
+      return;
+    }
+    const uint64_t Offset = Address - RecordBase;
+    if (Offset >= DecodedBytes.size()) {
+      if (Offset > (1U << 20)) {
+        DecodedBytesConsistent = false;
+        return;
+      }
+      DecodedBytes.resize(Offset + 1);
+      RecordKnown.resize(Offset + 1);
+    }
+    if (RecordKnown[Offset] && DecodedBytes[Offset] != Value) {
+      DecodedBytesConsistent = false;
+    }
+    DecodedBytes[Offset] = Value;
+    RecordKnown[Offset] = true;
+  }
+#endif
 
   void SetExternalBranches(fextl::set<uint64_t>* v) {
     ExternalBranches = v;

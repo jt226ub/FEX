@@ -140,9 +140,44 @@ uint8_t Decoder::ReadByte() {
   }
 
   Instruction[InstructionSize] = *Byte;
+#ifdef __APPLE__
+  RecordByte(reinterpret_cast<uint64_t>(InstStream.InstStream + InstructionSize), *Byte);
+#endif
   InstructionSize++;
   return *Byte;
 }
+
+#ifdef __APPLE__
+void Decoder::BeginRecordingBytes(uint64_t Base) {
+  RecordBytes = true;
+  RecordBase = Base;
+  DecodedBytes.clear();
+  RecordKnown.clear();
+  DecodedBytesConsistent = true;
+}
+
+void Decoder::EndRecordingBytes() {
+  RecordBytes = false;
+  if (DecodedMinAddress != RecordBase || DecodedMaxAddress < DecodedMinAddress) {
+    DecodedBytesConsistent = false;
+    return;
+  }
+  // Bytes inside the decoded range that no instruction consumed (gaps between the blocks
+  // of a multiblock) are never hashed; take them as they are now, for the stored copy.
+  const uint64_t Size = DecodedMaxAddress - DecodedMinAddress;
+  if (Size > (1U << 20)) {
+    DecodedBytesConsistent = false;
+    return;
+  }
+  DecodedBytes.resize(Size);
+  RecordKnown.resize(Size);
+  for (uint64_t i = 0; i < Size; ++i) {
+    if (!RecordKnown[i]) {
+      DecodedBytes[i] = reinterpret_cast<const uint8_t*>(RecordBase)[i];
+    }
+  }
+}
+#endif
 
 std::optional<uint8_t> Decoder::PeekByte(uint8_t Offset) {
   uint64_t ByteAddress = reinterpret_cast<uint64_t>(InstStream.InstStream + InstructionSize + Offset);
@@ -163,6 +198,11 @@ std::pair<uint64_t, bool> Decoder::ReadData(uint8_t Size) {
   auto ReadableSize = CheckRangeExecutable(Address, Size);
   if (ReadableSize == Size) {
     std::memcpy(&Res, &InstStream.AdjustedInstStream[InstructionSize], Size);
+#ifdef __APPLE__
+    for (uint8_t i = 0; i < Size; ++i) {
+      RecordByte(Address + i, static_cast<uint8_t>(Res >> (i * 8)));
+    }
+#endif
   } else {
     HitNonExecutableRange = true;
     // See PeekByte, this specific case may cause some executable memory to read as 0 but it doesn't matter as the entire instruction will be rolled back anyway.

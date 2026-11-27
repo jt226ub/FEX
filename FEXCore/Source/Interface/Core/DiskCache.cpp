@@ -292,24 +292,6 @@ namespace DiskCache {
       return false;
     }
 
-#ifdef __APPLE__
-    // macOS port: CacheFileSize is only kept when a file mapper is installed, which no
-    // macOS embedder does, so check the real sizes of both files (under the locks, so
-    // other processes' appends are counted).
-    if (!WithinSizeLimit(Blob.size(), sizeof(MesaFOZ::foz_payload_key) + sizeof(MesaFOZ::foz_payload_header) +
-                                        sizeof(MesaFOZ::mesa_index_db_file_entry) + IndexBlob.size())) {
-      MaxSizeReached = true;
-      CacheFOZ.Unlock();
-      IndexFOZ.Unlock();
-      return false;
-    }
-    if (!RepairIndexTail()) {
-      CacheFOZ.Unlock();
-      IndexFOZ.Unlock();
-      return false;
-    }
-#endif
-
     // write cache side first so we get offset for index
     std::span<const uint8_t> BlobChunks[] = {Blob};
     uint64_t BlobOffset = 0;
@@ -335,9 +317,6 @@ namespace DiskCache {
       return false;
     }
 
-#ifdef __APPLE__
-    NoteAppended();
-#endif
     CacheFOZ.Unlock();
     IndexFOZ.Unlock();
 
@@ -400,6 +379,13 @@ namespace DiskCache {
   };
 
   bool DiskCache::Flush() {
+#ifdef __APPLE__
+    if (InForkedChild()) {
+      // The writer thread is the parent's; waiting for it would wait for ever.
+      BecomeReadOnlyAfterFork();
+      return false;
+    }
+#endif
     if (!IsWritingDiskCache() || !Writer) {
       return false;
     }
@@ -781,6 +767,12 @@ namespace DiskCache {
       Advance = true;
 
       // entry not backed by anything right now - todo prune..
+#ifdef __APPLE__
+      // An entry that failed its checks in this process is never tried again.
+      if (EntryUnderReview->Rejected) {
+        continue;
+      }
+#endif
       if (!EntryUnderReview->DB && !BlobRef) {
         continue;
       }
@@ -928,6 +920,12 @@ namespace DiskCache {
 #ifdef __APPLE__
     if (!ValidateHit(Header, BlobBody, LookupKey, Available, Entry.GuestExtents)) {
       RejectedCount.fetch_add(1, std::memory_order_relaxed);
+      {
+        // Never served again, and the freshly compiled block may be stored in its place;
+        // the newer record supersedes this one in later processes (ParseRecord).
+        std::lock_guard Guard(IndexLock);
+        MarkRejectedLocked(LookupKey, Entry);
+      }
       LogMan::Msg::EFmt("DiskCache: entry for guest code at {:#x} failed its integrity or sanity check; compiling instead", GuestRIP);
       return std::nullopt;
     }
@@ -1030,13 +1028,22 @@ namespace DiskCache {
   IndexEntry* DiskCache::LookupLocked(const uint64_t LookupKey, const XXH128_hash_t& GuestHash, const uint64_t GuestFootprint) {
     auto It = Index.find(LookupKey);
     if (It != Index.end()) {
-      if (XXH128_isEqual(It->second.MainEntry.GuestHash, GuestHash)) {
+#ifdef __APPLE__
+      auto Live = [](const IndexEntry& Entry) {
+        return !Entry.Rejected;
+      };
+#else
+      auto Live = [](const IndexEntry&) {
+        return true;
+      };
+#endif
+      if (XXH128_isEqual(It->second.MainEntry.GuestHash, GuestHash) && Live(It->second.MainEntry)) {
         return &It->second.MainEntry;
       }
       if (It->second.MoreEntries.get()) {
         auto Range = It->second.MoreEntries->equal_range(GuestFootprint);
         for (auto MoreEntriesIt = Range.first; MoreEntriesIt != Range.second; MoreEntriesIt++) {
-          if (XXH128_isEqual(MoreEntriesIt->second.GuestHash, GuestHash)) {
+          if (XXH128_isEqual(MoreEntriesIt->second.GuestHash, GuestHash) && Live(MoreEntriesIt->second)) {
             return &MoreEntriesIt->second;
           }
         }
@@ -1064,11 +1071,11 @@ namespace DiskCache {
       , StoreDisk(StoreDisk) {}
     void Run() override {
       struct MesaFOZ::mesa_index_db_file_entry IndexHeader;
-      bool DiskSuccess = !StoreDisk || DB->StoreCacheBlob(UniqueKey, LookupKey, Blob, IndexHeader, IndexBlob);
 #ifdef __APPLE__
-      if (!DiskSuccess && !DB->Full()) {
-        LogMan::Msg::EFmt("DiskCache: could not write an entry to {} (the database is busy); it stays in memory only", DB->Name);
-      }
+      // macOS port: into the current generation, with one lock wait per process at most.
+      bool DiskSuccess = StoreDisk && Self->StoreMacOS(UniqueKey, LookupKey, Blob, IndexHeader, IndexBlob, &DB);
+#else
+      bool DiskSuccess = !StoreDisk || DB->StoreCacheBlob(UniqueKey, LookupKey, Blob, IndexHeader, IndexBlob);
 #endif
 
       bool KeepEntryInMemory = true;
@@ -1121,9 +1128,15 @@ namespace DiskCache {
     }
 #ifdef __APPLE__
     {
-      // Code changed between decoding and now: the compiled code may not match the bytes
-      // that would be hashed below, so do not file it under them.
-      if (XXH3_64bits(GuestCode.data(), GuestCode.size()) != Thread->FrontendDecoder->DecodedBytesHash) {
+      if (InForkedChild()) {
+        // A fork the atfork handlers did not see (cannot happen with them registered):
+        // this process shares the parent's files, so it must not write.
+        BecomeReadOnlyAfterFork();
+        return false;
+      }
+      // GuestCode is the decoder's own copy of the bytes it consumed (Core.cpp); if the
+      // guest changed them while they were being decoded the copy is not usable.
+      if (!Thread->FrontendDecoder->DecodedBytesConsistent || GuestCode.data() != Thread->FrontendDecoder->DecodedBytes.data()) {
         return false;
       }
       fextl::vector<uint64_t> EntryRIPs;
@@ -1356,13 +1369,21 @@ namespace DiskCache {
         bool Dupe = false;
         if (It->second.MoreEntries.get()) {
           for (auto& [Key, Elem] : *It->second.MoreEntries) {
-            if (XXH128_isEqual(Elem.GuestHash, Header.GuestHash)) {
+            if (XXH128_isEqual(Elem.GuestHash, Header.GuestHash)
+#ifdef __APPLE__
+                && !Elem.Rejected
+#endif
+            ) {
               Dupe = true;
               break;
             }
           }
         }
-        if (!Dupe && XXH128_isEqual(It->second.MainEntry.GuestHash, Header.GuestHash)) {
+        if (!Dupe && XXH128_isEqual(It->second.MainEntry.GuestHash, Header.GuestHash)
+#ifdef __APPLE__
+            && !It->second.MainEntry.Rejected
+#endif
+        ) {
           Dupe = true;
         }
         // could happen if it's seen again while in flight in the store queue
@@ -1400,12 +1421,21 @@ namespace DiskCache {
 
     bool StoreDisk = true;
 
+#ifdef __APPLE__
+    // Decided by the writer (StoreMacOS): the current generation may change.
+#else
     if (RWCacheDB->Full()) {
       StoreDisk = false;
     }
+#endif
 
     // hand the rest off to the writer thread
-    Writer->QueueWork(fextl::make_unique<CacheStoreWorkItem>(this, RWCacheDB.get(), Key, LookupKey, std::span(BlobData, TotalSize),
+#ifdef __APPLE__
+    IndexedDB* TargetDB = nullptr; // chosen by the writer
+#else
+    IndexedDB* TargetDB = RWCacheDB.get();
+#endif
+    Writer->QueueWork(fextl::make_unique<CacheStoreWorkItem>(this, TargetDB, Key, LookupKey, std::span(BlobData, TotalSize),
                                                              std::move(IndexBlob), StoreDisk));
     // Counted after it is queued; see Flush.
     QueuedCount.fetch_add(1, std::memory_order_release);
