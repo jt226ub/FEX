@@ -2126,7 +2126,7 @@ static void CodeBufferSwitch(int Cache) {
   uint64_t Expected = 0;
   const size_t Length = WriteBigBlock(Code, 1024, 8, &Expected);
   if (Cache) {
-    CheckResult(fexmac_add_code_range(Context, (uint64_t)(uintptr_t)Code, 0x4000, 0), FEXMAC_OK, "registering the guest code");
+    CheckResult(fexmac_memory_map(Context, (uint64_t)(uintptr_t)Code, 0x4000, FEXMAC_PROT_READ | FEXMAC_PROT_EXEC), FEXMAC_OK, "registering the guest code");
   }
   uint8_t* Data = MapGuestMemory(0x10000);
   fexmac_thread* Thread = CreateThreadAt(Context, 0, (uint64_t)(uintptr_t)Data + 0x8000);
