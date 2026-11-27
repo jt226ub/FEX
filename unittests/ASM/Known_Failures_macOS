@@ -2,40 +2,42 @@
 # Used by Scripts/macos_asm_tests.py in addition to upstream's lists.
 #
 # Background: macOS on Apple silicon reserves the first 4GB of every 64-bit process, so
-# the tests' fixed low addresses are moved up by 1TB before assembly. A test whose result
-# depends on an address fitting in 32 or 16 bits cannot survive that move.
+# the tests' fixed low addresses are moved up by 1TB before assembly, and the loader
+# places the test's code at 0x100_0001_0000 instead of 0x1_0000. Guest addresses are host
+# addresses, so nothing can be mapped where an address cut to 32 bits lands.
+#
+# Every entry below was checked on an M4 by running it: the runner prints the faulting
+# address ("Unhandled host fault: ... at 0x..."), and each address is the moved address
+# cut to 32 bits, exactly as stated. None is a translator fault. results.tsv repeats the
+# reason next to each failure.
 
-# --- Believed to be side effects of the move, not translator faults. Not individually
-# --- confirmed: each should be read before being trusted.
-
-# 32-bit address-size override cuts the moved address back to 32 bits.
+# A 32-bit address-size override (0x67) cuts the address to 32 bits; the result is below
+# 4GB and cannot be mapped. Faults seen: a32_lods and a32_rep_lods at 0x80000 (RSI
+# 0x1_0008_0000 cut, as the test intends); A6_addrmod and A6_REP_addrmod at 0x10000200
+# (RDI 0x61626364_10000200 cut to EDI); AE_addrmod at 0x10000100 (EDI).
 Test_FEX_bugs/a32_lods.asm
 Test_FEX_bugs/a32_rep_lods.asm
 Test_Primary/Primary_A6_REP_addrmod.asm
 Test_Primary/Primary_A6_addrmod.asm
 Test_Primary/Primary_AE_addrmod.asm
 
-# Far and operand-size-limited branches and frame operations: the target or frame
-# address is taken through a 16 or 32-bit operand.
+# The same, in the middle of a test of vector moves: `vmovd xmm2, [edx]` with RDX
+# 0x100_e000_0000 faults at 0xe0000000.
+Test_VEX/vmovq_vmovd_reg.asm
+
+# Far jumps and calls through an m16:32 pointer: the test stores `lea edi, [rel .success]`,
+# the code address cut to 32 bits, as the target. The translator reads a 32-bit offset
+# (also for the o64 forms, as AMD does), so control goes to 0x10028, the original code
+# address of .success, and faults there. The o32 forms fault first, at 0xe0000ff0,
+# reading the pointer through `[esp]`.
 Test_PrimaryGroup/5_FF_05.asm
 Test_PrimaryGroup/5_FF_05_03_o32.asm
 Test_PrimaryGroup/5_FF_05_03_o32_imm.asm
 Test_PrimaryGroup/5_FF_05_03_o64.asm
 Test_PrimaryGroup/5_FF_05_03_o64_imm.asm
-Test_TwoByte/0F_8B_16.asm
-Test_FEX_bugs/o16_leave.asm
 
-# Expected values are derived from addresses or instruction lengths that the move changes.
-Test_FEX_bugs/cmpxchg16b.asm
-Test_FEX_bugs/cmpxchg8b.asm
-Test_FEX_bugs/SIBScaleTranspose.asm
-
-# Moves an address through a 32-bit vector register move, which cuts it short.
-# Confirmed in a debugger: the faulting access is at the original low address.
-Test_VEX/vmovq_vmovd_reg.asm
-
-# --- Needs something the core-only runner does not provide.
-
-# Makes a Linux system call and loops until it succeeds. The runner's system call handler
-# does nothing. Confirmed by sampling: it spins in the handler.
-Test_TwoByte/0F_02.asm
+# Not listed here because upstream lists it (Known_Failures_jit), and it fails the same
+# way on Linux: Test_FEX_bugs/32bit_syscall.asm. FEX refuses `int 0x80` in a 64-bit
+# process ("[Unsupported] Trying to execute 32-bit syscall from a 64-bit process"), the
+# block cannot be compiled, CompileBlock returns 0, and Arm64JITCore::ExitFunctionLink
+# links the caller to host address 0, faulting at 0x0 in its `dc cvau`.
