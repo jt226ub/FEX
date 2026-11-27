@@ -1475,7 +1475,7 @@ static void TestStopResyncStorm(void) {
 }
 
 /* Four threads run misaligned lock xadd on a word whose page the main thread unmaps and
- * remaps (fexmac_memory_unmap then munmap, mmap then fexmac_memory_map) for 3 seconds:
+ * remaps (fexmac_memory_unmap then a replacing PROT_NONE mmap, mmap then fexmac_memory_map) for 3 seconds:
  * the threads see page faults, the process survives. Died with SIGSEGV within seconds
  * when fexmac_memory_unmap left the host page accessible. */
 static fexmac_context* UnmapContext;
@@ -1518,8 +1518,11 @@ static void TestSplitLockUnmapRace(void) {
   const double Start = Now();
   long Rounds = 0;
   while (Now() - Start < 3.0) {
+    /* As an embedder's munmap, but replacing the mapping instead of removing it: a hole
+     * would let another thread's allocator map something there, which the MAP_FIXED
+     * below would then destroy. */
     fexmac_memory_unmap(UnmapContext, Addr(UnmapBase) + 0x40000, 0x4000);
-    munmap(UnmapBase + 0x40000, 0x4000);
+    mmap(UnmapBase + 0x40000, 0x4000, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
     usleep(10);
     mmap(UnmapBase + 0x40000, 0x4000, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
     fexmac_memory_map(UnmapContext, Addr(UnmapBase) + 0x40000, 0x4000, FEXMAC_PROT_READ | FEXMAC_PROT_WRITE);

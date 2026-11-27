@@ -711,11 +711,14 @@ def main():
     # generation starts, the previous one is still read, and older ones are deleted.
     target = os.path.join(work, "generations")
     gen_cmd = [cache_test, "--threads", "1", "--blocks", "120", "--distinct", "--base", "0x8000000000"]
-    first = run(gen_cmd, target, {"FEX_DISKCACHEMAXFILESIZE": "16384"})
+    # Sized for code without per-instruction self-modifying-code checks (fexmac's default
+    # became SMCCHECKS full with package D, which makes every entry larger).
+    gen_env = {"FEX_DISKCACHEMAXFILESIZE": "16384", "FEX_SMCCHECKS": "none"}
+    first = run(gen_cmd, target, gen_env)
     names = sorted(f for folder, _, files in os.walk(target) for f in files if f.endswith("_idx.foz"))
     generations = [n for n in names if re.search(r"-\d+_idx\.foz$", n)]
     sizes = [os.path.getsize(f) for pair in db_files(target) for f in pair]
-    second = run(gen_cmd, target, {"FEX_DISKCACHEMAXFILESIZE": "16384"})
+    second = run(gen_cmd, target, gen_env)
     check("a full database continues in a new generation; at most two are kept, each within the limit; the next run loads",
           first["rc"] == 0 and second["rc"] == 0 and generations and len(names) <= 2 and max(sizes) <= 16384 and
           second.get("loaded", 0) > 0 and second.get("rejected") == 0 and first.get("dropped") == 0,
