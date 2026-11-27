@@ -98,5 +98,10 @@ int main(int argc, char** argv) {
   }
   pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
   int ran = 0;
-  return bench_main(flags, reps, only, &ran) == 0 ? 0 : 1;
+  const int failures = bench_main(flags, reps, only, &ran);
+  if (flags & BENCH_LITERAL) {
+    /* The guest build reports these through its exit call; this build on stderr. */
+    fprintf(stderr, "literal mode: %d kernel(s) run, %d wrong checksum(s)\n", ran, failures);
+  }
+  return failures == 0 ? 0 : 1;
 }
