@@ -251,6 +251,15 @@ void OpDispatchBuilder::ADCOp(OpcodeArgs, uint32_t SrcIndex, bool DestRAX) {
   }
 
   Ref Result;
+#ifdef __APPLE__
+  if (!DestIsLockedMem(Op) && !DestRAX && !Op->Dest.IsGPR()) {
+    // Memory destination: the sum with the incoming carry first (reads CF, sets no
+    // flags), stored, then the flags (see ALUOp: restartable guest faults).
+    StoreResultGPR(Op, Add(OpSize, Before, IncrementByCarry(OpSize, Src)));
+    CalculateFlags_ADC(Size, Before, Src);
+    return;
+  }
+#endif
   if (!DestIsLockedMem(Op) && Op->Src[SrcIndex].IsLiteral() && Op->Src[SrcIndex].Literal() == 0 && Size >= OpSize::i32Bit) {
     HandleNZCV_RMW();
     RectifyCarryInvert(true);
@@ -291,6 +300,15 @@ void OpDispatchBuilder::SBBOp(OpcodeArgs, uint32_t SrcIndex, bool DestRAX) {
     Before = LoadSourceGPR(Op, Op->Dest, Op->Flags, {.AllowUpperGarbage = true});
   }
 
+#ifdef __APPLE__
+  if (!DestIsLockedMem(Op) && !DestRAX && !Op->Dest.IsGPR()) {
+    // Memory destination: the difference with the incoming borrow first, stored, then
+    // the flags (see ADCOp).
+    StoreResultGPR(Op, Sub(OpSize, Before, IncrementByCarry(OpSize, Src)));
+    CalculateFlags_SBB(Size, Before, Src);
+    return;
+  }
+#endif
   Result = CalculateFlags_SBB(Size, Before, Src);
 
   if (DestRAX) {
@@ -1453,6 +1471,19 @@ void OpDispatchBuilder::SHLImmediateOp(OpcodeArgs, bool SHL1Bit) {
 
   Ref Result = _Lshl(Size == 64 ? OpSize::i64Bit : OpSize::i32Bit, Dest, Constant(Shift));
 
+#ifdef __APPLE__
+  if (!Op->Dest.IsGPR()) {
+    // Memory destination: store first, flags after (see ALUOp), from a recomputed
+    // result so that the register allocator cannot compute the stored value straight
+    // into the PF register before the store.
+    StoreResultGPR(Op, Result);
+    CalculateFlags_ShiftLeftImmediate(OpSizeFromSrc(Op), _Lshl(Size == 64 ? OpSize::i64Bit : OpSize::i32Bit, Dest, Constant(Shift)), Dest,
+                                      Shift);
+    CalculateDeferredFlags();
+    AcidTestFlags(X86State::RFLAG_AF_RAW_LOC);
+    return;
+  }
+#endif
   CalculateFlags_ShiftLeftImmediate(OpSizeFromSrc(Op), Result, Dest, Shift);
   CalculateDeferredFlags();
   StoreResultGPR(Op, Result);
@@ -1477,6 +1508,17 @@ void OpDispatchBuilder::SHRImmediateOp(OpcodeArgs, bool SHR1Bit) {
   uint64_t Shift = GetConstantShift(Op, SHR1Bit);
   auto ALUOp = _Lshr(Size == 64 ? OpSize::i64Bit : OpSize::i32Bit, Dest, Constant(Shift));
 
+#ifdef __APPLE__
+  if (!Op->Dest.IsGPR()) {
+    // Memory destination: store first, flags after (see SHLImmediateOp).
+    StoreResultGPR(Op, ALUOp);
+    CalculateFlags_ShiftRightImmediate(OpSizeFromSrc(Op), _Lshr(Size == 64 ? OpSize::i64Bit : OpSize::i32Bit, Dest, Constant(Shift)), Dest,
+                                       Shift);
+    CalculateDeferredFlags();
+    AcidTestFlags(X86State::RFLAG_AF_RAW_LOC);
+    return;
+  }
+#endif
   CalculateFlags_ShiftRightImmediate(OpSizeFromSrc(Op), ALUOp, Dest, Shift);
   CalculateDeferredFlags();
   StoreResultGPR(Op, ALUOp);

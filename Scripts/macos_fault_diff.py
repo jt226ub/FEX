@@ -152,7 +152,7 @@ REP_CASES.append(rep_case("rep-movsq-src-none", "lea rsi, [r15-64]\nlea rdi, [rs
 RMW_CASES = []
 for ins in ["add {s} [r15], 3", "or {s} [r15], rax", "adc {s} [r15], 7", "sbb {s} [r15], 1", "and {s} [r15], 0x55", "sub {s} [r15], rcx",
             "xor {s} [r15], 1", "inc {s} [r15]", "dec {s} [r15]", "neg {s} [r15]", "not {s} [r15]", "rol {s} [r15], 1", "ror {s} [r15], 3",
-            "rcl {s} [r15], 1", "rcr {s} [r15], 2", "shl {s} [r15], cl", "shr {s} [r15], 1", "sar {s} [r15], 3", "bts {s} [r15], 3",
+            "rcl {s} [r15], 1", "rcr {s} [r15], 2", "shl {s} [r15], cl", "shr {s} [r15], 1", "sar {s} [r15], 3", "shl {s} [r15], 5", "shr {s} [r15], 7", "shl {s} [r15], 1", "bts {s} [r15], 3",
             "btr {s} [r15], 1", "btc {s} [r15], 2", "lock add {s} [r15], 1", "lock sbb {s} [r15], 1"]:
     for size in ("byte ptr", "word ptr", "dword ptr", "qword ptr"):
         if ins.startswith("bt") and size == "byte ptr":
@@ -238,22 +238,25 @@ def diff(a, b, pa, pb):
 
 
 # Cases whose marked instruction overwrites every status flag without reading one, and
-# computes them after its store (add/or/and/sub/xor/neg on memory, also locked): the
+# computes them after its store (add/or/and/sub/xor/neg on memory, also locked; xadd and
+# cmpxchg on memory, always atomic): the
 # incoming status flags are dead there, so a block that does not read them does not
 # compute them, and at the fault they are as stale as any dead flag (the documented
 # dead-flags limit). For these the at-fault comparison leaves out the status flags
 # (CF, PF, AF, ZF, SF, OF); everything else, and the resumed result, is compared in full.
 # With SMCCHECKS full every instruction ends a block, so the flags are computed there and
 # the at-fault comparison is complete: it shows the reorder leaves them untouched.
-DEAD_STATUS_FLAGS_IN = re.compile(r"^(rmw-(add|or|and|sub|xor|neg|lock-add)-|carry-neg-)")
+DEAD_STATUS_FLAGS_IN = re.compile(r"^(rmw-(add|or|and|sub|xor|neg|lock-add|xadd|cmpxchg|shr)-|rmw-shl-[a-z]+-r15-[15]$|carry-(neg|xadd|cmpxchg)-)")
+# Bit tests on memory overwrite only CF (the others are kept and compared).
+DEAD_CF_IN = re.compile(r"^(rmw-bt[src]-|carry-btc-)")
 STATUS_FLAGS = 0x8D5
 
 
-def without_status_flags(out, tag):
+def without_status_flags(out, tag, flags=STATUS_FLAGS):
     out = dict(out)
     key = tag + ".rflags"
     if key in out:
-        out[key] = "%x" % (int(out[key], 16) & ~STATUS_FLAGS)
+        out[key] = "%x" % (int(out[key], 16) & ~flags)
     return out
 
 
@@ -291,6 +294,8 @@ def check_case(tool, name, src, prot, clean=True, ref_src=None):
             found.setdefault("no-fault", []).append(tag + " reason " + str(f.get("a.reason")))
         if DEAD_STATUS_FLAGS_IN.match(name) and smc != "full":
             checks = [("at-fault", diff(without_status_flags(f, "a"), without_status_flags(r, "a"), "a", "a"))]
+        elif DEAD_CF_IN.match(name) and smc != "full":
+            checks = [("at-fault", diff(without_status_flags(f, "a", 1), without_status_flags(r, "a", 1), "a", "a"))]
         else:
             checks = [("at-fault", diff(f, r, "a", "a"))]
         if name.startswith("rep-") and f.get("a.reason") == "3":

@@ -299,7 +299,11 @@ FEXMAC_EXPORT fexmac_result fexmac_after_fork(fexmac_context* context, int child
  * the process with a core message. */
 FEXMAC_EXPORT fexmac_result fexmac_thread_create(fexmac_context* context, fexmac_thread** out_thread);
 
-/* Destroys a thread that is not running. */
+/* Destroys a thread that is not running. Its translator state, stacks and code are freed;
+ * the small handle itself is kept until fexmac_context_destroy, so that a late
+ * fexmac_thread_request_stop on it is refused (FEXMAC_ERROR_INVALID_HANDLE) instead of
+ * touching freed memory. A context that creates and destroys threads without end grows
+ * by one small handle per destroyed thread. */
 FEXMAC_EXPORT fexmac_result fexmac_thread_destroy(fexmac_thread* thread);
 
 FEXMAC_EXPORT fexmac_context* fexmac_thread_context(fexmac_thread* thread);

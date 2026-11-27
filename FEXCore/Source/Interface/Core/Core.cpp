@@ -727,12 +727,15 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
         // before the instruction and running it again computes the same result.
         uint32_t UndoMask = 0;
         if (MayFault && TableInfo->Name) {
-          // add/or/and/sub/xor/inc/dec/neg on memory store first and compute the flags
-          // after (OpcodeDispatcher.cpp; the lock forms compute them after the atomic
-          // operation), so they need no record. The rest consume incoming flags, keep some
-          // (zero counts, bit tests) or compute them before their store.
-          static constexpr std::string_view FlagsRMW[] = {"ADC", "SBB", "ROL",  "ROR",  "RCL", "RCR", "SHL", "SAL",
-                                                          "SHR", "SAR", "SHLD", "SHRD", "BTS", "BTR", "BTC", "XADD", "CMPXCHG"};
+          // add/or/and/sub/xor/inc/dec/neg/adc/sbb on memory store first and compute the
+          // flags after (OpcodeDispatcher.cpp); their lock forms, and xadd and cmpxchg on
+          // memory (always atomic), compute them after the atomic operation, which is the
+          // only access that can fault. So none of them needs a record. The rest keep some
+          // flags (a zero count) or set CF before the store (bit tests).
+          // bts/btr/btc on memory store before setting CF already; shl/shr by an
+          // immediate or 1 store first too (OpcodeDispatcher.cpp). By cl (a zero count
+          // keeps every flag), rotates, sar, shld/shrd keep the record.
+          static constexpr std::string_view FlagsRMW[] = {"ROL", "ROR", "RCL", "RCR", "SHL", "SAL", "SHR", "SAR", "SHLD", "SHRD"};
           const std::string_view Name {TableInfo->Name};
           const auto IsMemoryDest = [&] {
             using T = X86Tables::DecodedOperand::OpType;
@@ -747,7 +750,20 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
             default: return false;
             }
           };
-          if (IsMemoryDest() && std::find(std::begin(FlagsRMW), std::end(FlagsRMW), Name) != std::end(FlagsRMW)) {
+          // By an immediate (C0/C1) or by 1 (D0/D1), not by cl (D2/D3): the opcode byte
+          // after the prefixes.
+          const auto ShiftOpcode = [&] {
+            const auto* Bytes = reinterpret_cast<const uint8_t*>(InstAddress);
+            size_t i = 0;
+            while (i < DecodedInfo->InstSize &&
+                   (Bytes[i] == 0x66 || Bytes[i] == 0x67 || Bytes[i] == 0xF0 || Bytes[i] == 0xF2 || Bytes[i] == 0xF3 || Bytes[i] == 0x26 ||
+                    Bytes[i] == 0x2E || Bytes[i] == 0x36 || Bytes[i] == 0x3E || Bytes[i] == 0x64 || Bytes[i] == 0x65 || (Bytes[i] & 0xF0) == 0x40)) {
+              ++i;
+            }
+            return i < DecodedInfo->InstSize ? Bytes[i] : uint8_t {0};
+          };
+          const bool ShiftByConstant = (Name == "SHL" || Name == "SHR") && (ShiftOpcode() & 0xFE) != 0xD2;
+          if (IsMemoryDest() && !ShiftByConstant && std::find(std::begin(FlagsRMW), std::end(FlagsRMW), Name) != std::end(FlagsRMW)) {
             UndoMask |= Core::CPUState::UNDO_FLAGS;
           }
           // pop [m] and leave are reordered (OpcodeDispatcher.cpp) except pop to an
@@ -761,9 +777,6 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
             Thread->OpDispatcher->_SyncStackToSlow();
           }
           Thread->OpDispatcher->FlushRegisterCache(false);
-          if (UndoMask) {
-            Thread->OpDispatcher->SaveUndoRecord(UndoMask);
-          }
         } else {
           Thread->OpDispatcher->FlushRegisterCache(true);
         }
@@ -820,6 +833,14 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
           Thread->OpDispatcher->StartNewBlock();
         }
 
+#ifdef __APPLE__
+        // The undo record is saved after the self-modifying-code check above, which can
+        // leave the block for retranslation: a record left set there would be applied to
+        // whatever instruction faults next.
+        if (UndoMask) {
+          Thread->OpDispatcher->SaveUndoRecord(UndoMask);
+        }
+#endif
         if (TableInfo && TableInfo->OpcodeDispatcher.OpDispatch) {
           auto Fn = TableInfo->OpcodeDispatcher.OpDispatch;
           Thread->OpDispatcher->ResetHandledLock();

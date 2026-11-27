@@ -882,7 +882,11 @@ fexmac_result fexmac_thread_destroy(fexmac_thread* thread) {
     Threads.erase(std::remove(Threads.begin(), Threads.end(), thread), Threads.end());
     Context->CTX->DestroyThread(thread->Thread);
     thread->Thread = nullptr;
-    // The handle stays allocated until the context is destroyed (fexmac_thread::Dead).
+    // The handle stays allocated until the context is destroyed (fexmac_thread::Dead), so
+    // that fexmac_thread_request_stop on a destroyed handle is refused instead of touching
+    // freed memory. The cost is a small allocation per destroyed thread held for the life
+    // of the context (documented in fexmac.h): an embedder that creates and destroys
+    // threads for ever in one context grows by that much each time.
     Context->DeadThreads.push_back(thread);
   }
   if (thread->CallRetAllocation) {
