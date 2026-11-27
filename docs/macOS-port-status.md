@@ -12,6 +12,8 @@ Related documents:
   commits into the port. Upstream merged so far: FEX-Emu/FEX `main` at `a92baf073`
   (27 November 2026).
 - `Scripts/macos_asm_tests.py`: runs the instruction tests.
+- `docs/macOS-benchmarks.md` and `Scripts/macos_bench.py`: the guest benchmark, its method,
+  results and analysis.
 
 ## Where it stands
 
@@ -31,7 +33,14 @@ Related documents:
 - **Runs eight guest threads at once** with correct, separate results.
 - **Keeps x86 memory ordering between threads** with the emulation on: multi-thread litmus
   tests see no forbidden outcome in 100 million tries each, and see them by the million
-  with it off (physical Mac).
+  with it off; vector and string-instruction ordering are each shown to depend on their
+  own setting (physical Mac).
+- **Runs a real guest program to the right answer** (criterion 7): a freestanding x86-64
+  benchmark of 18 kernels, run through `fexmac` by `FEXCoreBench`, gives bit-identical
+  checksums to the same C source under Rosetta 2 and natively on arm64. Speed is
+  recorded (criterion 8): with x86 memory-ordering emulation off, 0.74 times Rosetta 2's
+  time (geometric mean); with all of it on, 1.9 times, almost all of it barriers on vector
+  accesses. See "Guest program and benchmark" below.
 - **Linux is unaffected.** The core-only Linux build passes with the same changes.
 
 Only the translator core is built on macOS. FEX's Linux process loader, syscall emulation,
@@ -107,8 +116,8 @@ Added for embedders (the core expects these from whatever hosts it):
   hung until package E's reader-writer lock fix; `fexmac_c_test invalidate-concurrent`
   now passes.
 - `Source/Tools/CommonTools/MacOSHostFaults.h` and `CoreThreadSetup.h`, the previous
-  per-tool versions, are used only by `FEXCoreOrderingTest` (package E) and kept until it
-  is ported; `MacOSHostFaults.h` got the same fault-status check.
+  per-tool versions, are gone: `FEXCoreOrderingTest`, the last tool using them, now uses
+  `fexmac.h` only.
 
 Checked and found not to need a change:
 
@@ -142,8 +151,8 @@ with `JITWriteProbe`:
   because the signal is blocked while its handler runs. A hang in a test can be a crash
   in a fault handler.
 - **Returning from a signal handler does not restore the thread's write setting.** A
-  handler that switches leaves the setting it last chose. `MacOSHostFaults.h` handles two
-  kinds of fault. Misaligned accesses in translated code are patched with the setting
+  handler that switches leaves the setting it last chose. The library's fault handler (and
+  before it `MacOSHostFaults.h`) handles these kinds of fault. Misaligned accesses in translated code are patched with the setting
   switched, and translated code only runs executable, so the handler ends in the state
   it found. Scratch-buffer guard faults in the translator's own emitter code are
   resumed without touching the setting at all. Neither path leaves a wrong setting.
@@ -179,59 +188,202 @@ same translated code; each run copies the code to a fresh address so it is trans
 again. Outcomes are counted. Pinning threads to cores is not possible on macOS; the
 threads ask for the user-interactive quality of service and the tool relies on numbers.
 
-Results on the Mac mini (M4), hardened runtime, `--soak` (100 million tries per test):
+Every test must also show an outcome that is only possible when its two threads overlap
+(for message passing: the flag not yet written but some data already; for SB: both loads
+seeing both stores), or it fails as NOT RACING in every mode, so no test can pass because
+its threads stopped overlapping. Counting tests instead run locked operations from every
+thread of every group on one misaligned word and check the exact total.
 
-| Test | What it checks | Forbidden by x86, emulation off | Emulation on |
-|---|---|---|---|
-| SB | store buffering; allowed by x86, shows the threads race | relaxed outcome 27.8M | relaxed outcome 0.58M (allowed) |
-| MP, MP+spin | message passing, plain 64-bit moves | 14.3M, 0.52M | 0 |
-| S | store then store against load then store | 185,129 | 0 |
-| 2+2W | two threads each storing twice | 271,950 | 0 |
-| LB | load buffering | 0 | 0 |
-| MP-sse, MP-sse2 | 16-byte `movdqu` data, scalar or `movdqu` flag | 14.0M, 14.3M | 0 |
-| MP-movsb, MP-stosq, MP-movsb-read | data written or read by `rep movsb` / `rep stosq` | 18.6M, 15.2M, 8.6M | 0 |
-| MP-flag-stosq, MP-flag-movsb | flag written or read by a string instruction | 13.2M, 8.0M | 0 |
-| MP-split16, MP-splitline | misaligned data and flag across 16 bytes, across a 128-byte line | 13.4M, 21.2M | 0 |
-| MP-split4K | data across a 4K guest page, flag across a 16K host page | 21.2M | 0 |
-| MP-split16K | data across a 16K host page | 24 | 0 |
+Results on the Mac mini (M4), hardened runtime, `--soak`: 100 million tries per litmus
+test, 8 million locked operations per counting test, in each of the three modes. "On" is
+all three settings (`FEX_TSOENABLED`, `FEX_VECTORTSOENABLED`, `FEX_MEMCPYSETTSOENABLED`);
+"scalar" is only the first, as upstream's defaults; "off" is none.
 
-So x86 ordering holds between threads with emulation on, and the same harness sees it
-broken with emulation off: Apple M-series cores reorder loads with loads and stores with
-stores. LB is never seen (the cores do not let a store pass an older load), and a load that
-crosses a 16K page almost never completes out of order, so `--expect weak` does not
-require those two. With emulation on, the misaligned tests take 6 to 9 alignment faults
-per run where 4 instructions are patched, so several threads fault on the same
-instruction at once and the back-patching under the block's spin lock is exercised
-concurrently.
+| Test | What it checks | Forbidden outcome, off | scalar | on |
+|---|---|---|---|---|
+| SB | store buffering; allowed by x86 (relaxed outcome counted) | 27.2M relaxed | 0.46M relaxed | 0.45M relaxed |
+| SB+mfence, SB+lock | Dekker: `mfence` or a locked instruction between store and load | 0, 0 | 0, 0 | 0, 0 |
+| MP, MP+spin | message passing, plain 64-bit moves | 18.8M, 0.84M | 0, 0 | 0, 0 |
+| S | store then store against load then store | 172,771 | 0 | 0 |
+| 2+2W | two threads each storing twice | 187,567 | 0 | 0 |
+| LB | load buffering | 0 | 0 | 0 |
+| MP-sse | `movdqu` data, scalar flag | 18.9M | 0 | 0 |
+| MP-sse2 | `movdqu` data and flag, both sides | 17.7M | 3.69M | 0 |
+| MP-sse-st | `movdqu` stores, scalar loads | 16.6M | 45,941 | 0 |
+| MP-sse-ld | scalar stores, `movdqu` loads | 20.8M | 108,934 | 0 |
+| MP-movsb, MP-stosq | data by `rep movsb` / `rep stosq`, scalar flag | 21.3M, 18.9M | 0, 0 | 0, 0 |
+| MP-stos-stos, MP-movs-movs | data and flag both by `rep stosq` / `rep movsb` | 18.6M, 15.8M | 993, 6,944 | 0, 0 |
+| MP-movsb-read | scalar flag load, data copied by `rep movsb` | 11.1M | 0 | 0 |
+| MP-movsb-read2 | flag and data both copied by `rep movsb` | 7.8M | 9,652 | 0 |
+| MP-flag-stosq | scalar data, flag by `rep stosq` | 15.8M | 0 | 0 |
+| MP-flag-movsb | scalar data, flag copied by `rep movsb` | 10.1M | 92,596 | 0 |
+| MP-split16, MP-splitline | misaligned data and flag across 16 bytes, across a 128-byte line | 17.5M, 21.5M | 0, 0 | 0, 0 |
+| MP-split4K | data across a 4K guest page, flag across a 16K host page | 20.8M | 0 | 0 |
+| MP-split16K | data across a 16K host page | 31 | 0 | 0 |
+| LOCK-xadd-split16/-splitline/-splitpage | `lock xadd` on a qword crossing 16 bytes, a line, a page | exact | exact | exact |
+| LOCK-cmpxchg-split16 | `lock cmpxchg` increment loop across 16 bytes | exact | exact | exact |
+| LOCK-xchg-split16 | spin lock by `xchg` across 16 bytes, released by a plain store | exact | exact | exact |
 
-`--tso scalar` switches on only the general setting, as upstream's defaults do (vector
-and string-instruction ordering off). Then MP-sse2 (vector flag) and MP-flag-movsb (flag
-read by `rep movsb`) still break; the other tests hold because the release store or
-acquire load of the scalar access next to them orders them.
+So x86 ordering holds between threads with all three settings on, and the same harness
+sees it broken with them off: Apple M-series cores reorder loads with loads and stores
+with stores. `--expect weak` (the default with `--tso off`) requires each forbidden
+outcome above that the M4 showed, except LB and MP-split16K, and requires the fence,
+locked-instruction and counting tests to hold. Why LB never appears, and why a load that
+crosses a 16K page almost never completes out of order, has not been established; a
+plausible but unverified explanation is that the cores do not let a store become visible
+before an older load has its value, and perform a page-crossing load late, in order.
 
-The default run (`FEXCoreOrderingTest`, emulation on, 3.2 million tries per test) takes
-about 4 seconds; `--tso off` checks the weak side the same way. Both run in the Mac job.
-The hosted Mac is a virtual machine on Apple silicon with three processors: the ordering
-check with emulation on is meaningful there (one pair at a time), but whether the weak
-outcomes appear with emulation off depends on the host, so that run only warns. Only a
-physical Mac has shown the table above.
+With emulation on, the misaligned tests take more alignment faults per run than the 4
+instructions they patch, so in some runs several threads fault on the same instruction at
+once and the back-patching under the block's spin lock runs concurrently: 9 to 10 per run
+when the tool set up its threads itself, 4.0 to 4.4 per run (403 to 436 over 100) since
+it runs on `fexmac`, so concurrent faults on one instruction are now the exception rather
+than the rule.
+
+The tool now uses only `fexmac.h` (it owns SIGBUS and SIGSEGV and hands each fault to
+`fexmac_handle_fault`, counting the alignment faults the library claims). The three
+soaks were repeated on it, hardened: all pass, with no forbidden outcome with emulation
+on, every required one with it off and in the scalar mode, and exact counting totals
+(MP-split16K showed 19 with emulation off, LB none).
+
+**What each sub-setting protects.** With only the general setting on, scalar loads
+become acquire loads (`ldapr`/`ldapur`) and scalar stores release stores
+(`stlr`/`stlur`): `DEF_OP(LoadMemTSO)` and `DEF_OP(StoreMemTSO)` in
+`FEXCore/Source/Interface/Core/JIT/MemoryOps.cpp`. Vector loads and stores stay plain
+`ldr`/`str` unless `FEX_VECTORTSOENABLED` adds a `dmb ishld` after the load or a `dmb ish`
+before the store (same functions), and `rep movs`/`rep stos` stay plain copies unless
+`FEX_MEMCPYSETTSOENABLED` makes each element an acquire load and release store
+(`DEF_OP(MemCpy)`, `DEF_OP(MemSet)`, the `IsAtomic` branch). A release store orders every
+earlier access before it and an acquire load orders every later access after it, so a
+vector or string access followed by a scalar store, or preceded by a scalar load, is
+ordered by the general setting alone: MP-sse, MP-movsb, MP-stosq and MP-movsb-read hold in
+the scalar mode. What depends on the sub-settings is order between two vector accesses
+(MP-sse-st: stores, MP-sse-ld: loads) and between two string accesses (MP-stos-stos,
+MP-movs-movs: stores; MP-movsb-read2: loads), and a plain load before an acquire load
+(MP-flag-movsb). A plain store after a release store (MP-flag-stosq) is also allowed to
+pass it by the architecture but has not been seen to on the M4. `--expect scalar` (the
+default with `--tso scalar`) requires each of those named tests to break and the rest to
+hold, so a sub-setting that stopped ordering its accesses would be noticed.
+
+The default run (`FEXCoreOrderingTest`, emulation on, 3.2 million tries per litmus test)
+takes about 11 seconds, of which the counting tests are about 6: every locked operation on
+a misaligned word is a fault. `--tso off` and `--tso scalar` take the same. All three run
+in the Mac job. The hosted Mac is a virtual machine on Apple silicon with three
+processors: the checks that must hold are meaningful there (one pair at a time), but
+whether the weak outcomes appear depends on the host, so there a test that should break
+and does not only warns; a test that must hold and breaks, a stall, a crash, BROKEN or NOT
+RACING fail the job. Only a physical Mac has shown the table above.
 
 Found by it and fixed:
 
 - **Lost wake-up in the core's reader-writer lock** (`WritePriorityMutex`, used for the
   code invalidation lock). On macOS readers and writers wait on the same word with
   `os_sync_wait_on_address`, which, unlike Linux futex bitsets, cannot wake only writers.
-  A writer's hand-off woke one waiter, which could be a reader; the reader went back to
+  A writer hand-off woke one waiter, which could be a reader; the reader went back to
   sleep and the writer never woke. Threads that started translating together hung about
   once in 300 to 1,500 runs of eight threads. A writer hand-off now wakes all waiters.
-  `FEXCoreMutexWakeTest` reproduces the hang deterministically (a reader and then a
-  writer queue behind a writer); 20,000 eight-thread starts ran clean after the fix.
+  `FEXCoreMutexWakeTest` checks six queueing orders, each step waiting until the thread
+  is blocked in the kernel (its Mach run state), not for a fixed time. With the old
+  header two of them hang every time: a writer owns while a reader then a writer queue
+  (write-to-write hand-off), and a reader owns while a writer then a reader queue and a
+  spurious wake moves the writer behind the reader (read-to-write hand-off); the other
+  four pass with either header. 20,000 eight-thread starts ran clean after the fix.
+- **Lost updates from locked operations on a word that crosses 16 bytes.** ARM64 atomics
+  fault there and the core emulates them with two compare-and-swaps. With
+  `StrictInProcessSplitLocks` off (upstream's default) concurrent emulations interleave
+  and tear, and the update is lost: before the next fix, LOCK-xadd-split* lost between 1
+  in 4,000 and 1 in 900 increments in every run. On macOS the setting now defaults to on
+  (`FEXCore/Source/CMakeLists.txt`) and `fexmac` always sets it (it is not an option an
+  embedder can change; see "Fault handler locks" in `docs/macOS-embedding-interface.md`
+  for why taking that lock in the fault handler is safe). It serialises the emulated
+  operations within the process; they already cost a fault each and the counting tests
+  show no measurable slowdown. The ordering test's counting tests and `fexmac_c_test
+  split-locks-concurrent` add 0x100000001 per operation, which changes both halves of the
+  word: with the lock switched off in a scratch build, the C subtest's three `lock xadd`
+  totals came out short in 3 of 3 runs; with it on they are exact.
+- **A locked operation could report an old value it never wrote.** The emulation wrote
+  the upper half first; if anything (another emulation, or a plain store such as a spin
+  lock's release) changed the lower half before the second compare-and-swap, the
+  operation gave up as "torn" and returned a mix of old values without completing. For
+  an `xchg` lock that meant two threads held the lock: LOCK-xchg-split16 lost an
+  increment in 3 of 10 long runs (and in 1 to 3 of 100 soak runs). On macOS the half that
+  the operation does not change is now compared first, so a failure of the second has
+  written nothing and is retried (`SplitCAS` in
+  `FEXCore/Source/Utils/ArchHelpers/Arm64.cpp`); 10 long runs and the soaks are clean.
 
-Not found, but noted: when the core back-patches a misaligned release store, it writes the
-barrier into the instruction slot before it and then the plain store. A thread that ran
-the old slot just before the patch and fetches the new store just after would make one
-store without its barrier, once. The window is a few instructions wide, once per patched
-instruction, and was not observed; it is upstream's design.
+Remaining limits of split locked operations: the split-lock lock makes emulations atomic
+with each other, and `SplitCAS` keeps an operation that changes only one half from
+completing with a stale result when a plain store intervenes (it retries instead). An operation that changes both halves can still tear if a plain store
+from another thread (one that is not a locked operation, so not under the lock) lands
+between its two compare-and-swaps: the upper half is then written and the lower is not,
+and the guest gets a mixed result. x86 promises a locked operation is atomic even against
+plain stores, which two compare-and-swaps cannot give. Not observed (the tests' plain
+stores only touch the lower half of their lock word).
+
+Known gap, not fixed: **the misaligned back-patch is cross-modifying code that the
+architecture does not guarantee.** When a misaligned acquire load or release store
+faults, the handler (`HandleUnalignedAccess` in
+`FEXCore/Source/Utils/ArchHelpers/Arm64.cpp`, the LDAPR/LDAPUR and STLR/STLUR branches)
+rewrites it while other threads may be running the same code:
+
+- Store: the emitted pair is `nop; stlur`. The handler writes `dmb ish` over the `nop`,
+  then `stur` over the `stlur`. A thread that has already executed the old `nop`, and
+  then fetches the new `stur`, makes that store without the barrier: an earlier store
+  may become visible after it.
+- Load: the pair is `ldapur; nop`, rewritten to `ldur; dmb ishld` (barrier first). A
+  thread that fetches the new `ldur` but still has the old `nop` (the two words can be in
+  different instruction-cache lines, and no instruction synchronisation barrier is
+  executed by the other thread) makes that load without the barrier.
+
+Each case affects at most one access per thread per patched instruction, once, and has not
+been observed. ARM guarantees concurrent modification only between B, BL, NOP, BRK, SVC,
+HVC, SMC and ISB, so no order of writes fixes it. Two remedies were weighed. Patching a
+single `nop` into a branch to an out-of-line stub would be safe but needs stub space for
+every such access, a change to code generation. Leaving the instruction alone and
+emulating it in the fault handler on every execution is safe and small, and was measured:
+the four misaligned message-passing tests went from 0.3 seconds each to 55 to 63 seconds
+(12.8 million faults per test, tens of microseconds per access under contention), which
+would make every misaligned access that crosses 16 bytes hundreds of times slower in real
+programs. Neither is done; the gap is upstream's design and is kept.
+
+## Guest program and benchmark (criteria 7 and 8)
+
+`unittests/macOS/Bench/` holds a benchmark written for the port: 18 kernels (CRC and
+hashing, sorting, an interpreter with indirect jumps and calls, a state machine,
+`rep movs`/`rep stos`, a vector copy, pointer chasing, scalar and vector matrix multiply,
+n-body, FFT, x87 `long double`, 64-bit multiply and divide, call/return and deep
+recursion, and two four-thread kernels with a spin lock, atomics and message passing).
+The same C file is built as a freestanding x86-64 image (static Mach-O at 2TB, no libc;
+its only host services are a private system call ABI: exit, write, clock, start and wait
+for a guest thread), as an x86-64 macOS program for Rosetta 2 and as an arm64 program.
+`FEXCoreBench` (`Source/Tools/CoreBench/`, `fexmac.h` only) loads and runs the image.
+
+Evidence, Mac mini M4, macOS 27.0.1, 27 November 2026, other workers using about 2 of
+10 cores (full method, table and analysis in `docs/macOS-benchmarks.md`):
+
+- **Criterion 7.** All 18 checksums equal Rosetta 2's and native arm64's (x87: Rosetta's;
+  `long double` is 64-bit on arm64), bit-exact including floating point, in quick and
+  full sizes with `MAXINST=500 MULTIBLOCK=1` and TSO on, scalar TSO only and multiblock
+  off; in quick size also as hardened (TSO on, off, multiblock off) and with `MAXINST=1`,
+  `MAXINST=5000` with half-barriers off, `SMCCHECKS=full` and
+  `HOSTFEATURES=disableatomics`. Two differences are expected and
+  seen: with TSO off the message-passing kernel reads stale data (wrong and varying
+  checksum), and with `X87REDUCEDPRECISION=1` the x87 checksum changes. No translator
+  bug was found.
+- **Criterion 8.** Median time relative to Rosetta 2, geometric mean over the kernels:
+  native arm64 0.61; this port with TSO off 0.74, scalar TSO only 0.89, all three TSO
+  switches on 1.91, all on with multiblock off 2.19. Worst with TSO on: the SSE copy loop
+  98x Rosetta (a `dmb` around every vector access: the M4 has no `FEAT_LRCPC3`), SSE
+  matrix multiply 5.2x, FFT 4.5x, n-body 3.2x, the interpreter 2x (`ldapr`/`stlr` on every
+  access); all near or below 1x with vector TSO off. x87 is 0.72x Rosetta (both emulate
+  80-bit arithmetic in software). Translation is cheap: 79 blocks for the whole program,
+  3 ms from launch to the guest's first output.
+- **Rosetta 2 on this Mac** hangs, unkillably, at the launch of an unsigned x86-64
+  program; the script signs the Rosetta build ad hoc.
+
+The quick mode (checksums only) runs in the Mac workflow as built and hardened; it
+asserts no timing. The hosted Mac may not have Rosetta 2, in which case the script
+compares with native arm64 only.
 
 ## On-disk code cache
 
@@ -324,10 +476,11 @@ All of these run in the Mac job on every push to a `macos/**` branch.
 | `fexmac_c_test` cache subtests | `cache-off`, `cache-cold-warm`, `cache-cross-process`, `cache-untrusted`, `cache-options`, `cache-fork`, `code-ranges` (with the rest: 41 subtests) | added in package F, not yet run there | pass, both |
 | `Scripts/macos_asm_tests.py --cache-dir DIR --cache-passes 2` | The instruction tests cold then warm; fails if a warm result differs, a finished warm run compiled anything, or an entry was rejected | added in package F, not yet run there (two modes in the job) | pass, all four modes, both |
 | `FEXCoreASMTestRunner` with `Scripts/macos_asm_tests.py` | Upstream's 2,292 assembly instruction tests plus the port's four in `unittests/macOS/ASM`, in four modes | 2,253 pass in each mode (before the upstream sync added one test) | 2,265 of 2,296 pass in each mode, both |
-| `FEXCoreOrderingTest` | Multi-thread x86 memory-ordering litmus tests, emulation on (must hold) and off (must break); see above | not yet run | pass, both; off: all required weak outcomes seen |
-| `FEXCoreMutexWakeTest` | The core's reader-writer lock never loses a wake-up | not yet run | pass |
-| `fexmac_c_test` | A C program using only `fexmac.h`, linked as an outside project would be: 34 subtests covering system calls (prefixed, restarted), stops, state, guest faults, invalidation (also from 8 threads at once), misaligned atomics with each signal-handler arrangement, call/return stack overflow and underflow, guest accesses to protected pages, chained handlers (one that leaves with siglongjmp, over 306 stack layouts; one that faults itself, which must end the process quickly; one that returns without fixing the fault) and sent signals, garbage struct sizes, lifetime races and error paths | not yet run | pass, both |
+| `FEXCoreOrderingTest` | Multi-thread x86 memory-ordering litmus tests and misaligned locked-operation counts, in three emulation modes; see above | not yet run | pass, both, in each mode |
+| `FEXCoreMutexWakeTest` | The core's reader-writer lock never loses a wake-up, in six queueing orders | not yet run | pass, both; with the bug restored, two orders hang |
+| `fexmac_c_test` | A C program using only `fexmac.h`, linked as an outside project would be: 35 subtests covering system calls (prefixed, restarted), stops, state, guest faults, invalidation (also from 8 threads at once), misaligned atomics with each signal-handler arrangement, call/return stack overflow and underflow, guest accesses to protected pages, chained handlers (one that leaves with siglongjmp, over 306 stack layouts; one that faults itself, which must end the process quickly; one that returns without fixing the fault) and sent signals, garbage struct sizes, lifetime races, split locked operations from 8 threads (exact totals) and error paths | not yet run | pass, both |
 | `fexmac_hook_test` | The same library built with test hooks, 9 subtests: guest and callback accesses to guard pages are not claimed, the scratch-buffer guard is disarmed after each translation, a log callback cannot re-enter the library, a fault inside the handler crashes with a message instead of hanging, the log callback is never called from a signal handler, a failed create leaves no log hook, invalidation leaves fault signals unblocked | not yet run | pass, both |
+| `FEXCoreBench` with `Scripts/macos_bench.py --quick` | The freestanding x86-64 benchmark (18 kernels, 4 guest threads) in three translator configurations, as built and hardened: every checksum must match the recorded value and the native arm64 build (and Rosetta 2's where present); TSO off may get the message-passing kernel wrong | not yet run (added after the last hosted run) | pass, both |
 | `JITWriteProbe` | Reports how the machine treats executable memory, including writes and switches from a fault handler and instruction-cache flushing | report only | see the facts above |
 | `JITWriteProbe --expect-enforced` | The same, but exits 1 unless every asserted case gives the result the port relies on with write protection enforced, or if a fault-handler case's handler never ran | not run: the hosted Mac does not enforce, so it would fail | pass, as built and hardened |
 | `Scripts/macos_check_linkage.sh` | Fails if the core or a test tool links anything but `libSystem` and `libc++`, if one of them is missing, or if the bundled `fmt` was not compiled. Homebrew's `fmt` is installed first. `otool` shows only that no fmt dylib is linked; the `build.ninja` check covers a static one | not yet run (added after the last hosted run) | pass, both toolchains |

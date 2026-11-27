@@ -153,8 +153,9 @@ hexadecimal; a leading 0 is refused rather than read as octal.
 | `IS64BIT_MODE` | 1 | 32-bit guests cannot have the memory they need on macOS |
 
 Everything else is refused on purpose, for example `DISKCACHE` and `DISKCACHEPATH` (the
-code cache is switched on with the `code_cache_*` config fields, below), `STRICTINPROCESSSPLITLOCKS` (makes the fault
-handler spin on a lock), `GDBSERVER`, `SINGLESTEP`, `JITFEATURES`. To add one, give it
+code cache is switched on with the `code_cache_*` config fields, below),
+`STRICTINPROCESSSPLITLOCKS` (always on: see "Fault handler locks"), `GDBSERVER`,
+`SINGLESTEP`, `JITFEATURES`. To add one, give it
 the narrowest rule in `Options.cpp` and list it here.
 
 ## Host faults and signal handlers
@@ -221,12 +222,56 @@ with a host handler (installed before, or owning the signals) the host receives 
 Delivering it to the guest with reconstructed state is package D.
 
 `fexmac_handle_fault` allocates nothing, takes no lock that code outside a fault handler
-holds and never calls the log callback. The one lock it can take is the core's per-block
-patch spin lock, held only by another thread's fault handler for the few instructions of
-a patch (the option that would add another, `STRICTINPROCESSSPLITLOCKS`, is refused). If
-the core meets an atomic instruction it cannot rewrite (a core bug), it formats an error
-message, which allocates; the library writes it with `write(2)` and the fault is not
-claimed.
+holds and never calls the log callback. If the core meets an atomic instruction it cannot
+rewrite (a core bug), it formats an error message, which allocates; the library writes it
+with `write(2)` and the fault is not claimed.
+
+### Fault handler locks
+
+The handler can take two spin locks, both the core's, and nothing else:
+
+- **The per-block patch lock** (in the block's tail), around the rewrite of a misaligned
+  acquire load or release store. Held for the few instructions of a patch; no guest
+  memory is touched while it is held.
+- **The split-lock lock** (`StrictInProcessSplitLocks`, one word per context), around
+  the emulation of one locked operation (`lock xadd`, `lock cmpxchg`, `xchg`, ...) on a
+  word that crosses 16 bytes. The core emulates those with two compare-and-swaps; without
+  the lock two emulations interleave and lose updates (`fexmac_c_test
+  split-locks-concurrent` fails 3 of 3 runs without it). The library always sets it on;
+  the option is not one an embedder can set, because switching it off only loses updates
+  and buys nothing measurable.
+
+Why holding them cannot deadlock or hang, from the code (`HandleUnalignedAccess`,
+`HandleAtomicMemOp`, `HandleCASAL`, `HandleCASPAL` and the `DoCAS*` helpers in
+`FEXCore/Source/Utils/ArchHelpers/Arm64.cpp`):
+
+- Each lock is taken and released within one call of the handler (a scoped guard); no
+  code path leaves the handler between the two. The library never leaves its handler by
+  a jump from these paths, and the only other way out of the handler, the scratch-buffer
+  restart, is a different branch that takes neither lock.
+- Only the fault handler takes them. A guest stop (`hlt`, a guest exception, a system
+  call) is reached from the dispatcher, never from inside the handler, so neither lock is
+  held when `fexmac_thread_run` returns or a callback runs.
+- No asynchronous signal can interrupt the holder with the library's handlers (way 1):
+  every asynchronous signal is blocked while they run. With way 2 the host chooses the
+  mask, but nothing an asynchronous handler may call takes either lock: both are reached
+  only through `fexmac_handle_fault` for an alignment fault in translated code.
+- The holder cannot need the same lock again: the emulation's own accesses are aligned
+  atomics, which cannot take an alignment fault, and the patch path touches only code.
+- The one fault possible while a lock is held is the split-lock emulation's access to
+  guest memory that is not accessible (a misaligned locked operation on a protected or
+  unmapped page). With the library's handlers this fault is reported as the guest's and
+  the process dies (`fexmac_c_test guest-lock-xadd-prot-none-dies`); the lock dies with
+  it. With way 2 the host's handler receives that fault while the lock is held (the
+  library does not claim it): if the host returns after fixing the page, the emulation
+  finishes and releases the lock; if it ends the process, nothing waits. **A host must
+  not leave such a fault with `siglongjmp`**: the lock would stay held and every later
+  split locked operation in the process would spin forever (the library's per-thread
+  depth stays raised too, as already documented).
+
+A thread spinning for either lock is in a fault handler with asynchronous signals
+blocked (way 1); the holder is another thread doing a bounded step, so the wait ends
+unless the holder's process is dying.
 
 ### Connecting the library
 
@@ -399,6 +444,7 @@ alarm kills it.
 | `sent-signal-ignored`, `sent-signal-default-dies` | `kill(SIGSEGV)` with the previous action "ignore" or the default |
 | `unclaimed-fault-dies` | a host fault outside guest code dies silently with SIGBUS |
 | `invalidate-concurrent` | 8 guest threads invalidating in every one of 20,000 system calls each while the main thread invalidates in a loop, at least 12 runs; a progress watchdog fails it within 5 seconds of a hang. It hung in each of 3 runs before package E's reader-writer lock fix and passed 6 of 6 after it |
+| `split-locks-concurrent` | 8 threads at once run 30,000 `lock xadd` each on one qword crossing 16 bytes, a 128-byte line and the 16K page, a `lock cmpxchg` increment loop across 16 bytes (each adding 0x100000001, which changes both halves), and a spin lock taken with `xchg` across 16 bytes and released by a plain store; every total must be exact. With the split-lock lock switched off in a scratch build, the three `lock xadd` totals came out short in 3 of 3 runs |
 | `lifetime-races` | runs racing with destroys of the same thread; context destroy racing with CPUID, invalidation and thread creation |
 | `cache-off` | without the cache: state `OFF`, blocks compiled, nothing loaded or queued, flush `UNSUPPORTED` |
 | `cache-cold-warm` | a cold run queues and flushes; a second context in the same process loads everything and compiles nothing (code at a different address) |
@@ -457,6 +503,3 @@ mapped as a code range, flushes before exiting and prints the translation counte
   library's handler returns too and the instruction faults again, forever. It should end
   in death by the original signal. The test runner avoids it by owning the signals (way 2).
 - Several contexts in one process (the core's configuration is process-wide).
-- `FEXCoreOrderingTest` (package E) still uses the superseded `CoreThreadSetup.h` and
-  `MacOSHostFaults.h` rather than `fexmac.h`; `MacOSHostFaults.h` now uses the same
-  syndrome check for alignment faults.
