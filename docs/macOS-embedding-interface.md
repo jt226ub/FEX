@@ -524,58 +524,79 @@ unmapped address (reported as `SEGV_MAPERR`, not present) and SIGBUS for a prote
 ### Guest memory faults: what is exact
 
 Checked by `Scripts/macos_fault_diff.py` (the package D review's differential harness,
-kept as a permanent test; tool `fexmac_fault_diff`): 54 programs, each with one marked
+kept as a permanent test; tool `fexmac_fault_diff`): 281 programs, each with one marked
 instruction that faults on a test page, in all four multiblock/TSO combinations, each
 translated with `SMCCHECKS` full and none, comparing the complete guest state (all GPRs,
 rip, rflags, MXCSR, x87 control/status/tags and registers, MMX, XMM, YMM upper halves,
-FS/GS bases, a hash of the data pages) at the fault against a run where the marked
-instruction is `hlt`, the result after fixing the page and resuming against a clean run,
-and, for writes, the result through the write-protection path against `SMCCHECKS` full.
-Every difference fails the test unless `Source/Embedding/tests/fault_diff_known.txt`
-lists it; a listed difference that disappears fails it too.
+FS/GS bases, a hash of the data pages) at the fault against a reference run (the marked
+instruction replaced by `hlt`; for `rep` forms, the same program with rcx set to the
+elements x86 completes before the fault), the result after fixing the page and resuming
+against a clean run, and, for writes, the result through the write-protection path
+(`mtrack`) against `SMCCHECKS` full. The data area is mapped at a fixed address so that
+stored addresses compare alike. Every difference fails the test unless
+`Source/Embedding/tests/fault_diff_known.txt` lists it; a listed difference that
+disappears fails it too. The programs cover every ALU, shift, rotate and bit-test form on
+memory at every size with CF live afterwards (`rmw-*`), `xadd`, `cmpxchg`, `shld`/`shrd`,
+`pop [m]`, `leave`, `enter`, `push`/`call` across a page, 16- and 32-byte stores and
+`fxsave` across a page, x87 store-and-pop, and 121 `rep movs`/`rep stos` cases (every
+element size, both directions, faults at offsets 1 to 65 into a 32-byte chunk, overlapping
+copies ahead and behind by 1, 3, 8 and 31 bytes, a faulting source).
 
-**Exact:** for an instruction whose only effect before its faulting access is that access
-(loads, plain stores, `push`/`pop` of registers, `call`/`ret`, `movs` single, vector loads
-and 16-byte stores, x87 loads and stores, `fxsave`, `lock` operations, `rep lods`/`scas`/
-`cmps` part-way), the reported state is the state before the instruction, including state
-the translator caches outside its static registers. For that, on macOS the core flushes
-its whole register cache (DF, MMX, the AVX upper halves, cached context values) and puts
-the flags in their canonical form before every instruction with a memory operand, and
-writes a virtual x87 stack back to the frame first (`Core.cpp`, `__APPLE__`). Before
-this, a fault after `std` reported DF clear (and a resumed `rep movsb` ran forward), after
-`movq mm0, rax` mm0 was 0, after `vpcmpeqb ymm0` the upper half was stale, and after
-`fld1; fldpi` the x87 stack was empty. (Memory operands of the `[reg]` form were not even
-recognised as such before; they now are, in every addressing form.)
+**Exact (the state before the instruction, and running again gives x86's result):**
 
-**Not exact (listed in `fault_diff_known.txt`; criterion 4 is not met while these
-remain):**
+- Loads, plain stores, register `push`/`pop`, `call`/`ret`, vector and x87 accesses,
+  `lock` operations. On macOS the core flushes its whole register cache (DF, MMX, the AVX
+  upper halves, cached context values) and puts the flags in their canonical form before
+  every instruction with a memory operand, and writes a virtual x87 stack back to the
+  frame first (`Core.cpp`, `__APPLE__`). Before this, a fault after `std` reported DF
+  clear, after `movq mm0, rax` mm0 was 0, after `vpcmpeqb ymm0` the upper half was stale,
+  and after `fld1; fldpi` the x87 stack was empty.
+- **Read-modify-write instructions on memory** (`add`, `or`, `adc`, `sbb`, `and`, `sub`,
+  `xor`, `inc`, `dec`, `neg`, rotates and shifts, `shld`/`shrd`, `bts`/`btr`/`btc`, `xadd`,
+  `cmpxchg`, `lock` forms) and **`pop [m]`, `leave`**: these change the flags (or rsp)
+  before their store. Design: an *undo record*. Before such an instruction (chosen in
+  `Core.cpp` by opcode name and a memory destination) the translated code stores NZCV, the
+  raw PF and AF, and for the stack forms rsp, into `CPUState::UndoNZCV/UndoPF/UndoAF/
+  UndoRSP`, sets `CPUState::UndoMask` to the live slots, and clears it after the
+  instruction. The fault path (`Faults.cpp`, SpillGuestState) uses the saved values when
+  the mask is set. The mask lives in the thread frame rather than in the RIP-entry metadata
+  because the fault path then needs no lookup, and the code cache needs no format change
+  for it (its port revision is bumped anyway, to 3, for the new code). `xadd`/`cmpxchg`
+  write their register only after the store and x87 store-and-pop pops after the store
+  (checked; no record needed). Cost: three or four stores before and one after each such
+  instruction (see the performance table in `docs/macOS-port-status.md`). Before this,
+  `stc; sbb qword [m], 1` on 0x100 resumed to 0xff (x86 0xfe) and `pop [m]` resumed with
+  rsp off by 8.
+- **`rep movs` / `rep stos`** (JIT `MemCpy`/`MemSet`, `EmitRepStringInPlace` in
+  `MemoryOps.cpp`): when the IR passes the guest's own rcx/rsi/rdi static registers (no
+  segment base added), the loop uses them as its induction variables: one element is
+  loaded and stored before the registers move; 32-byte chunks (`ldp`/`stp` of two q
+  registers) only while the destination chunk is 32-byte aligned (so a chunk store cannot
+  cross a page and a faulting one writes nothing) and the source is at least 32 bytes
+  away (so a chunk never reads its own writes; overlapping copies go element by element,
+  in x86's order); the plain and the TSO (`ldapr`/`stlr`, per element) forms; both
+  directions. The interrupt page is written every chunk and every 64 elements, so a stop
+  request lands inside a long `rep` with exact registers and running again continues
+  (`stop-rep-movs`: 32 MB copies and stores, overlapping by 1, 24 and -3 bytes, about 15
+  to 290 stops each, final memory compared with x86's element-by-element result). `rep
+  lods`/`scas`/`cmps` were already exact.
+- **Multi-part stores:** a 32-byte store is emitted as two 16-byte stores, the upper half
+  first, so a store running into an inaccessible page above writes nothing; `push`,
+  `call`, `enter`, 16-byte stores and `cmpxchg16b` across a page write nothing before the
+  fault (checked).
 
-- **Instructions that change guest state before their last faulting access** are not
-  restartable: read-modify-write instructions on memory set the flags before the store
-  (`add`, `neg`, `shl`, `btc`, `xadd`, `cmpxchg` report the post-instruction flags;
-  `adc`/`sbb`/`rcl`/`rcr [m]` also consume and rewrite CF, so running them again computes
-  a wrong result: `stc; sbb qword [m], 1` with 0x100 gives 0xff, x86 0xfe); `pop [m]`
-  adds 8 to rsp before the store (resuming pops the wrong value); `leave` sets rsp to rbp
-  before its load; a 32-byte `vmovdqu` store across a page writes its first 16 bytes
-  before the fault; `call` with a read-only stack leaves a different memory image after
-  resuming. Making them exact means reordering each such opcode handler in the core's
-  opcode dispatcher (commit registers and flags after the last access that can fault, or
-  record an undo the handler applies) for every read-modify-write, stack and string form
-  and the multi-part stores; see the package report for options and cost. Not done.
-- **`rep movs` / `rep stos`** run as one host loop (`MemCpy`/`MemSet` in the JIT) that
-  updates rcx/rsi/rdi only at the end: a fault part-way reports the registers from before
-  the instruction with part of the memory written, and running again redoes the copy,
-  which is wrong for an overlapping forward copy (the memmove pattern). They are also not
-  interruptible by a stop request. Fixing it means rewriting those JIT loops to keep
-  x86-exact progress in the guest registers and to check the interrupt page every N
-  chunks. Not done.
+**Not exact, at the fault only (listed in `fault_diff_known.txt`; running again gives
+x86's result in every case):**
+
+- A 32-byte store whose *lower* page is the inaccessible one has already written its
+  upper 16 bytes.
+- `fxsave` across a page may be partly written (x86 may leave it partly written too).
 - **Dead flags:** a flag that the rest of the block overwrites without reading (typically
   PF and AF, when only CF or ZF is read later) is not computed and is reported as the
-  frame held it. Running again is unaffected; a handler that reads EFLAGS sees it.
-
-The embedder may still fix the cause and run again; for the instructions above the result
-can be wrong, so an embedder that resumes guest faults (demand paging, guard pages) must
-know its guest does not depend on them, or wait for the fix.
+  frame held it (`sub-carry-then-load-adc`, `flags-multiblock-edge`). Running again is
+  unaffected; a handler that reads EFLAGS sees it.
+- `rep movs`/`rep stos` with a segment-override prefix (rare in 64-bit code) still use the
+  core's general loop: registers from before the instruction, memory partly written.
 
 The embedder may then fix the cause (map or unprotect the page) and run again, which runs
 the same instruction (`fault-mid-block`, `fault-store-loop`, the `guest-*` subtests), or

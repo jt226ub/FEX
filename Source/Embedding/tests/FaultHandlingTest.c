@@ -452,8 +452,8 @@ static void TestFaultKinds(void) {
   }
 }
 
-/* rep lodsb into an inaccessible page shows its progress; rep stosb reports the state from
- * before the instruction (the core's limit) and completes when run again. */
+/* rep lodsb and rep stosb into an inaccessible page show their progress, as x86 does, and
+ * complete when run again. */
 static void TestFaultRep(void) {
   fexmac_install_fault_handlers();
   for (int TSO = 0; TSO < 2; ++TSO) {
@@ -477,8 +477,8 @@ static void TestFaultRep(void) {
       Check(Stop.fault_address >= Start && Stop.fault_address < Addr(Data) + 0x4000 + 64,
             "fault address at the inaccessible page (+0x%" PRIx64 ")", Stop.fault_address - Addr(Data));
       if (Stos) {
-        Check(State.gpr[RCX] == 1000 && State.gpr[RDI] == Start, "rep stos: registers as before the instruction (rcx %" PRIu64 ")",
-              State.gpr[RCX]);
+        Check(State.gpr[RCX] == 900 && State.gpr[RDI] == Start + 100 && Data[0x4000 - 1] == 0x5A,
+              "rep stos: rcx %" PRIu64 " and rdi +%" PRIu64 " show 100 bytes done, and stored", State.gpr[RCX], State.gpr[RDI] - Start);
       } else {
         Check(State.gpr[RCX] == 900 && State.gpr[RSI] == Start + 100, "rep lods: rcx %" PRIu64 " and rsi +%" PRIu64 " show 100 bytes done",
               State.gpr[RCX], State.gpr[RSI] - Start);

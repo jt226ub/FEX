@@ -108,6 +108,36 @@ for d in (1, 3, 8, 31):
 # The source page inaccessible instead.
 REP_CASES.append(rep_case("rep-movsq-src-none", "lea rsi, [r15-64]\nlea rdi, [rsi-0x2000]", "rep movsq", 8, 32, 0))
 
+# Read-modify-write and stack forms (undo records): every ALU, shift, rotate and bit-test
+# form on memory at each size, with CF live afterwards and the flags pushed.
+RMW_CASES = []
+for ins in ["add {s} [r15], 3", "or {s} [r15], rax", "adc {s} [r15], 7", "sbb {s} [r15], 1", "and {s} [r15], 0x55", "sub {s} [r15], rcx",
+            "xor {s} [r15], 1", "inc {s} [r15]", "dec {s} [r15]", "neg {s} [r15]", "not {s} [r15]", "rol {s} [r15], 1", "ror {s} [r15], 3",
+            "rcl {s} [r15], 1", "rcr {s} [r15], 2", "shl {s} [r15], cl", "shr {s} [r15], 1", "sar {s} [r15], 3", "bts {s} [r15], 3",
+            "btr {s} [r15], 1", "btc {s} [r15], 2", "lock add {s} [r15], 1", "lock sbb {s} [r15], 1"]:
+    for size in ("byte ptr", "word ptr", "dword ptr", "qword ptr"):
+        if ins.startswith("bt") and size == "byte ptr":
+            continue
+        text = ins.format(s=size).replace(", rax", ", " + {"byte ptr": "al", "word ptr": "ax", "dword ptr": "eax", "qword ptr": "rax"}[size])
+        text = text.replace(", rcx", ", " + {"byte ptr": "cl", "word ptr": "cx", "dword ptr": "ecx", "qword ptr": "rcx"}[size])
+        RMW_CASES.append(("rmw-" + text.replace(" ptr", "").replace(" ", "-").replace(",", "").replace("[", "").replace("]", ""),
+                          "stc\nFAULT: " + text + "\nadc rbx, 0\npushfq\npop rdx\nhlt", 1))
+for ins in ["shld qword ptr [r15], rax, 3", "shrd dword ptr [r15], eax, cl", "xadd qword ptr [r15], rbx", "xadd word ptr [r15], bx",
+            "cmpxchg dword ptr [r15], ebx", "xchg qword ptr [r15], rax", "pop qword ptr [r15]", "pop word ptr [r15]"]:
+    RMW_CASES.append(("rmw-" + ins.split()[0] + "-" + ins.split()[1], "stc\npush 77\nFAULT: " + ins + "\nadc rbx, 0\npushfq\npop rdx\nhlt", 1))
+RMW_CASES.append(("leave-rbp-none", "lea rbp, [r15+8]\nFAULT: leave\nhlt", 0))
+# Multi-part stores across a page boundary.
+RMW_CASES += [
+    ("ystore-cross-low-ro", "FAULT: vmovdqu [r15+0x4000-16], ymm1\nhlt", 1),
+    ("fxsave-cross-ro", "FAULT: fxsave [r15-256]\nhlt", 1),
+    ("xsave-like-movdqu-pair", "FAULT: movdqu [r15-8], xmm2\nhlt", 1),
+    ("enter-cross-ro", "lea rsp, [r15+8]\nlea rbp, [r15+0x200]\nFAULT: enter 32, 2\nhlt", 1),
+    ("cmpxchg16b-cross-ro", "lea rdi, [r15-8]\nFAULT: lock cmpxchg16b [r15]\nhlt", 1),
+    ("push-cross-ro", "lea rsp, [r15+4]\nFAULT: push rax\nhlt", 1),
+    ("call-cross-ro", "lea rsp, [r15+4]\nFAULT: call 1f\n1: hlt", 1),
+    ("fstp-tbyte-cross-ro", "fld1\nFAULT: fstp tbyte ptr [r15-4]\nhlt", 1),
+]
+
 MODES = [(0, 0), (1, 0), (0, 1), (1, 1)]
 # The guest-fault comparisons run with each way of translating: SMCCHECKS full (the
 # default; its per-instruction check also splits blocks, which can hide a missing flush)
@@ -216,7 +246,7 @@ def main():
             words = line.split("#", 1)[0].split()
             if len(words) >= 2:
                 known.add((words[0], words[1]))
-    cases = [c for c in CASES + REP_CASES if args.filter in c[0]]
+    cases = [c for c in CASES + REP_CASES + RMW_CASES if args.filter in c[0]]
     failures = 0
     seen = set()
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as pool:

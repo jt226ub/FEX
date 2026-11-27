@@ -343,7 +343,7 @@ static void TestSplitEmulationFaultHosted(void) {
  * offset in the guard page. Each overflow restarts the translation from the restart
  * point with a buffer twice as generous; the block must then run correctly, the thread
  * must be back in executable state (or the translated code would fault), and the guard
- * must be disarmed. With the core's default first size, a long run of rep movsq
+ * must be disarmed. Starting from 16 bytes per IR node, a long run of rep movsq
  * overflows once; starting from 1 byte per IR node, blocks overflow up to 6 times. */
 static uint64_t OverflowsForBlock(size_t Count, size_t Every, uint32_t Start, uint8_t* Data, int* Wrong) {
   fexmac_context* Context = CreateContextWithOptions(BigBlockOptions, 2, NULL, NULL);
@@ -372,12 +372,21 @@ static void TestScratchOverflowMany(void) {
   uint8_t* Data = MapGuestMemory(0x10000);
   int Wrong = 0;
 
-  /* The default first size: the premise of fexmac_c_test scratch-overflow-sizes, whose
-   * sweep runs from a block that fits to one that overflows. */
-  const uint64_t Smallest = OverflowsForBlock(96, 32, 0, Data, &Wrong);
-  const uint64_t Largest = OverflowsForBlock(416, 32, 0, Data, &Wrong);
+  /* rep movsq translates to about 19 bytes of host code per IR node (the in-place loop
+   * of the macOS port; the core's general loop was about 26), under the core's first
+   * allowance of 24, so blocks of it no longer overflow at the default. With a first
+   * allowance of 16 bytes per node, 96 fit and 416 overflow; every size between, one
+   * instruction apart, runs correctly, so the guard is hit at offsets across its page. */
+  const uint64_t Smallest = OverflowsForBlock(96, 32, 16, Data, &Wrong);
+  const uint64_t Largest = OverflowsForBlock(416, 32, 16, Data, &Wrong);
   Check(Wrong == 0 && Smallest == 0 && Largest >= 1,
-        "with the default first size, 96 rep movsq fit (%" PRIu64 " overflows) and 416 overflow (%" PRIu64 ")", Smallest, Largest);
+        "with 16 bytes per IR node first, 96 rep movsq fit (%" PRIu64 " overflows) and 416 overflow (%" PRIu64 ")", Smallest, Largest);
+  int Swept = 0, SweptOverflowing = 0;
+  for (size_t Count = 96; Count <= 416; ++Count, ++Swept) {
+    SweptOverflowing += OverflowsForBlock(Count, 32, 16, Data, &Wrong) > 0;
+  }
+  Check(Wrong == 0 && SweptOverflowing > 100, "%d blocks of 96 to 416 rep movsq at 16 bytes per node ran correctly (%d overflowed)", Swept,
+        SweptOverflowing);
 
   /* A thread keeps its scratch buffer between translations and only claims a larger
    * one when a translation needs it, so each translation gets a fresh context, and with
@@ -422,7 +431,7 @@ static void TestScratchLimitStops(void) {
   const fexmac_stop Stop = Run(Thread);
   Check(Stop.reason == FEXMAC_STOP_UNSUPPORTED_INSTRUCTION && Stop.instruction_address == (uint64_t)(uintptr_t)Code,
         "a block that does not fit within the limit stops as untranslatable at its start (reason %d)", Stop.reason);
-  Check(fexmac_testing_scratch_overflows(Thread) >= 3, "after overflowing %" PRIu64 " times", fexmac_testing_scratch_overflows(Thread));
+  Check(fexmac_testing_scratch_overflows(Thread) >= 2, "after overflowing %" PRIu64 " times (at least twice)", fexmac_testing_scratch_overflows(Thread));
   uint64_t Low = 0, High = 0, Scratch = 1;
   fexmac_testing_guard_pages(Thread, &Low, &High, &Scratch);
   Check(Scratch == 0, "the scratch-buffer guard is disarmed after giving up");

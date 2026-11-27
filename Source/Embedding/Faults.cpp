@@ -249,6 +249,11 @@ namespace {
 
   // ---- Leaving translated code (see the top of this file) ----
 
+  // The static registers holding the raw PF and AF values (REG_PF, REG_AF in the core's
+  // Arm64Emitter.h).
+  constexpr unsigned PFRegister = 26;
+  constexpr unsigned AFRegister = 27;
+
   void SpillGuestState(fexmac_thread* Current, ucontext_t* Context) {
     auto* Thread = Current->Thread;
     auto* Frame = Thread->CurrentFrame;
@@ -276,8 +281,24 @@ namespace {
     constexpr unsigned CallRetStackRegister = 25;
     Frame->State.callret_sp = X[CallRetStackRegister];
     // NZCV from PSTATE and PF/AF from their registers, written back in the frame's form.
-    const uint32_t EFLAGS = CTX->ReconstructCompactedEFLAGS(Thread, true, X, State.__cpsr);
+    // An instruction that changes them (or rsp) before its last access that can fault
+    // saved them first (the undo record, CPUState::UndoMask): use the saved values, the
+    // state before the instruction.
+    const uint32_t Undo = Frame->State.UndoMask;
+    uint64_t Registers[32];
+    memcpy(Registers, X, sizeof(Registers));
+    uint64_t PSTATE = State.__cpsr;
+    if (Undo & FEXCore::Core::CPUState::UNDO_FLAGS) {
+      PSTATE = Frame->State.UndoNZCV;
+      Registers[PFRegister] = Frame->State.UndoPF;
+      Registers[AFRegister] = Frame->State.UndoAF;
+    }
+    const uint32_t EFLAGS = CTX->ReconstructCompactedEFLAGS(Thread, true, Registers, PSTATE);
     CTX->SetFlagsFromCompactedEFLAGS(Thread, EFLAGS);
+    if (Undo & FEXCore::Core::CPUState::UNDO_RSP) {
+      Frame->State.gregs[FEXCore::X86State::REG_RSP] = Frame->State.UndoRSP;
+    }
+    Frame->State.UndoMask = 0;
     Frame->InSyscallInfo = 0;
   }
 

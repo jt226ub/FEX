@@ -104,7 +104,19 @@ void OpDispatchBuilder::AVX128_StoreResult_WithOpSize(FEXCore::X86Tables::Decode
     AddressMode A = DecodeAddress(Op, Operand, AccessType, false /* IsLoad */);
 
     if (Src.High) {
+#ifdef __APPLE__
+      // The upper half first, as two stores: a store pair crossing into a page that
+      // faults can write its first half before the fault, which a guest resumed after the
+      // fault (macOS embedding library) would see. With the upper half first, a store
+      // running into an inaccessible page above writes nothing. (A store whose lower page
+      // is the inaccessible one still writes the upper half first.)
+      AddressMode High = A;
+      High.Offset += 16;
+      _StoreMemFPRAutoTSO(OpSize::i128Bit, High, Src.High, OpSize::i8Bit);
+      _StoreMemFPRAutoTSO(OpSize::i128Bit, A, Src.Low, OpSize::i8Bit);
+#else
       _StoreMemPairFPRAutoTSO(OpSize::i128Bit, A, Src.Low, Src.High, OpSize::i8Bit);
+#endif
     } else {
       _StoreMemFPRAutoTSO(OpSize::i128Bit, A, Src.Low, OpSize::i8Bit);
     }

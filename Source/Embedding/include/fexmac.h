@@ -562,15 +562,19 @@ FEXMAC_EXPORT uint64_t fexmac_memory_code_write_count(fexmac_context* context);
  * but the host refused it (a file mapping past its end, for example). Without registered
  * memory the library goes by the host fault: SIGSEGV from the host is an unmapped page,
  * SIGBUS a protected one. The guest state (registers, flags, x87, MMX, XMM/YMM, MXCSR) is
- * the state before the faulting instruction for instructions whose only effect before
- * the faulting access is that access (loads, plain stores, register push/pop, call/ret,
- * vector and x87 accesses, lock operations, rep lods/scas/cmps part-way). NOT for
- * read-modify-write instructions on memory (their flags are already updated; adc, sbb,
- * rcl and rcr also compute wrong when run again), pop [m] and leave (rsp already
- * changed), a 32-byte store crossing into the faulting page (first half written), and
- * rep movs / rep stos part-way (registers from before the instruction, memory partly
- * written; an overlapping forward copy run again gives a different result). Flags the
- * rest of the block overwrites without reading may be stale. See
+ * the state before the faulting instruction, and running it again after fixing the
+ * cause gives x86's result. That includes read-modify-write instructions on memory
+ * (their flags are put back from an undo record the translated code saves before them;
+ * xadd/cmpxchg write their register only after the store), pop [m] and leave (rsp put
+ * back the same way), x87 store-and-pop (the stack is popped after the store), push/call/enter
+ * and 16- and 32-byte stores across a page (nothing written when the higher page faults),
+ * and rep movs / stos / lods / scas / cmps, which stop part-way with rcx, rsi and rdi
+ * counting exactly the elements done, as x86 does (rep movs/stos with a segment-override
+ * prefix excepted: those report the registers from before the instruction with memory
+ * partly written). Not exact, at the fault only (running
+ * again is right): a 32-byte store whose LOWER page faults has already written its upper
+ * half, fxsave/xsave across a page may be partly written (as on x86), and flags the rest
+ * of the block overwrites without reading (PF and AF most often) may be stale. See
  * docs/macOS-embedding-interface.md, "Guest memory faults: what is exact".
  *
  * One fault outside these is always a core bug: an access past the end of a code buffer,

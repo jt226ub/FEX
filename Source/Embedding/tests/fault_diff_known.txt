@@ -1,38 +1,19 @@
 # Differences Scripts/macos_fault_diff.py knows about and does not fail on: case, check.
-# Each is a limit of the translator that package D did not fix; see
+# Each is a limit of the translator that package D did not fix, at the fault only: running
+# again gives x86's result in every case. See
 # docs/macOS-embedding-interface.md, "Guest memory faults: what is exact".
 #
-# Not restartable: the instruction changes guest state (flags, a register, part of the
-# memory) before its last access that can fault, so the state at the fault is not the
-# state before it and running it again after the fix computes from changed state.
-add-rmw-ro-flags        at-fault   # add [m]: flags computed before the store
-carry-rcl-0             at-fault   # rcl [m]: CF consumed and rewritten before the store
-carry-rcl-0             resume
-carry-rcl-0             smc
-carry-rcr-1             at-fault
-carry-rcr-1             resume
-carry-rcr-1             smc
-carry-sbb-2             at-fault   # sbb [m]: CF consumed and rewritten before the store
-carry-sbb-2             resume
-carry-sbb-2             smc
-carry-rcl-4             at-fault
-carry-rcl-4             resume
-carry-rcl-4             smc
-carry-neg-6             at-fault   # flags of the RMW set before its store (reported only)
-carry-shl-7             at-fault
-carry-btc-8             at-fault
-carry-xadd-9            at-fault
-carry-cmpxchg-10        at-fault
-leave-stack-fault       at-fault   # leave: rsp = rbp before the load of rbp
-pop-mem-dst-fault       at-fault   # pop [m]: rsp += 8 before the store
-pop-mem-dst-fault       resume
-pop-mem-dst-fault       smc
-call-stack-ro           resume     # call: see the doc (the return address the resumed call writes)
-call-stack-ro           smc
-ystore-cross-ro         at-fault   # 32-byte store: first 16 bytes written before the fault
+# Every restartable-fault entry (read-modify-write flags, pop [m], leave, rep movs/stos,
+# the 32-byte store, the call stack) is fixed: undo records and in-place rep loops.
 #
 # Dead flags: PF and AF (or any flag) that the rest of the block overwrites without reading
 # are not computed and are reported as whatever the frame held. Running again is not
 # affected. With SMCCHECKS full the extra per-instruction block split computes them.
 sub-carry-then-load-adc   at-fault
 flags-multiblock-edge     at-fault
+#
+# Multi-part stores that can leave part of their data written before a fault (running
+# again writes the same data, so the resumed result is right; only the memory seen at the
+# fault differs from x86's):
+ystore-cross-low-ro    at-fault   # 32-byte store whose LOWER page faults: the upper half is stored first
+fxsave-cross-ro        at-fault   # fxsave across a page: written in parts (x86 too may leave it partly written)

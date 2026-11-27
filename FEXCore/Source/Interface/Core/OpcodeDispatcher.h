@@ -1257,6 +1257,25 @@ public:
     _StoreContext(Size, Class, Value, Offset);
   }
 
+#ifdef __APPLE__
+  // The undo record (CPUState::UndoMask). Called right after the full register-cache
+  // flush before the instruction, so the flags are in their canonical form.
+  void SaveUndoRecord(uint32_t Mask) {
+    if (Mask & Core::CPUState::UNDO_FLAGS) {
+      _StoreContextGPR(OpSize::i32Bit, GetNZCV(), offsetof(Core::CPUState, UndoNZCV));
+      _StoreContextGPR(OpSize::i32Bit, _LoadPF(OpSize::i32Bit), offsetof(Core::CPUState, UndoPF));
+      _StoreContextGPR(OpSize::i32Bit, _LoadAF(OpSize::i32Bit), offsetof(Core::CPUState, UndoAF));
+    }
+    if (Mask & Core::CPUState::UNDO_RSP) {
+      _StoreContextGPR(OpSize::i64Bit, LoadGPRRegister(X86State::REG_RSP), offsetof(Core::CPUState, UndoRSP));
+    }
+    _StoreContextGPR(OpSize::i32Bit, Constant(Mask), offsetof(Core::CPUState, UndoMask));
+  }
+  void ClearUndoRecord() {
+    _StoreContextGPR(OpSize::i32Bit, Constant(0), offsetof(Core::CPUState, UndoMask));
+  }
+#endif
+
   void FlushRegisterCache(bool SRAOnly = false, bool MMXOnly = false) {
     // At block boundaries, fix up the carry flag.
     if (!SRAOnly) {

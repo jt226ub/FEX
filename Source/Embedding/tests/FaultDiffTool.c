@@ -60,15 +60,23 @@ static void Dump(const char* Tag, const fexmac_stop* Stop) {
   for (int i = 0; i < 16; i++) {
     printf("%s.ymmh%d=%" PRIx64 ":%" PRIx64 "\n", Tag, i, S.ymm_high[i][1], S.ymm_high[i][0]);
   }
+  /* Hashed per aligned 8-byte word, with addresses inside the mapping made relative to
+   * it, so that a stored address (a return address, a pushed rsp) hashes alike in two
+   * runs that got the mapping at different addresses. */
   uint64_t H = 1469598103934665603ULL;
-  for (int i = 0x10000; i < 0x30000; i++) {
+  for (int i = 0x10000; i < 0x30000; i += 8) {
     if (i >= 0x14000 && i < 0x18000 && !TestPageReadable) {
       continue;
     }
     if (i >= 0x17F00 && i < 0x18000) {
       continue; /* the warm-up stub */
     }
-    H ^= Base[i];
+    uint64_t V;
+    memcpy(&V, Base + i, sizeof(V));
+    if (V >= B && V < B + 0x100000) {
+      V -= B;
+    }
+    H ^= V;
     H *= 1099511628211ULL;
   }
   printf("%s.memhash=%" PRIx64 "\n", Tag, H);
@@ -101,7 +109,13 @@ int main(int argc, char** argv) {
     return 2;
   }
   fexmac_install_fault_handlers();
-  Base = mmap(NULL, 0x100000, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  /* The same address in every run, so that memory holding addresses (return addresses,
+   * pushed pointers, also stored misaligned) compares alike between runs. */
+  Base = mmap((void*)(uintptr_t)0x500000000000ULL, 0x100000, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+  if (Base == MAP_FAILED) {
+    printf("mapping failed\n");
+    return 2;
+  }
   memcpy(Base, Code, N);
   for (int i = 0x10000; i < 0x30000; i++) {
     Base[i] = (uint8_t)(i * 7 + 3);

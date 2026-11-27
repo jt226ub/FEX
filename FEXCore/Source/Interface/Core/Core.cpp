@@ -722,11 +722,43 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
           MayFault = (TableInfo->Flags & X86Tables::InstFlags::FLAGS_DEBUG_MEM_ACCESS) || IsMemory(DecodedInfo->Dest) ||
                      IsMemory(DecodedInfo->Src[0]) || IsMemory(DecodedInfo->Src[1]) || IsMemory(DecodedInfo->Src[2]);
         }
+        // Instructions that change guest state before their last access that can fault
+        // save it first (CPUState::UndoMask), so the fault path can give the state
+        // before the instruction and running it again computes the same result.
+        uint32_t UndoMask = 0;
+        if (MayFault && TableInfo->Name) {
+          static constexpr std::string_view FlagsRMW[] = {"ADD", "OR",  "ADC", "SBB",  "AND",  "SUB", "XOR", "INC", "DEC",
+                                                          "NEG", "ROL", "ROR", "RCL",  "RCR",  "SHL", "SAL", "SHR", "SAR",
+                                                          "SHLD", "SHRD", "BTS", "BTR", "BTC", "XADD", "CMPXCHG"};
+          const std::string_view Name {TableInfo->Name};
+          const auto IsMemoryDest = [&] {
+            using T = X86Tables::DecodedOperand::OpType;
+            switch (DecodedInfo->Dest.Type) {
+            case T::GPRDirect:
+            case T::GPRIndirect:
+            case T::GPRIndirectRelocation:
+            case T::RIPRelative:
+            case T::RIPRelativeRelocation:
+            case T::SIB:
+            case T::SIBRelocation: return true;
+            default: return false;
+            }
+          };
+          if (IsMemoryDest() && std::find(std::begin(FlagsRMW), std::end(FlagsRMW), Name) != std::end(FlagsRMW)) {
+            UndoMask |= Core::CPUState::UNDO_FLAGS;
+          }
+          if ((Name == "POP" && IsMemoryDest()) || Name == "LEAVE") {
+            UndoMask |= Core::CPUState::UNDO_RSP;
+          }
+        }
         if (MayFault) {
           if (SawX87) {
             Thread->OpDispatcher->_SyncStackToSlow();
           }
           Thread->OpDispatcher->FlushRegisterCache(false);
+          if (UndoMask) {
+            Thread->OpDispatcher->SaveUndoRecord(UndoMask);
+          }
         } else {
           Thread->OpDispatcher->FlushRegisterCache(true);
         }
@@ -800,6 +832,11 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
 
           Thread->OpDispatcher->SetForceTSO(ForceTSO);
           std::invoke(Fn, Thread->OpDispatcher, DecodedInfo);
+#ifdef __APPLE__
+          if (UndoMask) {
+            Thread->OpDispatcher->ClearUndoRecord();
+          }
+#endif
           if (Thread->OpDispatcher->HadDecodeFailure()) {
             HadDispatchError = true;
           } else {
