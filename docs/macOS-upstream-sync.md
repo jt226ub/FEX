@@ -8,31 +8,62 @@ base. Nothing is ever sent upstream: no push, pull request, issue or comment.
 
 | Date | Upstream `main` | Merge base before | New upstream commits | Branch |
 |---|---|---|---|---|
-| 27 November 2026 | `a92baf073` | `3ee253992` | 11 (7 without merges) | `macos/wp-h-upstream-sync` |
+| 27 November 2026 | `a92baf073` | `3ee253992` | 11 (7 without merge commits) | `macos/wp-h-upstream-sync` |
 
 ## The script
 
 ```
-Scripts/macos_sync_upstream.sh [--here | --branch NAME] [--dry-run] [port-branch] [upstream-ref]
+Scripts/macos_sync_upstream.sh [--here | --branch NAME] [--dry-run | --harden-only] [port-branch] [upstream-ref]
 ```
 
 Defaults: port branch `macos/v1`, upstream ref `main`. It:
 
-1. Sets an invalid push address (`DISABLED-never-push-upstream`) on every remote whose
-   address is FEX-Emu/FEX, and keeps a fetch-only remote `upstream-readonly`.
-2. Fetches the upstream ref into `refs/remotes/upstream-readonly/<ref>`. A named ref is
-   used instead of `FETCH_HEAD`, which each worktree keeps separately.
-3. Prints the new upstream commits, the files both sides changed, submodule pointers
-   upstream moved, instruction tests upstream added or changed, and the upstream source
-   files to review.
-4. Merges with `--no-ff`. Without options it first creates `sync/upstream-<hash>` from
-   the port branch in the current worktree. With `--here` it merges into the branch
-   checked out in this worktree, which must already contain the port branch (a package
-   branch made from `macos/v1`, for example). With `--dry-run` it stops after step 3.
-5. On conflict it stops with status 2 and lists the conflicted files.
+1. **Makes upstream unpushable.** Any remote with a fetch or push address that names
+   FEX-Emu/FEX has all its push addresses removed and replaced by one invalid address
+   (`DISABLED-never-push-upstream`). The match ignores letter case, `.git` and trailing
+   slashes, and covers https, ssh (with or without a port) and scp-style addresses. It
+   checks both the configured addresses and the addresses after `insteadOf` and
+   `pushInsteadOf` rewriting, so a fork remote whose push address leads upstream is
+   caught too. Every remote's push addresses are then resolved again, and the script
+   stops with status 3 if any can still reach FEX-Emu/FEX. An existing
+   `upstream-readonly` remote must point only at FEX-Emu/FEX, or the script stops with
+   status 3. `--harden-only` does this step alone and reports each change.
+2. **Checks what needs no network**: a clean tree (untracked files are allowed), that
+   the port branch exists, and for `--here` a checked-out branch that contains the port
+   branch.
+3. **Fetches** the upstream ref from the fixed address `https://github.com/FEX-Emu/FEX.git`,
+   not through a remote, into `refs/remotes/upstream-readonly/<ref>`. It refuses if a
+   `url.*.insteadOf` rule would send that fetch elsewhere. A named ref is used instead of
+   `FETCH_HEAD`, which each worktree keeps separately. A fetch-only `upstream-readonly`
+   remote is added if missing.
+4. **Reports** the new upstream commits (all of them, and how many are not merge
+   commits), the files both sides changed, submodule pointers upstream moved,
+   instruction tests upstream added, changed or renamed, and the upstream source files
+   to review. It refuses if an untracked file sits where upstream adds a file.
+5. **Merges** with `--no-ff`. Without options it first creates `sync/upstream-<hash>`
+   from the port branch in the current worktree. With `--here` it merges into the branch
+   checked out in this worktree.
+
+`--dry-run` does steps 1 to 4 but fetches into a temporary ref that is deleted on exit.
+It creates no branch, remote or lasting ref and merges nothing. The only change it can
+make is step 1's safety change, which it lists. The fetched objects stay in the object
+store.
+
+Exit status: 0 merged or nothing to do; 1 refused before merging, or the merge did not
+start (for example because of an untracked file git would overwrite), with git's reason
+printed and nothing merged; 2 the merge stopped on conflicts, with the conflicted files
+listed and the merge left in progress to resolve; 3 a remote could still push upstream,
+or `upstream-readonly` or the fetch address points elsewhere.
 
 It works from any worktree and never checks out the port branch itself, so it runs while
 another worktree has `macos/v1` checked out. It never pushes.
+
+`Scripts/macos_sync_upstream_test.sh` tests it offline, in the Mac job too. It builds
+throwaway repositories under a temporary path with spaces and runs every case under
+macOS's bash 3.2: remotes in each address form, every refusal, the dry run, a clean
+merge, a conflict, and a merge that does not start. For the merge cases the environment
+variable `MACOS_SYNC_TEST_UPSTREAM_URL` stands in a local repository for upstream; it is
+a test hook only and the script says so when it is set.
 
 ## Resolving conflicts
 
