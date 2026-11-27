@@ -27,6 +27,11 @@ FEXMAC_EXPORT void fexmac_testing_log_from_fault_handler(int enable);
  * stop), to observe the signal mask there. */
 FEXMAC_EXPORT void fexmac_testing_set_invalidation_hook(void (*hook)(void));
 
+/* The inaccessible guard pages of a thread: the low and high guard of its call/return
+ * stack, and the page after its translator scratch buffer (0 before its first
+ * translation). */
+FEXMAC_EXPORT void fexmac_testing_guard_pages(fexmac_thread* thread, uint64_t* callret_low, uint64_t* callret_high, uint64_t* scratch);
+
 /* Logs a core message at info level, outside any fault handler. */
 FEXMAC_EXPORT void fexmac_testing_log(const char* message);
 

@@ -1179,6 +1179,14 @@ CPUBackend::CompiledCode Arm64JITCore::EmitJITCode(uint64_t Entry, uint64_t Size
 
   TempCodeBufferAllocator.DelayedDisownBuffer();
 
+#ifdef __APPLE__
+  // The block is emitted: the scratch buffer's guard page and restart point are only
+  // meaningful while the emitter writes. Disarming them here lets the macOS embedder
+  // (Source/Embedding/Faults.cpp) restart only a translation that is really running,
+  // instead of jumping to this stale restart point for a later stray write to the page.
+  ThreadState->JITGuardPage = 0;
+#endif
+
   ClearICache(CodeBegin, CodeOnlySize);
 
 #ifdef VIXL_DISASSEMBLER

@@ -34,7 +34,9 @@ fexmac_stop Run(fexmac_thread* Thread);
 struct Subtest {
   const char* Name;
   void (*Run)(void);
-  /* 0: the child must exit 0. Otherwise it must die by exactly this signal. */
+  /* 0: the child must exit 0. -1: it must die by SIGSEGV, SIGBUS or SIGILL
+   * (how macOS ends a process whose stack is exhausted while delivering a signal). Otherwise it must
+   * die by exactly this signal. */
   int ExpectSignal;
   /* If set, the child's standard error must contain this text. */
   const char* ExpectStderr;
