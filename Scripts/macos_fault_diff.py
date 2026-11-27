@@ -105,6 +105,17 @@ for d in (1, 3, 8, 31):
     REP_CASES.append(rep_case("rep-movsb-overlap-behind-%d" % d, "lea rdi, [r15-40]\nlea rsi, [rdi+%d]" % d, "rep movsb", 40, 128))
     REP_CASES.append(rep_case("rep-movsb-back-overlap-%d" % d, "std\nlea rdi, [r15+0x4000+39]\nlea rsi, [rdi+%d]" % d, "rep movsb", 40,
                               128))
+# The source runs into the inaccessible page part-way through a 32-byte chunk while the
+# destination is 32-byte aligned (the chunked path): progress is still x86's.
+for ins, size in (("rep movsb", 1), ("rep movsd", 4), ("rep movsq", 8)):
+    for k in (8, 20, 24, 40, 1000, 4000):
+        if k % size:
+            continue
+        REP_CASES.append(rep_case("%s-src-mid-%d" % (ins.replace(" ", "-"), k), "lea rsi, [r15-%d]\nlea rdi, [r15-0x3100]" % k, ins,
+                                  k // size, k // size + 128, 0))
+        REP_CASES.append(rep_case("%s-src-back-mid-%d" % (ins.replace(" ", "-"), k),
+                                  "std\nlea rsi, [r15+0x4000+%d]\nlea rdi, [r15+0x6100-%d]" % (k - size, size), ins, k // size,
+                                  k // size + 128, 0))
 # The source page inaccessible instead.
 REP_CASES.append(rep_case("rep-movsq-src-none", "lea rsi, [r15-64]\nlea rdi, [rsi-0x2000]", "rep movsq", 8, 32, 0))
 

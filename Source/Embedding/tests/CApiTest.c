@@ -2025,13 +2025,12 @@ static void TestSplitLockSignalStorm(void) {
  * block's IR, followed by a guard page; a block whose code is larger runs into the guard
  * and the translation restarts with a buffer twice as generous. The finished block is
  * copied into the shared code buffer, which is replaced by a larger one when the block
- * does not fit in what is left. `rep movsq` produces much host code per IR node
- * (FEX_bugs/CodeBufferOverflow uses it the same way); with rcx = 0 it does nothing. With
- * the macOS port's in-place rep loop it stays under the core's first allowance, so these
- * blocks test large translations and code-buffer replacement; fexmac_hook_test lowers the
- * first allowance (a testing hook) to sweep the scratch guard and count overflows. */
+ * does not fit in what is left. `rep movsq` produces far more host code per IR node than
+ * the first size allows (FEX_bugs/CodeBufferOverflow uses it the same way), so runs of
+ * it overflow; with rcx = 0 it does nothing. fexmac_hook_test counts the overflows. */
 
-/* Blocks of every size from 96 to 416 instructions, in steps of one instruction. A thread keeps its
+/* Blocks of every size from below the first overflow to well past it, in steps of one
+ * instruction, so the guard is hit at every offset in its page. A thread keeps its
  * scratch buffer between translations and only claims a larger one when a translation
  * needs it, so each size gets a fresh context, and with it a first buffer of exactly
  * the size the translator asks for. */

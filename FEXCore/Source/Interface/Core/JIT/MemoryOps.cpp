@@ -1870,13 +1870,14 @@ DEF_OP(StoreMemTSO) {
 //    load or the store leaves the registers before that element and nothing of it
 //    written (a single store of up to 8 bytes does not write partly on this hardware;
 //    the differential test checks a store across a page);
-//  - 32-byte chunks (ldp/stp of two q registers) only while the destination chunk is
-//    32-byte aligned, so it cannot cross a page and a faulting stp writes nothing, and
-//    only when source and destination are at least 32 bytes apart, so a chunk never
-//    reads bytes it writes (overlapping copies go element by element, which is x86's
-//    order); a load that faults has written nothing of the chunk;
-//  - the interrupt fault page is written every chunk and every 64 elements, so a stop
-//    request lands inside a long rep with the registers exact; running again continues.
+//  - 32-byte chunks (ldp/stp of two q registers) in runs during which neither the source
+//    nor the destination chunk crosses a 4K page, so a chunk faults whole or not at all,
+//    exactly where x86 would stop; only when source and destination are at least 32
+//    bytes apart, so a chunk never reads bytes it writes (overlapping copies go element
+//    by element, which is x86's order);
+//  - the interrupt fault page is written after every run (at most a page) and every 64
+//    elements, so a stop request lands inside a long rep with the registers exact;
+//    running again continues.
 // NZCV is not touched (no flag-setting instruction). Direction comes from DF.
 // Returns false (and emits nothing) when the registers are not the guest's.
 bool Arm64JITCore::EmitRepStringInPlace(bool Copy, bool IsAtomic, size_t Size, ARMEmitter::Register Length, ARMEmitter::Register DestIn,
@@ -1956,18 +1957,16 @@ bool Arm64JITCore::EmitRepStringInPlace(bool Copy, bool IsAtomic, size_t Size, A
 
     (void)Bind(&ElementLoop);
     if (!IsAtomic) {
-      // Chunk when at least one chunk is left, the destination chunk is 32-byte aligned
-      // and (copies) source and destination are 32 bytes apart or more.
+      // A run of 32-byte chunks (ldp/stp of two q registers) when at least one chunk is
+      // left and (copies) source and destination are 32 bytes apart or more, so that a
+      // chunk never reads bytes it writes. The run is as long as neither the source nor
+      // the destination chunk crosses a 4K page: a chunk's access then either faults
+      // whole or not at all, at an element boundary x86 would also stop at, with the
+      // registers counting the chunks before it. Elements one at a time otherwise, until
+      // the page boundary is passed.
       ARMEmitter::ForwardLabel NoChunk;
       sub(ARMEmitter::Size::i64Bit, TMP1, R, ChunkElements);
       (void)tbnz(TMP1, 63, &NoChunk);
-      if (Back) {
-        add(ARMEmitter::Size::i64Bit, TMP1, D, Size);
-      } else {
-        mov(TMP1, D);
-      }
-      and_(ARMEmitter::Size::i64Bit, TMP1, TMP1, 31);
-      (void)cbnz(ARMEmitter::Size::i64Bit, TMP1, &NoChunk);
       if (Copy) {
         ARMEmitter::ForwardLabel Positive;
         sub(ARMEmitter::Size::i64Bit, TMP1, D, S);
@@ -1977,6 +1976,33 @@ bool Arm64JITCore::EmitRepStringInPlace(bool Copy, bool IsAtomic, size_t Size, A
         sub(ARMEmitter::Size::i64Bit, TMP1, TMP1, 32);
         (void)tbnz(TMP1, 63, &NoChunk);
       }
+      // TMP1 = whole chunks before the page boundary, for one pointer.
+      auto Room = [&](ARMEmitter::Register Out, ARMEmitter::XRegister Pointer) {
+        and_(ARMEmitter::Size::i64Bit, Out, Pointer, 4095);
+        if (Back) {
+          add(ARMEmitter::Size::i64Bit, Out, Out, Size);
+        } else {
+          neg(ARMEmitter::Size::i64Bit, Out, Out);
+          add(ARMEmitter::Size::i64Bit, Out, Out, 4096);
+        }
+        lsr(ARMEmitter::Size::i64Bit, Out, Out, 5);
+      };
+      // Out = min(Out, Other), without flags.
+      auto Min = [&](ARMEmitter::Register Out, ARMEmitter::Register Other) {
+        ARMEmitter::ForwardLabel Keep;
+        sub(ARMEmitter::Size::i64Bit, TMP3, Other, Out);
+        (void)tbz(TMP3, 63, &Keep);
+        mov(Out.X(), Other.X());
+        (void)Bind(&Keep);
+      };
+      Room(TMP1, D);
+      if (Copy) {
+        Room(TMP2, S);
+        Min(TMP1, TMP2);
+      }
+      lsr(ARMEmitter::Size::i64Bit, TMP2, R, 5 - Log2);
+      Min(TMP1, TMP2);
+      (void)cbz(ARMEmitter::Size::i64Bit, TMP1, &NoChunk);
       (void)Bind(&ChunkLoop);
       if (Back) {
         sub(ARMEmitter::Size::i64Bit, TMP2, D, 32 - Size);
@@ -1993,25 +2019,20 @@ bool Arm64JITCore::EmitRepStringInPlace(bool Copy, bool IsAtomic, size_t Size, A
         if (Copy) {
           ldp<ARMEmitter::IndexType::OFFSET>(VTMP1.Q(), VTMP2.Q(), S, 0);
         }
-        stp<ARMEmitter::IndexType::OFFSET>(Copy ? VTMP1.Q() : VTMP2.Q(), VTMP2.Q(), D, 0);
-        add(ARMEmitter::Size::i64Bit, D, D, 32);
+        // Post-index: rdi moves only when the store is done.
+        stp<ARMEmitter::IndexType::POST>(Copy ? VTMP1.Q() : VTMP2.Q(), VTMP2.Q(), D, 32);
         if (Copy) {
           add(ARMEmitter::Size::i64Bit, S, S, 32);
         }
       }
       sub(ARMEmitter::Size::i64Bit, R, R, ChunkElements);
+      sub(ARMEmitter::Size::i64Bit, TMP1, TMP1, 1);
+      (void)cbnz(ARMEmitter::Size::i64Bit, TMP1, &ChunkLoop);
+      // At most a page per run: the interrupt check, then the next run.
       EmitSuspendInterruptCheck();
-      sub(ARMEmitter::Size::i64Bit, TMP1, R, ChunkElements);
-      (void)tbz(TMP1, 63, &ChunkLoop);
       (void)cbz(ARMEmitter::Size::i64Bit, R, &Finished);
-      if (!Copy) {
-        // The pattern register was clobbered only for copies; nothing to restore.
-      } else if (false) {
-      }
+      (void)b(&ElementLoop);
       (void)Bind(&NoChunk);
-      if (Copy) {
-        // VTMP2 held copy data; a memset never reaches here with it changed.
-      }
     }
     // One element.
     if (Copy) {
