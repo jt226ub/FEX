@@ -93,9 +93,12 @@ The header documents every function. The design decisions:
   written the guest registers back.
 - **Stop reasons:** `SYSCALL`, `HALT` (a user-mode `hlt`, which the core reports as a
   general protection fault at the instruction) and `GUEST_FAULT` (an exception the core
-  detects itself, with vector, signal, `si_code`, error code and address; also code the
-  translator cannot translate at all, such as `int 0x80` in 64-bit mode, which arrives as
-  SIGILL, vector 6, at the instruction instead of crashing the host). Stopping a
+  detects itself, with vector, signal, `si_code`, error code and address) and
+  `UNSUPPORTED_INSTRUCTION`: the translator cannot translate the instruction at
+  `instruction_address` although x86 may define it (`int 0x80` in 64-bit mode, `mov` to
+  fs or gs, `o16 iret`, ...), as opposed to a guest #UD such as `ud2`, which is a
+  `GUEST_FAULT` with si_code 2. It is filled like #UD (SIGILL, vector 6, si_code 0) so a
+  host can still deliver it as one. Before this the host crashed at address 0. Stopping a
   thread from another thread and guest memory faults are package D.
 - **One context per process.** The core's configuration, its log hooks and the fault
   handlers are process-wide, so a second `fexmac_context_create` returns `BUSY` until the
@@ -342,6 +345,15 @@ variables for supported options only.
 - Self-modifying code detected by write-protecting pages (package D).
 - Stopping a thread from another thread through the interrupt fault page (package D).
 - Guest memory faults delivered as stops with reconstructed guest state (package D).
+- Before resuming a guest from the core's synchronous-fault entry (package D's guest
+  fault delivery), reset the host stack: the route the core takes there for untranslatable
+  code from `ExitFunctionLink` (`UntranslatableFault` in `Core.cpp`) does not, unlike
+  `DEF_OP(Break)`, so call/return entries stay on it. Harmless today because the handler
+  never returns.
+- The fault-handler contract does not say what happens when the library chains to a
+  previously installed handler and that handler returns without resolving the fault: the
+  library's handler returns too and the instruction faults again, forever. It should end
+  in death by the original signal. The test runner avoids it by owning the signals (way 2).
 - Cached translations (package F; reserved fields above).
 - Several contexts in one process (the core's configuration is process-wide).
 - `FEXCoreOrderingTest` (package E) still uses the superseded `CoreThreadSetup.h` and
