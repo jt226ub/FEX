@@ -505,7 +505,9 @@ int main(int argc, char** argv) {
   for (const auto& [Address, Size] : Img.Code) {
     const uint64_t Begin = Address & ~uint64_t {0xFFF};
     const uint64_t End = (Address + Size + 0xFFF) & ~uint64_t {0xFFF};
-    if (fexmac_memory_protect(Context, Begin, End - Begin, FEXMAC_PROT_READ | FEXMAC_PROT_EXEC) != FEXMAC_OK) {
+    // Segments are 4K-aligned and may share a 16K host page with data: accept the host
+    // page's union protection there (the guest never relies on it).
+    if (fexmac_memory_protect(Context, Begin, End - Begin, FEXMAC_PROT_READ | FEXMAC_PROT_EXEC | FEXMAC_PROT_ALLOW_UNENFORCED) != FEXMAC_OK) {
       Die("cannot register the image's code");
     }
   }

@@ -144,6 +144,10 @@ public:
   // so the next change discards translations regardless. Guarded by Mutex.
   bool UntrackedCode {};
 
+  // Changes the embedder accepted with FEXMAC_PROT_ALLOW_UNENFORCED or by unmapping part
+  // of a host page: host pages whose 4K guest pages do not all agree (relaxed).
+  std::atomic<uint64_t> UnenforcedChanges {};
+
   // Number of writes to write-protected code handled (statistics, relaxed).
   std::atomic<uint64_t> CodeWriteFaults {};
 

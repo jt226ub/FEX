@@ -409,7 +409,7 @@ void InvalidateLocked(fexmac_context* Context, uint64_t Start, uint64_t Length) 
   }
 }
 
-fexmac_result SetGuestMemory(fexmac_context* Context, uint64_t Address, uint64_t Size, uint8_t Value, bool RequireMapped);
+fexmac_result SetGuestMemory(fexmac_context* Context, uint64_t Address, uint64_t Size, uint8_t Value, bool RequireMapped, bool AllowUnenforced);
 fexmac_result WriteBegin(fexmac_context* Context, uint64_t Address, uint64_t Size, bool Begin);
 
 void SyscallHandler::HandleSyscall(FEXCore::Core::CpuStateFrame* Frame) {
@@ -1035,10 +1035,12 @@ fexmac_result fexmac_memory_map(fexmac_context* context, uint64_t address, uint6
   if (!Use) {
     return FEXMAC_ERROR_INVALID_HANDLE;
   }
+  const bool AllowUnenforced = prot & FEXMAC_PROT_ALLOW_UNENFORCED;
+  prot &= ~FEXMAC_PROT_ALLOW_UNENFORCED;
   if (prot & ~GuestMemory::ProtMask) {
     return FEXMAC_ERROR_INVALID_ARGUMENT;
   }
-  return SetGuestMemory(context, address, size, static_cast<uint8_t>(prot | GuestMemory::Mapped), false);
+  return SetGuestMemory(context, address, size, static_cast<uint8_t>(prot | GuestMemory::Mapped), false, AllowUnenforced);
 }
 
 fexmac_result fexmac_memory_protect(fexmac_context* context, uint64_t address, uint64_t size, uint32_t prot) {
@@ -1049,10 +1051,12 @@ fexmac_result fexmac_memory_protect(fexmac_context* context, uint64_t address, u
   if (!Use) {
     return FEXMAC_ERROR_INVALID_HANDLE;
   }
+  const bool AllowUnenforced = prot & FEXMAC_PROT_ALLOW_UNENFORCED;
+  prot &= ~FEXMAC_PROT_ALLOW_UNENFORCED;
   if (prot & ~GuestMemory::ProtMask) {
     return FEXMAC_ERROR_INVALID_ARGUMENT;
   }
-  return SetGuestMemory(context, address, size, static_cast<uint8_t>(prot | GuestMemory::Mapped), true);
+  return SetGuestMemory(context, address, size, static_cast<uint8_t>(prot | GuestMemory::Mapped), true, AllowUnenforced);
 }
 
 fexmac_result fexmac_memory_unmap(fexmac_context* context, uint64_t address, uint64_t size) {
@@ -1063,7 +1067,10 @@ fexmac_result fexmac_memory_unmap(fexmac_context* context, uint64_t address, uin
   if (!Use) {
     return FEXMAC_ERROR_INVALID_HANDLE;
   }
-  return SetGuestMemory(context, address, size, 0, false);
+  // Unmapping part of a host page is always done (the memory is gone for the guest), but
+  // if the rest of the host page stays mapped the guest can still reach the unmapped
+  // part: counted in fexmac_memory_unenforced_count.
+  return SetGuestMemory(context, address, size, 0, false, true);
 }
 
 fexmac_result fexmac_memory_query(fexmac_context* context, uint64_t address, uint32_t* prot, int* mapped) {
@@ -1104,6 +1111,17 @@ fexmac_result fexmac_memory_write_end(fexmac_context* context, uint64_t address,
     return FEXMAC_ERROR_INVALID_HANDLE;
   }
   return WriteBegin(context, address, size, false);
+}
+
+uint64_t fexmac_memory_unenforced_count(fexmac_context* context) {
+  if (InLogCallback) {
+    return 0;
+  }
+  ContextUse Use {context};
+  if (!Use) {
+    return 0;
+  }
+  return context->Memory.UnenforcedChanges.load(std::memory_order_relaxed);
 }
 
 uint64_t fexmac_memory_code_write_count(fexmac_context* context) {

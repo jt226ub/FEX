@@ -504,7 +504,9 @@ def main():
         ("TSO on, memcpy TSO on", {"FEX_TSOENABLED": "1", "FEX_MEMCPYSETTSOENABLED": "1"}),
         ("max instructions 1", {"FEX_MAXINST": "1"}),
         ("multiblock on", {"FEX_MULTIBLOCK": "1"}),
-        ("full self-modifying-code checks", {"FEX_SMCCHECKS": "full"}),
+        # fexmac's default is SMCCHECKS full (package D), so the other modes are the mismatch.
+        ("self-modifying-code detection by write protection", {"FEX_SMCCHECKS": "mtrack"}),
+        ("no self-modifying-code detection", {"FEX_SMCCHECKS": "none"}),
         ("x87 reduced precision", {"FEX_X87REDUCEDPRECISION": "1"}),
     ]:
         # Within one run the core may load blocks it stored itself moments earlier, so

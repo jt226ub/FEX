@@ -467,8 +467,13 @@ FEXMAC_EXPORT fexmac_result fexmac_thread_request_stop(fexmac_thread* thread);
  * pages are 16K and carry one protection: the library sets each host page to the union
  * of the protections of its four guest pages (minus write access while it holds
  * translated code). So a guest protection is only enforced where all four guest pages of
- * a host page agree; a write to a 4K data page that shares a host page with translated
- * code faults and is handled as a code write (correct, but slow if frequent).
+ * a host page agree (same protection, all mapped). fexmac_memory_map and
+ * fexmac_memory_protect refuse (FEXMAC_ERROR_UNSUPPORTED, nothing changed) a change that
+ * would leave a host page with guest pages that disagree, unless the protection carries
+ * FEXMAC_PROT_ALLOW_UNENFORCED: then the host page gets the union and the guest can read
+ * a PROT_NONE 4K page or write a read-only one next to a more permissive one, without a
+ * fault (fexmac_memory_unenforced_count counts such changes). Lay guest memory out on
+ * 16K boundaries to keep every protection enforced.
  *
  * After registering, the embedder must change protections only with these functions,
  * not with mprotect (which would undo the write protection without discarding
@@ -487,6 +492,10 @@ FEXMAC_EXPORT fexmac_result fexmac_thread_request_stop(fexmac_thread* thread);
 #define FEXMAC_PROT_READ 1u
 #define FEXMAC_PROT_WRITE 2u
 #define FEXMAC_PROT_EXEC 4u
+/* Accept a protection the host cannot enforce (see "Granularity"); without it such a
+ * fexmac_memory_map or fexmac_memory_protect is refused. Not a protection: never
+ * stored, never reported by fexmac_memory_query. */
+#define FEXMAC_PROT_ALLOW_UNENFORCED 0x100u
 
 /* Records that [address, address + size) is mapped with the guest protection `prot`
  * (FEXMAC_PROT_* bits) and sets the host protection of the host pages it covers (see
@@ -507,6 +516,10 @@ FEXMAC_EXPORT fexmac_result fexmac_memory_query(fexmac_context* context, uint64_
 /* See "Writes by the embedder". Calls must pair up with the same range; they nest. */
 FEXMAC_EXPORT fexmac_result fexmac_memory_write_begin(fexmac_context* context, uint64_t address, uint64_t size);
 FEXMAC_EXPORT fexmac_result fexmac_memory_write_end(fexmac_context* context, uint64_t address, uint64_t size);
+/* Number of changes so far that left a host page with guest pages of different
+ * protections (accepted with FEXMAC_PROT_ALLOW_UNENFORCED, or a partial unmap): on those
+ * host pages the guest's 4K protections are not enforced. */
+FEXMAC_EXPORT uint64_t fexmac_memory_unenforced_count(fexmac_context* context);
 /* Number of guest writes to write-protected code the library has handled. */
 FEXMAC_EXPORT uint64_t fexmac_memory_code_write_count(fexmac_context* context);
 

@@ -28,6 +28,7 @@
 #include <FEXCore/Utils/SignalScopeGuards.h>
 
 #include <algorithm>
+#include <optional>
 #include <cstring>
 #include <signal.h>
 #include <pthread.h>
@@ -265,7 +266,24 @@ namespace {
 
 // Sets the guest pages of [Address, Address + Size) to Value and every host page they
 // touch to its new protection, discarding those host pages' translations.
-fexmac_result SetGuestMemory(fexmac_context* Context, uint64_t Address, uint64_t Size, uint8_t Value, bool RequireMapped) {
+// Whether, with [Address, Address + Size) set to Value, every host page the range touches
+// has four guest pages with the same protection and mapped state: only then can the
+// host's single protection per 16K page enforce the guest's.
+static bool Enforceable(const GuestMemory& Memory, uint64_t Address, uint64_t Size, uint8_t Value) {
+  for (uint64_t HostPage = Address & ~HostPageMask; HostPage < Address + Size; HostPage += GuestMemory::HostPage) {
+    std::optional<uint8_t> First;
+    for (uint64_t Page = HostPage; Page < HostPage + GuestMemory::HostPage; Page += GuestMemory::GuestPage) {
+      const uint8_t Byte = (Page >= Address && Page < Address + Size) ? Value : Memory.Page(Page);
+      if (First && *First != Byte) {
+        return false;
+      }
+      First = Byte;
+    }
+  }
+  return true;
+}
+
+fexmac_result SetGuestMemory(fexmac_context* Context, uint64_t Address, uint64_t Size, uint8_t Value, bool RequireMapped, bool AllowUnenforced) {
   if (!ValidRange(Address, Size) || (Value & GuestMemory::ProtMask) != (Value & ~GuestMemory::Mapped)) {
     return FEXMAC_ERROR_INVALID_ARGUMENT;
   }
@@ -279,6 +297,15 @@ fexmac_result SetGuestMemory(fexmac_context* Context, uint64_t Address, uint64_t
           return;
         }
       }
+    }
+    if (!Enforceable(Memory, Address, Size, Value)) {
+      if (!AllowUnenforced) {
+        // Refused, nothing changed: the embedder can choose a 16K-aligned layout, or say
+        // that it accepts the host page's union protection.
+        Result = FEXMAC_ERROR_UNSUPPORTED;
+        return;
+      }
+      Memory.UnenforcedChanges.fetch_add(1, std::memory_order_relaxed);
     }
     if (!Memory.Tracking()) {
       // Code translated before memory was tracked has no record of its pages.

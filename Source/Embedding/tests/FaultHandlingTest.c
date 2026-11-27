@@ -8,6 +8,7 @@
  */
 #include "TestSupport.h"
 
+#include <fcntl.h>
 #include <inttypes.h>
 #include <pthread.h>
 #include <signal.h>
@@ -632,6 +633,17 @@ static void TestMemoryArguments(void) {
   CheckResult(fexmac_memory_map(Context, Addr(Data), 0x4000, FEXMAC_PROT_READ), FEXMAC_OK, "map");
   CheckResult(fexmac_memory_protect(Context, Addr(Data), 0x4000, FEXMAC_PROT_READ | FEXMAC_PROT_WRITE), FEXMAC_OK, "protect");
   CheckResult(fexmac_memory_write_end(Context, Addr(Data), 0x10), FEXMAC_ERROR_INVALID_ARGUMENT, "write_end without begin");
+  /* 4K protections the 16K host page cannot enforce are refused unless accepted. */
+  CheckResult(fexmac_memory_protect(Context, Addr(Data), 0x1000, FEXMAC_PROT_READ), FEXMAC_ERROR_UNSUPPORTED,
+              "a read-only 4K page inside a writable host page");
+  uint32_t Prot = 0;
+  fexmac_memory_query(Context, Addr(Data), &Prot, NULL);
+  Check(Prot == (FEXMAC_PROT_READ | FEXMAC_PROT_WRITE) && fexmac_memory_unenforced_count(Context) == 0, "the refused change changed nothing");
+  CheckResult(fexmac_memory_protect(Context, Addr(Data), 0x1000, FEXMAC_PROT_READ | FEXMAC_PROT_ALLOW_UNENFORCED), FEXMAC_OK,
+              "the same, accepted with FEXMAC_PROT_ALLOW_UNENFORCED");
+  fexmac_memory_query(Context, Addr(Data), &Prot, NULL);
+  Check(Prot == FEXMAC_PROT_READ && fexmac_memory_unenforced_count(Context) == 1, "recorded, and counted");
+  CheckResult(fexmac_memory_protect(Context, Addr(Data), 0x4000, FEXMAC_PROT_READ), FEXMAC_OK, "the whole host page read-only");
   CheckResult(fexmac_memory_map(NULL, Addr(Data), 0x4000, FEXMAC_PROT_READ), FEXMAC_ERROR_INVALID_HANDLE, "no context");
   CheckResult(fexmac_thread_request_stop(NULL), FEXMAC_ERROR_INVALID_ARGUMENT, "stop request for NULL");
   fexmac_context_destroy(Context);
@@ -1470,6 +1482,7 @@ static fexmac_context* UnmapContext;
 static uint8_t* UnmapBase;
 static atomic_int UnmapDone;
 static atomic_long UnmapFaults;
+static fexmac_thread* _Atomic UnmapThreads[4];
 static void* UnmapGuest(void* Argument) {
   const long i = (long)Argument;
   static const uint8_t P[] = {0xF0, 0x49, 0x0F, 0xC1, 0x5F, 0x0C, 0x48, 0xFF, 0xC1, 0xEB, 0xF5}; /* 1: lock xadd [r15+12], rbx; inc rcx; jmp 1b */
@@ -1479,6 +1492,7 @@ static void* UnmapGuest(void* Argument) {
   S.gpr[15] = Addr(UnmapBase) + 0x40000 + i * 64;
   S.gpr[RBX] = 1;
   SetState(T, &S);
+  atomic_store(&UnmapThreads[i], T);
   while (!atomic_load(&UnmapDone)) {
     const fexmac_stop Stop = Run(T);
     if (Stop.reason == FEXMAC_STOP_GUEST_FAULT) {
@@ -1514,6 +1528,10 @@ static void TestSplitLockUnmapRace(void) {
   }
   atomic_store(&UnmapDone, 1);
   for (int i = 0; i < 4; ++i) {
+    /* The guest loops until a fault or a stop: ask each to stop. */
+    while (!atomic_load(&UnmapThreads[i])) {
+    }
+    fexmac_thread_request_stop(atomic_load(&UnmapThreads[i]));
     pthread_join(G[i], NULL);
   }
   printf("  %ld unmap/map rounds, %ld guest page faults\n", Rounds, atomic_load(&UnmapFaults));
@@ -1555,6 +1573,57 @@ static void TestStopAfterDestroy(void) {
   CheckResult(fexmac_context_destroy(Context), FEXMAC_OK, "context destroy frees the handles");
 }
 
+/* A JIT-style dual mapping: the guest runs code through an executable alias and writes it
+ * through a writable alias of the same memory. Write protection only covers the page the
+ * code was translated from, so the write through the other alias is not seen; the
+ * embedder (which made the alias) must call fexmac_invalidate for the executable alias,
+ * as documented. With that, the new code runs. */
+static void TestSMCAliasNeedsInvalidate(void) {
+  fexmac_install_fault_handlers();
+  fexmac_context* Context = MakeContext(1, 0, "mtrack", NULL, NULL);
+  char Name[64];
+  snprintf(Name, sizeof(Name), "/fexmac-alias-%d", (int)getpid());
+  const int Fd = shm_open(Name, O_RDWR | O_CREAT | O_EXCL, 0600);
+  shm_unlink(Name);
+  if (Fd < 0 || ftruncate(Fd, 0x4000) != 0) {
+    Check(0, "shared memory");
+    return;
+  }
+  uint8_t* Exec = mmap(NULL, 0x4000, PROT_READ | PROT_WRITE, MAP_SHARED, Fd, 0);
+  uint8_t* Write = mmap(NULL, 0x4000, PROT_READ | PROT_WRITE, MAP_SHARED, Fd, 0);
+  static const uint8_t Old[] = {0xB8, 1, 0, 0, 0, 0xF4}; /* mov eax, 1 ; hlt */
+  memcpy(Exec, Old, sizeof(Old));
+  fexmac_memory_map(Context, Addr(Exec), 0x4000, FEXMAC_PROT_READ | FEXMAC_PROT_EXEC);
+  fexmac_memory_map(Context, Addr(Write), 0x4000, FEXMAC_PROT_READ | FEXMAC_PROT_WRITE);
+  /* The writer: mov byte [rdi+1], 42 ; hlt */
+  static const uint8_t Patch[] = {0xC6, 0x47, 0x01, 0x2A, 0xF4};
+  uint8_t* PatchCode = MapCode(Context, Patch, sizeof(Patch), 1);
+  fexmac_thread* Thread = CreateThreadAt(Context, Addr(Exec), 0);
+  fexmac_stop Stop = Run(Thread);
+  fexmac_x86_state State = GetState(Thread);
+  Check(Stop.reason == FEXMAC_STOP_HALT && State.gpr[RAX] == 1, "the old code ran through the executable alias");
+  State.rip = Addr(PatchCode);
+  State.gpr[RDI] = Addr(Write);
+  SetState(Thread, &State);
+  Stop = Run(Thread);
+  Check(Stop.reason == FEXMAC_STOP_HALT && Exec[1] == 42, "the guest wrote the code through the writable alias");
+  State = GetState(Thread);
+  State.rip = Addr(Exec);
+  SetState(Thread, &State);
+  Stop = Run(Thread);
+  State = GetState(Thread);
+  printf("  without fexmac_invalidate the executable alias ran eax %" PRIu64 " (1: stale)\n", State.gpr[RAX]);
+  CheckResult(fexmac_invalidate(Context, Addr(Exec), 0x4000), FEXMAC_OK, "the embedder invalidates the executable alias");
+  State.rip = Addr(Exec);
+  SetState(Thread, &State);
+  Stop = Run(Thread);
+  State = GetState(Thread);
+  Check(Stop.reason == FEXMAC_STOP_HALT && State.gpr[RAX] == 42, "after fexmac_invalidate the new code runs (eax %" PRIu64 ")", State.gpr[RAX]);
+  fexmac_thread_destroy(Thread);
+  fexmac_context_destroy(Context);
+  close(Fd);
+}
+
 const struct Subtest FaultSubtests[] = {
   {"fault-mid-block", TestFaultMidBlock, 0, NULL, "fexmac:", 0},
   {"fault-flags", TestFaultFlags, 0, NULL, "fexmac:", 0},
@@ -1580,6 +1649,7 @@ const struct Subtest FaultSubtests[] = {
   {"stop-resync-storm", TestStopResyncStorm, 0, NULL, "fexmac:", 0},
   {"split-lock-unmap-race", TestSplitLockUnmapRace, 0, NULL, "fexmac:", 0},
   {"stop-after-destroy", TestStopAfterDestroy, 0, NULL, "fexmac:", 0},
+  {"smc-alias-needs-invalidate", TestSMCAliasNeedsInvalidate, 0, NULL, "fexmac:", 0},
   {"smc-embedder-write", TestSMCEmbedderWrite, 0, NULL, "fexmac:", 2},
   {"smc-embedder-write-unbracketed-dies", TestSMCEmbedderWriteUnbracketed, SIGBUS, "fexmac_memory_write_begin", NULL, 1},
 };
