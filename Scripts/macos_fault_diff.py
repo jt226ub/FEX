@@ -121,6 +121,29 @@ for ins, size in (("rep movsb", 1), ("rep movsd", 4), ("rep movsq", 8)):
         REP_CASES.append(rep_case("%s-src-back-mid-%d" % (ins.replace(" ", "-"), k),
                                   "std\nlea rsi, [r15+0x4000+%d]\nlea rdi, [r15+0x6100-%d]" % (k - size, size), ins, k // size,
                                   k // size + 128, 0))
+# fs:/gs: on the source (the in-place loop with the base added per access): with a zero
+# base and with fs set so that fs:[rsi] reaches the same addresses as before.
+for seg in ("fs", "gs"):
+    for ins, size in (("movsb", 1), ("movsq", 8)):
+        for k in (8, 40, 1000):
+            setup = "lea rdi, [r15-%d]\nlea rsi, [rdi-0x2000]" % k
+            REP_CASES.append(rep_case("rep-%s-%s-fwd-%d" % (seg, ins, k), setup, "rep %s %s ptr [rdi], %s:[rsi]" %
+                                      (ins, "byte" if size == 1 else "qword", seg), k // size, k // size + 64))
+        REP_CASES.append(rep_case("rep-%s-%s-src-mid" % (seg, ins), "lea rsi, [r15-40]\nlea rdi, [r15-0x3100]",
+                                  "rep %s %s ptr [rdi], %s:[rsi]" % (ins, "byte" if size == 1 else "qword", seg), 40 // size,
+                                  40 // size + 64, 0))
+    REP_CASES.append(rep_case("rep-%s-movsb-overlap1" % seg, "lea rdi, [r15-100]\nlea rsi, [rdi-1]", "rep movsb byte ptr [rdi], %s:[rsi]" % seg,
+                              100, 228))
+    REP_CASES.append(rep_case("rep-%s-movsb-back-overlap3" % seg, "std\nlea rdi, [r15+0x4000+39]\nlea rsi, [rdi+3]",
+                              "rep movsb byte ptr [rdi], %s:[rsi]" % seg, 40, 128))
+# A non-zero fs base: rsi counts in the segment, the access goes to rsi + base.
+REP_CASES.append(rep_case("rep-fs-base-movsq", "lea rax, [r15-0x1000]\nwrfsbase rax\nmov rsi, 0xf00\nlea rdi, [r15-0x3000]",
+                          "rep movsq qword ptr [rdi], fs:[rsi]", 32, 96, 0))
+# Overlaps with the source ahead in the direction of copying use whole chunks.
+for d in (1, 8, 31):
+    REP_CASES.append(rep_case("rep-movsb-src-ahead-%d" % d, "lea rdi, [r15-100]\nlea rsi, [rdi+%d]" % d, "rep movsb", 100 + 0, 200))
+    REP_CASES.append(rep_case("rep-movsb-back-src-ahead-%d" % d, "std\nlea rdi, [r15+0x4000+99]\nlea rsi, [rdi-%d]" % d, "rep movsb",
+                              100, 200))
 # The source page inaccessible instead.
 REP_CASES.append(rep_case("rep-movsq-src-none", "lea rsi, [r15-64]\nlea rdi, [rsi-0x2000]", "rep movsq", 8, 32, 0))
 
@@ -270,6 +293,21 @@ def check_case(tool, name, src, prot, clean=True, ref_src=None):
             checks = [("at-fault", diff(without_status_flags(f, "a"), without_status_flags(r, "a"), "a", "a"))]
         else:
             checks = [("at-fault", diff(f, r, "a", "a"))]
+        if name.startswith("rep-") and f.get("a.reason") == "3":
+            # x86 reports the first inaccessible byte of the element at rdi (store) or at
+            # rsi plus the segment base (load), with the registers as at the fault (the
+            # reference run's).
+            def offset(value):
+                value = value or "0"
+                return int(value.replace("B+", "").replace("+", ""), 16) if "B" in value or value.startswith("+") else None
+            write = f.get("a.access") == "2"
+            element = offset(r.get("a.gpr7" if write else "a.gpr6"))
+            got = offset(f.get("a.faddr"))
+            if element is not None and got is not None and not write:
+                base = r.get("a.fsbase" if ":[rsi]" in src and "fs:" in src else "a.gsbase" if "gs:" in src else None)
+                element += offset(base) if base and base.startswith("B+") else 0
+            if element is not None and got is not None and got != max(element, got & ~0xFFF):
+                checks.append(("fault-address", ["faddr: got +%x, element at +%x" % (got, element)]))
         if clean:
             checks.append(("resume", diff(f, c, "b", "a")))
         for check, lines in checks:

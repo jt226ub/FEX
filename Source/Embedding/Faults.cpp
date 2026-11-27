@@ -611,6 +611,42 @@ namespace {
     return true;
   }
 
+  // The address x86 reports (CR2) for a fault in rep movs/stos. The in-place loops move
+  // 32-byte chunks; the host reports some address of the faulting chunk (for a backward
+  // chunk its lowest byte), x86 the first inaccessible byte of the element at rdi (store)
+  // or at rsi plus the segment base (load), whose registers are exact here. Anything
+  // that is not such an instruction, or a host address too far from that element, is
+  // left as the host gave it.
+  uint64_t RepStringFaultAddress(const FEXCore::Core::CPUState& State, uint64_t HostAddress, bool Write) {
+    const auto* Bytes = reinterpret_cast<const uint8_t*>(State.rip);
+    bool Rep = false;
+    uint64_t SegmentBase = 0;
+    size_t i = 0;
+    for (; i < 15; ++i) {
+      const uint8_t B = Bytes[i];
+      if (B == 0xF2 || B == 0xF3) {
+        Rep = true;
+      } else if (B == 0x64) {
+        SegmentBase = State.fs_cached;
+      } else if (B == 0x65) {
+        SegmentBase = State.gs_cached;
+      } else if (B == 0x26 || B == 0x2E || B == 0x36 || B == 0x3E || B == 0x66 || B == 0x67 || B == 0xF0 || (B & 0xF0) == 0x40) {
+      } else {
+        break;
+      }
+    }
+    const uint8_t Opcode = i < 15 ? Bytes[i] : 0;
+    if (!Rep || (Opcode != 0xA4 && Opcode != 0xA5 && Opcode != 0xAA && Opcode != 0xAB) || (!Write && (Opcode & 0xFE) == 0xAA)) {
+      return HostAddress;
+    }
+    const uint64_t Element = Write ? State.gregs[FEXCore::X86State::REG_RDI] : State.gregs[FEXCore::X86State::REG_RSI] + SegmentBase;
+    if (HostAddress + 64 < Element || HostAddress > Element + 64) {
+      return HostAddress;
+    }
+    const uint64_t PageStart = HostAddress & ~uint64_t {0xFFF};
+    return Element > PageStart ? Element : PageStart;
+  }
+
   // Any other memory access fault in translated code is the guest's own page fault.
   bool HandleGuestMemoryFault(fexmac_thread* Current, int Signal, const Classification& Kind, siginfo_t* Info, ucontext_t* Context) {
     const uint64_t PC = Context->uc_mcontext->__ss.__pc;
@@ -622,8 +658,8 @@ namespace {
     fexmac_stop Stop {};
     Stop.instruction_address = Current->Thread->CurrentFrame->State.rip;
     const bool Permission = Kind.StatusCode >= 0x0C && Kind.StatusCode <= 0x0F;
-    DescribePageFault(Current->Context, &Stop, reinterpret_cast<uint64_t>(Info->si_addr), Write ? FEXMAC_ACCESS_WRITE : FEXMAC_ACCESS_READ,
-                      Signal, Permission);
+    const uint64_t Address = RepStringFaultAddress(Current->Thread->CurrentFrame->State, reinterpret_cast<uint64_t>(Info->si_addr), Write);
+    DescribePageFault(Current->Context, &Stop, Address, Write ? FEXMAC_ACCESS_WRITE : FEXMAC_ACCESS_READ, Signal, Permission);
     LeaveDispatcherFromHandler(Current, Context, Stop);
     return true;
   }

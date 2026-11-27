@@ -3417,6 +3417,16 @@ void OpDispatchBuilder::MOVSOp(OpcodeArgs) {
 
     Ref Result_Src = _AllocateGPR(false);
     Ref Result_Dst = _AllocateGPR(false);
+#ifdef __APPLE__
+    if (SrcSegment && !DstSegment) {
+      // fs:/gs: source: the in-place loop with the base added per access (exact progress).
+      _MemCpySrcBase(Size, DstAddr, LoadGPRRegister(X86State::REG_RSI), SrcSegment, Counter, LoadDir(1), Result_Dst, Result_Src);
+      StoreGPRRegister(X86State::REG_RCX, Constant(0));
+      StoreGPRRegister(X86State::REG_RDI, Result_Dst);
+      StoreGPRRegister(X86State::REG_RSI, Result_Src);
+      return;
+    }
+#endif
     _MemCpy(CTX->IsAtomicTSOEnabled(), Size, DstAddr, SrcAddr, Counter, LoadDir(1), Result_Dst, Result_Src);
 
     if (DstSegment) {

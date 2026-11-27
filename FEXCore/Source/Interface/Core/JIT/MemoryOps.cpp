@@ -1883,7 +1883,7 @@ DEF_OP(StoreMemTSO) {
 bool Arm64JITCore::EmitRepStringInPlace(bool Copy, bool IsAtomic, size_t Size, ARMEmitter::Register Length, ARMEmitter::Register DestIn,
                                         ARMEmitter::Register SrcIn, ARMEmitter::Register Value, bool DirectionIsInline,
                                         uint64_t DirectionConstant, ARMEmitter::Register DirectionReg, ARMEmitter::Register OutDst,
-                                        ARMEmitter::Register OutSrc) {
+                                        ARMEmitter::Register OutSrc, ARMEmitter::Register SrcBase) {
   const auto RCX = StaticRegisters[X86State::REG_RCX];
   const auto RDI = StaticRegisters[X86State::REG_RDI];
   const auto RSI = StaticRegisters[X86State::REG_RSI];
@@ -1897,6 +1897,16 @@ bool Arm64JITCore::EmitRepStringInPlace(bool Copy, bool IsAtomic, size_t Size, A
   const auto D = RDI.X();
   const auto S = RSI.X();
   const uint32_t Log2 = FEXCore::ilog2(Size);
+  // A segment base (fs:/gs: on the source of rep movs) is added to rsi for every source
+  // access; rsi itself keeps counting x86's way.
+  const bool HasSrcBase = SrcBase != ARMEmitter::Reg::zr;
+  auto SrcAddress = [&](ARMEmitter::Register Temp) -> ARMEmitter::XRegister {
+    if (!HasSrcBase) {
+      return S;
+    }
+    add(ARMEmitter::Size::i64Bit, Temp.X(), S, SrcBase.X());
+    return Temp.X();
+  };
   const uint32_t ChunkElements = 32 / Size;
 
   auto LoadElement = [&](ARMEmitter::XRegister Base) {
@@ -1957,7 +1967,7 @@ bool Arm64JITCore::EmitRepStringInPlace(bool Copy, bool IsAtomic, size_t Size, A
     auto EmitElement = [&]() {
       ARMEmitter::ForwardLabel SkipCheck;
       if (Copy) {
-        LoadElement(S);
+        LoadElement(SrcAddress(TMP2));
         StoreElement(TMP4);
       } else {
         StoreElement(Value);
@@ -1982,15 +1992,19 @@ bool Arm64JITCore::EmitRepStringInPlace(bool Copy, bool IsAtomic, size_t Size, A
     ARMEmitter::ForwardLabel PureEntry;
     ARMEmitter::ForwardLabel OverlapEntry;
     if (!IsAtomic && Copy) {
-      // Source and destination less than 32 bytes apart (an overlapping copy): element by
-      // element throughout, in x86's order. The distance does not change during the copy.
-      ARMEmitter::ForwardLabel Positive;
-      sub(ARMEmitter::Size::i64Bit, TMP1, D, S);
-      (void)tbz(TMP1, 63, &Positive);
-      neg(ARMEmitter::Size::i64Bit, TMP1, TMP1);
-      (void)Bind(&Positive);
-      sub(ARMEmitter::Size::i64Bit, TMP1, TMP1, 32);
-      (void)tbnz(TMP1, 63, &OverlapEntry);
+      // The destination 1 to 32 bytes ahead of the source in the direction of the copy
+      // (the copy reads what it wrote, x86 propagates it): element by element, in x86's
+      // order. A source ahead of the destination is never read after being written by
+      // the copy, so whole chunks (all loads before the stores) are right however close.
+      // The distance does not change during the copy.
+      if (Back) {
+        sub(ARMEmitter::Size::i64Bit, TMP1, SrcAddress(TMP1), D);
+      } else {
+        sub(ARMEmitter::Size::i64Bit, TMP1, D, SrcAddress(TMP1));
+      }
+      sub(ARMEmitter::Size::i64Bit, TMP1, TMP1, 1);
+      lsr(ARMEmitter::Size::i64Bit, TMP1, TMP1, 5);
+      (void)cbz(ARMEmitter::Size::i64Bit, TMP1, &OverlapEntry);
     }
     (void)Bind(&ElementLoop);
     if (!IsAtomic) {
@@ -2026,7 +2040,7 @@ bool Arm64JITCore::EmitRepStringInPlace(bool Copy, bool IsAtomic, size_t Size, A
       };
       Room(TMP1, D);
       if (Copy) {
-        Room(TMP2, S);
+        Room(TMP2, SrcAddress(TMP2));
         Min(TMP1, TMP2);
       }
       lsr(ARMEmitter::Size::i64Bit, TMP2, R, 5 - Log2);
@@ -2036,7 +2050,7 @@ bool Arm64JITCore::EmitRepStringInPlace(bool Copy, bool IsAtomic, size_t Size, A
       if (Back) {
         sub(ARMEmitter::Size::i64Bit, TMP2, D, 32 - Size);
         if (Copy) {
-          sub(ARMEmitter::Size::i64Bit, TMP3, S, 32 - Size);
+          sub(ARMEmitter::Size::i64Bit, TMP3, SrcAddress(TMP3), 32 - Size);
           ldp<ARMEmitter::IndexType::OFFSET>(VTMP1.Q(), VTMP2.Q(), TMP3, 0);
         }
         stp<ARMEmitter::IndexType::OFFSET>(Copy ? VTMP1.Q() : VTMP2.Q(), VTMP2.Q(), TMP2, 0);
@@ -2046,7 +2060,7 @@ bool Arm64JITCore::EmitRepStringInPlace(bool Copy, bool IsAtomic, size_t Size, A
         }
       } else {
         if (Copy) {
-          ldp<ARMEmitter::IndexType::OFFSET>(VTMP1.Q(), VTMP2.Q(), S, 0);
+          ldp<ARMEmitter::IndexType::OFFSET>(VTMP1.Q(), VTMP2.Q(), SrcAddress(TMP2), 0);
         }
         // Post-index: rdi moves only when the store is done.
         stp<ARMEmitter::IndexType::POST>(Copy ? VTMP1.Q() : VTMP2.Q(), VTMP2.Q(), D, 32);
@@ -2079,10 +2093,10 @@ bool Arm64JITCore::EmitRepStringInPlace(bool Copy, bool IsAtomic, size_t Size, A
       ARMEmitter::BackwardLabel FillLoop;
       ARMEmitter::BackwardLabel FillRun;
       ARMEmitter::ForwardLabel FillOne;
-      sub(ARMEmitter::Size::i64Bit, TMP1, D, S);
+      sub(ARMEmitter::Size::i64Bit, TMP1, D, SrcAddress(TMP1));
       sub(ARMEmitter::Size::i64Bit, TMP1, TMP1, 1);
       (void)cbnz(ARMEmitter::Size::i64Bit, TMP1, &NotByOne);
-      ldrb(TMP4.W(), S, 0);
+      ldrb(TMP4.W(), SrcAddress(TMP1), 0);
       dup(ARMEmitter::SubRegSize::i8Bit, VTMP2.Q(), TMP4.W());
       (void)Bind(&FillLoop);
       sub(ARMEmitter::Size::i64Bit, TMP1, R, 32);
@@ -2176,7 +2190,7 @@ DEF_OP(MemSet) {
 #ifdef __APPLE__
   if (Op->Prefix.IsInvalid() &&
       EmitRepStringInPlace(false, IsAtomic, Size, Length, MemReg, ARMEmitter::Reg::zr, Value, DirectionIsInline, DirectionConstant,
-                           DirectionReg, Dst, ARMEmitter::Reg::zr)) {
+                           DirectionReg, Dst, ARMEmitter::Reg::zr, ARMEmitter::Reg::zr)) {
     return;
   }
 #endif
@@ -2399,6 +2413,23 @@ DEF_OP(MemSet) {
   }
 }
 
+DEF_OP(MemCpySrcBase) {
+  // rep movs with fs:/gs: on the source (macOS): the in-place loop with the segment base
+  // added to every source address, so rcx/rsi/rdi stay exact at faults and stops.
+  const auto Op = IROp->C<IR::IROp_MemCpySrcBase>();
+  uint64_t DirectionConstant;
+  bool DirectionIsInline = IsInlineConstant(Op->Direction, &DirectionConstant);
+  ARMEmitter::Register DirectionReg = ARMEmitter::Reg::r0;
+  if (!DirectionIsInline) {
+    DirectionReg = GetReg(Op->Direction);
+  }
+  const bool Emitted = EmitRepStringInPlace(true, CTX->IsMemcpyAtomicTSOEnabled(), IR::OpSizeToSize(Op->Size), GetReg(Op->Length),
+                                            GetReg(Op->Dest), GetReg(Op->Src), ARMEmitter::Reg::zr, DirectionIsInline, DirectionConstant,
+                                            DirectionReg, GetReg(Op->OutDstAddress), GetReg(Op->OutSrcAddress), GetReg(Op->SrcBase));
+  LOGMAN_THROW_A_FMT(Emitted, "MemCpySrcBase needs the guest's rcx/rsi/rdi");
+  (void)Emitted;
+}
+
 DEF_OP(MemCpy) {
   const auto Op = IROp->C<IR::IROp_MemCpy>();
 
@@ -2419,7 +2450,7 @@ DEF_OP(MemCpy) {
   auto Dst1 = GetReg(Op->OutSrcAddress);
 #ifdef __APPLE__
   if (EmitRepStringInPlace(true, IsAtomic, Size, Length, MemRegDest, MemRegSrc, ARMEmitter::Reg::zr, DirectionIsInline, DirectionConstant,
-                           DirectionReg, Dst0, Dst1)) {
+                           DirectionReg, Dst0, Dst1, ARMEmitter::Reg::zr)) {
     return;
   }
 #endif
