@@ -93,7 +93,9 @@ The header documents every function. The design decisions:
   written the guest registers back.
 - **Stop reasons:** `SYSCALL`, `HALT` (a user-mode `hlt`, which the core reports as a
   general protection fault at the instruction) and `GUEST_FAULT` (an exception the core
-  detects itself, with vector, signal, `si_code`, error code and address). Stopping a
+  detects itself, with vector, signal, `si_code`, error code and address; also code the
+  translator cannot translate at all, such as `int 0x80` in 64-bit mode, which arrives as
+  SIGILL, vector 6, at the instruction instead of crashing the host). Stopping a
   thread from another thread and guest memory faults are package D.
 - **One context per process.** The core's configuration, its log hooks and the fault
   handlers are process-wide, so a second `fexmac_context_create` returns `BUSY` until the

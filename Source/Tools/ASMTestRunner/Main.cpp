@@ -34,6 +34,8 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <ctime>
+#include <signal.h>
 #include <set>
 #include <string>
 #include <string_view>
@@ -44,6 +46,7 @@
 #ifdef __APPLE__
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
+#include <sys/ucontext.h>
 #endif
 
 namespace {
@@ -146,19 +149,114 @@ private:
   uint64_t PageSize;
   std::set<uint64_t> Mapped;
 };
-// This runner has no Linux system calls (tests that need them declare it and are
-// skipped). Every call fails with ENOSYS, as a Linux kernel answers an unknown number, and
-// the guest continues after the instruction. Without a callback the run would stop at the
-// first `syscall` and the test would fail although the instruction worked.
+// Whether [Address, Address + Size) is mapped writable in this process (guest addresses
+// are host addresses). Used before writing a system call's result through a guest pointer.
+bool IsWritable(uint64_t Address, uint64_t Size) {
+#ifdef __APPLE__
+  uint64_t Cursor = Address;
+  while (Cursor < Address + Size) {
+    mach_vm_address_t RegionAddress = Cursor;
+    mach_vm_size_t RegionSize = 0;
+    vm_region_basic_info_data_64_t Info {};
+    mach_msg_type_number_t Count = VM_REGION_BASIC_INFO_COUNT_64;
+    mach_port_t Object = MACH_PORT_NULL;
+    if (mach_vm_region(mach_task_self(), &RegionAddress, &RegionSize, VM_REGION_BASIC_INFO_64, reinterpret_cast<vm_region_info_t>(&Info),
+                       &Count, &Object) != KERN_SUCCESS ||
+        RegionAddress > Cursor || !(Info.protection & VM_PROT_WRITE)) {
+      return false;
+    }
+    Cursor = RegionAddress + RegionSize;
+  }
+  return true;
+#else
+  return Address != 0;
+#endif
+}
+
+// This runner has no Linux system calls in general (tests that need them declare it and
+// are skipped). It answers `time` (201) honestly, as the one call a test makes
+// (TwoByte/0F_02, macOS/syscall_time), and every other call fails with ENOSYS, as a Linux
+// kernel answers an unknown number; either way the guest continues after the instruction.
+// Without a callback the run would stop at the first `syscall` and the test would fail
+// although the instruction worked.
 fexmac_syscall_action SyscallHandler(fexmac_thread* Thread, void*) {
+  constexpr uint64_t LinuxSysTime = 201;
   constexpr uint64_t LinuxENOSYS = 38;
+  constexpr uint64_t LinuxEFAULT = 14;
   fexmac_x86_state State;
   fexmac_x86_state_init(&State);
-  fexmac_thread_get_state(Thread, &State);
-  State.gpr[0] = -LinuxENOSYS; // rax
-  fexmac_thread_set_state(Thread, &State);
+  if (fexmac_thread_get_state(Thread, &State) != FEXMAC_OK) {
+    // Nothing sensible to answer with; end the run, and the test fails.
+    return FEXMAC_SYSCALL_STOP;
+  }
+  uint64_t& RAX = State.gpr[0];
+  const uint64_t RDI = State.gpr[7];
+  if (RAX == LinuxSysTime) {
+    // time(time_t* tloc): seconds since the epoch, also stored through tloc if non-null.
+    const uint64_t Now = static_cast<uint64_t>(::time(nullptr));
+    if (RDI && !IsWritable(RDI, sizeof(uint64_t))) {
+      RAX = -LinuxEFAULT;
+    } else {
+      if (RDI) {
+        memcpy(reinterpret_cast<void*>(RDI), &Now, sizeof(Now));
+      }
+      RAX = Now;
+    }
+  } else {
+    RAX = -LinuxENOSYS;
+  }
+  if (fexmac_thread_set_state(Thread, &State) != FEXMAC_OK) {
+    return FEXMAC_SYSCALL_STOP;
+  }
   return FEXMAC_SYSCALL_RESUME;
 }
+
+#ifdef __APPLE__
+// Installed before the library's handlers, so the library calls it for every fault it
+// does not claim (it chains to the previous action). It names the fault, so a crash in
+// host code (for example the translator reading guest instructions at an unmapped
+// target) leaves its address in the test output, then restores the default action: the
+// instruction faults again and the process dies with the usual signal. Only write(2) is
+// used; this runs in a signal handler.
+void UnclaimedFaultReporter(int Signal, siginfo_t* Info, void* RawContext) {
+  char Buffer[160];
+  size_t Length = 0;
+  auto Append = [&](const char* Text) {
+    while (*Text && Length < sizeof(Buffer)) {
+      Buffer[Length++] = *Text++;
+    }
+  };
+  auto AppendHex = [&](uint64_t Value) {
+    Append("0x");
+    bool Started = false;
+    for (int Shift = 60; Shift >= 0; Shift -= 4) {
+      const auto Digit = (Value >> Shift) & 0xF;
+      if (Digit || Started || Shift == 0) {
+        Started = true;
+        if (Length < sizeof(Buffer)) {
+          Buffer[Length++] = "0123456789abcdef"[Digit];
+        }
+      }
+    }
+  };
+  const auto* Context = static_cast<ucontext_t*>(RawContext);
+  const uint64_t ESR = Context->uc_mcontext->__es.__esr;
+  Append(Signal == SIGBUS ? "runner: unclaimed SIGBUS at address " : "runner: unclaimed SIGSEGV at address ");
+  AppendHex(reinterpret_cast<uint64_t>(Info->si_addr));
+  Append(", pc ");
+  AppendHex(Context->uc_mcontext->__ss.__pc);
+  Append(" (ESR class ");
+  AppendHex((ESR >> 26) & 0x3F);
+  Append(", fault status ");
+  AppendHex(ESR & 0x3F);
+  Append(")\n");
+  (void)!write(STDOUT_FILENO, Buffer, Length);
+  struct sigaction Default {};
+  Default.sa_handler = SIG_DFL;
+  sigemptyset(&Default.sa_mask);
+  sigaction(Signal, &Default, nullptr);
+}
+#endif
 } // namespace
 
 int main(int argc, char** argv, char** const envp) {
@@ -296,9 +394,26 @@ int main(int argc, char** argv, char** const envp) {
   }
   fexmac_x86_state GuestState;
   fexmac_x86_state_init(&GuestState);
-  fexmac_thread_get_state(Thread, &GuestState);
+  if (const auto Result = fexmac_thread_get_state(Thread, &GuestState); Result != FEXMAC_OK) {
+    fextl::fmt::print("Could not read the thread's state: {}\n", fexmac_result_string(Result));
+    return ExitFail;
+  }
   GuestState.rip = Loader.DefaultRIP();
-  fexmac_thread_set_state(Thread, &GuestState);
+  if (const auto Result = fexmac_thread_set_state(Thread, &GuestState); Result != FEXMAC_OK) {
+    fextl::fmt::print("Could not set the thread's state: {}\n", fexmac_result_string(Result));
+    return ExitFail;
+  }
+
+#ifdef __APPLE__
+  {
+    struct sigaction Reporter {};
+    Reporter.sa_sigaction = UnclaimedFaultReporter;
+    Reporter.sa_flags = SA_SIGINFO;
+    sigemptyset(&Reporter.sa_mask);
+    sigaction(SIGSEGV, &Reporter, nullptr);
+    sigaction(SIGBUS, &Reporter, nullptr);
+  }
+#endif
 
   // Misaligned atomics and the translator's scratch-buffer restart need these.
   if (const auto Result = fexmac_install_fault_handlers(); Result != FEXMAC_OK) {
@@ -312,7 +427,15 @@ int main(int argc, char** argv, char** const envp) {
   fexmac_stop_init(&Stop);
   const auto RunResult = fexmac_thread_run(Thread, &Stop);
   const bool DidFault = RunResult != FEXMAC_OK || Stop.reason != FEXMAC_STOP_HALT;
-  fexmac_thread_get_state(Thread, &GuestState);
+  if (DidFault) {
+    // Machine-readable, for Scripts/macos_asm_tests.py's expected-outcome check.
+    fextl::fmt::print("Stopped: result {} reason {} signal {} trap {} at 0x{:x} fault address 0x{:x}\n", fexmac_result_string(RunResult),
+                      static_cast<int>(Stop.reason), Stop.signal, Stop.trap_number, Stop.instruction_address, Stop.fault_address);
+  }
+  if (const auto Result = fexmac_thread_get_state(Thread, &GuestState); Result != FEXMAC_OK) {
+    fextl::fmt::print("Could not read the thread's state: {}\n", fexmac_result_string(Result));
+    return ExitFail;
+  }
 
   // The harness compares registers laid out as the core's CPUState, with the vector
   // registers in the layout it expects for this host.

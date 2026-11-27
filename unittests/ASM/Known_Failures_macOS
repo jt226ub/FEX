@@ -6,41 +6,48 @@
 # places the test's code at 0x100_0001_0000 instead of 0x1_0000. Guest addresses are host
 # addresses, so nothing can be mapped where an address cut to 32 bits lands.
 #
-# Every entry below was checked on an M4 by running it, and each faulting address is the
-# moved address cut to 32 bits, exactly as stated. None is a translator fault. For a guest
-# memory access the fexmac library prints the address ("fexmac: SIGSEGV: guest memory
-# access fault in translated code at address 0x..."), and results.tsv carries that line
-# with the reason below. The far jumps fault in host code instead (the translator reading
-# the guest instructions at the bad target), where the library prints nothing; their
-# address was read with a diagnostic fault handler during the check.
+# Format: the test, then how it must fail. The script reports any other failure of a
+# listed test as unexpected.
+#   crash fault=<address>   the process dies of a host fault at that address. The runner
+#                           prints "runner: unclaimed SIGSEGV at address <a>, pc <p>
+#                           (ESR class <c>, fault status <s>)" for every fault the fexmac
+#                           library does not claim, and results.tsv keeps that line.
+#   guest-fault signal=<n> trap=<n> at=<rip>
+#                           the run stops with that guest fault (runner line "Stopped:").
+#
+# Every entry was checked on an M4 by running it in all four modes; each faulting address
+# is the moved address cut to 32 bits, exactly as stated. None is a translator fault.
 
 # A 32-bit address-size override (0x67) cuts the address to 32 bits; the result is below
-# 4GB and cannot be mapped. Faults seen: a32_lods and a32_rep_lods at 0x80000 (RSI
-# 0x1_0008_0000 cut, as the test intends); A6_addrmod and A6_REP_addrmod at 0x10000200
-# (RDI 0x61626364_10000200 cut to EDI); AE_addrmod at 0x10000100 (EDI).
-Test_FEX_bugs/a32_lods.asm
-Test_FEX_bugs/a32_rep_lods.asm
-Test_Primary/Primary_A6_REP_addrmod.asm
-Test_Primary/Primary_A6_addrmod.asm
-Test_Primary/Primary_AE_addrmod.asm
+# 4GB and cannot be mapped. a32_lods and a32_rep_lods: RSI 0x1_0008_0000 cut to 0x80000,
+# as the test intends. A6_addrmod and A6_REP_addrmod: RDI 0x61626364_10000200 cut to
+# EDI. AE_addrmod: EDI 0x10000100. All data aborts in translated code (ESR class 0x24).
+Test_FEX_bugs/a32_lods.asm               crash fault=0x80000
+Test_FEX_bugs/a32_rep_lods.asm           crash fault=0x80000
+Test_Primary/Primary_A6_REP_addrmod.asm  crash fault=0x10000200
+Test_Primary/Primary_A6_addrmod.asm      crash fault=0x10000200
+Test_Primary/Primary_AE_addrmod.asm      crash fault=0x10000100
 
 # The same, in the middle of a test of vector moves: `vmovd xmm2, [edx]` with RDX
-# 0x100_e000_0000 faults at 0xe0000000.
-Test_VEX/vmovq_vmovd_reg.asm
+# 0x100_e000_0000.
+Test_VEX/vmovq_vmovd_reg.asm             crash fault=0xe0000000
 
 # Far jumps and calls through an m16:32 pointer: the test stores `lea edi, [rel .success]`,
 # the code address cut to 32 bits, as the target. The translator reads a 32-bit offset
 # (also for the o64 forms, as AMD does), so control goes to 0x10028, the original code
-# address of .success, and faults there. The o32 forms fault first, at 0xe0000ff0,
-# reading the pointer through `[esp]`.
-Test_PrimaryGroup/5_FF_05.asm
-Test_PrimaryGroup/5_FF_05_03_o32.asm
-Test_PrimaryGroup/5_FF_05_03_o32_imm.asm
-Test_PrimaryGroup/5_FF_05_03_o64.asm
-Test_PrimaryGroup/5_FF_05_03_o64_imm.asm
+# address of .success. The fault is in host code (the translator reading the guest
+# instructions there; the pc is in the runner, not the code buffer). The o32 forms fault
+# first, in translated code, reading the pointer through `[esp]`.
+Test_PrimaryGroup/5_FF_05.asm            crash fault=0x10028
+Test_PrimaryGroup/5_FF_05_03_o32.asm     crash fault=0xe0000ff0
+Test_PrimaryGroup/5_FF_05_03_o32_imm.asm crash fault=0xe0000ff0
+Test_PrimaryGroup/5_FF_05_03_o64.asm     crash fault=0x10028
+Test_PrimaryGroup/5_FF_05_03_o64_imm.asm crash fault=0x10028
 
-# Not listed here because upstream lists it (Known_Failures_jit), and it fails the same
-# way on Linux: Test_FEX_bugs/32bit_syscall.asm. FEX refuses `int 0x80` in a 64-bit
-# process ("[Unsupported] Trying to execute 32-bit syscall from a 64-bit process"), the
-# block cannot be compiled, CompileBlock returns 0, and Arm64JITCore::ExitFunctionLink
-# links the caller to host address 0, faulting at 0x0 in its `dc cvau`.
+# Also on upstream's Known_Failures_jit; listed here to state how it fails on macOS. FEX
+# refuses `int 0x80` in a 64-bit process ("[Unsupported] Trying to execute 32-bit
+# syscall from a 64-bit process"), so no block can be compiled at the instruction (code
+# offset 0x1d). On macOS that is reported as an invalid-opcode guest fault there
+# (SIGILL, #UD) and the run stops; upstream, and this port before, jumped to host
+# address 0.
+Test_FEX_bugs/32bit_syscall.asm          guest-fault signal=4 trap=6 at=0x1000001001d

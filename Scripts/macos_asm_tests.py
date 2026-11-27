@@ -195,8 +195,59 @@ def read_list(path):
                 if not text:
                     comment = []
                     continue
-                names[text.split("#", 1)[0].strip()] = " ".join(comment)
+                names[text.split("#", 1)[0].split()[0]] = " ".join(comment)
     return names
+
+
+FAULT_LINE = re.compile(r"^(?:fexmac: SIG\w+: .*?|runner: unclaimed SIG\w+) at address (0x[0-9a-f]+)")
+STOP_LINE = re.compile(r"^Stopped: result \S+ reason (\d+) signal (-?\d+) trap (\d+) at (0x[0-9a-f]+) fault address (0x[0-9a-f]+)")
+
+
+def read_outcomes(path):
+    """Returns {test name: {"kind": ..., key: value}} from the words after a test's name.
+
+    `crash fault=<address>`: the process dies of a host fault at that address, as the
+    runner (or the fexmac library) reports it. `guest-fault signal=<n> trap=<n> at=<rip>`:
+    the run stops with that guest fault, which fails the test. Any key may be left out.
+    """
+    outcomes = {}
+    if os.path.exists(path):
+        with open(path) as handle:
+            for line in handle:
+                words = line.split("#", 1)[0].split()
+                if len(words) >= 2:
+                    spec = {"kind": words[1]}
+                    for word in words[2:]:
+                        key, _, value = word.partition("=")
+                        spec[key] = value
+                    outcomes[words[0]] = spec
+    return outcomes
+
+
+def observed_outcome(status, detail):
+    """What a failed run did, in the terms read_outcomes uses."""
+    lines = detail.split(" | ")
+    seen = {"kind": "timeout" if status == "timeout" else "crash" if status.startswith("crash") else "fail"}
+    for line in lines:
+        match = FAULT_LINE.match(line)
+        if match and "fault" not in seen:
+            seen["fault"] = hex(int(match.group(1), 16))
+        match = STOP_LINE.match(line)
+        if match:
+            seen["kind"] = "guest-fault"
+            seen["signal"], seen["trap"], seen["at"] = match.group(2), match.group(3), hex(int(match.group(4), 16))
+    return seen
+
+
+def outcome_mismatch(spec, seen):
+    """Returns why a failure does not match its listed outcome, or None if it does."""
+    for key, value in spec.items():
+        actual = seen.get(key)
+        if key in ("fault", "at") and actual is not None:
+            value = hex(int(value, 16))
+        if actual != value:
+            return "listed as %s, but %s is %s" % (" ".join("%s=%s" % item for item in spec.items()), key, actual)
+    return None
 
 
 def prepare(root, asm_dir, source, out_dir):
@@ -257,11 +308,11 @@ def run_one(runner, name, mode, binary, config, timeout):
     lines = (result.stdout + result.stderr).strip().splitlines()
     tail = lines[-6:]
     status = "crash(signal %d)" % -result.returncode if result.returncode < 0 else "fail"
-    # For a crash, lead with what the fexmac library said about the fault (a guest memory
-    # access in translated code names its address), so the reason is in results.tsv.
-    library = [line for line in lines if line.startswith("fexmac:")]
-    if status.startswith("crash"):
-        tail = library[-1:] + [line for line in tail if line not in library[-1:]]
+    # Lead with the lines that say what happened: the fault report (from the runner, or
+    # from the fexmac library when no earlier handler is installed) and the runner's stop
+    # line. The expected-outcome check reads them, and results.tsv keeps them.
+    key = [line for line in lines if FAULT_LINE.match(line) or STOP_LINE.match(line)][-2:]
+    tail = key + [line for line in tail if line not in key]
     return status, " | ".join(line[:200] for line in tail)
 
 
@@ -290,6 +341,9 @@ def main():
     for name in ("Known_Failures", "Known_Failures_jit", "Known_Failures_macOS"):
         for test, why in read_list(os.path.join(asm_dir, name)).items():
             expected[test] = "%s: %s" % (name, why or "no reason given")
+    # How each listed test is expected to fail. Only this port's list says; an entry there
+    # with an outcome also overrides upstream's lists for the same test.
+    outcomes = read_outcomes(os.path.join(asm_dir, "Known_Failures_macOS"))
 
     sources = []
     for folder, _, files in os.walk(asm_dir):
@@ -341,8 +395,13 @@ def main():
     with open(os.path.join(args.out, "results.tsv"), "w") as handle:
         for (mode, name), (status, detail) in sorted(rows.items()):
             if status not in ("pass",) and not status.startswith("skip") and name in expected:
-                status = "expected-" + status
-                detail = "%s [%s]" % (detail, expected[name])
+                why = outcome_mismatch(outcomes[name], observed_outcome(status, detail)) if name in outcomes else None
+                if why:
+                    status = "unexpected-" + status
+                    detail = "%s [%s]" % (detail, why)
+                else:
+                    status = "expected-" + status
+                    detail = "%s [%s]" % (detail, expected[name])
             handle.write("%s\t%s\t%s\t%s\n" % (mode, name, status, detail))
 
     print("Tests found: %d   disabled by upstream lists: %d   could not be prepared: %d" %
@@ -368,6 +427,10 @@ def main():
             failed = status not in ("pass", "skip")
             if failed and name not in expected:
                 unexpected.append((name, status, detail))
+            elif failed and name in outcomes:
+                why = outcome_mismatch(outcomes[name], observed_outcome(status, detail))
+                if why:
+                    unexpected.append((name, status, "%s [%s]" % (why, detail)))
             if not failed and status == "pass" and name in expected:
                 fixed.append(name)
         print("\n== %s: %s" % (mode, "  ".join("%s %d" % item for item in sorted(counts.items()))))
