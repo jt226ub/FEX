@@ -132,6 +132,11 @@ namespace CPU {
     virtual void ClearRelocations() {}
 
     bool IsAddressInCodeBuffer(uintptr_t Address) const;
+#ifdef __APPLE__
+    // The guard page after each code buffer IsAddressInCodeBuffer checks.
+    bool IsAddressInCodeBufferGuard(uintptr_t Address) const;
+    uintptr_t GetCodeBufferGuard() const;
+#endif
 
     // Updates the CodeBuffer if needed and returns a reference to the old one.
     // The returned reference should be kept alive carefully to avoid early deletion of resources.

@@ -374,7 +374,9 @@ typedef enum fexmac_stop_reason {
    * fs or gs, `o16 iret`, ...) or bytes it cannot decode. A real CPU might run it; this
    * is not the guest's #UD. Filled like an invalid-opcode fault (signal SIGILL, trap 6,
    * si_code 0, fault_address = instruction_address) so a host that only knows
-   * GUEST_FAULT can still deliver it as one. */
+   * GUEST_FAULT can still deliver it as one. Also used, with instruction_address at the
+   * block's start and a core message saying why, for a block the translator gives up
+   * on because its code keeps overflowing the translator's buffer (an emitter bug). */
   FEXMAC_STOP_UNSUPPORTED_INSTRUCTION = 4,
   /* Later versions add: a stop requested by another thread, and guest memory faults
    * caught as host faults. Until then a guest memory fault in translated code is passed
@@ -419,7 +421,10 @@ FEXMAC_EXPORT fexmac_result fexmac_thread_run(fexmac_thread* thread, fexmac_stop
  * an alignment fault alike as SIGBUS with si_code 1. The library claims only faults from
  * a host thread that is running guest code, and among those only the cases above. Every
  * other fault, including a guest load or store to an unmapped or protected page in
- * translated code, is not the library's.
+ * translated code, is not the library's. One of them is always a core bug: an access
+ * past the end of a code buffer, which ends in the inaccessible page after it; with the
+ * library's handlers installed it writes a "fexmac:" line naming it before passing the
+ * fault on.
  *
  * Two ways to connect it, pick one per process:
  *

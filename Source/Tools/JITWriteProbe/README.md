@@ -20,3 +20,12 @@ protection, so run that mode only on real hardware:
 ```
 ./JITWriteProbe --expect-enforced
 ```
+
+The "Guard:" cases show how a guard page can be placed after `MAP_JIT` memory. With
+`--expect-enforced` they assert what FEXCore's code buffer relies on: `MAP_JIT` with
+`MAP_FIXED` is refused, `mprotect` and `mach_vm_protect` inside a `MAP_JIT` mapping are
+refused, and a `MAP_FIXED` `PROT_NONE` mapping over the tail of the program's own
+`MAP_JIT` mapping is allowed, leaves the front runnable and write-protected, faults a
+write past it even while the thread is switched to writable, and is freed with the rest
+by one `munmap`. Whether a merely hinted mapping lands right after `MAP_JIT` memory is
+reported only.

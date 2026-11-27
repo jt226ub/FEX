@@ -56,6 +56,16 @@ bool FEXCore::Context::ContextImpl::IsAddressInCodeBuffer(FEXCore::Core::Interna
   return Thread->CPUBackend->IsAddressInCodeBuffer(Address) || CodeCache.IsAddressInMappedCodeBuffer(Address);
 }
 
+#ifdef __APPLE__
+bool FEXCore::Context::ContextImpl::IsAddressInCodeBufferGuard(FEXCore::Core::InternalThreadState* Thread, uintptr_t Address) const {
+  return Thread->CPUBackend->IsAddressInCodeBufferGuard(Address);
+}
+
+uintptr_t FEXCore::Context::ContextImpl::GetCodeBufferGuard(FEXCore::Core::InternalThreadState* Thread) const {
+  return Thread->CPUBackend->GetCodeBufferGuard();
+}
+#endif
+
 bool FEXCore::Context::ContextImpl::RequiresRelocatableConstants() const {
   // Support relocation when generating a cache or when generating reference code for validation
   return CodeCache.IsGeneratingCache || FEXCore::Config::Get_ENABLECODECACHEVALIDATION() || DiskCache.IsWritingDiskCache();

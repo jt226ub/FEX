@@ -76,8 +76,24 @@ Fixed in code on `macos/runtime-fixes`:
    dynamic save lists on macOS.
 3. **Fault page.** The per-thread interrupt fault page and the thread state are aligned to
    the 16K host page.
-4. **Code-buffer guard page.** Skipped on macOS. Without this the core logs
-   `Failed to mprotect last page of code buffer`.
+4. **Code-buffer guard page.** Linux protects the last page of each code buffer with
+   `mprotect`; macOS refuses that inside a `MAP_JIT` mapping (and `mach_vm_protect`
+   too), and refuses `MAP_JIT` with `MAP_FIXED`, so the guard was first skipped and a
+   write past a buffer's end landed in whatever was mapped next. It now replaces the
+   buffer's last 16K host page with a `MAP_FIXED` mapping of ordinary `PROT_NONE`
+   memory: the rest stays `MAP_JIT`, and a write past the end faults whatever the
+   thread's write setting (`JITWriteProbe`'s "Guard:" cases, as built and hardened on
+   the M4: the replacement is allowed, the front still runs code and is still
+   write-protected, a store past it faults with DFSC 0x07 while the thread is
+   writable, one `munmap` frees both). Every write into a code buffer (compiled blocks,
+   blocks copied from the code cache, block tails) is bounds-checked before it is made,
+   so in normal operation the guard never fires; it is a safety net. If it does, the
+   library's handler writes `fexmac: SIGBUS: write past the end of a code buffer, at
+   address ... (its guard page) from host pc ...` and passes the fault on, and the
+   process dies (`fexmac_hook_test code-buffer-overrun-dies`, `-chained`). Cost: one
+   extra `mmap` per code buffer (0.4 us; buffers are made a handful of times per
+   process), no extra address space, 12K less usable space per buffer than the 4K
+   page Linux reserves.
 5. **Host feature detection.** The Linux kernel version check is kept out of the Mac build.
 6. **Clearing memory.** `MADV_DONTNEED` does not zero memory on macOS, but the block
    lookup cache is cleared by relying on that. `VirtualDontNeed` now maps fresh pages
@@ -111,6 +127,32 @@ Added for embedders (the core expects these from whatever hosts it):
   fault inside one ends in a stack overflow rather than a hang. The core disarms the
   translator's scratch-buffer guard when a block is emitted (macOS only), so only a
   translation in progress can be restarted.
+- **The translator's scratch buffer** (package J). Each block is emitted into a
+  per-thread scratch buffer followed by one inaccessible 16K host page; a block whose
+  code does not fit runs into it, the handler resumes the thread at the restart point
+  set at the start of `Arm64JITCore::EmitJITCode` (per thread, valid exactly while the
+  guard is armed), and the translation starts again with twice the bytes per IR node.
+  On macOS: the guard address the core records is exactly the first byte of that page
+  and the handler claims exactly that page (it used to be inferred from a 4K-based
+  address that could sit up to 16K below the real page, and the emitter stopped 4K
+  short of it); the guard is disarmed as soon as the emitter stops writing, before the
+  copy into the code buffer, so a restart can never skip that copy's write-protect
+  switch; a restarted attempt drops the abandoned attempt's guest-instruction records,
+  which were written into the block's RIP table before; and growth is bounded: a
+  translation that would need more than 64MB (half the largest code buffer, so
+  whatever fits can be stored) gives up with `Block at ... still overflows its
+  translation buffer` and the run stops as `FEXMAC_STOP_UNSUPPORTED_INSTRUCTION` at
+  the block, instead of doubling until the size wraps. The emitter's writes are
+  sequential; the largest step it takes without writing is the block tail (under 64
+  bytes), so no emit can step over a 16K guard. The scratch buffer is ordinary memory,
+  written with the thread executable, so the restart leaves the thread in the state it
+  had. Translation never nests on a thread (one restart point per thread is enough),
+  and nothing else runs on the thread while the guard is armed: guest code and callbacks
+  run only between translations (package D's stop requests and guest-fault delivery act
+  on translated code and must keep out of the translator). A thread keeps its buffer and only
+  claims a larger one when a translation needs it. Measured with `rep movsq` blocks:
+  with the default first size, long runs overflow once; starting from 1 byte per IR
+  node (a test hook) translations overflow up to 5 times, and every one runs correctly.
 - Invalidation discards stale translations when guest code changes, holding the core's
   invalidation lock, for every thread of the context. The self-modifying-code tests
   looped forever until the runner did this. With many threads invalidating at once it
@@ -145,9 +187,14 @@ with `JITWriteProbe`:
   thread must switch to writable before writing `MAP_JIT` memory (in its default state or
   switched to executable, the write faults with SIGBUS) and back before running it
   (running while writable faults). Atomic operations count as writes.
-- **`mprotect` of a page inside a `MAP_JIT` mapping is refused.** Guard pages and
-  page-protection self-modifying-code detection cannot be built that way inside the code
-  buffer.
+- **`mprotect` of a page inside a `MAP_JIT` mapping is refused**, and so is
+  `mach_vm_protect`; `MAP_JIT` together with `MAP_FIXED` is refused (EINVAL), so a
+  `MAP_JIT` mapping cannot be placed over a reserved range. A `MAP_FIXED` `PROT_NONE`
+  mapping may replace the tail of the program's own `MAP_JIT` mapping, which is how the
+  code buffer gets its guard page (runtime fix 4). A `PROT_NONE` mapping merely hinted
+  at the end of a `MAP_JIT` mapping happened to land there in one run and not in
+  another, so hints are not relied on. Page-protection self-modifying-code detection
+  still cannot be built inside the code buffer.
 - **A fault inside a SIGBUS handler hangs the thread** instead of killing the process,
   because the signal is blocked while its handler runs. A hang in a test can be a crash
   in a fault handler.
@@ -156,7 +203,9 @@ with `JITWriteProbe`:
   before it `MacOSHostFaults.h`) handles these kinds of fault. Misaligned accesses in translated code are patched with the setting
   switched, and translated code only runs executable, so the handler ends in the state
   it found. Scratch-buffer guard faults in the translator's own emitter code are
-  resumed without touching the setting at all. Neither path leaves a wrong setting.
+  resumed without touching the setting at all (the emitter writes ordinary memory with
+  the thread executable, and the guard is disarmed before the translator switches to
+  writable to copy the block into the code buffer). Neither path leaves a wrong setting.
 - **Flushing the instruction cache while still writable is enough.** Rewriting the same
   code 50,000 times with a different result each time, flushing before switching back,
   always ran the new code; flushing after switching back did too; never flushing ran
@@ -552,11 +601,11 @@ All of these run in the Mac job on every push to a `macos/**` branch.
 | `FEXCoreASMTestRunner` with `Scripts/macos_asm_tests.py` | Upstream's 2,292 assembly instruction tests plus the port's four in `unittests/macOS/ASM`, in four modes | 2,253 pass in each mode (before the upstream sync added one test) | 2,265 of 2,296 pass in each mode, both |
 | `FEXCoreOrderingTest` | Multi-thread x86 memory-ordering litmus tests and misaligned locked-operation counts, in three emulation modes; see above | not yet run | pass, both, in each mode |
 | `FEXCoreMutexWakeTest` | The core's reader-writer lock never loses a wake-up, in six queueing orders | not yet run | pass, both; with the bug restored, two orders hang |
-| `fexmac_c_test` | A C program using only `fexmac.h`, linked as an outside project would be: 44 subtests covering system calls (prefixed, restarted), stops, state, guest faults, invalidation (also from 8 threads at once), misaligned atomics with each signal-handler arrangement, call/return stack overflow and underflow, guest accesses to protected pages, chained handlers (one that leaves with siglongjmp, over 306 stack layouts; one that faults itself, which must end the process quickly; one that returns without fixing the fault) and sent signals, garbage struct sizes, lifetime races, cached translations and code ranges, split locked operations from 8 threads in every emulated form, also with plain stores to neighbouring bytes and under a signal storm (exact results), and error paths | not yet run | pass, both |
-| `fexmac_hook_test` | The same library built with test hooks, 9 subtests: guest and callback accesses to guard pages are not claimed, the scratch-buffer guard is disarmed after each translation, a log callback cannot re-enter the library, a fault inside the handler crashes with a message instead of hanging, the log callback is never called from a signal handler, a failed create leaves no log hook, invalidation leaves fault signals unblocked | not yet run | pass, both |
+| `fexmac_c_test` | A C program using only `fexmac.h`, linked as an outside project would be: 50 subtests covering large blocks (every size across the first scratch-buffer overflow, 8 threads translating large blocks at once, translations filling three code buffers in turn, also from the code cache), system calls (prefixed, restarted), stops, state, guest faults, invalidation (also from 8 threads at once), misaligned atomics with each signal-handler arrangement, call/return stack overflow and underflow, guest accesses to protected pages, chained handlers (one that leaves with siglongjmp, over 306 stack layouts; one that faults itself, which must end the process quickly; one that returns without fixing the fault) and sent signals, garbage struct sizes, lifetime races, cached translations and code ranges, split locked operations from 8 threads in every emulated form, also with plain stores to neighbouring bytes and under a signal storm (exact results), and error paths | not yet run | pass, both |
+| `fexmac_hook_test` | The same library built with test hooks, 14 subtests: translations overflowing the scratch buffer 0 to 5 times run correctly, a block that never fits stops cleanly at its start and the thread stays usable, each code buffer ends in an inaccessible page, a write past the end of a code buffer dies with a message (also with a host handler chained), guest and callback accesses to guard pages are not claimed, the scratch-buffer guard is disarmed after each translation, a log callback cannot re-enter the library, a fault inside the handler crashes with a message instead of hanging, the log callback is never called from a signal handler, a failed create leaves no log hook, invalidation leaves fault signals unblocked | not yet run | pass, both |
 | `FEXCoreBench` with `Scripts/macos_bench.py --quick` | The freestanding x86-64 benchmark, as built and hardened: the literal mode (no system call but exit) natively and under FEX; the loader's contract (9 cases of a guest breaking it); the timed mode (18 kernels, 4 guest threads) in four translator configurations, every checksum matching the recorded value and the native arm64 build (and Rosetta 2's where present), with the stated exceptions for ordering off and reduced x87 precision | not yet run (added after the last hosted run) | pass, both |
 | `Scripts/macos_bench_mutations.py` | 58 mutations of the benchmark kernels, each of which must change its kernel's checksum (native arm64; x86-64-only ones under Rosetta 2) | not yet run | pass |
-| `JITWriteProbe` | Reports how the machine treats executable memory, including writes and switches from a fault handler and instruction-cache flushing | report only | see the facts above |
+| `JITWriteProbe` | Reports how the machine treats executable memory, including writes and switches from a fault handler, instruction-cache flushing and the ways of placing a guard page after `MAP_JIT` memory | report only | see the facts above |
 | `JITWriteProbe --expect-enforced` | The same, but exits 1 unless every asserted case gives the result the port relies on with write protection enforced, or if a fault-handler case's handler never ran | not run: the hosted Mac does not enforce, so it would fail | pass, as built and hardened |
 | `Scripts/macos_check_linkage.sh` | Fails if the core or a test tool links anything but `libSystem` and `libc++`, if one of them is missing, or if the bundled `fmt` was not compiled. Homebrew's `fmt` is installed first. `otool` shows only that no fmt dylib is linked; the `build.ninja` check covers a static one | not yet run (added after the last hosted run) | pass, both toolchains |
 | Low-memory probe | Shows that a program with a small page-zero reservation is killed | report only | same as hosted |
