@@ -1,7 +1,7 @@
-# Smallest end-to-end check of the translator core. See Main.cpp.
+# Smallest end-to-end check of the translator core, through the fexmac interface. See
+# Main.cpp. Built on the macOS embedding library only.
+if (NOT APPLE)
+  return()
+endif()
 add_executable(FEXCoreSmokeTest Main.cpp)
-target_include_directories(FEXCoreSmokeTest PRIVATE
-  ${CMAKE_BINARY_DIR}/generated
-  ${CMAKE_SOURCE_DIR}/Source
-  ${CMAKE_SOURCE_DIR}/Source/Tools/CommonTools)
-target_link_libraries(FEXCoreSmokeTest PRIVATE FEXCore Common CommonTools JemallocLibs Threads::Threads)
+target_link_libraries(FEXCoreSmokeTest PRIVATE fexmac)

@@ -1,5 +1,10 @@
 // SPDX-License-Identifier: MIT
 //
+// SUPERSEDED by the fexmac library (Source/Embedding, fexmac.h), which owns this duty now.
+// No tool on this branch uses this header. It is kept only so that tools on branches
+// written before the library existed still build when merged; port them to fexmac.h
+// and delete this file.
+//
 // Host fault handling for programs that embed the translator core on macOS.
 //
 // The core does not install signal handlers itself; whatever embeds it must catch the

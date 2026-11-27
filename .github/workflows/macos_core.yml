@@ -60,7 +60,7 @@ jobs:
       - name: Build
         run: |
           set -o pipefail
-          ninja -C build -k 0 FEXCore FEXCore_shared Common CommonTools FEXCoreSmokeTest FEXCoreASMTestRunner FEXCoreThreadTest 2>&1 | tee build.log
+          ninja -C build -k 0 FEXCore FEXCore_shared Common CommonTools FEXCoreSmokeTest FEXCoreASMTestRunner FEXCoreThreadTest fexmac fexmac_shared fexmac_bundle fexmac_c_test 2>&1 | tee build.log
 
       - name: Inspect what was built
         run: |
@@ -76,10 +76,10 @@ jobs:
         # the test tools may depend on libSystem and libc++ only.
         run: |
           bad=0
-          for f in $(find build -name 'libFEXCore*.dylib') build/Bin/FEXCoreSmokeTest build/Bin/FEXCoreThreadTest build/Bin/FEXCoreASMTestRunner; do
+          for f in $(find build -name 'libFEXCore*.dylib' -o -name 'libfexmac.dylib') build/Bin/FEXCoreSmokeTest build/Bin/FEXCoreThreadTest build/Bin/FEXCoreASMTestRunner build/Bin/fexmac_c_test; do
             echo "--- $f"
             otool -L "$f" | tail -n +2
-            if otool -L "$f" | tail -n +2 | grep -v -E '^[[:space:]]*(/usr/lib/libSystem\.B\.dylib|/usr/lib/libc\+\+\.1\.dylib|@rpath/libFEXCore\.dylib) '; then
+            if otool -L "$f" | tail -n +2 | grep -v -E '^[[:space:]]*(/usr/lib/libSystem\.B\.dylib|/usr/lib/libc\+\+\.1\.dylib|@rpath/libFEXCore\.dylib|@rpath/libfexmac\.dylib) '; then
               echo "unexpected dependency in $f"
               bad=1
             fi
@@ -126,6 +126,19 @@ jobs:
             [ -n "$R" ] && head -c 6000 "$R" || true
           fi
           exit "$code"
+
+      - name: Run the embedding interface tests
+        # A C program using only fexmac.h, linked against the standalone archive as an
+        # outside project would be.
+        run: |
+          set -o pipefail
+          T=build/Bin/fexmac_c_test
+          echo "=== as built"
+          "$T" 2>&1 | tee fexmac-c-test.log
+          cp "$T" fexmac_c_test-hardened
+          codesign --force --sign - --options runtime --entitlements Data/macOS/jit.entitlements fexmac_c_test-hardened
+          echo "=== hardened runtime"
+          ./fexmac_c_test-hardened 2>&1 | tee fexmac-c-test-hardened.log
 
       - name: Run the multi-thread test
         run: |
@@ -222,6 +235,8 @@ jobs:
             probe.log
             asm-tests.log
             thread-test.log
+            fexmac-c-test.log
+            fexmac-c-test-hardened.log
             asm-out/results.tsv
             probe-hardened.log
             build/CMakeFiles/CMakeConfigureLog.yaml

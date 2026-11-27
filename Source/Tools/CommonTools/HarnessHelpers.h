@@ -425,7 +425,15 @@ public:
   }
 
 private:
+#ifdef __APPLE__
+  // Read when used rather than at construction: the macOS runner loads the test's config
+  // file before the fexmac library has set up the core's configuration.
+  bool ConfigDumpGPRs() const {
+    return FEXCore::Config::Get_DUMPGPRS()();
+  }
+#else
   FEX_CONFIG_OPT(ConfigDumpGPRs, DUMPGPRS);
+#endif
 
   struct ConfigStructBase {
     uint64_t OptionMatch;

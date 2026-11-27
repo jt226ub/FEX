@@ -1,5 +1,10 @@
 // SPDX-License-Identifier: MIT
 //
+// SUPERSEDED by the fexmac library (Source/Embedding, fexmac.h), which owns this duty now.
+// No tool on this branch uses this header. It is kept only so that tools on branches
+// written before the library existed still build when merged; port them to fexmac.h
+// and delete this file.
+//
 // Per-thread setup the translator core expects its embedder to do. On Linux this lives
 // in FEX's process emulation layer; tools that embed the core directly use this.
 #pragma once

@@ -72,15 +72,27 @@ Fixed in code on `macos/runtime-fixes`:
 
 Added for embedders (the core expects these from whatever hosts it):
 
-- `Source/Tools/CommonTools/MacOSHostFaults.h`: catches the alignment fault ARM64 raises
-  for a misaligned atomic operation and hands it to the core (53 instruction tests depend
-  on it), and restarts translation when the translator's scratch buffer fills.
-- The test runner implements the callback that discards stale translations when guest
-  code changes, holding the core's invalidation lock. The self-modifying-code tests
-  looped forever until it did both.
-- `Source/Tools/CommonTools/CoreThreadSetup.h`: allocates the per-thread call and return
-  stack and a full descriptor table. Every guest `call` and `ret` depends on the first.
-- `docs/macOS-embedding-interface.md` lists every such duty found so far.
+- **`fexmac`, a C embedding interface** (`Source/Embedding/`, header `fexmac.h`), built
+  as a static library, as a standalone prelinked archive that needs only `libSystem` and
+  `libc++` (`build/Lib/libfexmac_bundle.a`) and as a dylib. It owns context creation and
+  option checking, per-thread setup (call and return stack, descriptor tables, allocator
+  per-thread initialisation), guest state, running guest code, system calls, the host
+  fault handlers and stale-translation invalidation. All three test tools use it; the
+  smoke and thread tests use nothing else. `docs/macOS-embedding-interface.md` describes
+  it, the signal-handler contract and what the instruction-test runner still takes from
+  the core for harness work.
+- The fault handlers catch the alignment fault ARM64 raises for a misaligned atomic
+  operation and hand it to the core (53 instruction tests depend on it), and restart
+  translation when the translator's scratch buffer fills. They can be installed by the
+  library (chaining to handlers installed before) or called from the host's own
+  handlers. They are installed with `SA_NODEFER`, so a fault inside the handler crashes
+  the process instead of hanging it (a reproducer hangs without it on the M4).
+- Invalidation discards stale translations when guest code changes, holding the core's
+  invalidation lock, for every thread of the context. The self-modifying-code tests
+  looped forever until the runner did this.
+- `Source/Tools/CommonTools/MacOSHostFaults.h` and `CoreThreadSetup.h`, the previous
+  per-tool versions, are no longer used and are kept only until tools on other branches
+  are ported.
 
 Checked and found not to need a change:
 
@@ -158,6 +170,7 @@ All of these run in the Mac job on every push to a `macos/**` branch.
 | `FEXCoreSmokeTest` | Translates and runs a 23-byte loop, as built and under the hardened runtime | pass, both | pass, both |
 | `FEXCoreThreadTest` | Eight host threads share a context, each summing a different count in a long guest loop | pass | pass, both |
 | `FEXCoreASMTestRunner` with `Scripts/macos_asm_tests.py` | Upstream's 2,291 assembly instruction tests, in four modes | 2,253 pass in each mode | 2,254 pass in each mode, both |
+| `fexmac_c_test` | A C program using only `fexmac.h`, linked as an outside project would be: system calls, stops, state, guest faults, invalidation, misaligned atomics with each signal-handler arrangement, error paths, and a fault inside the handler crashing instead of hanging | | pass, both |
 | `JITWriteProbe` | Reports how the machine treats executable memory, including writes from a fault handler | report only | see the facts above |
 | Linkage check | Fails if the core or a test tool links anything but `libSystem` and `libc++` (Homebrew's `fmt` is installed first) | | pass |
 | Low-memory probe | Shows that a program with a small page-zero reservation is killed | report only | same as hosted |
@@ -171,7 +184,11 @@ hardened, with either toolchain, the same):
 | Skipped by the runner (host lacks a CPU feature the test needs, or it needs Linux system calls) | 8 |
 | Skipped by upstream's own lists | 6 |
 | Skipped because the test reaches low memory through a 32-bit operand | 5 |
-| Expected failures | 18 |
+| Expected failures | 18 (12 crash, 6 fail) |
+
+Since the runner uses `fexmac`, `TwoByte/0F_02` (a test that makes a Linux system call)
+fails at once instead of timing out: the old runner's handler left `rip` on the
+`syscall`, so the call repeated forever. The totals are otherwise unchanged.
 
 The skip count depends on the CPU: the hosted Mac skips one more test than the M4, and an
 earlier hosted run on a different virtual CPU skipped 16 and passed 2,244 with the same
