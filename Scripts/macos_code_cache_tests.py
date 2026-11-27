@@ -506,7 +506,9 @@ def main():
         ("multiblock on", {"FEX_MULTIBLOCK": "1"}),
         # FEXCoreCacheTest states SMCCHECKS none unless told otherwise.
         ("full self-modifying-code checks", {"FEX_SMCCHECKS": "full"}),
-        ("self-modifying-code detection by write protection", {"FEX_SMCCHECKS": "mtrack"}),
+        # Not a mismatch: mtrack translates the same code as none (its detection is page
+        # protection), and a block loaded from the cache registers its code pages like a
+        # translated one (CodeCache.cpp, MarkGuestExecutableRange), so the cache is shared.
         ("x87 reduced precision", {"FEX_X87REDUCEDPRECISION": "1"}),
     ]:
         # Within one run the core may load blocks it stored itself moments earlier, so

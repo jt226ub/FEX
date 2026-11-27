@@ -1750,7 +1750,9 @@ static void TestStopRepMovs(void) {
     pthread_join(Requester, NULL);
     printf("  %s: %d stops part-way\n", Run_->Name, Stops);
     Check(Bad == 0, "%s: every stop at the rep instruction with rcx, rsi, rdi exact (%d bad)", Run_->Name, Bad);
-    Check(Stops > 3, "%s: stopped part-way (%d times)", Run_->Name, Stops);
+    /* At least once: under load the requester may get little time during the fast
+     * chunked runs (3 stops in one of 20 loaded runs); exactness is checked above. */
+    Check(Stops >= 1, "%s: stopped part-way (%d times)", Run_->Name, Stops);
     Check(State.gpr[RCX] == 0 && memcmp(Area, Expect, Bytes * 3) == 0, "%s: after all the resumes, memory is x86's result", Run_->Name);
     fexmac_thread_destroy(Thread);
     fexmac_context_destroy(Context);
