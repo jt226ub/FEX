@@ -45,7 +45,7 @@ jobs:
           cmake --version
 
       - name: Install Ninja
-        # fmt is installed only so the linkage check below proves the build ignores it:
+        # fmt is installed only so the linkage check below runs with a system fmt present:
         # a Homebrew dylib cannot be loaded under the hardened runtime.
         run: brew install ninja fmt
 
@@ -72,19 +72,9 @@ jobs:
           otool -L "$(find build -name 'libFEXCore*.dylib' | head -1)"
 
       - name: Check that only system libraries are linked
-        # The hardened runtime refuses libraries signed by anyone else, so the core and
-        # the test tools may depend on libSystem and libc++ only.
-        run: |
-          bad=0
-          for f in $(find build -name 'libFEXCore*.dylib') build/Bin/FEXCoreSmokeTest build/Bin/FEXCoreThreadTest build/Bin/FEXCoreASMTestRunner; do
-            echo "--- $f"
-            otool -L "$f" | tail -n +2
-            if otool -L "$f" | tail -n +2 | grep -v -E '^[[:space:]]*(/usr/lib/libSystem\.B\.dylib|/usr/lib/libc\+\+\.1\.dylib|@rpath/libFEXCore\.dylib) '; then
-              echo "unexpected dependency in $f"
-              bad=1
-            fi
-          done
-          exit "$bad"
+        # Fails if the core or a test tool links anything but libSystem and libc++, if
+        # any of them is missing, or if the bundled fmt was not compiled.
+        run: bash Scripts/macos_check_linkage.sh build
 
       - name: Run the smoke test
         run: |
