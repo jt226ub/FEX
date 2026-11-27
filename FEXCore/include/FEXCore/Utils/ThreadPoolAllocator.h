@@ -420,6 +420,7 @@ public:
   }
 
 private:
+#ifdef __APPLE__
   // Historically this class carved its guard page out of the caller-provided Size (usable ==
   // Size - one page), matching callers that pad their request by exactly one guest page
   // (FEX_PAGE_SIZE, 4KB) for that purpose (see JIT.cpp's DesiredBufferRange comment). That
@@ -454,6 +455,31 @@ private:
     FEXCore::Allocator::VirtualFree(Ptr, TotalAllocSize(Size));
   }
 
+#else
+  // Upstream's layout on every other host: the guard is the last 4K page of Size, which is
+  // where the JIT (JITGuardPage in JIT.cpp) and Linux's SignalDelegator expect it. The
+  // macOS layout above put the guard after Size there too, so a full scratch buffer faulted
+  // outside the range the signal handler checks and the process crashed instead of
+  // restarting the translation with a larger buffer (FEX_bugs/CodeBufferOverflow, multiblock,
+  // on Linux arm64; found by the Linux workflow).
+  void* Alloc(size_t Size) override {
+    auto Ptr = FEXCore::Allocator::VirtualAlloc(Size);
+    uintptr_t LastPageAddr = AlignDown(reinterpret_cast<uintptr_t>(Ptr) + Size - 1, FEXCore::Utils::FEX_PAGE_SIZE);
+    if (!FEXCore::Allocator::VirtualProtect(reinterpret_cast<void*>(LastPageAddr), FEXCore::Utils::FEX_PAGE_SIZE,
+                                            FEXCore::Allocator::ProtectOptions::None)) {
+      LogMan::Msg::EFmt("Failed to mprotect last page of code buffer.");
+    }
+    if (Name) {
+      FEXCore::Allocator::VirtualName(Name, Ptr, Size);
+    }
+    return Ptr;
+  }
+
+  void Free(void* Ptr, size_t Size) override {
+    FEXCore::Allocator::VirtualFree(Ptr, Size);
+  }
+
+#endif
   const char* Name {};
 };
 
