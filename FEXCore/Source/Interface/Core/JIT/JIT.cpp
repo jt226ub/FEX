@@ -898,6 +898,11 @@ CPUBackend::CompiledCode Arm64JITCore::EmitJITCode(uint64_t Entry, uint64_t Size
   this->IR = IR;
   RequiresFarARM64Jumps = false;
   SSANodeMultiplier = 24;
+#ifdef __APPLE__
+  if (ThreadState->JITScratchStartMultiplier) {
+    SSANodeMultiplier = ThreadState->JITScratchStartMultiplier;
+  }
+#endif
 
   // Prepare restart via long jump in case branch encoding fails.
   // This uses UncheckedLongJump since we don't implement std::longjmp in WoA setups
@@ -910,9 +915,20 @@ CPUBackend::CompiledCode Arm64JITCore::EmitJITCode(uint64_t Entry, uint64_t Size
     // Get rid of the claimed buffer immediately, we can't fit in it at all.
     TempCodeBufferAllocator.UnclaimBuffer();
     SSANodeMultiplier *= 2;
+#ifdef __APPLE__
+    ++ThreadState->JITScratchOverflows;
+#endif
     break;
   default: LOGMAN_MSG_A_FMT("Unhandled Arm64 restart condition!");
   }
+#ifdef __APPLE__
+  // A restarted attempt emits the block from the start again. Without this the guest
+  // instruction and sub-block records of the abandoned attempt stay in front of the new
+  // ones and are written into the block tail's RIP table, with host offsets from that
+  // attempt (different ones after a far-jumps restart).
+  DebugData->GuestOpcodes.clear();
+  DebugData->Subblocks.clear();
+#endif
 
   uint32_t SSACount = IR->GetSSACount();
   JumpTargets.clear();
@@ -925,13 +941,43 @@ CPUBackend::CompiledCode Arm64JITCore::EmitJITCode(uint64_t Entry, uint64_t Size
 
   // Fairly excessive buffer range to make sure we don't overflow
   // One page baseline, plus SSANodeMultipler bytes, plus another page for guard page.
+#ifdef __APPLE__
+  // Each overflow doubles SSANodeMultiplier (the restart resumes at the SetJump above, so
+  // the doubling accumulates). An emitter that never fits would otherwise keep doubling
+  // until the size wraps or the allocation fails. Stop at a limit instead and report the
+  // block as untranslatable: 64MB, half the largest code buffer (MAX_CODE_SIZE in
+  // SharedCodeBufferManager.cpp), so anything that did fit can always be stored. Real
+  // blocks need a small fraction of that; reaching it means an emitter bug.
+  {
+    constexpr uint64_t DefaultScratchBufferLimit = 64 * 1024 * 1024;
+    const uint64_t Limit = ThreadState->JITScratchBufferLimit ? ThreadState->JITScratchBufferLimit : DefaultScratchBufferLimit;
+    const uint64_t Wanted = FEXCore::Utils::FEX_PAGE_SIZE * 2 + uint64_t {SSACount} * SSANodeMultiplier;
+    if (Wanted > Limit) {
+      TempCodeBufferAllocator.UnclaimBuffer();
+      ThreadState->JITGuardPage = 0;
+      Relocations.resize(PrevNumAllocations, FEXCore::CPU::Relocation::Default());
+      CodeData.EntryPoints.clear();
+      this->IR = nullptr;
+      LogMan::Msg::EFmt("Block at {:#x} still overflows its translation buffer at {} bytes ({} IR nodes); not translating it", Entry,
+                        Wanted, SSACount);
+      return {};
+    }
+  }
+#endif
   const uint32_t DesiredBufferRange = AlignUp(FEXCore::Utils::FEX_PAGE_SIZE * 2 + SSACount * SSANodeMultiplier, FEXCore::Utils::FEX_PAGE_SIZE);
 
   // JIT output is first written to a temporary buffer and later relocated to the CodeBuffer.
   // This minimizes lock contention of CodeBufferWriteMutex.
   auto TempCodeBufferInfo = TempCodeBufferAllocator.ReownOrClaimBufferWithSize(DesiredBufferRange);
   auto TempCodeBuffer = TempCodeBufferInfo.Ptr;
+#ifdef __APPLE__
+  // The guard is the whole host page the allocator put after the buffer
+  // (PooledAllocatorVirtualWithGuard): everything before it is writable, and JITGuardPage
+  // is exactly where it starts, so the fault handler can claim exactly that one page.
+  const uint32_t UsableBufferRange = FEXCore::Utils::PooledAllocatorVirtualWithGuard::GuardOffset(TempCodeBufferInfo.Size);
+#else
   const uint32_t UsableBufferRange = TempCodeBufferInfo.Size - FEXCore::Utils::FEX_PAGE_SIZE;
+#endif
 
   SetBuffer(TempCodeBuffer, UsableBufferRange);
 
@@ -1152,6 +1198,16 @@ CPUBackend::CompiledCode Arm64JITCore::EmitJITCode(uint64_t Entry, uint64_t Size
     SetBuffer(nullptr, 0);
   }
 
+#ifdef __APPLE__
+  // The block is emitted: the scratch buffer's guard page and restart point are only
+  // meaningful while the emitter writes. Disarming them here lets the macOS embedder
+  // (Source/Embedding/Faults.cpp) restart only a translation that is really running,
+  // instead of jumping to this stale restart point for a later stray write to the page.
+  // Disarmed before the copy into the code buffer: a restart from inside the
+  // ScopedJITWrite below would skip its destructor and leave the thread writable.
+  ThreadState->JITGuardPage = 0;
+#endif
+
   // Migrate the compile output from temporary storage to the actual CodeBuffer.
   {
     LOGMAN_THROW_A_FMT(CodeData.Size % 16 == 0, "Needs to be 16B aligned!");
@@ -1178,14 +1234,6 @@ CPUBackend::CompiledCode Arm64JITCore::EmitJITCode(uint64_t Entry, uint64_t Size
   }
 
   TempCodeBufferAllocator.DelayedDisownBuffer();
-
-#ifdef __APPLE__
-  // The block is emitted: the scratch buffer's guard page and restart point are only
-  // meaningful while the emitter writes. Disarming them here lets the macOS embedder
-  // (Source/Embedding/Faults.cpp) restart only a translation that is really running,
-  // instead of jumping to this stale restart point for a later stray write to the page.
-  ThreadState->JITGuardPage = 0;
-#endif
 
   ClearICache(CodeBegin, CodeOnlySize);
 

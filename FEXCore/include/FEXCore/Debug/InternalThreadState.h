@@ -117,6 +117,19 @@ struct alignas(FEXCore::Utils::FEX_HOST_PAGE_SIZE) InternalThreadState : public 
   uintptr_t JITGuardPage {};
   uint64_t JITGuardOverflowArgument {};
   FEXCore::UncheckedLongJump::JumpBuf RestartJump;
+#ifdef __APPLE__
+  // The largest scratch buffer the translator asks for before it gives up on a block
+  // that keeps overflowing it. 0 means the default (Arm64JITCore::EmitJITCode). Only
+  // tests set a smaller one, to reach that limit.
+  uint64_t JITScratchBufferLimit {};
+  // The scratch-buffer bytes the translator first allows per IR node; 0 means the
+  // default (24). Only tests set a smaller one, to make translations overflow and
+  // restart many times.
+  uint32_t JITScratchStartMultiplier {};
+  // How many times translation on this thread restarted because the scratch buffer was
+  // too small. Read by tests.
+  uint64_t JITScratchOverflows {};
+#endif
 
   // BaseFrameState should always be at the end, directly before the interrupt fault page
   FEXCore::Core::CpuStateFrame BaseFrameState {};
