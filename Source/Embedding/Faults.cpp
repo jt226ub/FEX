@@ -223,10 +223,23 @@ namespace {
     if (Kind.Kind != FaultKind::Alignment || !Thread->CTX->IsAddressInCodeBuffer(Thread, PC)) {
       return false;
     }
+    // The core may now take its per-block patch lock (with the thread switched to writing
+    // code) or its split-lock lock. Block asynchronous signals for that time: a host that
+    // owns the fault signals runs this with its own mask, and an asynchronous handler that
+    // left by a jump, or stopped the thread, would leave a lock held (and the thread in
+    // write mode). The library's own handler already blocks them; synchronous fault
+    // signals stay open as everywhere in the handler.
+    sigset_t Asynchronous, Previous;
+    sigfillset(&Asynchronous);
+    for (int Synchronous : SynchronousSignals) {
+      sigdelset(&Asynchronous, Synchronous);
+    }
+    pthread_sigmask(SIG_BLOCK, &Asynchronous, &Previous);
     SetKey(EmulatingKey, reinterpret_cast<uintptr_t>(Info->si_addr));
     const auto Result = FEXCore::ArchHelpers::Arm64::HandleUnalignedAccess(
       Thread, FEXCore::ArchHelpers::Arm64::UnalignedHandlerType::HalfBarrier, PC, &State.__x[0]);
     SetKey(EmulatingKey, 0);
+    pthread_sigmask(SIG_SETMASK, &Previous, nullptr);
     if (!Result.has_value()) {
       return false;
     }

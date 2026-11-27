@@ -25,6 +25,10 @@ import sys
 import time
 
 CACHE_LINE = re.compile(r"^Code cache: compiled (\d+) loaded (\d+) rejected (\d+) queued (\d+)$", re.M)
+STATE_LINE = re.compile(r"^Code cache state: (\d+) dropped (\d+) replaced (\d+) reset (\d+)$", re.M)
+FLUSH_LINE = re.compile(r"^flush took ([0-9.]+) s$", re.M)
+# fexmac_cache_state
+OFF, ACTIVE, READ_ONLY, UNTRUSTED, UNAVAILABLE = range(5)
 TIMEOUT = 60
 
 # On-disk layout (see FEXCore/Source/Interface/Core/DiskCache.{h,cpp}).
@@ -68,12 +72,19 @@ def run(cmd, cache_dir, extra_env=None):
     match = CACHE_LINE.search(result.stdout)
     if match:
         info.update(zip(("compiled", "loaded", "rejected", "queued"), map(int, match.groups())))
+    match = STATE_LINE.search(result.stdout)
+    if match:
+        info.update(zip(("state", "dropped", "replaced", "reset"), map(int, match.groups())))
+    match = FLUSH_LINE.search(result.stdout)
+    if match:
+        info["flush"] = float(match.group(1))
     return info
 
 
 def summary(info):
-    return "rc=%s compiled=%s loaded=%s rejected=%s queued=%s" % (info["rc"], info.get("compiled"), info.get("loaded"),
-                                                                 info.get("rejected"), info.get("queued"))
+    return "rc=%s compiled=%s loaded=%s rejected=%s queued=%s state=%s dropped=%s replaced=%s reset=%s" % (
+        info["rc"], info.get("compiled"), info.get("loaded"), info.get("rejected"), info.get("queued"), info.get("state"),
+        info.get("dropped"), info.get("replaced"), info.get("reset"))
 
 
 def db_files(cache_dir):
@@ -120,6 +131,16 @@ def poke32(path, offset, value):
 def truncate(path, size):
     with open(path, "r+b") as handle:
         handle.truncate(size)
+
+
+def hold_locks(cache_dir):
+    """A process that takes flock on every cache file under cache_dir and keeps it."""
+    code = ("import fcntl,os,sys,time\nfds=[]\nfor d,_,fs in os.walk(sys.argv[1]):\n for f in fs:\n  if f.endswith('.foz'):\n"
+            "   fd=os.open(os.path.join(d,f),os.O_RDONLY); fcntl.flock(fd,fcntl.LOCK_EX); fds.append(fd)\nprint(len(fds),flush=True)\n"
+            "time.sleep(120)\n")
+    holder = subprocess.Popen([sys.executable, "-c", code, cache_dir], stdout=subprocess.PIPE, text=True)
+    holder.stdout.readline()
+    return holder
 
 
 def fresh_copy(source, work, name):
@@ -566,16 +587,17 @@ def main():
     target = fresh_copy(pristine, work, "shared-dir")
     os.chmod(target, 0o777)
     info = run(test_cmd, target)
-    check("a base directory writable by other users switches the cache off",
-          info["rc"] == 0 and info.get("loaded") == 0 and info.get("queued") == 0 and os.stat(target).st_mode & 0o777 == 0o777, summary(info))
+    check("a base directory writable by other users switches the cache off (state UNTRUSTED)",
+          info["rc"] == 0 and info.get("loaded") == 0 and info.get("queued") == 0 and info.get("state") == UNTRUSTED and
+          os.stat(target).st_mode & 0o777 == 0o777, summary(info))
     os.chmod(target, 0o755)
 
     target = fresh_copy(pristine, work, "bucket-open")
     os.chmod(bucket_of(target), 0o755)
     info = run(test_cmd, target)
-    check("a bucket directory that is not private switches the cache off and is left as it was",
-          info["rc"] == 0 and info.get("loaded") == 0 and info.get("queued") == 0 and os.stat(bucket_of(target)).st_mode & 0o777 == 0o755,
-          summary(info))
+    check("a bucket directory that is not private switches the cache off (UNTRUSTED) and is left as it was",
+          info["rc"] == 0 and info.get("loaded") == 0 and info.get("queued") == 0 and info.get("state") == UNTRUSTED and
+          os.stat(bucket_of(target)).st_mode & 0o777 == 0o755, summary(info))
 
     target = fresh_copy(pristine, work, "file-open")
     path = os.path.join(target, cache_rel)
@@ -583,8 +605,27 @@ def main():
     before = os.stat(path).st_ino
     info = run(test_cmd, target)
     after = os.stat(path)
-    check("a cache file writable by others is not used: it is removed and the database started again",
-          info["rc"] == 0 and info.get("loaded") == 0 and after.st_ino != before and after.st_mode & 0o777 == 0o600, summary(info))
+    check("a cache file writable by others is not used: removed, started again, counted (state ACTIVE, replaced 1)",
+          info["rc"] == 0 and info.get("loaded") == 0 and after.st_ino != before and after.st_mode & 0o777 == 0o600 and
+          info.get("state") == ACTIVE and info.get("replaced") == 1, summary(info))
+
+    # Not trust: the cache cannot be used for another reason (state UNAVAILABLE).
+    target = os.path.join(work, "read-only-dir")
+    os.makedirs(target)
+    os.chmod(target, 0o500)
+    info = run(test_cmd, target)
+    os.chmod(target, 0o700)
+    check("a cache directory that cannot be written: state UNAVAILABLE, the run is right",
+          info["rc"] == 0 and info.get("state") == UNAVAILABLE and info.get("queued") == 0, summary(info))
+    target = fresh_copy(pristine, work, "busy-at-open")
+    holder = hold_locks(target)
+    started = time.monotonic()
+    info = run(test_cmd, target)
+    waited = time.monotonic() - started
+    holder.kill()
+    holder.wait()
+    check("a database kept locked by another process at open: state UNAVAILABLE after one wait (%.1f s)" % waited,
+          info["rc"] == 0 and info.get("state") == UNAVAILABLE and waited < 9, summary(info))
 
     target = fresh_copy(pristine, work, "file-acl")
     path = os.path.join(target, cache_rel)
@@ -664,8 +705,31 @@ def main():
     info = run([cache_test, "--threads", "1", "--blocks", "300"], target, {"FEX_DISKCACHEMAXFILESIZE": str(limit)})
     sizes = [os.path.getsize(f) for pair in db_files(target) for f in pair]
     check("cache files stay within the size limit", info["rc"] == 0 and sizes and max(sizes) <= limit, "%s sizes=%s" % (summary(info), sizes))
-    info = run([cache_test, "--threads", "1", "--blocks", "300"], target, {"FEX_DISKCACHEMAXFILESIZE": "16"})
-    check("a database larger than the limit is emptied and the run is right", info["rc"] == 0, summary(info))
+    # Generations: with a small limit and many different blocks the database fills, a new
+    # generation starts, the previous one is still read, and older ones are deleted.
+    target = os.path.join(work, "generations")
+    gen_cmd = [cache_test, "--threads", "1", "--blocks", "120", "--distinct", "--base", "0x8000000000"]
+    first = run(gen_cmd, target, {"FEX_DISKCACHEMAXFILESIZE": "16384"})
+    names = sorted(f for folder, _, files in os.walk(target) for f in files if f.endswith("_idx.foz"))
+    generations = [n for n in names if re.search(r"-\d+_idx\.foz$", n)]
+    sizes = [os.path.getsize(f) for pair in db_files(target) for f in pair]
+    second = run(gen_cmd, target, {"FEX_DISKCACHEMAXFILESIZE": "16384"})
+    check("a full database continues in a new generation; at most two are kept, each within the limit; the next run loads",
+          first["rc"] == 0 and second["rc"] == 0 and generations and len(names) <= 2 and max(sizes) <= 16384 and
+          second.get("loaded", 0) > 0 and second.get("rejected") == 0 and first.get("dropped") == 0,
+          "%s / %s generations=%s sizes=%s" % (summary(first), summary(second), names, sizes))
+
+    # A database another process filled past this process's (smaller) limit is used read-only,
+    # never emptied.
+    target = os.path.join(work, "over-limit")
+    big = run(gen_cmd, target)
+    before = sorted((f, os.path.getsize(f)) for pair in db_files(target) for f in pair)
+    small = run(gen_cmd, target, {"FEX_DISKCACHEMAXFILESIZE": "4096"})
+    after = sorted((f, os.path.getsize(f)) for pair in db_files(target) for f in pair)
+    again = run(gen_cmd, target)
+    check("a database larger than this process's limit is read, not written or emptied (state READ_ONLY)",
+          big["rc"] == 0 and small["rc"] == 0 and small.get("state") == READ_ONLY and small.get("compiled") == 0 and
+          before == after and again.get("compiled") == 0, "%s / %s / %s" % (summary(big), summary(small), summary(again)))
 
     # 8. Code generation state that is not in the configuration.
     print("== code generation state outside the configuration")
@@ -701,6 +765,38 @@ def main():
         info = run([cache_test, "--threads", "4", "--fork"], fdir)
         ok = info["rc"] == 0 and "child: 0 wrong, flush skipped" in info["out"]
         check("fork with a %s cache" % name, ok, summary(info) + " " + info["out"][-300:])
+    rawdir = os.path.join(work, "fork-raw")
+    for name in ("cold", "warm"):
+        info = run([cache_test, "--threads", "4", "--fork-raw"], rawdir)
+        ok = info["rc"] == 0 and "child: 0 wrong, flush skipped, cache state as expected" in info["out"]
+        check("fork without fexmac_before_fork, %s cache: the child turns read-only, its flush returns" % name, ok,
+              summary(info) + " " + info["out"][-300:])
+
+    # A process holding the database's locks (sleeping, or stopped with SIGSTOP) after this
+    # one opened it: one wait, then every store is dropped and counted; the flush at exit
+    # returns after about one deadline whatever the number of entries.
+    print("== a stalled lock holder")
+    ldir = os.path.join(work, "stall")
+    run([cache_test, "--threads", "1", "--blocks", "3"], ldir)
+    for how in ("hold", "stop"):
+        info = run([cache_test, "--threads", "1", "--blocks", "60", "--distinct", "--stall-lock", how], ldir)
+        check("lock holder that %s: %s entries dropped, flush %.1f s" % ("sleeps" if how == "hold" else "is stopped", info.get("dropped"),
+                                                                         info.get("flush", -1)),
+              info["rc"] == 0 and info.get("queued", 0) > 10 and info.get("dropped") == info.get("queued") and info.get("flush", 99) < 7,
+              summary(info))
+
+    # An entry that fails its checks is superseded: the next run loads cleanly.
+    print("== a damaged entry is replaced")
+    target = fresh_copy(pristine, work, "superseded")
+    (dcache, dindex), = db_files(target)
+    damaged = [r for r in parse_index(dindex) if not r["metadata"]][0]
+    flip(dcache, damaged["blob"] + BLOB_HEADER + 8, 3)
+    first = run(test_cmd, target)
+    second = run(test_cmd, target)
+    third = run(test_cmd, target)
+    check("damaged entry: rejected once, then replaced (next runs load everything, rejected 0)",
+          first.get("rejected", 0) >= 1 and second.get("compiled") == 0 and second.get("rejected") == 0 and third.get("rejected") == 0,
+          "%s / %s / %s" % (summary(first), summary(second), summary(third)))
 
     # 11. Entries re-sealed with a correct integrity hash but bad contents (what a process
     # running as the user could write), and index records outside the hash.

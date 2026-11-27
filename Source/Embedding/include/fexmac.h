@@ -164,11 +164,18 @@ typedef struct fexmac_config {
    *
    * The directory must be owned by this user and writable by nobody else (no group or
    * other write bit, no ACL entry granting write); the library creates it 0700 if it is
-   * missing and never changes an existing one. If it, or the cache files in it, may not
-   * be trusted, the context is still created, without a cache, and
-   * fexmac_context_get_counters reports FEXMAC_CACHE_REFUSED. A cache file is code that
-   * will run: anything running as this user can write it, and the library's integrity
-   * checks do not stop that.
+   * missing and never changes an existing one. Whatever goes wrong with the cache, the
+   * context is still created and runs: fexmac_context_get_counters says what the cache is
+   * doing (see fexmac_cache_state). A cache file that may not be trusted is removed and
+   * started again (counted in untrusted_files_replaced). A cache file is code that will
+   * run: anything running as this user can write it, and the library's integrity checks
+   * do not stop that.
+   *
+   * Size: each cache file is limited to DISKCACHEMAXFILESIZE bytes (default 256MB, set by
+   * the library). When the current file is full a new generation starts; the previous one
+   * is still read and older ones are deleted. Every process reads the whole index of the
+   * generations it uses when it starts (about 40% of the cache file for small blocks),
+   * which is what the default bounds.
    *
    * With the cache on, register the guest's code with fexmac_add_code_range: cached code
    * is matched against the guest bytes inside the registered ranges only.
@@ -232,13 +239,21 @@ FEXMAC_EXPORT fexmac_result fexmac_remove_code_range(fexmac_context* context, ui
 typedef enum fexmac_cache_state {
   /* code_cache_enabled was 0. */
   FEXMAC_CACHE_OFF = 0,
-  /* Translations are loaded from and saved to the directory. */
+  /* Translations are loaded from and saved to the directory. Saving can still stop for
+   * the rest of the run (another process kept the database locked past the wait, or it
+   * could not grow): cache_entries_dropped counts what was not saved. */
   FEXMAC_CACHE_ACTIVE = 1,
-  /* Loaded but not saved: the child of a fork (see fexmac_before_fork). */
+  /* Loaded but not saved: the child of a fork, or a database that another process with a
+   * larger size limit filled past this process's limit (it is used, never emptied). */
   FEXMAC_CACHE_READ_ONLY = 2,
-  /* Requested, but the directory or its files may not be trusted, or the core's build
-   * cannot be identified; the context runs without a cache. The reason is logged. */
-  FEXMAC_CACHE_REFUSED = 3,
+  /* Not used because it may not be trusted: the directory (or the bucket directory in
+   * it) is not owned by this user, can be written by others (mode or ACL), or is a
+   * symbolic link. The reason is logged. */
+  FEXMAC_CACHE_UNTRUSTED = 3,
+  /* Not used for another reason: the database stayed locked by another process when it
+   * was opened, the directory cannot be created or written (read-only, no space, I/O
+   * error), or the core's build cannot be identified. The reason is logged. */
+  FEXMAC_CACHE_UNAVAILABLE = 4,
 } fexmac_cache_state;
 
 typedef struct fexmac_translation_counters {
@@ -250,6 +265,9 @@ typedef struct fexmac_translation_counters {
   uint64_t blocks_loaded;          /* blocks copied from the code cache instead */
   uint64_t cache_entries_rejected; /* cache entries that failed a check and were ignored */
   uint64_t cache_entries_queued;   /* compiled blocks handed to the cache writer */
+  uint64_t cache_entries_dropped;  /* queued entries that were not saved */
+  uint32_t untrusted_files_replaced; /* untrusted cache files removed and started again */
+  uint32_t damaged_databases_reset;  /* damaged databases emptied and started again */
 } fexmac_translation_counters;
 
 /* Sets struct_size and zeroes the rest. */
@@ -257,10 +275,12 @@ FEXMAC_EXPORT void fexmac_translation_counters_init(fexmac_translation_counters*
 
 FEXMAC_EXPORT fexmac_result fexmac_context_get_counters(fexmac_context* context, fexmac_translation_counters* counters);
 
-/* Waits until every translation queued for the code cache is written, then flushes the
- * cache files to stable storage. Call it before the process exits: translations still
- * queued then are lost (never half-written). FEXMAC_ERROR_UNSUPPORTED if the context
- * does not save translations (cache off, refused or read-only). */
+/* Waits until every translation queued for the code cache is written (or dropped), then
+ * flushes the cache files to stable storage. Call it before the process exits:
+ * translations still queued then are lost (never half-written). Waits for another
+ * process's lock at most once per process (about 5 s); after that, entries are dropped.
+ * FEXMAC_ERROR_UNSUPPORTED if the context does not save translations (cache off,
+ * untrusted, unavailable or read-only, including in a child after fork()). */
 FEXMAC_EXPORT fexmac_result fexmac_context_flush_cache(fexmac_context* context);
 
 /* fork() with a context: call fexmac_before_fork just before fork() and
@@ -269,7 +289,9 @@ FEXMAC_EXPORT fexmac_result fexmac_context_flush_cache(fexmac_context* context);
  * running. In the child only the forking host thread exists: threads created before the
  * fork must not be run there (destroy them or leave them), new ones may be created and
  * run. The child keeps loading from the code cache but saves nothing (it shares the
- * parent's open cache files); its cache state is FEXMAC_CACHE_READ_ONLY. */
+ * parent's open cache files); its cache state is FEXMAC_CACHE_READ_ONLY. The cache also
+ * notices a fork made without these calls and turns read-only in the child, but the
+ * library's own locks are only safe with them. */
 FEXMAC_EXPORT fexmac_result fexmac_before_fork(fexmac_context* context);
 FEXMAC_EXPORT fexmac_result fexmac_after_fork(fexmac_context* context, int child);
 
@@ -458,12 +480,15 @@ FEXMAC_EXPORT fexmac_result fexmac_install_fault_handlers(void);
  * handler holds, and never calls the log callback. It can take two spin locks, each held
  * only by another thread's fault handler and only for one bounded step: the core's
  * per-block patch lock (the few instructions of a patch) and the core's process-wide
- * split-lock lock (one emulated locked operation on a word that crosses 16 bytes; it
- * makes those operations atomic with each other and cannot be switched off). The latter
- * is held while guest memory is accessed: if that access faults, the fault reaches the
- * host's handler with the lock held, so a host using way 2 must not leave such a fault
- * with siglongjmp (every later such operation in the process would wait forever); dying
- * or returning after fixing the cause is fine. If the core meets an atomic instruction it cannot rewrite
+ * split-lock lock (one attempt at one emulated locked operation on an operand that
+ * crosses 16 bytes; it makes those operations atomic with each other and cannot be
+ * switched off). While the core may hold either, this function blocks asynchronous
+ * signals itself (everything but SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGTRAP and SIGSYS) and
+ * restores the caller's mask afterwards, so a host's asynchronous handler cannot run
+ * then. The split-lock lock is held while guest memory is accessed: if that access
+ * faults, the fault reaches the host's handler with the lock held, so a host using way 2
+ * must not leave such a fault with siglongjmp (every later such operation in the process
+ * would wait forever); dying or returning after fixing the cause is fine. If the core meets an atomic instruction it cannot rewrite
  * (which would be a core bug), the core formats an error message, which allocates; the
  * library writes it with write(2) and the fault is not claimed. */
 FEXMAC_EXPORT int fexmac_handle_fault(int signal, siginfo_t* info, void* ucontext);

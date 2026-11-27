@@ -174,24 +174,34 @@ static bool StoreCAS8(uint8_t& Expected, uint8_t Val, uint64_t Addr) {
   return Atom.compare_exchange_strong(Expected, Val);
 }
 
-// The two compare-and-swaps of an emulated read-modify-write that crosses a 16-byte (or,
-// for 16-bit accesses, an 8-byte) boundary. Returns true if both succeeded. On failure,
-// the Expected value of the compare-and-swap that failed holds what memory had, and Torn
-// says whether the other half had already been written, in which case the operation can
-// neither be completed nor retried.
+// The two compare-and-swaps of an emulated read-modify-write that crosses a 16-byte
+// boundary. Returns true if both succeeded. On failure, the Expected value of the
+// compare-and-swap that failed holds what memory had, and Torn says whether the upper half
+// had already been written, in which case the operation can neither be completed nor
+// retried. OursLower marks the bytes of the lower word that belong to the operand; the
+// rest of that word belongs to neighbouring data.
 //
 // Upstream always writes the upper half first, so any failure of the lower one is a tear.
-// On macOS the half that the operation does not change is compared first instead (a
-// compare-and-swap of a value with itself), and a failure of the second is then not a
-// tear: nothing has been written and the caller retries. This matters for an `xchg` lock
-// word or a flag whose value lives in one half: a plain store from another thread (such
-// as the lock's release) landing between the two compare-and-swaps used to make the
-// operation report a stale "old value" without having written, so two threads could
-// both take the lock (FEXCoreOrderingTest's LOCK-xchg-split16 lost increments). When both
-// halves change, a tear is still possible, as upstream.
+// On macOS:
+//  - The half that the operation does not change is compared first instead (a
+//    compare-and-swap of a value with itself), and a failure of the second is then not a
+//    tear: nothing has been written and the caller retries. This matters for an `xchg` or
+//    `cmpxchg8b` lock word whose value lives in one half: a plain store from another
+//    thread (such as the lock's release) landing between the two compare-and-swaps used
+//    to make the operation report a stale "old value" without having written, so two
+//    threads could both take the lock (FEXCoreOrderingTest's LOCK-xchg-split16 lost
+//    increments).
+//  - When both halves change and the lower compare-and-swap fails after the upper one
+//    succeeded only because the neighbouring bytes of the lower word changed (the
+//    operand's own bytes are as read), the lower half is written again with the new
+//    neighbouring bytes, completing the operation, a bounded number of times.
+// A tear is still possible when both halves change and another thread changed the
+// operand's own lower bytes in between (a plain store, or a native atomic; emulations of
+// each other are excluded by the split-lock lock). Every remaining limit is listed under
+// "Remaining limits of split locked operations" in docs/macOS-port-status.md.
 template<typename T>
 static bool SplitCAS(T& ExpectedLower, T DesiredLower, uint64_t AddrLower, T& ExpectedUpper, T DesiredUpper, uint64_t AddrUpper,
-                     bool (*CAS)(T&, T, uint64_t), bool& Torn) {
+                     bool (*CAS)(T&, T, uint64_t), bool& Torn, T OursLower = static_cast<T>(~T {})) {
   Torn = false;
 #ifdef __APPLE__
   if (ExpectedUpper != DesiredUpper && ExpectedLower == DesiredLower) {
@@ -203,15 +213,44 @@ static bool SplitCAS(T& ExpectedLower, T DesiredLower, uint64_t AddrLower, T& Ex
   const bool UpperChanges = ExpectedUpper != DesiredUpper;
 #else
   constexpr bool UpperChanges = true;
+  (void)OursLower;
 #endif
   if (!CAS(ExpectedUpper, DesiredUpper, AddrUpper)) {
     return false;
   }
+#ifdef __APPLE__
+  const T ReadLower = ExpectedLower;
+  for (int Attempt = 0; Attempt < 16; ++Attempt) {
+    if (CAS(ExpectedLower, DesiredLower, AddrLower)) {
+      return true;
+    }
+    if (!UpperChanges || ((ExpectedLower ^ ReadLower) & OursLower) != 0) {
+      break;
+    }
+    // Only the neighbouring bytes changed: keep them, write the operand's bytes again.
+    DesiredLower = static_cast<T>((ExpectedLower & ~OursLower) | (DesiredLower & OursLower));
+  }
+#else
   if (CAS(ExpectedLower, DesiredLower, AddrLower)) {
     return true;
   }
+#endif
   Torn = UpperChanges;
   return false;
+}
+
+// The split-lock lock (StrictInProcessSplitLocks) is held for one attempt of an emulated
+// operation at a time on macOS: released and taken again before each retry, so that plain
+// stores that keep changing the word make this thread retry, not hold the lock.
+using SplitLockGuard = std::optional<FEXCore::Utils::SpinWaitLock::UniqueSpinMutex<uint32_t>>;
+static inline void RetakeSplitLock([[maybe_unused]] SplitLockGuard& Lock, [[maybe_unused]] uint32_t* Mutex, bool& FirstAttempt) {
+#ifdef __APPLE__
+  if (!FirstAttempt && Lock.has_value()) {
+    Lock.reset();
+    Lock.emplace(Mutex);
+  }
+#endif
+  FirstAttempt = false;
 }
 
 static uint16_t DoLoad16(uint64_t Addr) {
@@ -380,6 +419,7 @@ static bool RunCASPAL(uint64_t* GPRs, uint32_t Size, uint32_t DesiredReg1, uint3
                       uint32_t ExpectedReg2, uint32_t AddressReg, uint32_t* StrictSplitLockMutex) {
 
   std::optional<FEXCore::Utils::SpinWaitLock::UniqueSpinMutex<uint32_t>> Lock {};
+  bool FirstAttempt = true;
   if (Size == 0) {
     // 32bit
     uint64_t Addr = GPRs[AddressReg];
@@ -436,6 +476,8 @@ static bool RunCASPAL(uint64_t* GPRs, uint32_t Size, uint32_t DesiredReg1, uint3
       Expected <<= Alignment * 8;
 
       while (1) {
+
+        RetakeSplitLock(Lock, StrictSplitLockMutex, FirstAttempt);
         __uint128_t LoadOrderUpper = LoadAcquire64(AddrUpper);
         LoadOrderUpper <<= 64;
         __uint128_t TmpActual = LoadOrderUpper | LoadAcquire64(Addr);
@@ -456,16 +498,16 @@ static bool RunCASPAL(uint64_t* GPRs, uint32_t Size, uint32_t DesiredReg1, uint3
         uint64_t TmpDesiredLower = TmpDesired;
         uint64_t TmpDesiredUpper = TmpDesired >> 64;
 
+        bool Tear = false;
         if (TmpExpected == TmpActual) {
-          if (StoreCAS64(TmpExpectedUpper, TmpDesiredUpper, AddrUpper)) {
-            if (StoreCAS64(TmpExpectedLower, TmpDesiredLower, Addr)) {
-              // Stored successfully
-              return true;
-            } else {
-              // CAS managed to tear, we can't really solve this
-              // Continue down the path to let the guest know values weren't expected
-              FEXCORE_TELEMETRY_SET(TYPE_CAS_128BIT_TEAR, 1);
-            }
+          if (SplitCAS<uint64_t>(TmpExpectedLower, TmpDesiredLower, Addr, TmpExpectedUpper, TmpDesiredUpper, AddrUpper, StoreCAS64,
+                                 Tear, static_cast<uint64_t>(Mask))) {
+            // Stored successfully
+            return true;
+          } else if (Tear) {
+            // CAS managed to tear, we can't really solve this
+            // Continue down the path to let the guest know values weren't expected
+            FEXCORE_TELEMETRY_SET(TYPE_CAS_128BIT_TEAR, 1);
           }
 
           TmpExpected = TmpExpectedUpper;
@@ -483,6 +525,16 @@ static bool RunCASPAL(uint64_t* GPRs, uint32_t Size, uint32_t DesiredReg1, uint3
 
         __uint128_t FailedDesiredOurBits = TmpDesired & Mask;
         __uint128_t FailedDesiredNotOurBits = TmpDesired & NegMask;
+#ifdef __APPLE__
+        if (Tear) {
+          // Half written: retrying would apply the operation to the torn value. Report the
+          // failure with what memory holds.
+          uint64_t FailedResult = FailedResultOurBits >> (Alignment * 8);
+          GPRs[ExpectedReg1] = FailedResult & ~0U;
+          GPRs[ExpectedReg2] = FailedResult >> 32;
+          return true;
+        }
+#endif
         if ((FailedResultNotOurBits ^ FailedDesiredNotOurBits) != 0) {
           // If the bits changed that weren't part of our regular CAS then we need to try again
           continue;
@@ -522,6 +574,8 @@ static bool RunCASPAL(uint64_t* GPRs, uint32_t Size, uint32_t DesiredReg1, uint3
       Expected <<= Alignment * 8;
 
       while (1) {
+
+        RetakeSplitLock(Lock, StrictSplitLockMutex, FirstAttempt);
         TmpExpected = Atomic128.load();
 
         // Set up expected
@@ -668,6 +722,7 @@ template<bool Retry>
 static uint16_t DoCAS16(uint16_t DesiredSrc, uint16_t ExpectedSrc, uint64_t Addr, CASExpectedFn<uint16_t> ExpectedFunction,
                         CASDesiredFn<uint16_t> DesiredFunction, uint32_t* StrictSplitLockMutex) {
   std::optional<FEXCore::Utils::SpinWaitLock::UniqueSpinMutex<uint32_t>> Lock {};
+  bool FirstAttempt = true;
 
   if ((Addr & 63) == 63) {
     FEXCORE_TELEMETRY_SET(TYPE_HAS_SPLIT_LOCKS, 1);
@@ -689,6 +744,8 @@ static uint16_t DoCAS16(uint16_t DesiredSrc, uint16_t ExpectedSrc, uint64_t Addr
     uint64_t AddrUpper = Addr + 1;
 
     while (1) {
+
+      RetakeSplitLock(Lock, StrictSplitLockMutex, FirstAttempt);
       uint8_t ActualUpper {};
       uint8_t ActualLower {};
       // Careful ordering here
@@ -762,6 +819,8 @@ static uint16_t DoCAS16(uint16_t DesiredSrc, uint16_t ExpectedSrc, uint64_t Addr
       __uint128_t TmpDesired {};
 
       while (1) {
+
+        RetakeSplitLock(Lock, StrictSplitLockMutex, FirstAttempt);
         TmpExpected = Atomic128.load();
 
         __uint128_t Desired = DesiredFunction(TmpExpected >> (Alignment * 8), DesiredSrc);
@@ -825,6 +884,7 @@ static uint16_t DoCAS16(uint16_t DesiredSrc, uint16_t ExpectedSrc, uint64_t Addr
 
         auto Atomic = std::atomic_ref<uint64_t>(*reinterpret_cast<uint64_t*>(Addr));
         while (1) {
+          RetakeSplitLock(Lock, StrictSplitLockMutex, FirstAttempt);
           TmpExpected = Atomic.load();
 
           uint64_t Desired = DesiredFunction(TmpExpected >> (Alignment * 8), DesiredSrc);
@@ -888,6 +948,7 @@ static uint16_t DoCAS16(uint16_t DesiredSrc, uint16_t ExpectedSrc, uint64_t Addr
 
         auto Atomic = std::atomic_ref<uint32_t>(*reinterpret_cast<uint32_t*>(Addr));
         while (1) {
+          RetakeSplitLock(Lock, StrictSplitLockMutex, FirstAttempt);
           TmpExpected = Atomic.load();
 
 
@@ -944,6 +1005,7 @@ template<bool Retry>
 static uint32_t DoCAS32(uint32_t DesiredSrc, uint32_t ExpectedSrc, uint64_t Addr, CASExpectedFn<uint32_t> ExpectedFunction,
                         CASDesiredFn<uint32_t> DesiredFunction, uint32_t* StrictSplitLockMutex) {
   std::optional<FEXCore::Utils::SpinWaitLock::UniqueSpinMutex<uint32_t>> Lock {};
+  bool FirstAttempt = true;
 
   if ((Addr & 63) > 60) {
     FEXCORE_TELEMETRY_SET(TYPE_HAS_SPLIT_LOCKS, 1);
@@ -973,6 +1035,7 @@ static uint32_t DoCAS32(uint32_t DesiredSrc, uint32_t ExpectedSrc, uint64_t Addr
 
     // Careful ordering here
     while (1) {
+      RetakeSplitLock(Lock, StrictSplitLockMutex, FirstAttempt);
       uint64_t LoadOrderUpper = LoadAcquire32(AddrUpper);
       LoadOrderUpper <<= 32;
       uint64_t TmpActual = LoadOrderUpper | LoadAcquire32(Addr);
@@ -996,7 +1059,8 @@ static uint32_t DoCAS32(uint32_t DesiredSrc, uint32_t ExpectedSrc, uint64_t Addr
         uint32_t TmpDesiredLower = TmpDesired;
         uint32_t TmpDesiredUpper = TmpDesired >> 32;
 
-        if (SplitCAS<uint32_t>(TmpExpectedLower, TmpDesiredLower, Addr, TmpExpectedUpper, TmpDesiredUpper, AddrUpper, StoreCAS32, Tear)) {
+        if (SplitCAS<uint32_t>(TmpExpectedLower, TmpDesiredLower, Addr, TmpExpectedUpper, TmpDesiredUpper, AddrUpper, StoreCAS32, Tear,
+                               static_cast<uint32_t>(Mask))) {
           // Stored successfully
           return Expected;
         } else if (Tear) {
@@ -1019,6 +1083,12 @@ static uint32_t DoCAS32(uint32_t DesiredSrc, uint32_t ExpectedSrc, uint64_t Addr
       uint64_t FailedResultNotOurBits = TmpExpected & NegMask;
 
       uint64_t FailedDesiredNotOurBits = TmpDesired & NegMask;
+#ifdef __APPLE__
+      if (Tear) {
+        // Half written: retrying would apply the operation to the torn value again.
+        return static_cast<uint32_t>(FailedResultOurBits >> (Alignment * 8));
+      }
+#endif
       if ((FailedResultNotOurBits ^ FailedDesiredNotOurBits) != 0) {
         // If the bits changed that weren't part of our regular CAS then we need to try again
         continue;
@@ -1059,6 +1129,8 @@ static uint32_t DoCAS32(uint32_t DesiredSrc, uint32_t ExpectedSrc, uint64_t Addr
       __uint128_t TmpDesired {};
 
       while (1) {
+
+        RetakeSplitLock(Lock, StrictSplitLockMutex, FirstAttempt);
         __uint128_t TmpActual = Atomic128.load();
 
         __uint128_t Desired = DesiredFunction(TmpActual >> (Alignment * 8), DesiredSrc);
@@ -1120,6 +1192,7 @@ static uint32_t DoCAS32(uint32_t DesiredSrc, uint32_t ExpectedSrc, uint64_t Addr
 
       auto Atomic = std::atomic_ref<uint64_t>(*reinterpret_cast<uint64_t*>(Addr));
       while (1) {
+        RetakeSplitLock(Lock, StrictSplitLockMutex, FirstAttempt);
         uint64_t TmpActual = Atomic.load();
 
         uint64_t Desired = DesiredFunction(TmpActual >> (Alignment * 8), DesiredSrc);
@@ -1173,6 +1246,7 @@ template<bool Retry>
 static uint64_t DoCAS64(uint64_t DesiredSrc, uint64_t ExpectedSrc, uint64_t Addr, CASExpectedFn<uint64_t> ExpectedFunction,
                         CASDesiredFn<uint64_t> DesiredFunction, uint32_t* StrictSplitLockMutex) {
   std::optional<FEXCore::Utils::SpinWaitLock::UniqueSpinMutex<uint32_t>> Lock {};
+  bool FirstAttempt = true;
 
   if ((Addr & 63) > 56) {
     FEXCORE_TELEMETRY_SET(TYPE_HAS_SPLIT_LOCKS, 1);
@@ -1202,6 +1276,8 @@ static uint64_t DoCAS64(uint64_t DesiredSrc, uint64_t ExpectedSrc, uint64_t Addr
     __uint128_t TmpDesired {};
 
     while (1) {
+
+      RetakeSplitLock(Lock, StrictSplitLockMutex, FirstAttempt);
       __uint128_t LoadOrderUpper = LoadAcquire64(AddrUpper);
       LoadOrderUpper <<= 64;
       __uint128_t TmpActual = LoadOrderUpper | LoadAcquire64(Addr);
@@ -1227,7 +1303,8 @@ static uint64_t DoCAS64(uint64_t DesiredSrc, uint64_t ExpectedSrc, uint64_t Addr
 
       bool Tear = false;
       if (TmpExpected == TmpActual) {
-        if (SplitCAS<uint64_t>(TmpExpectedLower, TmpDesiredLower, Addr, TmpExpectedUpper, TmpDesiredUpper, AddrUpper, StoreCAS64, Tear)) {
+        if (SplitCAS<uint64_t>(TmpExpectedLower, TmpDesiredLower, Addr, TmpExpectedUpper, TmpDesiredUpper, AddrUpper, StoreCAS64, Tear,
+                               static_cast<uint64_t>(Mask))) {
           // Stored successfully
           return Expected;
         } else if (Tear) {
@@ -1250,6 +1327,12 @@ static uint64_t DoCAS64(uint64_t DesiredSrc, uint64_t ExpectedSrc, uint64_t Addr
       __uint128_t FailedResultNotOurBits = TmpExpected & NegMask;
 
       __uint128_t FailedDesiredNotOurBits = TmpDesired & NegMask;
+#ifdef __APPLE__
+      if (Tear) {
+        // Half written: retrying would apply the operation to the torn value again.
+        return static_cast<uint64_t>(FailedResultOurBits >> (Alignment * 8));
+      }
+#endif
       if ((FailedResultNotOurBits ^ FailedDesiredNotOurBits) != 0) {
         // If the bits changed that weren't part of our regular CAS then we need to try again
         continue;
@@ -1286,6 +1369,8 @@ static uint64_t DoCAS64(uint64_t DesiredSrc, uint64_t ExpectedSrc, uint64_t Addr
     __uint128_t TmpDesired {};
 
     while (1) {
+
+      RetakeSplitLock(Lock, StrictSplitLockMutex, FirstAttempt);
       __uint128_t TmpActual = Atomic128.load();
 
       __uint128_t Desired = DesiredFunction(TmpActual >> (Alignment * 8), DesiredSrc);

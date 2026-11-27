@@ -507,6 +507,17 @@ TranslationCounters ContextImpl::GetTranslationCounters() const {
     .CacheEntriesQueued = DiskCache.GetQueuedCount(),
     .CacheReading = DiskCache.IsReadingDiskCache(),
     .CacheWriting = DiskCache.IsWritingDiskCache(),
+#ifdef __APPLE__
+    .CacheState = static_cast<uint8_t>(DiskCache.GetState()),
+    .CacheEntriesDropped = DiskCache.GetDroppedCount(),
+    .UntrustedFilesReplaced = DiskCache.GetUntrustedReplacedCount(),
+    .DamagedDatabasesReset = DiskCache.GetDamagedResetCount(),
+#else
+    .CacheState = static_cast<uint8_t>(DiskCache.IsWritingDiskCache() ? 1 : 0),
+    .CacheEntriesDropped = 0,
+    .UntrustedFilesReplaced = 0,
+    .DamagedDatabasesReset = 0,
+#endif
   };
 }
 
@@ -567,12 +578,18 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
   if (!HasCustomIR) {
     const auto* GuestCode = reinterpret_cast<const uint8_t*>(GuestRIP);
 
+#ifdef __APPLE__
+    const bool RecordForCache = DiskCache.IsWritingDiskCache();
+    if (RecordForCache) {
+      Thread->FrontendDecoder->BeginRecordingBytes(GuestRIP);
+    }
+#endif
     Thread->FrontendDecoder->DecodeLoop(GuestCode);
 #ifdef __APPLE__
-    if (DiskCache.IsWritingDiskCache()) {
-      const auto Min = Thread->FrontendDecoder->DecodedMinAddress;
-      const auto Max = Thread->FrontendDecoder->DecodedMaxAddress;
-      Thread->FrontendDecoder->DecodedBytesHash = XXH3_64bits(reinterpret_cast<const void*>(Min), Max - Min);
+    if (RecordForCache) {
+      Thread->FrontendDecoder->EndRecordingBytes();
+    } else {
+      Thread->FrontendDecoder->DecodedBytesConsistent = false;
     }
 #endif
 
@@ -1082,7 +1099,13 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
       if (DebugData && DebugData->Relocations) {
         Relocations = *DebugData->Relocations;
       }
+#ifdef __APPLE__
+      // The bytes the decoder consumed, copied as it read them (Frontend.h).
+      std::span<const uint8_t> GuestCode = {Thread->FrontendDecoder->DecodedBytes.data(),
+                                            std::min<size_t>(Length, Thread->FrontendDecoder->DecodedBytes.size())};
+#else
       std::span<const uint8_t> GuestCode = {reinterpret_cast<const uint8_t*>(StartAddr), Length};
+#endif
       const Frontend::Decoder::DecodedBlockInformation* BlockInfo =
         NeedsAddGuestCodeRanges ? Thread->FrontendDecoder->GetDecodedBlockInfo() : nullptr;
       DiskCache.Store(Thread, Region, GuestRIP, *DiskCacheGuestCodeKey, GuestCode, CompiledCode, Relocations, BlockInfo);

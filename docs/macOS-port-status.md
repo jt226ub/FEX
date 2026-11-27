@@ -186,66 +186,80 @@ Still unproven or open:
 few accesses to shared memory, many times over, meeting at a barrier in guest code before
 each try and waiting a small random time after it. Four such pairs run at once on the
 same translated code; each run copies the code to a fresh address so it is translated
-again. Outcomes are counted. Pinning threads to cores is not possible on macOS; the
-threads ask for the user-interactive quality of service and the tool relies on numbers.
+again, and all eight threads wait at a host-side start barrier before they run. Outcomes
+are counted. Pinning threads to cores is not possible on macOS; the threads ask for the
+user-interactive quality of service and the tool relies on numbers. The tool uses only
+`fexmac.h` (it owns SIGBUS and SIGSEGV and hands each fault to `fexmac_handle_fault`,
+counting the alignment faults the library claims).
 
 Every test must also show an outcome that is only possible when its two threads overlap
-(for message passing: the flag not yet written but some data already; for SB: both loads
-seeing both stores), or it fails as NOT RACING in every mode, so no test can pass because
-its threads stopped overlapping. Counting tests instead run locked operations from every
-thread of every group on one misaligned word and check the exact total.
+(for message passing: no flag yet but some data, or part of the flag with all of the
+data; for SB: both loads seeing both stores), or it fails as NOT RACING in every mode, so
+no test can pass because its threads stopped overlapping. A test that shows none gets up
+to two more sets of runs first (reported; their outcomes count too), and with fewer than
+four groups every run has proportionally more iterations, because on a machine with few
+processors (the hosted virtual Mac) two threads sometimes share a core for a whole run.
+Counting tests instead run one of the locked operations the core emulates from every
+thread of every group on one misaligned operand and check the exact result; each thread
+takes a native ticket before and after its operations, and a gap between the two is the
+evidence that threads ran in between.
+
+In message passing, x86 forbids seeing any part of the flag without all of the data: the
+flag is stored after the data, and a store becomes visible only after every earlier one.
+(The first version of the tool counted only a whole flag; a partly visible flag with
+missing data was counted as overlap. With emulation off that hid most of MP-splitline's
+and nearly all of MP-split16K's forbidden outcomes.)
 
 Results on the Mac mini (M4), hardened runtime, `--soak`: 100 million tries per litmus
-test, 8 million locked operations per counting test, in each of the three modes. "On" is
+test, 2 million locked operations per counting test, in each of the three modes. "On" is
 all three settings (`FEX_TSOENABLED`, `FEX_VECTORTSOENABLED`, `FEX_MEMCPYSETTSOENABLED`);
 "scalar" is only the first, as upstream's defaults; "off" is none.
 
 | Test | What it checks | Forbidden outcome, off | scalar | on |
 |---|---|---|---|---|
-| SB | store buffering; allowed by x86 (relaxed outcome counted) | 27.2M relaxed | 0.46M relaxed | 0.45M relaxed |
+| SB | store buffering; allowed by x86 (relaxed outcome counted) | 27.4M relaxed | 0.44M relaxed | 0.60M relaxed |
 | SB+mfence, SB+lock | Dekker: `mfence` or a locked instruction between store and load | 0, 0 | 0, 0 | 0, 0 |
-| MP, MP+spin | message passing, plain 64-bit moves | 18.8M, 0.84M | 0, 0 | 0, 0 |
-| S | store then store against load then store | 172,771 | 0 | 0 |
-| 2+2W | two threads each storing twice | 187,567 | 0 | 0 |
+| MP, MP+spin | message passing, plain 64-bit moves | 19.2M, 0.64M | 0, 0 | 0, 0 |
+| S | store then store against load then store | 182,194 | 0 | 0 |
+| 2+2W | two threads each storing twice | 201,416 | 0 | 0 |
 | LB | load buffering | 0 | 0 | 0 |
-| MP-sse | `movdqu` data, scalar flag | 18.9M | 0 | 0 |
-| MP-sse2 | `movdqu` data and flag, both sides | 17.7M | 3.69M | 0 |
-| MP-sse-st | `movdqu` stores, scalar loads | 16.6M | 45,941 | 0 |
-| MP-sse-ld | scalar stores, `movdqu` loads | 20.8M | 108,934 | 0 |
-| MP-movsb, MP-stosq | data by `rep movsb` / `rep stosq`, scalar flag | 21.3M, 18.9M | 0, 0 | 0, 0 |
-| MP-stos-stos, MP-movs-movs | data and flag both by `rep stosq` / `rep movsb` | 18.6M, 15.8M | 993, 6,944 | 0, 0 |
-| MP-movsb-read | scalar flag load, data copied by `rep movsb` | 11.1M | 0 | 0 |
-| MP-movsb-read2 | flag and data both copied by `rep movsb` | 7.8M | 9,652 | 0 |
-| MP-flag-stosq | scalar data, flag by `rep stosq` | 15.8M | 0 | 0 |
-| MP-flag-movsb | scalar data, flag copied by `rep movsb` | 10.1M | 92,596 | 0 |
-| MP-split16, MP-splitline | misaligned data and flag across 16 bytes, across a 128-byte line | 17.5M, 21.5M | 0, 0 | 0, 0 |
-| MP-split4K | data across a 4K guest page, flag across a 16K host page | 20.8M | 0 | 0 |
-| MP-split16K | data across a 16K host page | 31 | 0 | 0 |
-| LOCK-xadd-split16/-splitline/-splitpage | `lock xadd` on a qword crossing 16 bytes, a line, a page | exact | exact | exact |
-| LOCK-cmpxchg-split16 | `lock cmpxchg` increment loop across 16 bytes | exact | exact | exact |
-| LOCK-xchg-split16 | spin lock by `xchg` across 16 bytes, released by a plain store | exact | exact | exact |
+| MP-sse | `movdqu` data, scalar flag | 19.9M | 0 | 0 |
+| MP-sse2 | `movdqu` data and flag, both sides | 21.3M | 3.52M | 0 |
+| MP-sse-st | `movdqu` stores, scalar loads | 22.0M | 38,514 | 0 |
+| MP-sse-ld | scalar stores, `movdqu` loads | 24.8M | 81,651 | 0 |
+| MP-movsb, MP-stosq | data by `rep movsb` / `rep stosq`, scalar flag | 24.1M, 21.9M | 0, 0 | 0, 0 |
+| MP-stos-stos, MP-movs-movs | data and flag both by `rep stosq` / `rep movsb` | 20.7M, 13.4M | 2,204, 10,129 | 0, 0 |
+| MP-movsb-read | scalar flag load, data copied by `rep movsb` | 7.1M | 0 | 0 |
+| MP-movsb-read2 | flag and data both copied by `rep movsb` | 7.8M | 5,322 | 0 |
+| MP-flag-stosq | scalar data, flag by `rep stosq` | 17.8M | 0 | 0 |
+| MP-flag-movsb | scalar data, flag copied by `rep movsb` | 11.5M | 80,798 | 0 |
+| MP-split16, MP-splitline | misaligned data and flag across 16 bytes, across a 128-byte line | 21.8M, 56.6M | 0, 0 | 0, 0 |
+| MP-split4K | data across a 4K guest page, flag across a 16K host page | 23.3M | 0 | 0 |
+| MP-split16K | data across a 16K host page | 3,867 (9,336 in a repeat) | 0 | 0 |
+| LOCK-* (17 tests) | `lock xadd` of 16, 32 and 64 bits (64 also across a 128-byte line and the 16K page), `lock add`, `sub`, `xor`, `inc`, `dec`, `not`, `neg`, `or`/`and`, `cmpxchg` and `cmpxchg8b` loops, spin locks by `xchg` (plain release; and a value in both halves, `xchg` release) and by `cmpxchg8b` (plain release), with plain stores to the neighbouring bytes | exact | exact | exact |
 
 So x86 ordering holds between threads with all three settings on, and the same harness
 sees it broken with them off: Apple M-series cores reorder loads with loads and stores
 with stores. `--expect weak` (the default with `--tso off`) requires each forbidden
-outcome above that the M4 showed, except LB and MP-split16K, and requires the fence,
-locked-instruction and counting tests to hold. Why LB never appears, and why a load that
-crosses a 16K page almost never completes out of order, has not been established; a
-plausible but unverified explanation is that the cores do not let a store become visible
-before an older load has its value, and perform a page-crossing load late, in order.
+outcome above that the M4 showed, except LB, and requires the fence, locked-instruction
+and counting tests to hold, except the two spin locks with a plain release
+(LOCK-xchg-split16, LOCK-cmpxchg8b-lock), whose release needs TSO and so may lose counts
+with emulation off (none did here). Why LB never appears, and why a load that crosses a
+16K page reorders far less often than one that crosses a 4K page within it, has not been
+established; a plausible but unverified explanation is that the cores do not let a store
+become visible before an older load has its value, and perform a page-crossing load
+late.
 
-With emulation on, the misaligned tests take more alignment faults per run than the 4
-instructions they patch, so in some runs several threads fault on the same instruction at
-once and the back-patching under the block's spin lock runs concurrently: 9 to 10 per run
-when the tool set up its threads itself, 4.0 to 4.4 per run (403 to 436 over 100) since
-it runs on `fexmac`, so concurrent faults on one instruction are now the exception rather
-than the rule.
-
-The tool now uses only `fexmac.h` (it owns SIGBUS and SIGSEGV and hands each fault to
-`fexmac_handle_fault`, counting the alignment faults the library claims). The three
-soaks were repeated on it, hardened: all pass, with no forbidden outcome with emulation
-on, every required one with it off and in the scalar mode, and exact counting totals
-(MP-split16K showed 19 with emulation off, LB none).
+With emulation on, the misaligned tests must take more alignment faults over the run than
+the 4 instructions they patch per run, when there are at least two groups: some
+instruction must then have faulted on several threads at once, so the core's
+back-patching under the block's spin lock runs concurrently (otherwise the test fails as
+NOT CONCURRENT). They take 10 to 12 per run (1,025 to 1,208 over 100). The start barrier
+is what makes that happen: the guest barrier lines up only the two threads of one group,
+which run different code, so the threads that run the same code (the same role in
+different groups) used to reach its first, faulting execution at different times; after
+the move to `fexmac` that skew left 4.0 to 4.4 faults per run, almost never more than one
+thread per instruction (9 to 10 before the move, by the same skew being smaller).
 
 **What each sub-setting protects.** With only the general setting on, scalar loads
 become acquire loads (`ldapr`/`ldapur`) and scalar stores release stores
@@ -267,8 +281,8 @@ default with `--tso scalar`) requires each of those named tests to break and the
 hold, so a sub-setting that stopped ordering its accesses would be noticed.
 
 The default run (`FEXCoreOrderingTest`, emulation on, 3.2 million tries per litmus test)
-takes about 11 seconds, of which the counting tests are about 6: every locked operation on
-a misaligned word is a fault. `--tso off` and `--tso scalar` take the same. All three run
+takes about 15 seconds, of which the counting tests are about 10: every locked operation
+on a misaligned operand is a fault. `--tso off` and `--tso scalar` take the same. All three run
 in the Mac job. The hosted Mac is a virtual machine on Apple silicon with three
 processors: the checks that must hold are meaningful there (one pair at a time), but
 whether the weak outcomes appear depends on the host, so there a test that should break
@@ -289,8 +303,8 @@ Found by it and fixed:
   (write-to-write hand-off), and a reader owns while a writer then a reader queue and a
   spurious wake moves the writer behind the reader (read-to-write hand-off); the other
   four pass with either header. 20,000 eight-thread starts ran clean after the fix.
-- **Lost updates from locked operations on a word that crosses 16 bytes.** ARM64 atomics
-  fault there and the core emulates them with two compare-and-swaps. With
+- **Lost updates from locked operations on an operand that crosses 16 bytes.** ARM64
+  atomics fault there and the core emulates them with two compare-and-swaps. With
   `StrictInProcessSplitLocks` off (upstream's default) concurrent emulations interleave
   and tear, and the update is lost: before the next fix, LOCK-xadd-split* lost between 1
   in 4,000 and 1 in 900 increments in every run. On macOS the setting now defaults to on
@@ -298,28 +312,61 @@ Found by it and fixed:
   embedder can change; see "Fault handler locks" in `docs/macOS-embedding-interface.md`
   for why taking that lock in the fault handler is safe). It serialises the emulated
   operations within the process; they already cost a fault each and the counting tests
-  show no measurable slowdown. The ordering test's counting tests and `fexmac_c_test
-  split-locks-concurrent` add 0x100000001 per operation, which changes both halves of the
-  word: with the lock switched off in a scratch build, the C subtest's three `lock xadd`
-  totals came out short in 3 of 3 runs; with it on they are exact.
-- **A locked operation could report an old value it never wrote.** The emulation wrote
-  the upper half first; if anything (another emulation, or a plain store such as a spin
-  lock's release) changed the lower half before the second compare-and-swap, the
-  operation gave up as "torn" and returned a mix of old values without completing. For
-  an `xchg` lock that meant two threads held the lock: LOCK-xchg-split16 lost an
-  increment in 3 of 10 long runs (and in 1 to 3 of 100 soak runs). On macOS the half that
-  the operation does not change is now compared first, so a failure of the second has
-  written nothing and is retried (`SplitCAS` in
-  `FEXCore/Source/Utils/ArchHelpers/Arm64.cpp`); 10 long runs and the soaks are clean.
+  show no measurable slowdown. With the lock switched off in a scratch build,
+  `fexmac_c_test split-locks-concurrent` (operands that change both halves) came out short
+  in 3 of 3 runs; with it on it is exact.
+- **A locked operation could report an old value it never wrote, or apply itself twice.**
+  The emulation wrote the upper half first. If anything changed the lower half before the
+  second compare-and-swap (another thread's plain store, such as a spin lock's release or
+  a neighbouring field's update), the operation gave up as "torn"; for a read-modify-write
+  it then either returned a stale result without completing or, if the bytes next to the
+  operand had changed, started again on the half-written value and applied itself to the
+  upper half twice; `cmpxchg8b` reported failure while memory held its new value. Fixed on
+  macOS in `SplitCAS` (`FEXCore/Source/Utils/ArchHelpers/Arm64.cpp`), which every split
+  path now uses (`DoCAS16`, `DoCAS32`, `DoCAS64` and `RunCASPAL`, the last for
+  `cmpxchg8b`): the half the operation does not change is compared first, so that a
+  failure of the second has written nothing and is retried; when both halves change and
+  the second compare-and-swap fails only because the operand's neighbouring bytes
+  changed, the lower half is written again with the new neighbouring bytes, completing the
+  operation (at most 16 times); and after a real tear the operation is never started
+  again on the torn value. The split-lock lock is released and taken again between
+  attempts, so that plain stores that keep changing the word make the emulation retry,
+  not hold the lock. Evidence: LOCK-xchg-split16 lost an increment in 3 of 10 long runs
+  before the first part; `fexmac_c_test split-locks-every-form` (13 forms, with plain
+  stores to the neighbouring bytes) gives a wrong result for 7 of the 13 forms in each of
+  2 runs with the code before this round and none after; the ordering test's 17 counting
+  tests (which add the same neighbour stores from guest code) are exact in every soak.
+- **Asynchronous signals while the core held a lock.** A host that owns the fault
+  signals runs `fexmac_handle_fault` with its own mask; an asynchronous handler could
+  then interrupt the core while it held the split-lock lock or the patch lock (and the
+  thread was switched to writing code), and a handler that left by a jump or stopped the
+  thread would have left them so. `fexmac_handle_fault` now blocks asynchronous signals
+  itself around the core's handling of misaligned accesses. `fexmac_c_test
+  split-locks-signal-storm` stalls in 3 of 3 runs without that and never with it.
 
-Remaining limits of split locked operations: the split-lock lock makes emulations atomic
-with each other, and `SplitCAS` keeps an operation that changes only one half from
-completing with a stale result when a plain store intervenes (it retries instead). An operation that changes both halves can still tear if a plain store
-from another thread (one that is not a locked operation, so not under the lock) lands
-between its two compare-and-swaps: the upper half is then written and the lower is not,
-and the guest gets a mixed result. x86 promises a locked operation is atomic even against
-plain stores, which two compare-and-swaps cannot give. Not observed (the tests' plain
-stores only touch the lower half of their lock word).
+Remaining limits of split locked operations, none of them seen in the tests:
+
+1. When an operation changes both halves, there is a moment between its two
+   compare-and-swaps when the upper half is new and the lower half old. Any reader can
+   see that value: a plain load, or a native atomic on part of the same bytes. x86 makes a
+   locked operation atomic for every observer.
+2. A natively executed aligned locked operation on part of the same bytes (an atomic
+   that lies within one half, so it does not fault) bypasses the split-lock lock, so it
+   is not ordered with the emulation: it can land between the two compare-and-swaps.
+3. When both halves change and another thread changes the operand's own bytes in the
+   lower half (not just neighbouring bytes) between the two compare-and-swaps, the
+   operation is torn: the upper half has its new value, the lower half the other
+   thread's, and the guest is told the operation failed (`cmpxchg`) or given the old value
+   it read. It is not applied again.
+4. The lock is per process (one context per process). Memory shared with another process
+   is not covered.
+
+Inaccuracies in the previous write-up, corrected: the tests' spin-lock release is a plain
+store of a whole qword, across both halves (it changes only the lower one, since the
+upper is zero throughout); `--expect weak` does not require LOCK-xchg-split16 to hold (it
+is report-only with emulation off, like LOCK-cmpxchg8b-lock); and the 16-bit
+dual-compare-and-swap path is the one across a 16-byte boundary (a 16-bit operand that
+crosses only an 8-byte boundary uses a single 128-bit compare-and-swap).
 
 Known gap, not fixed: **the misaligned back-patch is cross-modifying code that the
 architecture does not guarantee.** When a misaligned acquire load or release store
@@ -499,13 +546,13 @@ All of these run in the Mac job on every push to a `macos/**` branch.
 | `FEXCoreSmokeTest` | Translates and runs a 23-byte loop, as built and under the hardened runtime | pass, both | pass, both |
 | `FEXCoreThreadTest` | Eight host threads share a context, each summing a different count in a long guest loop | pass | pass, both |
 | `FEXCoreCacheTest` | Eight threads run a chain of 200 blocks at once, with the code cache on; checks results that depend on every constant and on the code's address, and the cache counters | added in package F, not yet run there | pass, both; 150 of 150 runs after the mutex fix (hung about one run in 30 before it) |
-| `Scripts/macos_code_cache_tests.py` | Damaged, mismatched and moved caches, fuzzing, threads, fork, directory rules (see above) | added in package F, not yet run there | 93 of 93, both |
-| `fexmac_c_test` cache subtests | `cache-off`, `cache-cold-warm`, `cache-cross-process`, `cache-untrusted`, `cache-options`, `cache-fork`, `code-ranges` (with the rest: 41 subtests) | added in package F, not yet run there | pass, both |
+| `Scripts/macos_code_cache_tests.py` | Damaged, mismatched and moved caches, fuzzing, threads, fork (with and without the fexmac calls), stalled lock holders, superseded entries, generations and size limits, cache states, directory rules (see above) | added in package F, not yet run there | 101 of 101, both |
+| `fexmac_c_test` cache subtests | `cache-off`, `cache-cold-warm`, `cache-cross-process`, `cache-untrusted`, `cache-untrusted-file`, `cache-unavailable`, `cache-options`, `cache-fork`, `code-ranges` | added in package F, not yet run there | pass, both |
 | `Scripts/macos_asm_tests.py --cache-dir DIR --cache-passes 2` | The instruction tests cold then warm; fails if a warm result differs, a finished warm run compiled anything, or an entry was rejected | added in package F, not yet run there (two modes in the job) | pass, all four modes, both |
 | `FEXCoreASMTestRunner` with `Scripts/macos_asm_tests.py` | Upstream's 2,292 assembly instruction tests plus the port's four in `unittests/macOS/ASM`, in four modes | 2,253 pass in each mode (before the upstream sync added one test) | 2,265 of 2,296 pass in each mode, both |
 | `FEXCoreOrderingTest` | Multi-thread x86 memory-ordering litmus tests and misaligned locked-operation counts, in three emulation modes; see above | not yet run | pass, both, in each mode |
 | `FEXCoreMutexWakeTest` | The core's reader-writer lock never loses a wake-up, in six queueing orders | not yet run | pass, both; with the bug restored, two orders hang |
-| `fexmac_c_test` | A C program using only `fexmac.h`, linked as an outside project would be: 35 subtests covering system calls (prefixed, restarted), stops, state, guest faults, invalidation (also from 8 threads at once), misaligned atomics with each signal-handler arrangement, call/return stack overflow and underflow, guest accesses to protected pages, chained handlers (one that leaves with siglongjmp, over 306 stack layouts; one that faults itself, which must end the process quickly; one that returns without fixing the fault) and sent signals, garbage struct sizes, lifetime races, split locked operations from 8 threads (exact totals) and error paths | not yet run | pass, both |
+| `fexmac_c_test` | A C program using only `fexmac.h`, linked as an outside project would be: 44 subtests covering system calls (prefixed, restarted), stops, state, guest faults, invalidation (also from 8 threads at once), misaligned atomics with each signal-handler arrangement, call/return stack overflow and underflow, guest accesses to protected pages, chained handlers (one that leaves with siglongjmp, over 306 stack layouts; one that faults itself, which must end the process quickly; one that returns without fixing the fault) and sent signals, garbage struct sizes, lifetime races, cached translations and code ranges, split locked operations from 8 threads in every emulated form, also with plain stores to neighbouring bytes and under a signal storm (exact results), and error paths | not yet run | pass, both |
 | `fexmac_hook_test` | The same library built with test hooks, 9 subtests: guest and callback accesses to guard pages are not claimed, the scratch-buffer guard is disarmed after each translation, a log callback cannot re-enter the library, a fault inside the handler crashes with a message instead of hanging, the log callback is never called from a signal handler, a failed create leaves no log hook, invalidation leaves fault signals unblocked | not yet run | pass, both |
 | `FEXCoreBench` with `Scripts/macos_bench.py --quick` | The freestanding x86-64 benchmark, as built and hardened: the literal mode (no system call but exit) natively and under FEX; the loader's contract (9 cases of a guest breaking it); the timed mode (18 kernels, 4 guest threads) in four translator configurations, every checksum matching the recorded value and the native arm64 build (and Rosetta 2's where present), with the stated exceptions for ordering off and reduced x87 precision | not yet run (added after the last hosted run) | pass, both |
 | `Scripts/macos_bench_mutations.py` | 58 mutations of the benchmark kernels, each of which must change its kernel's checksum (native arm64; x86-64-only ones under Rosetta 2) | not yet run | pass |

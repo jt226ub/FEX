@@ -67,6 +67,14 @@ struct TranslationCounters {
   // refused, or read-only in a forked child).
   bool CacheReading;
   bool CacheWriting;
+  // 0 off, 1 active, 2 read-only, 3 untrusted (refused for trust), 4 unavailable (busy,
+  // I/O, no space, no build identity). macOS only; elsewhere 0 or 1.
+  uint8_t CacheState;
+  // Entries that could not be saved (the database stayed locked, could not grow, failed).
+  uint64_t CacheEntriesDropped;
+  // Untrusted cache files removed and started again, and damaged databases emptied.
+  uint32_t UntrustedFilesReplaced;
+  uint32_t DamagedDatabasesReset;
 };
 
 class Context {

@@ -17,6 +17,9 @@
 #include <sys/stat.h>
 #include <sys/sysctl.h>
 #include <sys/time.h>
+#include <dirent.h>
+#include <mutex>
+#include <pthread.h>
 #include <unistd.h>
 
 namespace FEXCore::DiskCache {
@@ -169,6 +172,14 @@ namespace {
 
   constexpr const char* LastUsedMarker = "last-used";
   constexpr time_t KeepIdleBucketSeconds = 7 * 24 * 60 * 60;
+  // How long a store, or opening the read-write database, waits for another process's
+  // lock: once per process (see DiskCache::StoreMacOS).
+  constexpr int STORE_DEADLINE_MS = 5000;
+
+  // The cache the pthread_atfork handlers look after (one context at a time).
+  std::atomic<DiskCache*> ForkWatched {};
+  std::once_flag AtForkOnce;
+  bool AtForkTookLocks = false;
 
   // Largest number of bytes each relocation type rewrites at its offset: a 64-bit literal,
   // or a padded four-instruction constant load.
@@ -207,26 +218,80 @@ namespace MacOS {
 
   // Pruning keeps a directory unless it is named like a bucket (16 hex digits, so a cache
   // path that holds other things is safe) and nobody has used it for a week. Use, not
-  // writes: every process touches the bucket's marker when it opens it.
-  bool KeepBucket(std::string_view CacheBase, std::string_view Name) {
-    if (Name.size() != 16 || !std::all_of(Name.begin(), Name.end(), [](char c) { return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'); })) {
-      return true;
-    }
-    const auto Path = fextl::fmt::format("{}/{}", CacheBase, Name);
-    struct stat Info;
-    if (lstat(Path.c_str(), &Info) != 0 || !S_ISDIR(Info.st_mode)) {
-      return true; // not ours to judge
-    }
-    const time_t Now = time(nullptr);
-    if (Now - Info.st_mtime < KeepIdleBucketSeconds) {
-      return true;
-    }
-    if (lstat(fextl::fmt::format("{}/{}", Path, LastUsedMarker).c_str(), &Info) == 0 && Now - Info.st_mtime < KeepIdleBucketSeconds) {
-      return true;
-    }
-    return false;
+  // writes: every process touches the bucket's marker when it opens it. On macOS pruning
+  // goes through PruneBuckets below, relative to the verified base directory; this is
+  // only the name rule upstream's path-based prune is filtered by.
+  bool KeepBucket(std::string_view, std::string_view) {
+    return true;
   }
 } // namespace MacOS
+
+namespace {
+  bool LooksLikeBucketName(std::string_view Name) {
+    return Name.size() == 16 && std::all_of(Name.begin(), Name.end(), [](char c) { return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'); });
+  }
+
+  // Removes a bucket directory's files (it holds no subdirectories) and the directory,
+  // all relative to descriptors, never following links.
+  void RemoveBucketAt(int BaseFD, const char* Name) {
+    const int DirFD = openat(BaseFD, Name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (DirFD < 0) {
+      return;
+    }
+    if (DIR* Dir = fdopendir(dup(DirFD))) {
+      while (const dirent* Entry = readdir(Dir)) {
+        if (strcmp(Entry->d_name, ".") != 0 && strcmp(Entry->d_name, "..") != 0) {
+          unlinkat(DirFD, Entry->d_name, 0);
+        }
+      }
+      closedir(Dir);
+    }
+    close(DirFD);
+    unlinkat(BaseFD, Name, AT_REMOVEDIR);
+  }
+
+  // A bucket was used within the week if its directory or its marker was written then.
+  bool BucketRecentlyUsedAt(int BaseFD, const char* Name, time_t Now, time_t Keep) {
+    struct stat Info;
+    if (fstatat(BaseFD, Name, &Info, AT_SYMLINK_NOFOLLOW) != 0 || !S_ISDIR(Info.st_mode)) {
+      return true; // not ours to judge
+    }
+    if (Now - Info.st_mtime < Keep) {
+      return true;
+    }
+    const int DirFD = openat(BaseFD, Name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (DirFD < 0) {
+      return true;
+    }
+    const bool Recent = fstatat(DirFD, "last-used", &Info, AT_SYMLINK_NOFOLLOW) == 0 && Now - Info.st_mtime < Keep;
+    close(DirFD);
+    return Recent;
+  }
+
+  void PruneBuckets(int BaseFD, std::string_view Current) {
+    FEX_CONFIG_OPT(DiskCachePruneStaleEntries, DISKCACHEPRUNESTALEENTRIES);
+    if (!DiskCachePruneStaleEntries) {
+      return;
+    }
+    DIR* Dir = fdopendir(dup(BaseFD));
+    if (!Dir) {
+      return;
+    }
+    fextl::vector<fextl::string> Stale;
+    const time_t Now = time(nullptr);
+    while (const dirent* Entry = readdir(Dir)) {
+      const std::string_view Name = Entry->d_name;
+      if (LooksLikeBucketName(Name) && Name != Current && !BucketRecentlyUsedAt(BaseFD, Entry->d_name, Now, KeepIdleBucketSeconds)) {
+        Stale.emplace_back(Name);
+      }
+    }
+    closedir(Dir);
+    for (const auto& Name : Stale) {
+      LogMan::Msg::IFmt("DiskCache: removing unused bucket {}", Name);
+      RemoveBucketAt(BaseFD, Name.c_str());
+    }
+  }
+} // namespace
 
 bool FOZFile::OpenAt(int DirFD, const fextl::string& Leaf, bool ReadOnly, bool& Refused) {
   Refused = false;
@@ -303,41 +368,49 @@ bool FOZFile::Truncate(uint64_t NewSize) {
   return FD && ftruncate(FD->GetHandle(), NewSize) == 0;
 }
 
-bool IndexedDB::OpenAt(int DirFD, const fextl::string& Leaf, bool ReadOnly, uint64_t) {
+IndexedDB::OpenResult IndexedDB::OpenAt(int DirFD, const fextl::string& Leaf, bool ReadOnly, bool& Replaced) {
   this->DirFD = DirFD;
   Name = Leaf;
   this->ReadOnly = ReadOnly;
+  Replaced = false;
   const auto CacheName = Leaf + ".foz";
   const auto IndexName = Leaf + "_idx.foz";
   for (int Attempt = 0; Attempt < 2; ++Attempt) {
     bool CacheRefused = false;
     bool IndexRefused = false;
     if (CacheFOZ.OpenAt(DirFD, CacheName, ReadOnly, CacheRefused) && IndexFOZ.OpenAt(DirFD, IndexName, ReadOnly, IndexRefused)) {
-      return true;
+      return OpenResult::Opened;
     }
     CacheFOZ = FOZFile {};
     IndexFOZ = FOZFile {};
-    if (ReadOnly || Attempt != 0 || !(CacheRefused || IndexRefused)) {
-      return false;
+    if (!(CacheRefused || IndexRefused)) {
+      return OpenResult::Failed;
+    }
+    if (ReadOnly || Attempt != 0) {
+      return OpenResult::Untrusted;
     }
     // The directory is verified private, so removing names from it is safe. Both files
     // go: one half of a database is no use without the other.
-    LogMan::Msg::IFmt("DiskCache: removing {} and starting it again", Leaf);
+    LogMan::Msg::EFmt("DiskCache: removing {}, which may not be trusted, and starting it again", Leaf);
     unlinkat(DirFD, CacheName.c_str(), 0);
     unlinkat(DirFD, IndexName.c_str(), 0);
+    Replaced = true;
   }
-  return false;
+  return OpenResult::Untrusted;
 }
 
 bool IndexedDB::LoadIndex(uint64_t MaxSize, bool& FoundMetadata) {
   const ssize_t IndexSize = IndexFOZ.Size();
   const ssize_t CacheSize = CacheFOZ.Size();
-  // Record offsets are kept in 32 bits; the size limit keeps a database far below that.
-  if (IndexSize < FOZ_REF_MAGIC_SIZE || CacheSize < FOZ_REF_MAGIC_SIZE || uint64_t(IndexSize) > std::min<uint64_t>(MaxSize, ResolvedSlot) ||
-      uint64_t(CacheSize) > MaxSize) {
-    LogMan::Msg::EFmt("DiskCache: {} is larger than the cache size limit", Name);
+  Limit = MaxSize;
+  // Record offsets are kept in 32 bits.
+  if (IndexSize < FOZ_REF_MAGIC_SIZE || CacheSize < FOZ_REF_MAGIC_SIZE || uint64_t(IndexSize) > ResolvedSlot) {
+    LogMan::Msg::EFmt("DiskCache: {} cannot be read", Name);
     return false;
   }
+  // Filled past this process's limit by a process with a larger one: use it, but do not
+  // add to it (and never empty it because of the smaller limit here).
+  WriteRefused = uint64_t(CacheSize) > MaxSize || uint64_t(IndexSize) > MaxSize;
   CacheFOZSizeAtOpen = CacheSize;
   if (!IndexFOZ.ReadAll(IndexData)) {
     return false;
@@ -456,12 +529,26 @@ bool IndexedDB::ParseRecord(uint32_t Offset, Index& CacheIndex) {
   auto It = CacheIndex.find(Common.hash);
   if (It == CacheIndex.end()) {
     CacheIndex.emplace(Common.hash, IndexCacheHead {std::move(NewEntry), Extra.GuestFootprint, nullptr});
-  } else {
-    if (!It->second.MoreEntries) {
-      It->second.MoreEntries = fextl::make_unique<fextl::multimap<uint64_t, IndexEntry>>();
-    }
-    It->second.MoreEntries->insert({Extra.GuestFootprint, std::move(NewEntry)});
+    return true;
   }
+  // A later record for the same guest code replaces an earlier one: that is how an entry
+  // that failed its checks (and was compiled and stored again) is superseded. Records are
+  // parsed oldest first. Assigned in place, so iterators other lookups hold stay valid.
+  auto& Head = It->second;
+  if (XXH128_isEqual(Head.MainEntry.GuestHash, NewEntry.GuestHash)) {
+    Head.MainEntry = std::move(NewEntry);
+    return true;
+  }
+  if (!Head.MoreEntries) {
+    Head.MoreEntries = fextl::make_unique<fextl::multimap<uint64_t, IndexEntry>>();
+  }
+  for (auto& [Footprint, Existing] : *Head.MoreEntries) {
+    if (XXH128_isEqual(Existing.GuestHash, NewEntry.GuestHash)) {
+      Existing = std::move(NewEntry);
+      return true;
+    }
+  }
+  Head.MoreEntries->insert({Extra.GuestFootprint, std::move(NewEntry)});
   return true;
 }
 
@@ -486,11 +573,11 @@ void IndexedDB::ResolveKey(uint64_t LookupKey, Index& CacheIndex) {
   }
 }
 
-bool IndexedDB::LockForOpen() {
-  if (!CacheFOZ.Lock(STORE_LOCK_TIMEOUT_MS)) {
+bool IndexedDB::LockForOpen(std::chrono::steady_clock::time_point Deadline) {
+  if (!CacheFOZ.LockUntil(Deadline)) {
     return false;
   }
-  if (!IndexFOZ.Lock(STORE_LOCK_TIMEOUT_MS)) {
+  if (!IndexFOZ.LockUntil(Deadline)) {
     CacheFOZ.Unlock();
     return false;
   }
@@ -563,6 +650,51 @@ bool IndexedDB::RepairIndexTail() {
   return true;
 }
 
+IndexedDB::StoreResult IndexedDB::StoreCacheBlobMacOS(const MesaFOZ::foz_payload_key& UniqueKey, uint64_t LookupKey,
+                                                      std::span<const uint8_t> Blob, MesaFOZ::mesa_index_db_file_entry& IndexEntry,
+                                                      std::span<const uint8_t> IndexBlob, std::chrono::steady_clock::time_point Deadline) {
+  if (ReadOnly || WriteRefused) {
+    return StoreResult::Failed;
+  }
+  if (!CacheFOZ.LockUntil(Deadline)) {
+    return StoreResult::Busy;
+  }
+  if (!IndexFOZ.LockUntil(Deadline)) {
+    CacheFOZ.Unlock();
+    return StoreResult::Busy;
+  }
+  auto Done = [&](StoreResult Result) {
+    CacheFOZ.Unlock();
+    IndexFOZ.Unlock();
+    return Result;
+  };
+  // The real sizes of both files, under the locks, so other processes' appends count.
+  if (!WithinSizeLimit(Blob.size(),
+                       sizeof(MesaFOZ::foz_payload_key) + sizeof(MesaFOZ::foz_payload_header) + sizeof(IndexEntry) + IndexBlob.size())) {
+    MaxSizeReached = true;
+    return Done(StoreResult::Full);
+  }
+  if (!RepairIndexTail()) {
+    return Done(StoreResult::Failed);
+  }
+  std::span<const uint8_t> BlobChunks[] = {Blob};
+  uint64_t BlobOffset = 0;
+  if (!CacheFOZ.WriteBlob(UniqueKey, BlobChunks, BlobOffset)) {
+    return Done(StoreResult::Failed);
+  }
+  IndexEntry = {.hash = LookupKey, .size = (uint32_t)Blob.size(), .last_access_time = 0, .cache_db_file_offset = BlobOffset};
+  std::span<const uint8_t> IndexBlobChunks[] = {
+    {(const uint8_t*)&IndexEntry, sizeof(IndexEntry)},
+    IndexBlob,
+  };
+  uint64_t UnusedIndexBlobOffset = 0;
+  if (!IndexFOZ.WriteBlob(UniqueKey, IndexBlobChunks, UnusedIndexBlobOffset)) {
+    return Done(StoreResult::Failed);
+  }
+  IndexKnownEnd = IndexFOZ.Size();
+  return Done(StoreResult::Stored);
+}
+
 bool IndexedDB::FlushToDisk() {
   if (ReadOnly) {
     return true;
@@ -577,8 +709,8 @@ bool IndexedDB::WithinSizeLimit(uint64_t BlobSize, uint64_t IndexRecordSize) {
   if (CacheSize < 0 || IndexSize < 0) {
     return false;
   }
-  const uint64_t Limit = std::min<uint64_t>(MaxFileSize, ResolvedSlot);
-  return uint64_t(CacheSize) + FOZRecordHeaderSize + BlobSize <= Limit && uint64_t(IndexSize) + IndexRecordSize <= Limit;
+  const uint64_t Max = std::min<uint64_t>(Limit ? Limit : uint64_t(MaxFileSize), ResolvedSlot);
+  return uint64_t(CacheSize) + FOZRecordHeaderSize + BlobSize <= Max && uint64_t(IndexSize) + IndexRecordSize <= Max;
 }
 
 uint8_t DiskCache::CodeGenStateFlags() const {
@@ -610,11 +742,32 @@ bool DiskCache::MayUseCache(uint64_t GuestRIP, uint64_t GuestSize, std::span<con
 }
 
 void DiskCache::ResolveLazyLocked(uint64_t LookupKey) {
-  if (RWCacheDB) {
-    RWCacheDB->ResolveKey(LookupKey, Index);
+  // Oldest generation first, so a newer record for the same code replaces an older one.
+  for (auto& DB : Generations) {
+    DB->ResolveKey(LookupKey, Index);
   }
   for (auto& DB : ROCacheDBs) {
     DB->ResolveKey(LookupKey, Index);
+  }
+}
+
+void DiskCache::MarkRejectedLocked(uint64_t LookupKey, const IndexEntry& Entry) {
+  auto It = Index.find(LookupKey);
+  if (It == Index.end()) {
+    return;
+  }
+  auto Matches = [&](const IndexEntry& Candidate) {
+    return Candidate.DB == Entry.DB && Candidate.Offset == Entry.Offset && XXH128_isEqual(Candidate.GuestHash, Entry.GuestHash);
+  };
+  if (Matches(It->second.MainEntry)) {
+    It->second.MainEntry.Rejected = true;
+  }
+  if (It->second.MoreEntries) {
+    for (auto& [Footprint, Candidate] : *It->second.MoreEntries) {
+      if (Matches(Candidate)) {
+        Candidate.Rejected = true;
+      }
+    }
   }
 }
 
@@ -637,46 +790,155 @@ bool DiskCache::CheckMetadata(IndexedDB& DB) {
   return true;
 }
 
+// Read-only databases named by DiskCacheRODBNames (the read-write one is opened by
+// OpenGeneration). They are used as they are: no lock, no repair, no reset.
 bool DiskCache::OpenCacheDBMacOS(const fextl::string& Leaf, bool ReadOnly) {
-  if ((!ReadOnly && RWCacheDB) || BucketDirFD < 0 || Leaf.empty() || Leaf.find('/') != fextl::string::npos) {
+  if (!ReadOnly || BucketDirFD < 0 || Leaf.empty() || Leaf.find('/') != fextl::string::npos) {
     return false;
   }
   auto CurDB = fextl::make_unique<IndexedDB>();
-  if (!CurDB->OpenAt(BucketDirFD, Leaf, ReadOnly, 0)) {
+  bool Replaced = false;
+  if (CurDB->OpenAt(BucketDirFD, Leaf, true, Replaced) != IndexedDB::OpenResult::Opened) {
     LogMan::Msg::IFmt("DiskCache: could not open {}; translating without it", Leaf);
-    return false;
-  }
-  // A read-write database is shared with other processes, which append under the file
-  // locks. Holding both locks while reading it means no record is half written.
-  if (!ReadOnly && !CurDB->LockForOpen()) {
-    LogMan::Msg::IFmt("DiskCache: {} is busy; translating without it", Leaf);
     return false;
   }
   FEX_CONFIG_OPT(MaxSize, DISKCACHEMAXFILESIZE);
   bool LocalFoundMetadata = false;
   if (!CurDB->LoadIndex(MaxSize, LocalFoundMetadata) || !CheckMetadata(*CurDB)) {
     RejectedCount.fetch_add(1, std::memory_order_relaxed);
-    if (ReadOnly || !CurDB->Reset()) {
-      if (!ReadOnly) {
-        CurDB->UnlockAfterOpen();
-      }
-      return false;
+    return false;
+  }
+  ROCacheDBs.push_back(std::move(CurDB));
+  return true;
+}
+
+fextl::string DiskCache::GenerationName(uint32_t Generation) const {
+  return Generation == 0 ? GenerationBase : fextl::fmt::format("{}-{}", GenerationBase, Generation);
+}
+
+// Opens one generation of the read-write database (creating it when Write is set), checks
+// it and gives it its description. Returns null, with CurrentState set, if it cannot be
+// used.
+IndexedDB* DiskCache::OpenGeneration(uint32_t Generation, bool Write) {
+  auto DB = fextl::make_unique<IndexedDB>();
+  DB->Generation = Generation;
+  const auto Name = GenerationName(Generation);
+  bool Replaced = false;
+  // The read-write files are opened writable even for an older generation: other
+  // processes may still be appending to it, and its index is repaired under the locks.
+  const auto Result = DB->OpenAt(BucketDirFD, Name, false, Replaced);
+  if (Replaced) {
+    UntrustedReplaced.fetch_add(1, std::memory_order_relaxed);
+  }
+  if (Result != IndexedDB::OpenResult::Opened) {
+    LogMan::Msg::IFmt("DiskCache: could not open {}; translating without it", Name);
+    if (Write) {
+      CurrentState = Result == IndexedDB::OpenResult::Untrusted ? State::Untrusted : State::Unavailable;
     }
-    // The cache directory is disposable: start this database again rather than
-    // translating without a cache from now on.
-    LogMan::Msg::IFmt("DiskCache: emptied {} and starting it again", Leaf);
+    return nullptr;
+  }
+  if (!DB->LockForOpen(std::chrono::steady_clock::now() + std::chrono::milliseconds(STORE_DEADLINE_MS))) {
+    LogMan::Msg::IFmt("DiskCache: {} is busy; translating without it", Name);
+    if (Write) {
+      CurrentState = State::Unavailable;
+    }
+    return nullptr;
+  }
+  FEX_CONFIG_OPT(MaxSize, DISKCACHEMAXFILESIZE);
+  bool LocalFoundMetadata = false;
+  bool Ok = DB->LoadIndex(MaxSize, LocalFoundMetadata);
+  if (Ok && !CheckMetadata(*DB)) {
+    Ok = false;
+  }
+  if (!Ok) {
+    RejectedCount.fetch_add(1, std::memory_order_relaxed);
+    // Damaged or made for something else under this name: the directory is disposable,
+    // so start this database again (new files, so a process still appending to the old
+    // ones never sees what it wrote move).
+    if (!DB->Reset()) {
+      DB->UnlockAfterOpen();
+      if (Write) {
+        CurrentState = State::Unavailable;
+      }
+      return nullptr;
+    }
+    DamagedReset.fetch_add(1, std::memory_order_relaxed);
+    LogMan::Msg::IFmt("DiskCache: emptied {} and starting it again", Name);
     LocalFoundMetadata = false;
+    DB->Limit = MaxSize;
+    DB->WriteRefused = false;
   }
-  if (!ReadOnly) {
-    CurDB->UnlockAfterOpen();
-  }
-  FoundMetadata |= LocalFoundMetadata;
-  if (ReadOnly) {
-    ROCacheDBs.push_back(std::move(CurDB));
+  if (!LocalFoundMetadata && !DB->WriteRefused) {
+    // A fresh database: its first record is the description.
+    MesaFOZ::foz_payload_key MetadataKey;
+    memset(MetadataKey.bytes, 0xFF, sizeof(MetadataKey));
+    IndexExtraBlobHeader MetaDataHeader = {};
+    MesaFOZ::mesa_index_db_file_entry IndexEntry = {};
+    DB->UnlockAfterOpen();
+    DB->StoreCacheBlobMacOS(MetadataKey, ~0, {ExpectedMetadata.data(), ExpectedMetadata.size()}, IndexEntry,
+                            {reinterpret_cast<uint8_t*>(&MetaDataHeader), sizeof(MetaDataHeader)},
+                            std::chrono::steady_clock::now() + std::chrono::milliseconds(STORE_DEADLINE_MS));
   } else {
-    RWCacheDB = std::move(CurDB);
+    DB->UnlockAfterOpen();
+  }
+  auto* Raw = DB.get();
+  Generations.push_back(std::move(DB));
+  return Raw;
+}
+
+// The current generation is full: start the next one, keep reading the full one, and
+// delete the generation before it. Safe across processes: a process that finds the next
+// generation already started opens it; one still writing an older generation fills it and
+// moves on too; deleting a generation other processes still have open only removes its
+// name.
+bool DiskCache::Rotate(IndexedDB* Full) {
+  std::lock_guard IndexGuard(IndexLock);
+  if (WriteDB.load() != Full) {
+    return true; // already moved on
+  }
+  const uint32_t Next = Full->Generation + 1;
+  auto* NewDB = OpenGeneration(Next, false);
+  if (!NewDB || NewDB->WriteRefused) {
+    return false;
+  }
+  LogMan::Msg::IFmt("DiskCache: {} is full; continuing in {}", Full->Name, NewDB->Name);
+  WriteDB = NewDB;
+  if (Next >= 2) {
+    const auto Old = GenerationName(Next - 2);
+    unlinkat(BucketDirFD, (Old + ".foz").c_str(), 0);
+    unlinkat(BucketDirFD, (Old + "_idx.foz").c_str(), 0);
   }
   return true;
+}
+
+// The writer thread's store. One lock wait per process at most: after a timeout (another
+// process holds the database's lock, perhaps stopped) every later store is dropped and
+// counted, so a flush before exit never waits more than one deadline.
+bool DiskCache::StoreMacOS(const MesaFOZ::foz_payload_key& UniqueKey, uint64_t LookupKey, std::span<const uint8_t> Blob,
+                           MesaFOZ::mesa_index_db_file_entry& IndexEntry, std::span<const uint8_t> IndexBlob, IndexedDB** Used) {
+  for (int Attempt = 0; Attempt < 2; ++Attempt) {
+    IndexedDB* DB = WriteDB.load();
+    if (!DB || StoresBusy.load(std::memory_order_relaxed) || InForkedChild()) {
+      break;
+    }
+    const auto Result = DB->StoreCacheBlobMacOS(UniqueKey, LookupKey, Blob, IndexEntry, IndexBlob,
+                                                std::chrono::steady_clock::now() + std::chrono::milliseconds(STORE_DEADLINE_MS));
+    if (Result == IndexedDB::StoreResult::Stored) {
+      *Used = DB;
+      return true;
+    }
+    if (Result == IndexedDB::StoreResult::Busy) {
+      if (!StoresBusy.exchange(true)) {
+        LogMan::Msg::EFmt("DiskCache: {} stayed locked by another process; translations of this run are not saved", DB->Name);
+      }
+      break;
+    }
+    if (Result != IndexedDB::StoreResult::Full || !Rotate(DB)) {
+      break;
+    }
+  }
+  DroppedCount.fetch_add(1, std::memory_order_relaxed);
+  return false;
 }
 
 void DiskCache::InitMacOS(const fextl::vector<uint8_t>& BucketBytes, size_t MachineDataSize, uint64_t ProcessBucketHash) {
@@ -684,6 +946,10 @@ void DiskCache::InitMacOS(const fextl::vector<uint8_t>& BucketBytes, size_t Mach
   // changes. The machine bucket here also holds the port identity: the exact build of the
   // core (Mach-O UUID), the CPU model (it reaches the guest through CPUID) and this port's
   // cache revision.
+  CurrentState = State::Unavailable;
+  OwnerPid = getpid();
+  std::call_once(AtForkOnce, [] { pthread_atfork(&DiskCache::AtForkPrepare, &DiskCache::AtForkParent, &DiskCache::AtForkChild); });
+  ForkWatched = this;
   const auto PortIdentity = MakePortIdentity(*CTX);
   if (PortIdentity.empty()) {
     LogMan::Msg::EFmt("DiskCache: the core's build cannot be identified (no LC_UUID); disk cache disabled");
@@ -710,16 +976,18 @@ void DiskCache::InitMacOS(const fextl::vector<uint8_t>& BucketBytes, size_t Mach
   BaseDirFD = open(BasePath.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
   if (BaseDirFD < 0) {
     LogMan::Msg::EFmt("DiskCache: cannot open {} (it must be a directory, not a link); disk cache disabled", BasePath);
+    CurrentState = errno == ELOOP || errno == ENOTDIR ? State::Untrusted : State::Unavailable;
     return;
   }
   if (!DirectoryIsTrusted(BaseDirFD, BasePath, false)) {
     close(BaseDirFD);
     BaseDirFD = -1;
+    CurrentState = State::Untrusted;
     return;
   }
 
   const auto BucketName = fextl::fmt::format("{:016x}", MachineBucketHash);
-  PruneStaleEntries(BasePath, BucketName);
+  PruneBuckets(BaseDirFD, BucketName);
 
   mkdirat(BaseDirFD, BucketName.c_str(), S_IRWXU);
   BucketDirFD = openat(BaseDirFD, BucketName.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
@@ -727,9 +995,11 @@ void DiskCache::InitMacOS(const fextl::vector<uint8_t>& BucketBytes, size_t Mach
   if (BucketDirFD < 0 || !DirectoryIsTrusted(BucketDirFD, BucketPath, true)) {
     if (BucketDirFD < 0) {
       LogMan::Msg::EFmt("DiskCache: cannot open {} (it must be a directory, not a link); disk cache disabled", BucketPath);
+      CurrentState = errno == ELOOP || errno == ENOTDIR ? State::Untrusted : State::Unavailable;
     } else {
       close(BucketDirFD);
       BucketDirFD = -1;
+      CurrentState = State::Untrusted;
     }
     return;
   }
@@ -742,16 +1012,46 @@ void DiskCache::InitMacOS(const fextl::vector<uint8_t>& BucketBytes, size_t Mach
 
   FileMapper = nullptr; // files are read with pread on macOS
 
-  OpenCacheDB(fextl::fmt::format("RWCacheDB_{:016x}", ProcessBucketHash), false);
-  if (RWCacheDB && !FoundMetadata) {
-    // A fresh database: its first record is the description.
-    MesaFOZ::foz_payload_key MetadataKey;
-    memset(MetadataKey.bytes, 0xFF, sizeof(MetadataKey));
-    IndexExtraBlobHeader MetaDataHeader = {};
-    MesaFOZ::mesa_index_db_file_entry IndexEntry = {};
-    RWCacheDB->StoreCacheBlob(MetadataKey, ~0, {ExpectedMetadata.data(), ExpectedMetadata.size()}, IndexEntry,
-                              {reinterpret_cast<uint8_t*>(&MetaDataHeader), sizeof(MetaDataHeader)});
-    Index.erase(~0);
+  // The read-write database's generations: write the newest, also read the one before,
+  // delete older ones.
+  GenerationBase = fextl::fmt::format("RWCacheDB_{:016x}", ProcessBucketHash);
+  uint32_t Newest = 0;
+  if (DIR* Dir = fdopendir(dup(BucketDirFD))) {
+    while (const dirent* Entry = readdir(Dir)) {
+      std::string_view Name = Entry->d_name;
+      if (!Name.starts_with(GenerationBase) || !Name.ends_with("_idx.foz")) {
+        continue;
+      }
+      Name.remove_prefix(GenerationBase.size());
+      Name.remove_suffix(strlen("_idx.foz"));
+      uint32_t Generation = 0;
+      if (!Name.empty()) {
+        if (Name[0] != '-' || Name.size() > 10) {
+          continue;
+        }
+        for (char c : Name.substr(1)) {
+          if (c < '0' || c > '9') {
+            Generation = 0;
+            break;
+          }
+          Generation = Generation * 10 + (c - '0');
+        }
+      }
+      Newest = std::max(Newest, Generation);
+    }
+    closedir(Dir);
+  }
+  for (uint32_t Old = 0; Newest >= 2 && Old + 2 <= Newest; ++Old) {
+    unlinkat(BucketDirFD, (GenerationName(Old) + ".foz").c_str(), 0);
+    unlinkat(BucketDirFD, (GenerationName(Old) + "_idx.foz").c_str(), 0);
+  }
+  if (Newest >= 1) {
+    OpenGeneration(Newest - 1, false);
+  }
+  CurrentState = State::Unavailable;
+  if (auto* Current = OpenGeneration(Newest, true)) {
+    WriteDB = Current;
+    CurrentState = Current->WriteRefused ? State::ReadOnly : State::Active;
   }
 
   std::string_view RONames = RODBNames();
@@ -767,8 +1067,11 @@ void DiskCache::InitMacOS(const fextl::vector<uint8_t>& BucketBytes, size_t Mach
     RONames.remove_prefix(Delim + 1);
   }
 
-  WritingDiskCache = (bool)RWCacheDB;
-  ReadingDiskCache = !ROCacheDBs.empty() || RWCacheDB != nullptr;
+  WritingDiskCache = CurrentState == State::Active;
+  ReadingDiskCache = !ROCacheDBs.empty() || !Generations.empty();
+  if (!WritingDiskCache && ReadingDiskCache && CurrentState != State::Untrusted && CurrentState != State::Unavailable) {
+    CurrentState = State::ReadOnly;
+  }
   if (IsWritingDiskCache()) {
     FEXCore::Threads::Flags WriterThreadFlags = {.LowPriority = true, .Internal = true};
     Writer = fextl::make_unique<WorkQueueThread>(WriterThreadFlags, "FEX:DiskCache");
@@ -905,16 +1208,80 @@ bool DiskCache::FlushToDiskMacOS(uint64_t QueuedBefore) {
   if (QueuedBefore == FlushedQueuedCount) {
     return true;
   }
-  if (!RWCacheDB->FlushToDisk()) {
+  auto* DB = WriteDB.load();
+  if (!DB || !DB->FlushToDisk()) {
     return false;
   }
   FlushedQueuedCount = QueuedBefore;
   return true;
 }
 
-// fork: the child has only the forking thread. ContextImpl::LockBeforeFork holds the code
-// invalidation lock, so no thread is in Lookup or Store; these locks stop the writer
-// thread from being inside the index at the moment of the fork.
+// fork. The child has only the forking thread: the writer thread is gone, and the child
+// shares the parent's open cache files and so their file locks, so it must not write.
+// pthread_atfork handlers (registered once, for the context's cache) hold the index locks
+// across every fork, so the child never inherits one held by the writer; with
+// fexmac_before_fork the locks are already held (ForkLocksHeld) and the handlers leave
+// them. A fork the handlers did not see is still caught by the process id check.
+DiskCache::~DiskCache() {
+  DiskCache* Self = this;
+  ForkWatched.compare_exchange_strong(Self, nullptr);
+}
+
+void DiskCache::AtForkPrepare() {
+  auto* Self = ForkWatched.load();
+  if (!Self || Self->ForkLocksHeld || !Self->ReadingDiskCache) {
+    return;
+  }
+  Self->IndexLock.lock();
+  Self->MemoryLRULock.lock();
+  AtForkTookLocks = true;
+}
+
+void DiskCache::AtForkParent() {
+  auto* Self = ForkWatched.load();
+  if (Self && AtForkTookLocks) {
+    AtForkTookLocks = false;
+    Self->MemoryLRULock.unlock();
+    Self->IndexLock.unlock();
+  }
+}
+
+void DiskCache::AtForkChild() {
+  auto* Self = ForkWatched.load();
+  if (!Self) {
+    return;
+  }
+  if (AtForkTookLocks) {
+    AtForkTookLocks = false;
+    Self->MemoryLRULock.unlock();
+    Self->IndexLock.unlock();
+  }
+  Self->BecomeReadOnlyAfterFork();
+}
+
+void DiskCache::BecomeReadOnlyAfterFork() {
+  if (ForkedChild) {
+    return;
+  }
+  ForkedChild = true;
+  OwnerPid = getpid();
+  if (WritingDiskCache) {
+    WritingDiskCache = false;
+    CurrentState = State::ReadOnly;
+  }
+  if (Writer) {
+    // The old queue object is abandoned (its mutex may have been held by the parent's
+    // writer thread at the fork); a new one runs the in-memory cache's housekeeping.
+    (void)Writer.release();
+    FEXCore::Threads::Flags WriterThreadFlags = {.LowPriority = true, .Internal = true};
+    Writer = fextl::make_unique<WorkQueueThread>(WriterThreadFlags, "FEX:DiskCache");
+  }
+}
+
+bool DiskCache::InForkedChild() {
+  return OwnerPid != 0 && getpid() != OwnerPid;
+}
+
 void DiskCache::LockBeforeFork() {
   if (!ReadingDiskCache) {
     return;
@@ -931,17 +1298,8 @@ void DiskCache::UnlockAfterFork(bool Child) {
   ForkLocksHeld = false;
   MemoryLRULock.unlock();
   IndexLock.unlock();
-  if (Child && Writer) {
-    // The writer thread does not exist in the child, and the child shares the parent's
-    // open files and so its file locks: two writers could interleave appends. The child
-    // keeps reading the cache but stores nothing. The old queue object is abandoned (its
-    // mutex may have been held by the parent's writer thread at the fork); a new one runs
-    // the in-memory cache's housekeeping.
-    (void)Writer.release();
-    WritingDiskCache = false;
-    ForkedChild = true;
-    FEXCore::Threads::Flags WriterThreadFlags = {.LowPriority = true, .Internal = true};
-    Writer = fextl::make_unique<WorkQueueThread>(WriterThreadFlags, "FEX:DiskCache");
+  if (Child) {
+    BecomeReadOnlyAfterFork();
   }
 }
 
