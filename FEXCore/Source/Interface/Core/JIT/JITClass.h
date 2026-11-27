@@ -640,6 +640,9 @@ private:
   void EmitSuspendInterruptCheck();
   template<ARMEmitter::IsLabel T>
   void EmitCondJumpBranch(const IR::IROp_CondJump* Op, T* TrueTargetLabel);
+#ifdef __APPLE__
+  void EmitCondJumpBranchInverted(const IR::IROp_CondJump* Op, ARMEmitter::ForwardLabel* Label);
+#endif
 
   void EmitEntryPoint(ARMEmitter::BackwardLabel& HeaderLabel, bool CheckTF);
 

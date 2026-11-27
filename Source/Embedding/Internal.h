@@ -91,6 +91,9 @@ public:
   static constexpr uint8_t ProtMask = 7;
   static constexpr uint8_t Mapped = 8;
   static constexpr uint8_t HostCodeProtected = 1;
+  // The core has translated code from the host page since its translations were last
+  // discarded: changes to the page must discard them (and resync threads).
+  static constexpr uint8_t HostHasCode = 2;
 
   static constexpr uint64_t GuestPage = 0x1000;
   static constexpr uint64_t HostPage = 0x4000;
@@ -114,6 +117,8 @@ public:
   std::mutex Mutex;
   bool SetPages(uint64_t Address, uint64_t Size, uint8_t Value);
   void SetCodeProtected(uint64_t HostPageAddress, bool Value);
+  bool HasCode(uint64_t HostPageAddress) const;
+  void SetHasCode(uint64_t HostPageAddress, bool Value);
   // The protection the host page should have: the union of its guest pages' protections,
   // without write access when the library write-protects it for code.
   int HostProtection(uint64_t HostPageAddress, bool IgnoreCodeProtection = false) const;
@@ -134,6 +139,10 @@ public:
   std::atomic<uint32_t> ProtectionChanges {};
   // mprotect that waits as described, for any change that may remove access.
   int ReduceProtection(uint64_t Address, uint64_t Size, int Prot);
+
+  // Set at the first registration: code translated before then is not recorded per page,
+  // so the next change discards translations regardless. Guarded by Mutex.
+  bool UntrackedCode {};
 
   // Number of writes to write-protected code handled (statistics, relaxed).
   std::atomic<uint64_t> CodeWriteFaults {};
@@ -175,6 +184,9 @@ struct fexmac_context {
   fextl::vector<fexmac_thread*> Threads;
 
   fexmac::GuestMemory Memory;
+  // Destroyed threads' handles, freed with the context (see fexmac_thread::Dead).
+  // Guarded by ThreadsMutex.
+  fextl::vector<fexmac_thread*> DeadThreads;
   // SMCCHECKS is mtrack: translated pages are write-protected once memory is registered.
   bool WriteProtectCode {};
 
@@ -208,6 +220,13 @@ struct fexmac_thread {
   // the thread re-enters the dispatcher at the same guest instruction, so a loop that
   // never leaves its block cannot keep running the stale translation.
   std::atomic<uint32_t> ResyncRequested {};
+
+  // fexmac_thread_request_stop takes no lock and may race with fexmac_thread_destroy (or
+  // run in a signal handler after it). The destroy sets Dead and waits until no request
+  // is in progress before freeing the core's thread state; the handle itself is kept
+  // until the context is destroyed, so a late request finds Dead and touches nothing.
+  std::atomic<uint32_t> Dead {};
+  std::atomic<uint32_t> StopCallers {};
 
   // A guest store to write-protected code is in progress on this thread (Memory.cpp): the
   // host page it writes, kept writable and unprotected until the store has run, and the

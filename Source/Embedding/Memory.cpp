@@ -30,6 +30,7 @@
 #include <algorithm>
 #include <cstring>
 #include <signal.h>
+#include <pthread.h>
 #include <sched.h>
 #include <sys/mman.h>
 
@@ -116,8 +117,34 @@ void GuestMemory::SetCodeProtected(uint64_t HostPageAddress, bool Value) {
   if (!Chunk) {
     return;
   }
-  __atomic_store_n(&Chunk[GuestBytesPerChunk + (HostPageAddress & ((1ULL << ChunkShift) - 1)) / HostPage],
-                   Value ? HostCodeProtected : uint8_t {0}, __ATOMIC_RELEASE);
+  uint8_t* Byte = &Chunk[GuestBytesPerChunk + (HostPageAddress & ((1ULL << ChunkShift) - 1)) / HostPage];
+  if (Value) {
+    __atomic_fetch_or(Byte, HostCodeProtected, __ATOMIC_SEQ_CST);
+  } else {
+    __atomic_fetch_and(Byte, static_cast<uint8_t>(~HostCodeProtected), __ATOMIC_SEQ_CST);
+  }
+}
+
+bool GuestMemory::HasCode(uint64_t HostPageAddress) const {
+  if (!Chunks || HostPageAddress >= AddressLimit) {
+    return false;
+  }
+  const uint8_t* Chunk = Chunks[HostPageAddress >> ChunkShift].load(std::memory_order_acquire);
+  return Chunk && (__atomic_load_n(&Chunk[GuestBytesPerChunk + (HostPageAddress & ((1ULL << ChunkShift) - 1)) / HostPage], __ATOMIC_ACQUIRE) &
+                   HostHasCode);
+}
+
+void GuestMemory::SetHasCode(uint64_t HostPageAddress, bool Value) {
+  uint8_t* Chunk = this->Chunk(HostPageAddress, true);
+  if (!Chunk) {
+    return;
+  }
+  uint8_t* Byte = &Chunk[GuestBytesPerChunk + (HostPageAddress & ((1ULL << ChunkShift) - 1)) / HostPage];
+  if (Value) {
+    __atomic_fetch_or(Byte, HostHasCode, __ATOMIC_SEQ_CST);
+  } else {
+    __atomic_fetch_and(Byte, static_cast<uint8_t>(~HostHasCode), __ATOMIC_SEQ_CST);
+  }
 }
 
 int GuestMemory::HostProtection(uint64_t HostPageAddress, bool IgnoreCodeProtection) const {
@@ -161,8 +188,32 @@ namespace {
   // Holds the context's thread list, the core's invalidation lock (exclusively) and the
   // memory lock, in that order, around Fn; then discards translations of
   // [InvalidateStart, InvalidateEnd) if Fn asks for it, still holding the first two.
+  // Asynchronous signals stay blocked while the locks below are held, also on a guest
+  // thread (the self-modifying-code trampolines run on one, where the core's
+  // signal-deferring guard does not mask them): an embedder's asynchronous handler that
+  // suspended the thread or left with siglongjmp would otherwise leave every thread's
+  // translation waiting for these locks.
+  class AsyncSignalsBlocked {
+  public:
+    AsyncSignalsBlocked() {
+      sigset_t Block;
+      sigfillset(&Block);
+      for (int Signal : {SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGTRAP, SIGSYS}) {
+        sigdelset(&Block, Signal);
+      }
+      pthread_sigmask(SIG_BLOCK, &Block, &Old);
+    }
+    ~AsyncSignalsBlocked() {
+      pthread_sigmask(SIG_SETMASK, &Old, nullptr);
+    }
+
+  private:
+    sigset_t Old;
+  };
+
   template<typename F>
   void WithCodeLocked(fexmac_context* Context, bool Resync, F&& Fn) {
+    AsyncSignalsBlocked Blocked;
     std::lock_guard ThreadsLock {Context->ThreadsMutex};
     auto Lock = FEXCore::GuardSignalDeferringSectionWithFallback(Context->CTX->GetCodeInvalidationMutex(), CallingGuestThread(Context),
                                                                  InvalidationSignalMask());
@@ -170,6 +221,26 @@ namespace {
     {
       std::lock_guard MemoryLock {Context->Memory.Mutex};
       Fn(Start, End);
+    }
+    // Only host pages the core translated code from need their code discarded (and the
+    // threads told): a write_end, map or protect of plain data costs no invalidation.
+    {
+      std::lock_guard MemoryLock {Context->Memory.Mutex};
+      bool AnyCode = false;
+      for (uint64_t Page = Start & ~(GuestMemory::HostPage - 1); Page < End; Page += GuestMemory::HostPage) {
+        if (Context->Memory.HasCode(Page)) {
+          AnyCode = true;
+          Context->Memory.SetHasCode(Page, false);
+        }
+      }
+      if (Context->Memory.UntrackedCode) {
+        // Code translated before memory was tracked may be anywhere: discard all of it once.
+        Context->Memory.UntrackedCode = false;
+        Start = 0;
+        End = GuestMemory::AddressLimit;
+      } else if (!AnyCode) {
+        End = Start;
+      }
     }
     if (End > Start) {
       InvalidateLocked(Context, Start, End - Start);
@@ -209,6 +280,10 @@ fexmac_result SetGuestMemory(fexmac_context* Context, uint64_t Address, uint64_t
         }
       }
     }
+    if (!Memory.Tracking()) {
+      // Code translated before memory was tracked has no record of its pages.
+      Memory.UntrackedCode = true;
+    }
     if (!Memory.SetPages(Address, Size, Value)) {
       Result = FEXMAC_ERROR_OUT_OF_MEMORY;
       return;
@@ -221,12 +296,14 @@ fexmac_result SetGuestMemory(fexmac_context* Context, uint64_t Address, uint64_t
       for (uint64_t Page = HostPage; Page < HostPage + GuestMemory::HostPage; Page += GuestMemory::GuestPage) {
         Mapped |= (Memory.Page(Page) & GuestMemory::Mapped) != 0;
       }
-      // A host page none of whose guest pages is mapped is left alone: the embedder
-      // owns whatever is there (or nothing is).
+      // A host page none of whose guest pages is mapped any more becomes inaccessible
+      // here, through the same wait for emulations in progress as any reduction, so an
+      // embedder's munmap that follows fexmac_memory_unmap cannot land between a
+      // misaligned atomic's access check and its emulation.
       // Translations of the page are discarded below, so it needs no write protection.
       // The host protection changes first and the mark after: a fault handler that finds
       // the page not marked must find the host's protection already the guest's.
-      if (Mapped && Memory.ReduceProtection(HostPage, GuestMemory::HostPage, Memory.HostProtection(HostPage, true)) != 0) {
+      if (Memory.ReduceProtection(HostPage, GuestMemory::HostPage, Mapped ? Memory.HostProtection(HostPage, true) : PROT_NONE) != 0 && Mapped) {
         Result = FEXMAC_ERROR_UNSUPPORTED;
       }
       Memory.SetCodeProtected(HostPage, false);
@@ -307,7 +384,7 @@ void SyscallHandler::MarkGuestExecutableRange(FEXCore::Core::InternalThreadState
   CallTestMarkHook(Start, Length);
 #endif
   auto& Memory = Context->Memory;
-  if (!Context->WriteProtectCode || !Memory.Tracking() || Length == 0) {
+  if (!Memory.Tracking() || Length == 0) {
     return;
   }
   // Called by the core while translating, holding its invalidation lock shared, so no
@@ -315,6 +392,12 @@ void SyscallHandler::MarkGuestExecutableRange(FEXCore::Core::InternalThreadState
   std::lock_guard MemoryLock {Memory.Mutex};
   const uint64_t First = Start & ~HostPageMask;
   const uint64_t Last = (Start + Length - 1) & ~HostPageMask;
+  for (uint64_t HostPage = First; HostPage <= Last; HostPage += GuestMemory::HostPage) {
+    Memory.SetHasCode(HostPage, true);
+  }
+  if (!Context->WriteProtectCode) {
+    return;
+  }
   for (uint64_t HostPage = First; HostPage <= Last; HostPage += GuestMemory::HostPage) {
     if (Memory.CodeProtected(HostPage) || Memory.Writers.contains(HostPage)) {
       continue;
@@ -338,14 +421,15 @@ void SyscallHandler::MarkGuestExecutableRange(FEXCore::Core::InternalThreadState
 // The store has not run yet when this is called, and other threads may translate the
 // page's old bytes meanwhile. So the page is treated as written by the embedder
 // (Writers, as fexmac_memory_write_begin): it is not write-protected again, and the store
-// cannot fault again however often other threads translate from it. FinishCodeWrite,
-// after the store, discards what they translated meanwhile and makes threads in loops of
-// that code look it up again.
+// cannot fault again however often other threads translate from it. Threads in a loop of
+// the discarded code are told to look it up again now (they may never leave the loop of
+// their own) and once more by FinishCodeWrite, after the store, which also discards what
+// they translated meanwhile from the old bytes.
 void ResolveCodeWrite(fexmac_thread* Thread, uint64_t Address) {
   FinishCodeWrite(Thread);
   auto* Context = Thread->Context;
   const uint64_t HostPage = Address & ~HostPageMask;
-  WithCodeLocked(Context, false, [&](uint64_t& Start, uint64_t& End) {
+  WithCodeLocked(Context, true, [&](uint64_t& Start, uint64_t& End) {
     auto& Memory = Context->Memory;
     ++Memory.Writers[HostPage];
     // Write access first, then the mark: a fault handler that finds the page not marked

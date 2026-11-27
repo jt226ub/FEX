@@ -1379,6 +1379,182 @@ static void TestSplitLockOnCodePage(void) {
   fexmac_context_destroy(R.Context);
 }
 
+/* ---------------------------------------------------------------------------------
+ * Races found by the package D review
+ * --------------------------------------------------------------------------------- */
+
+/* One thread spins (jmp self) and is stopped 3,000 times while four other guest threads
+ * write to code on their own pages (every write discards code and makes the spinner
+ * resync) and two requesters ask at once: every request is answered, none lost. */
+struct StormThread {
+  fexmac_thread* Thread;
+  uint64_t Rip;
+  int Count;
+};
+static atomic_long StormAnswered, StormOther;
+static atomic_int StormDone;
+static void* StormRunner(void* Argument) {
+  struct StormThread* T = Argument;
+  while (!atomic_load(&StormDone)) {
+    const fexmac_stop Stop = Run(T->Thread);
+    if (T->Count) {
+      if (Stop.reason == FEXMAC_STOP_REQUESTED) {
+        atomic_fetch_add(&StormAnswered, 1);
+      } else {
+        atomic_fetch_add(&StormOther, 1);
+      }
+    }
+  }
+  return NULL;
+}
+
+static void TestStopResyncStorm(void) {
+  fexmac_install_fault_handlers();
+  fexmac_context* Context = MakeContext(1, 0, "mtrack", NULL, NULL);
+  uint8_t* Base = MapGuestMemory(0x40000);
+  static const uint8_t SpinSelf[] = {0xEB, 0xFE};                                                   /* jmp self */
+  static const uint8_t CodeWriter[] = {0x48, 0x83, 0x05, 0x10, 0x00, 0x00, 0x00, 0x01, 0xEB, 0xF6}; /* 1: add qword [rip+16], 1; jmp 1b */
+  memcpy(Base, SpinSelf, sizeof(SpinSelf));
+  enum { Writers = 4, Requests = 3000 };
+  for (int w = 0; w < Writers; ++w) {
+    memcpy(Base + 0x4000 * (w + 1), CodeWriter, sizeof(CodeWriter));
+  }
+  fexmac_memory_map(Context, Addr(Base), 0x40000, FEXMAC_PROT_READ | FEXMAC_PROT_WRITE | FEXMAC_PROT_EXEC);
+  struct StormThread SpinT = {CreateThreadAt(Context, Addr(Base), 0), Addr(Base), 1};
+  struct StormThread W[Writers];
+  pthread_t Threads[Writers + 1];
+  pthread_create(&Threads[0], NULL, StormRunner, &SpinT);
+  for (int w = 0; w < Writers; ++w) {
+    W[w] = (struct StormThread) {CreateThreadAt(Context, Addr(Base) + 0x4000 * (w + 1), 0), 0, 0};
+    pthread_create(&Threads[w + 1], NULL, StormRunner, &W[w]);
+  }
+  usleep(50000);
+  long Lost = 0;
+  for (int i = 0; i < Requests; ++i) {
+    const long Before = atomic_load(&StormAnswered);
+    double Start = Now();
+    fexmac_thread_request_stop(SpinT.Thread);
+    fexmac_thread_request_stop(SpinT.Thread);
+    while (atomic_load(&StormAnswered) == Before) {
+      if (Now() - Start > 1.0) {
+        ++Lost;
+        fexmac_thread_request_stop(SpinT.Thread);
+        Start = Now();
+      }
+    }
+  }
+  const uint64_t Writes = fexmac_memory_code_write_count(Context);
+  atomic_store(&StormDone, 1);
+  fexmac_thread_request_stop(SpinT.Thread);
+  for (int w = 0; w < Writers; ++w) {
+    fexmac_thread_request_stop(W[w].Thread);
+  }
+  for (int i = 0; i < Writers + 1; ++i) {
+    pthread_join(Threads[i], NULL);
+  }
+  printf("  %d requests, %ld answered, %" PRIu64 " code writes meanwhile\n", Requests, atomic_load(&StormAnswered), Writes);
+  Check(Lost == 0, "no request lost (%ld needed a second request after 1 s)", Lost);
+  Check(atomic_load(&StormOther) == 0 && Writes > 1000, "the spinner only ever stopped for requests, under a storm of code writes");
+  fexmac_thread_destroy(SpinT.Thread);
+  for (int w = 0; w < Writers; ++w) {
+    fexmac_thread_destroy(W[w].Thread);
+  }
+  fexmac_context_destroy(Context);
+}
+
+/* Four threads run misaligned lock xadd on a word whose page the main thread unmaps and
+ * remaps (fexmac_memory_unmap then munmap, mmap then fexmac_memory_map) for 3 seconds:
+ * the threads see page faults, the process survives. Died with SIGSEGV within seconds
+ * when fexmac_memory_unmap left the host page accessible. */
+static fexmac_context* UnmapContext;
+static uint8_t* UnmapBase;
+static atomic_int UnmapDone;
+static atomic_long UnmapFaults;
+static void* UnmapGuest(void* Argument) {
+  const long i = (long)Argument;
+  static const uint8_t P[] = {0xF0, 0x49, 0x0F, 0xC1, 0x5F, 0x0C, 0x48, 0xFF, 0xC1, 0xEB, 0xF5}; /* 1: lock xadd [r15+12], rbx; inc rcx; jmp 1b */
+  (void)P;
+  fexmac_thread* T = CreateThreadAt(UnmapContext, Addr(UnmapBase), Addr(UnmapBase) + 0x80000 - i * 0x1000);
+  fexmac_x86_state S = GetState(T);
+  S.gpr[15] = Addr(UnmapBase) + 0x40000 + i * 64;
+  S.gpr[RBX] = 1;
+  SetState(T, &S);
+  while (!atomic_load(&UnmapDone)) {
+    const fexmac_stop Stop = Run(T);
+    if (Stop.reason == FEXMAC_STOP_GUEST_FAULT) {
+      atomic_fetch_add(&UnmapFaults, 1);
+    }
+  }
+  fexmac_thread_destroy(T);
+  return NULL;
+}
+
+static void TestSplitLockUnmapRace(void) {
+  fexmac_install_fault_handlers();
+  UnmapContext = MakeContext(1, 0, NULL, NULL, NULL);
+  UnmapBase = MapGuestMemory(0x100000);
+  static const uint8_t P[] = {0xF0, 0x49, 0x0F, 0xC1, 0x5F, 0x0C, 0x48, 0xFF, 0xC1, 0xEB, 0xF5};
+  memcpy(UnmapBase, P, sizeof(P));
+  fexmac_memory_map(UnmapContext, Addr(UnmapBase), 0x40000, FEXMAC_PROT_READ | FEXMAC_PROT_WRITE | FEXMAC_PROT_EXEC);
+  fexmac_memory_map(UnmapContext, Addr(UnmapBase) + 0x40000, 0xC0000, FEXMAC_PROT_READ | FEXMAC_PROT_WRITE);
+  pthread_t G[4];
+  for (long i = 0; i < 4; ++i) {
+    pthread_create(&G[i], NULL, UnmapGuest, (void*)i);
+  }
+  const double Start = Now();
+  long Rounds = 0;
+  while (Now() - Start < 3.0) {
+    fexmac_memory_unmap(UnmapContext, Addr(UnmapBase) + 0x40000, 0x4000);
+    munmap(UnmapBase + 0x40000, 0x4000);
+    usleep(10);
+    mmap(UnmapBase + 0x40000, 0x4000, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+    fexmac_memory_map(UnmapContext, Addr(UnmapBase) + 0x40000, 0x4000, FEXMAC_PROT_READ | FEXMAC_PROT_WRITE);
+    usleep(10);
+    ++Rounds;
+  }
+  atomic_store(&UnmapDone, 1);
+  for (int i = 0; i < 4; ++i) {
+    pthread_join(G[i], NULL);
+  }
+  printf("  %ld unmap/map rounds, %ld guest page faults\n", Rounds, atomic_load(&UnmapFaults));
+  Check(Rounds > 100, "the process survived %ld rounds of unmap racing the split-lock emulation", Rounds);
+  fexmac_context_destroy(UnmapContext);
+}
+
+/* fexmac_thread_request_stop on a destroyed thread returns INVALID_HANDLE and touches
+ * nothing; requests racing with destroys from another thread are safe. */
+static atomic_int RaceStop;
+static fexmac_thread* volatile RaceTarget;
+static void* StopRequester(void* Argument) {
+  (void)Argument;
+  while (!atomic_load(&RaceStop)) {
+    fexmac_thread* T = RaceTarget;
+    if (T) {
+      fexmac_thread_request_stop(T);
+    }
+  }
+  return NULL;
+}
+
+static void TestStopAfterDestroy(void) {
+  fexmac_context* Context = MakeContext(1, 0, NULL, NULL, NULL);
+  fexmac_thread* Thread = CreateThreadAt(Context, 0x10000, 0);
+  CheckResult(fexmac_thread_destroy(Thread), FEXMAC_OK, "destroy");
+  CheckResult(fexmac_thread_request_stop(Thread), FEXMAC_ERROR_INVALID_HANDLE, "stop request for a destroyed thread");
+  pthread_t Requester;
+  pthread_create(&Requester, NULL, StopRequester, NULL);
+  for (int i = 0; i < 2000; ++i) {
+    fexmac_thread* T = CreateThreadAt(Context, 0x10000, 0);
+    RaceTarget = T;
+    usleep(i % 3 == 0 ? 0 : 20);
+    fexmac_thread_destroy(T);
+  }
+  atomic_store(&RaceStop, 1);
+  pthread_join(Requester, NULL);
+  Check(1, "2,000 destroys raced with stop requests from another thread");
+  CheckResult(fexmac_context_destroy(Context), FEXMAC_OK, "context destroy frees the handles");
+}
+
 const struct Subtest FaultSubtests[] = {
   {"fault-mid-block", TestFaultMidBlock, 0, NULL, "fexmac:", 0},
   {"fault-flags", TestFaultFlags, 0, NULL, "fexmac:", 0},
@@ -1401,6 +1577,9 @@ const struct Subtest FaultSubtests[] = {
   {"smc-cross-thread", TestSMCCrossThread, 0, NULL, "fexmac:", 0},
   {"split-lock-faults", TestSplitLockFaults, 0, NULL, "fexmac:", 0},
   {"split-lock-on-code-page", TestSplitLockOnCodePage, 0, NULL, "fexmac:", 0},
+  {"stop-resync-storm", TestStopResyncStorm, 0, NULL, "fexmac:", 0},
+  {"split-lock-unmap-race", TestSplitLockUnmapRace, 0, NULL, "fexmac:", 0},
+  {"stop-after-destroy", TestStopAfterDestroy, 0, NULL, "fexmac:", 0},
   {"smc-embedder-write", TestSMCEmbedderWrite, 0, NULL, "fexmac:", 2},
   {"smc-embedder-write-unbracketed-dies", TestSMCEmbedderWriteUnbracketed, SIGBUS, "fexmac_memory_write_begin", NULL, 1},
 };

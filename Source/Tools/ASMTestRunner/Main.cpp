@@ -493,8 +493,7 @@ int main(int argc, char** argv, char** const envp) {
   // jump elsewhere stops with a guest fault), the code cache hashes and patches guest
   // bytes only inside it, and SMCCHECKS mtrack write-protects pages translated from it.
   if (!Mapper.Register(Context)) {
-    fextl::fmt::print("Failed to register the test's memory with fexmac
-");
+    fextl::fmt::print("Failed to register the test's memory with fexmac\n");
     return ExitFail;
   }
 

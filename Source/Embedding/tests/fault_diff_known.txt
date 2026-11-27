@@ -1,0 +1,47 @@
+# Differences Scripts/macos_fault_diff.py knows about and does not fail on: case, check.
+# Each is a limit of the translator that package D did not fix; see
+# docs/macOS-embedding-interface.md, "Guest memory faults: what is exact".
+#
+# Not restartable: the instruction changes guest state (flags, a register, part of the
+# memory) before its last access that can fault, so the state at the fault is not the
+# state before it and running it again after the fix computes from changed state.
+add-rmw-ro-flags        at-fault   # add [m]: flags computed before the store
+carry-rcl-0             at-fault   # rcl [m]: CF consumed and rewritten before the store
+carry-rcl-0             resume
+carry-rcl-0             smc
+carry-rcr-1             at-fault
+carry-rcr-1             resume
+carry-rcr-1             smc
+carry-sbb-2             at-fault   # sbb [m]: CF consumed and rewritten before the store
+carry-sbb-2             resume
+carry-sbb-2             smc
+carry-rcl-4             at-fault
+carry-rcl-4             resume
+carry-rcl-4             smc
+carry-neg-6             at-fault   # flags of the RMW set before its store (reported only)
+carry-shl-7             at-fault
+carry-btc-8             at-fault
+carry-xadd-9            at-fault
+carry-cmpxchg-10        at-fault
+leave-stack-fault       at-fault   # leave: rsp = rbp before the load of rbp
+pop-mem-dst-fault       at-fault   # pop [m]: rsp += 8 before the store
+pop-mem-dst-fault       resume
+pop-mem-dst-fault       smc
+call-stack-ro           resume     # call: see the doc (the return address the resumed call writes)
+call-stack-ro           smc
+ystore-cross-ro         at-fault   # 32-byte store: first 16 bytes written before the fault
+#
+# rep movs / rep stos: one host loop; registers from before the instruction, memory partly
+# written; an overlapping forward copy restarted from the start gives a different result.
+rep-movs-overlap        at-fault
+rep-movs-overlap-down   at-fault
+rep-movs-overlap-down   resume
+rep-movs-overlap-down   smc
+rep-movsq-nonoverlap    at-fault
+rep-stos-cross          at-fault
+#
+# Dead flags: PF and AF (or any flag) that the rest of the block overwrites without reading
+# are not computed and are reported as whatever the frame held. Running again is not
+# affected. With SMCCHECKS full the extra per-instruction block split computes them.
+sub-carry-then-load-adc   at-fault
+flags-multiblock-edge     at-fault

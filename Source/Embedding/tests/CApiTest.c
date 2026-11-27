@@ -1497,6 +1497,7 @@ static void TestCacheFork(void) {
 /* ---- code ranges: only registered memory is code once any range is registered ---- */
 
 static void TestCodeRanges(void) {
+  fexmac_install_fault_handlers();
   uint8_t* Code = MapGuestMemory(0x8000);
   const uint64_t Base = (uint64_t)(uintptr_t)Code;
   /* First page: mov eax, 1; jmp to the second page. Second page: mov eax, 2; hlt. */

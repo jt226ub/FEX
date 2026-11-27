@@ -28,6 +28,7 @@
 #include <cstdio>
 #include <cstring>
 #include <pthread.h>
+#include <sched.h>
 #include <signal.h>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -551,6 +552,12 @@ fexmac_result fexmac_context_create(const fexmac_config* config, fexmac_context*
     // emulation; why that is safe is in docs/macOS-embedding-interface.md (fault handler
     // locks).
     {FEXCore::Config::CONFIG_STRICTINPROCESSSPLITLOCKS, "1"},
+    // Self-modifying code is detected by a check of the guest bytes in every block unless
+    // the embedder asks for SMCCHECKS mtrack (write protection of translated pages, which
+    // has known gaps: see fexmac.h, "Guest memory") or none. The core's own default,
+    // mtrack, would detect nothing without registered memory, and with it would switch
+    // write protection on without the embedder choosing it.
+    {FEXCore::Config::CONFIG_SMCCHECKS, "2"},
   };
   if (const auto Result = ParseOptions(*config, &Parsed); Result != FEXMAC_OK) {
     return Fail(Result, false);
@@ -638,6 +645,10 @@ fexmac_result fexmac_context_destroy(fexmac_context* context) {
   }
   ProcessContext.store(nullptr);
 
+  for (auto* Dead : context->DeadThreads) {
+    delete Dead;
+  }
+  context->DeadThreads.clear();
   context->CTX.reset();
   context->Syscalls.reset();
   context->Delegator.reset();
@@ -849,6 +860,13 @@ fexmac_result fexmac_thread_destroy(fexmac_thread* thread) {
     LiveThreads.erase(thread);
   }
 
+  // A stop request in progress on another thread (or in a signal handler) still uses the
+  // core's thread state: wait for it, and make later ones find the handle dead.
+  thread->Dead.store(1, std::memory_order_seq_cst);
+  while (thread->StopCallers.load(std::memory_order_seq_cst) != 0) {
+    sched_yield();
+  }
+
   // Still listed in its context, so the context cannot be destroyed until this is done.
   auto* Context = thread->Context;
   {
@@ -856,11 +874,14 @@ fexmac_result fexmac_thread_destroy(fexmac_thread* thread) {
     auto& Threads = Context->Threads;
     Threads.erase(std::remove(Threads.begin(), Threads.end(), thread), Threads.end());
     Context->CTX->DestroyThread(thread->Thread);
+    thread->Thread = nullptr;
+    // The handle stays allocated until the context is destroyed (fexmac_thread::Dead).
+    Context->DeadThreads.push_back(thread);
   }
   if (thread->CallRetAllocation) {
     ::munmap(thread->CallRetAllocation, thread->CallRetAllocationSize);
+    thread->CallRetAllocation = nullptr;
   }
-  delete thread;
   return FEXMAC_OK;
 }
 
@@ -993,8 +1014,14 @@ fexmac_result fexmac_thread_request_stop(fexmac_thread* thread) {
   if (!thread) {
     return FEXMAC_ERROR_INVALID_ARGUMENT;
   }
+  thread->StopCallers.fetch_add(1, std::memory_order_seq_cst);
+  if (thread->Dead.load(std::memory_order_seq_cst)) {
+    thread->StopCallers.fetch_sub(1, std::memory_order_seq_cst);
+    return FEXMAC_ERROR_INVALID_HANDLE;
+  }
   thread->StopRequested.store(1, std::memory_order_seq_cst);
   ProtectInterruptPage(thread, true);
+  thread->StopCallers.fetch_sub(1, std::memory_order_seq_cst);
   return FEXMAC_OK;
 }
 

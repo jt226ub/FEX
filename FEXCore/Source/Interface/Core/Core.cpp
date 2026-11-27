@@ -600,6 +600,10 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
     }
 #endif
 
+#ifdef __APPLE__
+    // Whether an x87 instruction was translated earlier in this unit (see below).
+    bool SawX87 = false;
+#endif
     for (size_t j = 0; j < CodeBlocks.size(); ++j) {
       const auto& Block = CodeBlocks[j];
 
@@ -671,27 +675,66 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
         // It is potentially correctness bearing in that sense, but that is a
         // side effect here and (if that behaviour is required) we should handle
         // that more explicitly later.
-        Thread->OpDispatcher->FlushRegisterCache(true);
-
 #ifdef __APPLE__
+        // On macOS the embedding library resumes a guest at an instruction that faulted on
+        // memory, with the guest state it reconstructs from the host context and the
+        // thread's frame. Everything the register cache holds beyond the static registers
+        // (DF, MMX, the upper AVX halves, the x87 stack the x87 pass keeps virtual) would
+        // otherwise be written back only at the end of the block, and the flags could be
+        // pending in a temporary or have the carry inverted. So before an instruction that
+        // can access memory the whole cache is flushed and the flags put in canonical form
+        // (a full flush does both), and a virtual x87 stack is written to the frame.
+        // Register-only instructions keep the cheaper partial flush below.
+        bool MayFault = false;
         if (TableInfo && TableInfo->OpcodeDispatcher.OpDispatch) {
-          // An instruction that may access memory may fault there; see
-          // MaterializeFlagsForFault. A register-only instruction cannot.
+          // A memory operand: [reg] (GPRDirect), [reg+disp], [rip+disp], SIB, and the
+          // relocatable forms of each. GPR is a register operand.
           const auto IsMemory = [](const X86Tables::DecodedOperand& Operand) {
-            return Operand.IsGPRIndirect() || Operand.IsRIPRelative() || Operand.IsSIB();
+            using T = X86Tables::DecodedOperand::OpType;
+            switch (Operand.Type) {
+            case T::GPRDirect:
+            case T::GPRIndirect:
+            case T::GPRIndirectRelocation:
+            case T::RIPRelative:
+            case T::RIPRelativeRelocation:
+            case T::SIB:
+            case T::SIBRelocation: return true;
+            default: return false;
+            }
           };
-          if ((TableInfo->Flags & X86Tables::InstFlags::FLAGS_DEBUG_MEM_ACCESS) || IsMemory(DecodedInfo->Dest) ||
-              IsMemory(DecodedInfo->Src[0]) || IsMemory(DecodedInfo->Src[1]) || IsMemory(DecodedInfo->Src[2])) {
-            Thread->OpDispatcher->MaterializeFlagsForFault();
-          }
+          MayFault = (TableInfo->Flags & X86Tables::InstFlags::FLAGS_DEBUG_MEM_ACCESS) || IsMemory(DecodedInfo->Dest) ||
+                     IsMemory(DecodedInfo->Src[0]) || IsMemory(DecodedInfo->Src[1]) || IsMemory(DecodedInfo->Src[2]);
         }
+        if (MayFault) {
+          if (SawX87) {
+            Thread->OpDispatcher->_SyncStackToSlow();
+          }
+          Thread->OpDispatcher->FlushRegisterCache(false);
+        } else {
+          Thread->OpDispatcher->FlushRegisterCache(true);
+        }
+        if (TableInfo && ((TableInfo >= &X86Tables::X87F80Ops[0] && TableInfo < &X86Tables::X87F80Ops[0] + X86Tables::MAX_X87_TABLE_SIZE) ||
+                          (TableInfo >= &X86Tables::X87F64Ops[0] && TableInfo < &X86Tables::X87F64Ops[0] + X86Tables::MAX_X87_TABLE_SIZE))) {
+          SawX87 = true;
+        }
+#else
+        Thread->OpDispatcher->FlushRegisterCache(true);
 #endif
 
         if (ExtendedDebugInfo || Thread->OpDispatcher->CanHaveSideEffects(TableInfo, DecodedInfo)) {
           Thread->OpDispatcher->_GuestOpcode(InstAddress - GuestRIP);
         }
 
-        if (Config.SMCChecks == FEXCore::Config::CONFIG_SMC_FULL || Block.ForceFullSMCDetection) {
+#ifdef __APPLE__
+        // No code check for an instruction that could not be decoded (no-exec memory,
+        // invalid bytes): its bytes were not read, so the check could never match, and the
+        // block would discard itself and be translated again for ever instead of raising
+        // the fault (SMCCHECKS full and a fetch from a non-executable page looped).
+        const bool CheckCode = TableInfo && TableInfo->OpcodeDispatcher.OpDispatch;
+#else
+        constexpr bool CheckCode = true;
+#endif
+        if (CheckCode && (Config.SMCChecks == FEXCore::Config::CONFIG_SMC_FULL || Block.ForceFullSMCDetection)) {
           auto ExistingCodePtr = reinterpret_cast<uint8_t*>(Block.Entry + BlockInstructionsLength);
           auto InstAddressReg = Thread->OpDispatcher->_EntrypointOffset(GPRSize, InstAddress - GuestRIP);
 

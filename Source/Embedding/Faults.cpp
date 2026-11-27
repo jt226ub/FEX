@@ -490,6 +490,16 @@ namespace {
     return true;
   }
 
+  // Makes the interrupt fault page writable again, then checks for a request that arrived
+  // in between (its store and mprotect may both have come before the unprotect) and makes
+  // the page read-only again if so, so that no request is left with a writable page.
+  void UnprotectInterruptPageUnlessRequested(fexmac_thread* Current) {
+    ProtectInterruptPage(Current, false);
+    if (Current->StopRequested.load() || Current->ResyncRequested.load()) {
+      ProtectInterruptPage(Current, true);
+    }
+  }
+
   // Another thread asked this one to stop (fexmac_thread_request_stop) and made its
   // interrupt fault page read-only; this thread has just written to it. Translated code
   // writes it only at block entries and loop back-edges, where the guest state is at an
@@ -508,7 +518,7 @@ namespace {
     const bool StopWanted = Current->StopRequested.load() != 0;
     if (!StopWanted && Current->ResyncRequested.load() == 0 && Current->PendingCodeWriteChecks == 0) {
       // Stale: the request was answered between its store and its mprotect.
-      ProtectInterruptPage(Current, false);
+      UnprotectInterruptPageUnlessRequested(Current);
       return true;
     }
     if (!Current->Thread->CTX->IsAddressInCodeBuffer(Current->Thread, State.__pc)) {
@@ -535,7 +545,7 @@ namespace {
       // Code was discarded by another thread: re-enter the dispatcher at this guest
       // instruction (the fill-state entry, not single-stepping), which looks it up anew.
       Current->ResyncRequested.store(0);
-      ProtectInterruptPage(Current, false);
+      UnprotectInterruptPageUnlessRequested(Current);
       SpillGuestState(Current, Context);
       State.__sp = Current->Thread->CurrentFrame->ReturningStackLocation;
       State.__x[1] = 0;
@@ -547,7 +557,7 @@ namespace {
     // Consume first, then make the page writable: a request made in between is not lost
     // (it leaves the flag set, so the next run answers it at once).
     Current->StopRequested.store(0);
-    ProtectInterruptPage(Current, false);
+    UnprotectInterruptPageUnlessRequested(Current);
     SpillGuestState(Current, Context);
     fexmac_stop Stop {};
     Stop.reason = FEXMAC_STOP_REQUESTED;

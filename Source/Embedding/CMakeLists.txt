@@ -88,6 +88,15 @@ target_link_libraries(fexmac_c_test PRIVATE "${FEXMAC_BUNDLE}" c++)
 set_property(TARGET fexmac_c_test APPEND PROPERTY LINK_DEPENDS "${FEXMAC_BUNDLE}")
 target_link_libraries(fexmac_c_test PRIVATE Threads::Threads)
 
+# The state-comparison tool driven by Scripts/macos_fault_diff.py.
+add_executable(fexmac_fault_diff tests/FaultDiffTool.c)
+set_target_properties(fexmac_fault_diff PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED ON)
+target_include_directories(fexmac_fault_diff PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_compile_options(fexmac_fault_diff PRIVATE -Wall -Wextra -Werror)
+add_dependencies(fexmac_fault_diff fexmac_bundle)
+target_link_libraries(fexmac_fault_diff PRIVATE "${FEXMAC_BUNDLE}" c++)
+set_property(TARGET fexmac_fault_diff APPEND PROPERTY LINK_DEPENDS "${FEXMAC_BUNDLE}")
+
 # Tests of behaviour that needs the test-only hooks: a fault inside the library's
 # handler, and where core messages go. Linked against the fexmac_testing build.
 add_executable(fexmac_hook_test tests/HookTest.c tests/TestSupport.c)

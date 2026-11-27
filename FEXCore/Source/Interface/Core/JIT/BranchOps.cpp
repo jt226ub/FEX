@@ -263,11 +263,9 @@ DEF_OP(CondJump) {
   // is inside the current instruction (a rep loop): its RIP entry already applies and
   // its registers show the progress made, as x86 leaves them for an interrupted rep.
   if (CTX->Config.NeedsPendingInterruptFaultCheck && TrueTargetLabel->Backward.Location) {
-    ARMEmitter::ForwardLabel l_Taken;
+    // Not taken: one branch, over the stub. Taken: the check and the branch back.
     ARMEmitter::ForwardLabel l_NotTaken;
-    EmitCondJumpBranch(Op, &l_Taken);
-    (void)b(&l_NotTaken);
-    (void)Bind(&l_Taken);
+    EmitCondJumpBranchInverted(Op, &l_NotTaken);
     const auto TargetBlock = IR->GetOp<IR::IROp_CodeBlock>(Op->TrueBlock);
     const bool TargetIsEntry = TargetBlock->EntryPoint && !DebugData->GuestOpcodes.empty();
     const auto CurrentOffset = TargetIsEntry ? DebugData->GuestOpcodes.back().GuestEntryOffset : 0;
@@ -288,6 +286,27 @@ DEF_OP(CondJump) {
   EmitCondJumpBranch(Op, TrueTargetLabel);
   PendingTargetLabel = JumpTarget(Op->FalseBlock);
 }
+
+#ifdef __APPLE__
+// The branch of a CondJump with its condition inverted, to a nearby label.
+void Arm64JITCore::EmitCondJumpBranchInverted(const IR::IROp_CondJump* Op, ARMEmitter::ForwardLabel* Label) {
+  if (Op->FromNZCV) {
+    (void)b(ARMEmitter::Emitter::InvertCondition(MapCC(Op->Cond)), Label);
+    return;
+  }
+  auto Reg = GetReg(Op->Cmp1);
+  const auto Size = Op->CompareSize == IR::OpSize::i32Bit ? ARMEmitter::Size::i32Bit : ARMEmitter::Size::i64Bit;
+  uint64_t Const {};
+  (void)IsInlineConstant(Op->Cmp2, &Const);
+  switch (Op->Cond) {
+  case IR::CondClass::EQ: (void)cbnz(Size, Reg, Label); break;
+  case IR::CondClass::NEQ: (void)cbz(Size, Reg, Label); break;
+  case IR::CondClass::TSTZ: (void)tbnz(Reg, Const, Label); break;
+  case IR::CondClass::TSTNZ: (void)tbz(Reg, Const, Label); break;
+  default: LOGMAN_THROW_A_FMT(false, "CondJump expected simple condition"); break;
+  }
+}
+#endif
 
 template<ARMEmitter::IsLabel T>
 void Arm64JITCore::EmitCondJumpBranch(const IR::IROp_CondJump* Op, T* TrueTargetLabel) {
