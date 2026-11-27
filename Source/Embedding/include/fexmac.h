@@ -389,12 +389,15 @@ FEXMAC_EXPORT fexmac_result fexmac_install_fault_handlers(void);
  * handler holds, and never calls the log callback. It can take two spin locks, each held
  * only by another thread's fault handler and only for one bounded step: the core's
  * per-block patch lock (the few instructions of a patch) and the core's process-wide
- * split-lock lock (one emulated locked operation on a word that crosses 16 bytes; it
- * makes those operations atomic with each other and cannot be switched off). The latter
- * is held while guest memory is accessed: if that access faults, the fault reaches the
- * host's handler with the lock held, so a host using way 2 must not leave such a fault
- * with siglongjmp (every later such operation in the process would wait forever); dying
- * or returning after fixing the cause is fine. If the core meets an atomic instruction it cannot rewrite
+ * split-lock lock (one attempt at one emulated locked operation on an operand that
+ * crosses 16 bytes; it makes those operations atomic with each other and cannot be
+ * switched off). While the core may hold either, this function blocks asynchronous
+ * signals itself (everything but SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGTRAP and SIGSYS) and
+ * restores the caller's mask afterwards, so a host's asynchronous handler cannot run
+ * then. The split-lock lock is held while guest memory is accessed: if that access
+ * faults, the fault reaches the host's handler with the lock held, so a host using way 2
+ * must not leave such a fault with siglongjmp (every later such operation in the process
+ * would wait forever); dying or returning after fixing the cause is fine. If the core meets an atomic instruction it cannot rewrite
  * (which would be a core bug), the core formats an error message, which allocates; the
  * library writes it with write(2) and the fault is not claimed. */
 FEXMAC_EXPORT int fexmac_handle_fault(int signal, siginfo_t* info, void* ucontext);

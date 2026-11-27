@@ -224,13 +224,17 @@ The handler can take two spin locks, both the core's, and nothing else:
 - **The per-block patch lock** (in the block's tail), around the rewrite of a misaligned
   acquire load or release store. Held for the few instructions of a patch; no guest
   memory is touched while it is held.
-- **The split-lock lock** (`StrictInProcessSplitLocks`, one word per context), around
-  the emulation of one locked operation (`lock xadd`, `lock cmpxchg`, `xchg`, ...) on a
-  word that crosses 16 bytes. The core emulates those with two compare-and-swaps; without
-  the lock two emulations interleave and lose updates (`fexmac_c_test
-  split-locks-concurrent` fails 3 of 3 runs without it). The library always sets it on;
-  the option is not one an embedder can set, because switching it off only loses updates
-  and buys nothing measurable.
+- **The split-lock lock** (`StrictInProcessSplitLocks`, one word per context, so per
+  process since there is one context), around each attempt of the emulation of one
+  locked operation (`lock xadd`, `lock add`, `cmpxchg`, `cmpxchg8b`, `xchg`, ...) on an
+  operand that crosses 16 bytes. The core emulates those with two compare-and-swaps;
+  without the lock two emulations interleave and lose updates (`fexmac_c_test
+  split-locks-concurrent` fails 3 of 3 runs without it). On macOS the lock is released
+  and taken again between attempts, so an attempt (bounded: two compare-and-swaps, plus
+  at most 16 rewrites of the lower half when only neighbouring bytes changed) is all it
+  covers; plain stores that keep changing the word make the emulating thread retry, not
+  hold the lock. The library always sets it on; the option is not one an embedder can
+  set, because switching it off only loses updates and buys nothing measurable.
 
 Why holding them cannot deadlock or hang, from the code (`HandleUnalignedAccess`,
 `HandleAtomicMemOp`, `HandleCASAL`, `HandleCASPAL` and the `DoCAS*` helpers in
@@ -243,10 +247,18 @@ Why holding them cannot deadlock or hang, from the code (`HandleUnalignedAccess`
 - Only the fault handler takes them. A guest stop (`hlt`, a guest exception, a system
   call) is reached from the dispatcher, never from inside the handler, so neither lock is
   held when `fexmac_thread_run` returns or a callback runs.
-- No asynchronous signal can interrupt the holder with the library's handlers (way 1):
-  every asynchronous signal is blocked while they run. With way 2 the host chooses the
-  mask, but nothing an asynchronous handler may call takes either lock: both are reached
-  only through `fexmac_handle_fault` for an alignment fault in translated code.
+- No asynchronous signal can interrupt the holder, in either arrangement:
+  `fexmac_handle_fault` blocks every asynchronous signal (all but SIGSEGV, SIGBUS,
+  SIGILL, SIGFPE, SIGTRAP and SIGSYS) itself, with `pthread_sigmask`, around the core's
+  handling of a misaligned access (the only path that takes either lock or switches the
+  thread to writing code), and restores the previous mask afterwards. With the library's
+  own handlers they were already blocked; with way 2 the host's handler runs with the
+  host's mask, and an asynchronous handler that left by a jump, or stopped the thread,
+  while a lock was held would have left it held (and the thread in write mode).
+  `fexmac_c_test split-locks-signal-storm` interrupts a guest thread doing split locked
+  operations with a signal handler that waits for another thread's progress: with the
+  blocking removed it stalls in 3 of 3 runs, with it never. A signal that arrives while
+  blocked is delivered when the mask is restored, after the locks are released.
 - The holder cannot need the same lock again: the emulation's own accesses are aligned
   atomics, which cannot take an alignment fault, and the patch path touches only code.
 - The one fault possible while a lock is held is the split-lock emulation's access to
@@ -261,8 +273,8 @@ Why holding them cannot deadlock or hang, from the code (`HandleUnalignedAccess`
   depth stays raised too, as already documented).
 
 A thread spinning for either lock is in a fault handler with asynchronous signals
-blocked (way 1); the holder is another thread doing a bounded step, so the wait ends
-unless the holder's process is dying.
+blocked; the holder is another thread doing one bounded step (a patch, or one attempt of
+an emulation), so the wait ends unless the holder's process is dying.
 
 ### Connecting the library
 
@@ -413,6 +425,8 @@ alarm kills it.
 | `unclaimed-fault-dies` | a host fault outside guest code dies silently with SIGBUS |
 | `invalidate-concurrent` | 8 guest threads invalidating in every one of 20,000 system calls each while the main thread invalidates in a loop, at least 12 runs; a progress watchdog fails it within 5 seconds of a hang. It hung in each of 3 runs before package E's reader-writer lock fix and passed 6 of 6 after it |
 | `split-locks-concurrent` | 8 threads at once run 30,000 `lock xadd` each on one qword crossing 16 bytes, a 128-byte line and the 16K page, a `lock cmpxchg` increment loop across 16 bytes (each adding 0x100000001, which changes both halves), and a spin lock taken with `xchg` across 16 bytes and released by a plain store; every total must be exact. With the split-lock lock switched off in a scratch build, the three `lock xadd` totals came out short in 3 of 3 runs |
+| `split-locks-every-form` | every form the core emulates across 16 bytes, from 8 threads at once, 10,000 operations each: `lock xadd` of 16, 32 and 64 bits, `lock add`, `sub`, `xor`, `inc`, `dec`, `not`, `neg`, `or` then `and`, a `cmpxchg8b` increment loop, a `cmpxchg8b` spin lock with a plain release and an `xchg` spin lock whose value spans both halves; operands change both halves where the operation allows it; a host thread meanwhile writes the neighbouring bytes that share the operand's compare-and-swap units with plain stores. Every result exact. Before the split-lock fixes of package E's third round, 7 of the 13 forms came out wrong in each of 2 runs |
+| `split-locks-signal-storm` | the host owns the fault signals with an empty mask and a signal handler keeps interrupting one of 8 threads doing split `lock xadd`; the handler waits for another thread's progress, which cannot come if the interrupted thread holds the split-lock lock. No stall, exact total. With `fexmac_handle_fault`'s signal blocking removed: a stall in 3 of 3 runs |
 | `lifetime-races` | runs racing with destroys of the same thread; context destroy racing with CPUID, invalidation and thread creation |
 
 `fexmac_hook_test` (linked against `fexmac_testing`, whose hooks also report a thread's

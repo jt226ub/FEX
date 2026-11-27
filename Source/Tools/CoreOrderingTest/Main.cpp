@@ -24,8 +24,16 @@
 //
 // Further tests: store buffering with `mfence` or a locked instruction between store and
 // load (forbidden in every mode), and counting tests in which every thread of every group
-// runs locked operations on one misaligned word (crossing 16 bytes, a 128-byte line or a
-// 16K page) and the total must be exact.
+// runs one of the locked operations the core emulates when the operand crosses 16 bytes
+// (xadd of 16, 32 and 64 bits, also across a 128-byte line and the 16K page; add, sub,
+// xor, inc, dec, not, neg, or/and, cmpxchg, cmpxchg8b, xchg locks) on one shared operand,
+// with plain stores to its neighbouring bytes, and the result must be exact.
+//
+// Before running, every guest thread of a run waits at a host-side start barrier, so that
+// the threads that run the same code reach its first execution together. A test whose
+// threads were never seen to overlap gets up to two more sets of runs before it fails as
+// NOT RACING (all outcomes count). With fewer than four groups each run has
+// proportionally more iterations.
 //
 // Harness, all in hand-assembled x86-64 guest code:
 //  - Each iteration uses a fresh slot of a ring of slots, so no per-iteration reset
@@ -251,6 +259,37 @@ struct Asm {
     U8(0x87);
     Mem(R, Base, Disp);
   }
+  // Any instruction with a [base + disp32] operand: legacy prefixes, REX (W and the bits
+  // for RegField and Base), opcode bytes, ModRM.
+  void Op(std::initializer_list<uint8_t> Prefixes, bool W, std::initializer_list<uint8_t> Opcode, int RegField, int Base, int32_t Disp) {
+    for (auto P : Prefixes) {
+      U8(P);
+    }
+    Rex(W, RegField, Base);
+    for (auto O : Opcode) {
+      U8(O);
+    }
+    Mem(RegField, Base, Disp);
+  }
+  void Store32(int Base, int32_t Disp, int Src) {
+    Op({}, false, {0x89}, Src, Base, Disp);
+  }
+  void Store16(int Base, int32_t Disp, int Src) {
+    Op({0x66}, false, {0x89}, Src, Base, Disp);
+  }
+  void Store8(int Base, int32_t Disp, int Src) {
+    // A REX prefix (always present for these registers here) selects the low byte.
+    const uint8_t Value = 0x40 | (((Src >> 3) & 1) << 2) | ((Base >> 3) & 1);
+    U8(Value);
+    U8(0x88);
+    Mem(Src, Base, Disp);
+  }
+  void Shr(int R, uint8_t N) {
+    Rex(true, 0, R);
+    U8(0xC1);
+    RR(5, R);
+    U8(N);
+  }
   void JmpBack(size_t Target) {
     U8(0xE9);
     U32(static_cast<int32_t>(Target - (Here() + 4)));
@@ -291,17 +330,12 @@ constexpr uint64_t STOS_VALUE = 0x3333'3333'3333'3333ULL;
 constexpr int RESULT_SHIFT = 6; // 64 bytes (8 qwords) of results per thread per iteration
 constexpr uint32_t DELAY_ENTRIES = 4096;
 
-// The shared area: constants first, then counters at misaligned addresses.
+// The shared area: constants first, then the counting tests' operands at misaligned
+// addresses (0x1000 on, and across the page boundary at 0x4000), then their ticket.
 constexpr size_t SHARED_SIZE = 0x8000; // two 16K pages
 constexpr int ConstFull = 0;           // 16 bytes of FULL
 constexpr int ConstCopy = 64;          // 64 bytes of COPY_BYTE
 constexpr int ConstOne = 128;          // the qword 1
-constexpr int CtrSplit16 = 0x1000 + 12;        // crosses a 16-byte boundary
-constexpr int CtrSplitLine = 0x1000 + 0x100 + 124; // crosses a 128-byte line
-constexpr int CtrSplitPage = 0x4000 - 4;           // crosses the 16K page boundary
-constexpr int CasSplit16 = 0x1000 + 0x400 + 12;
-constexpr int XchgLock = 0x1000 + 0x800 + 12;
-constexpr int XchgCounter = 0x1000 + 0xC00;
 constexpr int Increments = 4; // locked operations per thread per iteration
 // Added by each locked increment. It changes both halves of a word that crosses 16 bytes
 // at its middle, so that two emulations' compare-and-swaps can interleave: without the
@@ -345,6 +379,14 @@ struct LitmusTest {
   // Runs this many times fewer iterations: every locked operation of the counting tests
   // takes a fault, a few microseconds each.
   uint32_t IterationDivisor = 1;
+  // Counting tests: writes initial values into the shared area before each run, and sets
+  // per-thread registers (thread index across all groups).
+  std::function<void(uint8_t* Shared)> InitShared;
+  std::function<void(int ThreadIndex, uint64_t* Regs)> InitRegs;
+  // Misaligned tests: the instructions that take an alignment fault and are patched, per
+  // run, with emulation on. With several groups the run must see more faults than this
+  // (several threads faulting on one instruction at once), or the test fails.
+  int PatchedPerRun = 0;
 };
 
 // Message passing outcome: flag and data each none, partial or all of what was written.
@@ -369,12 +411,14 @@ std::vector<std::string> MPLabels() {
   }
   return L;
 }
-// Forbidden under TSO: the whole flag is seen but not all of the data written before it.
-const std::vector<int> MPForbidden = {2 * 3 + 0, 2 * 3 + 1};
+// Forbidden under TSO: any part of the flag is seen but not all of the data written before
+// it. The flag is written after every data store, so once any byte of it is visible, all
+// of the data is.
+const std::vector<int> MPForbidden = {1 * 3 + 0, 1 * 3 + 1, 2 * 3 + 0, 2 * 3 + 1};
 // Possible only while the writer is between its stores: no flag but some data, or part of
-// the flag. (No flag and no data means the reader went first, all of both that it went
-// second.)
-const std::vector<int> MPInterleaved = {0 * 3 + 1, 0 * 3 + 2, 1 * 3 + 0, 1 * 3 + 1, 1 * 3 + 2};
+// the flag with all of the data. (No flag and no data means the reader went first, all of
+// both that it went second.)
+const std::vector<int> MPInterleaved = {0 * 3 + 1, 0 * 3 + 2, 1 * 3 + 2};
 
 LitmusTest MP(const char* Name, const char* Desc, Layout L = D) {
   LitmusTest t {Name, Desc, L};
@@ -911,6 +955,7 @@ std::vector<LitmusTest> MakeTests() {
     t.Classify = [](const uint64_t*, const uint64_t* R1) {
       return State(R1[0], FULL) * 3 + State(R1[1], FULL);
     };
+    t.PatchedPerRun = 4; // the two stores and the two loads
     return t;
   };
   T.push_back(Unaligned("MP-split16", "message passing, data and flag cross a 16-byte boundary", D, D.X + 12, D.Y + 28));
@@ -919,109 +964,250 @@ std::vector<LitmusTest> MakeTests() {
     // Slots of 32K: the data straddles a 16K host page boundary, the flag a 4K guest one.
     const Layout P {32768, 16, 16376, 20472};
     T.push_back(Unaligned("MP-split16K", "message passing, data crosses a 16K host page, flag a 4K guest page", P, P.X + 4, P.Y + 4));
-    // Rare on an M4: 24 forbidden outcomes in 100 million tries (--soak), none in the
-    // default run, so not required.
-    T.back().Off = Expect::Either;
     T.push_back(Unaligned("MP-split4K", "message passing, data crosses a 4K guest page, flag a 16K host page", P, P.Y + 4, P.X + 4));
   }
 
-  // Locked operations on misaligned addresses shared by every thread of every group. ARM64
-  // atomics fault on these, and the fault handler emulates them; the total must be exact.
-  // Each thread records whether another thread got in between its operations, which is
-  // the evidence that they contended.
-  auto Counting = [&T](const char* Name, const char* Desc) -> LitmusTest& {
-    LitmusTest t {Name, Desc, D};
-    t.Labels = {"no other thread between", "another thread between"};
-    t.Interleaved = {1};
-    t.Off = t.Scalar = Expect::Hold;
-    t.IterationDivisor = 100;
-    T.push_back(std::move(t));
-    return T.back();
+  // Locked operations on misaligned addresses shared by every thread of every group: every
+  // form the core emulates when its operand crosses 16 bytes (or a line, or the page). The
+  // total must be exact. Operands change both halves of the word where the operation
+  // allows it, so that two emulations can interleave, and after its operations every
+  // thread writes the neighbouring bytes that share the operand's compare-and-swap units
+  // with plain stores, as neighbouring fields of a real program would be written, so that
+  // the emulation's second compare-and-swap fails for bytes that are not its own. Each
+  // thread takes a ticket (a native, aligned lock xadd) before and after its operations;
+  // a gap between its two tickets shows that another thread ran in between, which is the
+  // evidence that they contended.
+  struct Neighbour {
+    int32_t Offset;
+    int Size; // 1, 2 or 4
   };
-  auto XaddTest = [&](const char* Name, const char* Desc, int32_t Ctr) {
-    auto& t = Counting(Name, Desc);
-    t.Body = [Ctr](Asm& A, int) {
-      for (int i = 0; i < Increments; ++i) {
-        A.MovImm(RAX, SplitIncrement);
-        A.LockXadd(R8, Ctr, RAX);
-        if (i == 0) {
-          A.Store(R12, 0, RAX);
-        }
-      }
-      A.Store(R12, 8, RAX);
-    };
-    t.Classify = [](const uint64_t* R0, const uint64_t* R1) {
-      return int(R0[1] - R0[0] != (Increments - 1) * SplitIncrement || R1[1] - R1[0] != (Increments - 1) * SplitIncrement);
-    };
-    t.FinalCheck = [Ctr](const uint8_t* Shared, uint64_t ThreadIterations) {
-      uint64_t V;
-      memcpy(&V, Shared + Ctr, 8);
-      const uint64_t Want = ThreadIterations * Increments * SplitIncrement;
-      return V == Want ? std::string() : "counter " + std::to_string(V) + ", expected " + std::to_string(Want);
-    };
+  struct CountForm {
+    const char* Name;
+    const char* Description;
+    int32_t Offset;
+    int Size;                                  // operand bytes
+    std::function<void(Asm&, int32_t Off)> Op; // one locked operation (run Increments times)
+    uint64_t Initial;
+    std::function<uint64_t(uint64_t Initial, uint64_t Operations)> Want;
+    std::vector<Neighbour> Neighbours;
+    int32_t Counter = 0; // lock forms: the plain counter the lock guards (checked instead)
+    bool PlainRelease = false;
+    std::function<void(int ThreadIndex, uint64_t* Regs)> InitRegs;
   };
-  XaddTest("LOCK-xadd-split16", "lock xadd on a qword crossing a 16-byte boundary, all threads", CtrSplit16);
-  XaddTest("LOCK-xadd-splitline", "lock xadd on a qword crossing a 128-byte line, all threads", CtrSplitLine);
-  XaddTest("LOCK-xadd-splitpage", "lock xadd on a qword crossing a 16K page, all threads", CtrSplitPage);
+  constexpr int32_t Ticket = 0x3000;
+  auto Mask = [](int Size, uint64_t V) {
+    return Size == 8 ? V : (V & ((1ULL << (Size * 8)) - 1));
+  };
+  auto QwordSplit = [](int32_t Off) {
+    // A qword at 4 mod 8: the lower unit holds 4 foreign bytes below, the upper 4 above.
+    return std::vector<Neighbour> {{Off - 4, 4}, {Off + 8, 4}};
+  };
+  constexpr uint64_t K = SplitIncrement;
+  auto Base = [](int Slot) {
+    return 0x1000 + Slot * 0x100;
+  };
+  std::vector<CountForm> Forms;
+  Forms.push_back({"LOCK-xadd16-split16", "lock xadd on a word crossing 16 bytes", Base(0) + 15, 2,
+                   [](Asm& A, int32_t Off) {
+                     A.MovImm(RAX, 0x0101);
+                     A.Op({0x66, 0xF0}, false, {0x0F, 0xC1}, RAX, R8, Off);
+                   },
+                   0, [](uint64_t I, uint64_t N) { return I + N * 0x0101; }, {}});
+  Forms.push_back({"LOCK-xadd32-split16", "lock xadd on a dword crossing 16 bytes", Base(1) + 14, 4,
+                   [](Asm& A, int32_t Off) {
+                     A.MovImm(RAX, 0x0001'0001);
+                     A.Op({0xF0}, false, {0x0F, 0xC1}, RAX, R8, Off);
+                   },
+                   0, [](uint64_t I, uint64_t N) { return I + N * 0x0001'0001; }, {{Base(1) + 12, 2}, {Base(1) + 18, 2}}});
+  auto Xadd64 = [&](const char* Name, const char* Desc, int32_t Off) {
+    Forms.push_back({Name, Desc, Off, 8,
+                     [](Asm& A, int32_t O) {
+                       A.MovImm(RAX, K);
+                       A.LockXadd(R8, O, RAX);
+                     },
+                     0, [](uint64_t I, uint64_t N) { return I + N * K; }, QwordSplit(Off)});
+  };
+  Xadd64("LOCK-xadd-split16", "lock xadd on a qword crossing 16 bytes", Base(2) + 12);
+  Xadd64("LOCK-xadd-splitline", "lock xadd on a qword crossing a 128-byte line", Base(3) + 124);
+  Xadd64("LOCK-xadd-splitpage", "lock xadd on a qword crossing the 16K page", 0x4000 - 4);
+  auto AluForm = [&](const char* Name, const char* Desc, int Slot, uint8_t Opcode, uint64_t Initial,
+                     std::function<uint64_t(uint64_t, uint64_t)> Want) {
+    Forms.push_back({Name, Desc, Base(Slot) + 12, 8,
+                     [Opcode](Asm& A, int32_t O) {
+                       A.MovImm(RAX, Opcode == 0x31 ? 0x5A5A'5A5A'A5A5'A5A5ULL : K);
+                       A.Op({0xF0}, true, {Opcode}, RAX, R8, O);
+                     },
+                     Initial, Want, QwordSplit(Base(Slot) + 12)});
+  };
+  AluForm("LOCK-add-split16", "lock add on a qword crossing 16 bytes", 4, 0x01, 0, [](uint64_t I, uint64_t N) { return I + N * K; });
+  AluForm("LOCK-sub-split16", "lock sub on a qword crossing 16 bytes", 5, 0x29, 0, [](uint64_t I, uint64_t N) { return I - N * K; });
+  // An even number of operations in all, so the value ends where it started.
+  AluForm("LOCK-xor-split16", "lock xor on a qword crossing 16 bytes", 6, 0x31, 0x1122'3344'5566'7788ULL,
+          [](uint64_t I, uint64_t N) { return (N & 1) ? I ^ 0x5A5A'5A5A'A5A5'A5A5ULL : I; });
+  auto UnaryForm = [&](const char* Name, const char* Desc, int Slot, int32_t Within, uint8_t Opcode, int Ext, uint64_t Initial,
+                       std::function<uint64_t(uint64_t, uint64_t)> Want, std::vector<Neighbour> N) {
+    Forms.push_back({Name, Desc, Base(Slot) + Within, 8,
+                     [Opcode, Ext](Asm& A, int32_t O) {
+                       A.Op({0xF0}, true, {Opcode}, Ext, R8, O);
+                     },
+                     Initial, Want, N});
+  };
+  // inc and dec change one byte below the boundary each time and the bytes above it on
+  // every 256th: the operand starts 1 byte below the 16-byte boundary.
+  UnaryForm("LOCK-inc-split16", "lock inc on a qword one byte below a 16-byte boundary", 7, 15, 0xFF, 0, 0,
+            [](uint64_t I, uint64_t N) { return I + N; }, {{Base(7) + 8, 4}, {Base(7) + 23, 1}});
+  UnaryForm("LOCK-dec-split16", "lock dec on a qword one byte below a 16-byte boundary", 8, 15, 0xFF, 1, 0,
+            [](uint64_t I, uint64_t N) { return I - N; }, {{Base(8) + 8, 4}, {Base(8) + 23, 1}});
+  UnaryForm("LOCK-not-split16", "lock not on a qword crossing 16 bytes", 9, 12, 0xF7, 2, 0x0123'4567'89AB'CDEFULL,
+            [](uint64_t I, uint64_t N) { return (N & 1) ? ~I : I; }, QwordSplit(Base(9) + 12));
+  UnaryForm("LOCK-neg-split16", "lock neg on a qword crossing 16 bytes", 10, 12, 0xF7, 3, 0x0123'4567'89AB'CDEFULL,
+            [](uint64_t I, uint64_t N) { return (N & 1) ? 0 - I : I; }, QwordSplit(Base(10) + 12));
   {
-    auto& t = Counting("LOCK-cmpxchg-split16", "lock cmpxchg increment loop on a qword crossing 16 bytes");
-    t.Body = [](Asm& A, int) {
-      A.MovImm(RSI, 0); // retries
-      for (int i = 0; i < Increments; ++i) {
-        const size_t Retry = A.Here();
-        A.Load(RAX, R8, CasSplit16);
-        A.Mov(RDX, RAX);
-        A.MovImm(RDI, SplitIncrement);
-        A.Add(RDX, RDI);
-        A.LockCmpxchg(R8, CasSplit16, RDX);
-        const size_t Done = A.JccFwd(CC_Z);
-        A.Inc(RSI);
-        A.JmpBack(Retry);
-        A.Bind(Done);
-      }
-      A.Store(R12, 0, RSI);
+    // Each thread sets its own bit in each half with lock or and clears them with lock and.
+    CountForm F {"LOCK-or-and-split16", "lock or then lock and of each thread's bits, on a qword crossing 16 bytes", Base(11) + 12, 8,
+                 [](Asm& A, int32_t O) {
+                   A.Op({0xF0}, true, {0x09}, RSI, R8, O);
+                   A.Op({0xF0}, true, {0x21}, RDI, R8, O);
+                 },
+                 0, [](uint64_t, uint64_t) { return uint64_t {0}; }, QwordSplit(Base(11) + 12)};
+    F.InitRegs = [](int Index, uint64_t* Regs) {
+      Regs[RSI] = (1ULL << Index) | (1ULL << (Index + 32));
+      Regs[RDI] = ~Regs[RSI];
     };
-    t.Classify = [](const uint64_t* R0, const uint64_t* R1) {
-      return int(R0[0] != 0 || R1[0] != 0);
-    };
-    t.FinalCheck = [](const uint8_t* Shared, uint64_t ThreadIterations) {
-      uint64_t V;
-      memcpy(&V, Shared + CasSplit16, 8);
-      const uint64_t Want = ThreadIterations * Increments * SplitIncrement;
-      return V == Want ? std::string() : "counter " + std::to_string(V) + ", expected " + std::to_string(Want);
-    };
+    Forms.push_back(std::move(F));
+  }
+  Forms.push_back({"LOCK-cmpxchg-split16", "lock cmpxchg increment loop on a qword crossing 16 bytes", Base(12) + 12, 8,
+                   [](Asm& A, int32_t O) {
+                     const size_t Retry = A.Here();
+                     A.Load(RAX, R8, O);
+                     A.Mov(RDX, RAX);
+                     A.MovImm(RCX, K);
+                     A.Add(RDX, RCX);
+                     A.LockCmpxchg(R8, O, RDX);
+                     A.JccBack(CC_NZ, Retry);
+                   },
+                   0, [](uint64_t I, uint64_t N) { return I + N * K; }, QwordSplit(Base(12) + 12)});
+  Forms.push_back({"LOCK-cmpxchg8b-split16", "lock cmpxchg8b increment loop on a qword crossing 16 bytes", Base(13) + 12, 8,
+                   [](Asm& A, int32_t O) {
+                     const size_t Retry = A.Here();
+                     A.Load(RAX, R8, O);
+                     A.Mov(RBX, RAX);
+                     A.MovImm(RCX, K);
+                     A.Add(RBX, RCX);
+                     A.Mov(RDX, RAX);
+                     A.Shr(RDX, 32);
+                     A.Mov(RCX, RBX);
+                     A.Shr(RCX, 32);
+                     A.Op({0xF0}, false, {0x0F, 0xC7}, 1, R8, O); // edx:eax against [m], ecx:ebx stored
+                     A.JccBack(CC_NZ, Retry);
+                   },
+                   0, [](uint64_t I, uint64_t N) { return I + N * K; }, QwordSplit(Base(13) + 12)});
+  // Spin locks guarding a plain counter. With a plain release the release needs TSO (the
+  // counter's store must not pass it), so with emulation off a short count is allowed.
+  {
+    CountForm F {"LOCK-xchg-split16", "spin lock by xchg on a qword crossing 16 bytes, plain release", Base(14) + 12, 8,
+                 [](Asm& A, int32_t O) {
+                   const size_t Retry = A.Here();
+                   A.MovImm(RAX, 1);
+                   A.Xchg(R8, O, RAX);
+                   A.Test(RAX, RAX);
+                   A.JccBack(CC_NZ, Retry);
+                   A.Load(RDX, R8, O + 0x80);
+                   A.Inc(RDX);
+                   A.Store(R8, O + 0x80, RDX);
+                   A.StoreImm(R8, O, 0);
+                 },
+                 0, nullptr, QwordSplit(Base(14) + 12), Base(14) + 12 + 0x80, true};
+    Forms.push_back(std::move(F));
   }
   {
-    // A spin lock taken with xchg on a misaligned word and released with a plain store,
-    // as x86 code does, guarding a plain increment. Mutual exclusion needs the xchg to be
-    // atomic; the release needs TSO (the increment's store must not pass it), so with
-    // emulation off a short count is allowed.
-    auto& t = Counting("LOCK-xchg-split16", "spin lock by xchg on a qword crossing 16 bytes, plain release");
-    t.Body = [](Asm& A, int) {
-      A.MovImm(RSI, 0); // spins
-      const size_t Retry = A.Here();
+    CountForm F {"LOCK-xchg2-split16", "spin lock by xchg of a value in both halves, xchg release", Base(15) + 12, 8,
+                 [](Asm& A, int32_t O) {
+                   const size_t Retry = A.Here();
+                   A.MovImm(RAX, K);
+                   A.Xchg(R8, O, RAX);
+                   A.Test(RAX, RAX);
+                   A.JccBack(CC_NZ, Retry);
+                   A.Load(RDX, R8, O + 0x80);
+                   A.Inc(RDX);
+                   A.Store(R8, O + 0x80, RDX);
+                   A.MovImm(RAX, 0);
+                   A.Xchg(R8, O, RAX);
+                 },
+                 0, nullptr, QwordSplit(Base(15) + 12), Base(15) + 12 + 0x80, false};
+    Forms.push_back(std::move(F));
+  }
+  {
+    CountForm F {"LOCK-cmpxchg8b-lock", "spin lock by cmpxchg8b on a qword crossing 16 bytes, plain release", Base(16) + 12, 8,
+                 [](Asm& A, int32_t O) {
+                   const size_t Retry = A.Here();
+                   A.MovImm(RAX, 0);
+                   A.MovImm(RDX, 0);
+                   A.MovImm(RBX, 1);
+                   A.MovImm(RCX, 0);
+                   A.Op({0xF0}, false, {0x0F, 0xC7}, 1, R8, O);
+                   A.JccBack(CC_NZ, Retry);
+                   A.Load(RDX, R8, O + 0x80);
+                   A.Inc(RDX);
+                   A.Store(R8, O + 0x80, RDX);
+                   A.StoreImm(R8, O, 0);
+                 },
+                 0, nullptr, QwordSplit(Base(16) + 12), Base(16) + 12 + 0x80, true};
+    Forms.push_back(std::move(F));
+  }
+
+  for (auto& F : Forms) {
+    LitmusTest t {F.Name, F.Description, D};
+    t.Labels = {"no other thread between", "another thread between"};
+    t.Interleaved = {1};
+    t.Off = F.PlainRelease ? Expect::Either : Expect::Hold;
+    t.Scalar = Expect::Hold;
+    t.IterationDivisor = 400;
+    t.Body = [F](Asm& A, int) {
       A.MovImm(RAX, 1);
-      A.Xchg(R8, XchgLock, RAX);
-      A.Test(RAX, RAX);
-      const size_t Got = A.JccFwd(CC_Z);
-      A.Inc(RSI);
-      A.JmpBack(Retry);
-      A.Bind(Got);
-      A.Load(RDX, R8, XchgCounter);
-      A.Inc(RDX);
-      A.Store(R8, XchgCounter, RDX);
-      A.StoreImm(R8, XchgLock, 0);
-      A.Store(R12, 0, RSI);
+      A.LockXadd(R8, Ticket, RAX);
+      A.Store(R12, 0, RAX);
+      for (int i = 0; i < Increments; ++i) {
+        F.Op(A, F.Offset);
+      }
+      A.MovImm(RAX, 1);
+      A.LockXadd(R8, Ticket, RAX);
+      A.Store(R12, 8, RAX);
+      for (const auto& N : F.Neighbours) {
+        if (N.Size == 4) {
+          A.Store32(R8, N.Offset, R15);
+        } else if (N.Size == 2) {
+          A.Store16(R8, N.Offset, R15);
+        } else {
+          A.Store8(R8, N.Offset, R15);
+        }
+      }
     };
-    t.Off = Expect::Either;
     t.Classify = [](const uint64_t* R0, const uint64_t* R1) {
-      return int(R0[0] != 0 || R1[0] != 0);
+      return int(R0[1] - R0[0] != 1 || R1[1] - R1[0] != 1);
     };
-    t.FinalCheck = [](const uint8_t* Shared, uint64_t ThreadIterations) {
-      uint64_t V;
-      memcpy(&V, Shared + XchgCounter, 8);
-      return V == ThreadIterations ? std::string() : "counter " + std::to_string(V) + ", expected " + std::to_string(ThreadIterations);
+    t.InitShared = [F](uint8_t* Shared) {
+      memcpy(Shared + F.Offset, &F.Initial, F.Size);
     };
+    t.InitRegs = F.InitRegs;
+    t.FinalCheck = [F, Mask](const uint8_t* Shared, uint64_t ThreadIterations) {
+      const uint64_t Operations = ThreadIterations * Increments;
+      uint64_t V = 0, Want;
+      if (F.Counter) {
+        memcpy(&V, Shared + F.Counter, 8);
+        Want = Operations;
+      } else {
+        memcpy(&V, Shared + F.Offset, F.Size);
+        Want = Mask(F.Size, F.Want(F.Initial, Operations));
+      }
+      if (V == Want) {
+        return std::string();
+      }
+      char Text[96];
+      snprintf(Text, sizeof(Text), "0x%llx, expected 0x%llx", static_cast<unsigned long long>(V), static_cast<unsigned long long>(Want));
+      return std::string(Text);
+    };
+    T.push_back(std::move(t));
   }
 
   return T;
@@ -1153,6 +1339,14 @@ struct GuestThread {
   pthread_t Handle {};
 };
 
+// A start barrier for every guest thread of a run, after its state is set and before it
+// runs. The guest barrier lines up only the two threads of one group, and those run
+// different code, so without this the threads that run the same code (the same role in
+// different groups) reach their first, faulting execution of it at different times, and
+// the core's back-patching is rarely entered by several threads at once.
+std::atomic<unsigned> StartArrived {};
+std::atomic<unsigned> StartTotal {};
+
 // What the stall watchdog reports.
 struct {
   std::mutex M;
@@ -1182,6 +1376,10 @@ void RunGuest(fexmac_context* Context, GuestThread* Self) {
     State.gpr[i] = Self->Regs[i];
   }
   fexmac_thread_set_state(Thread, &State);
+
+  StartArrived.fetch_add(1);
+  while (StartArrived.load(std::memory_order_acquire) < StartTotal.load(std::memory_order_relaxed)) {
+  }
 
   Self->Stage = 2;
   fexmac_stop Stop;
@@ -1323,7 +1521,11 @@ int main(int argc, char** argv) {
   }
 
   const unsigned Groups = Opt.Groups ? Opt.Groups : std::max(1U, std::min(4U, HostCPUs() / 2));
-  const uint64_t AllIterations = Opt.Iterations ? Opt.Iterations : (Opt.Soak ? 250'000 : 100'000);
+  // With fewer than four groups (a machine with few processors, such as the hosted
+  // virtual Mac), each run gives fewer tries, and rare outcomes, including the ones that
+  // show the threads overlap, may not appear: run proportionally more iterations instead.
+  const uint64_t BaseIterations = Opt.Soak ? 250'000 : 100'000;
+  const uint64_t AllIterations = Opt.Iterations ? Opt.Iterations : BaseIterations * ((4 + Groups - 1) / Groups);
   const unsigned Runs = Opt.Runs ? Opt.Runs : (Opt.Soak ? 100 : 8);
   // Every test has two threads; the result arrays and the stall report assume it.
   constexpr int NumThreads = 2;
@@ -1439,7 +1641,19 @@ int main(int argc, char** argv) {
     uint64_t FinalFailures = 0;
     std::string FinalMessage;
 
-    for (unsigned Run = 0; Run < Runs && !Broken; ++Run) {
+    // A test whose threads were never seen to overlap gets up to two more sets of runs
+    // (reported): on a machine with few processors two threads sometimes share a core for
+    // a whole run. Every outcome of every set counts, so this cannot hide a forbidden one.
+    unsigned RunLimit = Runs;
+    unsigned ExtraSets = 0;
+    auto Racing = [&] {
+      uint64_t Overlap = 0;
+      for (int I : T.Interleaved) {
+        Overlap += Counts[I];
+      }
+      return Overlap != 0 && (T.Relaxed < 0 || Counts[T.Relaxed] != 0);
+    };
+    for (unsigned Run = 0; Run < RunLimit && !Broken; ++Run) {
       // A fresh copy of the code for every run, so it is translated again and the
       // threads meet its first execution together. Code regions are never unmapped: the
       // core keeps translations by guest address.
@@ -1484,6 +1698,9 @@ int main(int argc, char** argv) {
       memset(Shared + ConstCopy, COPY_BYTE, 64);
       const uint64_t One = 1;
       memcpy(Shared + ConstOne, &One, 8);
+      if (T.InitShared) {
+        T.InitShared(Shared);
+      }
 
       std::vector<GroupMemory> Mem(Groups);
       std::vector<GuestThread> Threads(Groups * NumThreads);
@@ -1523,6 +1740,9 @@ int main(int argc, char** argv) {
           GT.Regs[R10] = reinterpret_cast<uint64_t>(M.Counter);
           GT.Regs[R9] = reinterpret_cast<uint64_t>(M.Delays[R]);
           GT.Regs[R8] = reinterpret_cast<uint64_t>(Shared);
+          if (T.InitRegs) {
+            T.InitRegs(G * NumThreads + R, GT.Regs);
+          }
         }
       }
 
@@ -1540,6 +1760,8 @@ int main(int argc, char** argv) {
           Progress.Threads.push_back(&GT);
         }
       }
+      StartArrived = 0;
+      StartTotal = static_cast<unsigned>(Threads.size());
       std::vector<std::thread> Host;
       for (auto& GT : Threads) {
         Host.emplace_back(RunGuest, Context, &GT);
@@ -1588,6 +1810,10 @@ int main(int argc, char** argv) {
         ::munmap(M.Base, M.Size);
       }
       ::munmap(Shared, SHARED_SIZE);
+      if (Run + 1 == RunLimit && !Broken && ExtraSets < 2 && !Racing()) {
+        ++ExtraSets;
+        RunLimit += Runs;
+      }
     }
 
     uint64_t Forbidden = FinalFailures;
@@ -1599,6 +1825,11 @@ int main(int argc, char** argv) {
       Overlapping += Counts[I];
     }
     const double Seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - TestStart).count();
+    const uint64_t Faults = AlignmentFaults.load() - FaultsBefore;
+    // With emulation on and several groups, the threads of one role run the same code and
+    // meet its first execution together (start barrier above), so a misaligned test must
+    // have seen some instruction fault on more than one thread at once.
+    const bool NeedConcurrentFaults = T.PatchedPerRun && Opt.Mode == Options::TSO::On && Groups >= 2;
     const Expect Required = Opt.Want == Options::Expect::TSO    ? Expect::Hold :
                             Opt.Want == Options::Expect::Weak   ? T.Off :
                             Opt.Want == Options::Expect::Scalar ? T.Scalar :
@@ -1612,6 +1843,9 @@ int main(int argc, char** argv) {
       Verdict = "NOT RACING (no outcome that needs the threads to overlap)";
     } else if (T.Relaxed >= 0 && Counts[T.Relaxed] == 0) {
       Verdict = "NOT RACING (relaxed outcome never seen)";
+    } else if (NeedConcurrentFaults && Faults <= uint64_t(T.PatchedPerRun) * RunLimit) {
+      Verdict = "NOT CONCURRENT (no instruction faulted on several threads at once: " + std::to_string(Faults) + " faults for " +
+                std::to_string(T.PatchedPerRun * RunLimit) + " patched instructions)";
     } else if (Required == Expect::Hold) {
       Failed = Forbidden != 0;
       Verdict = Forbidden ? "FAIL (TSO-forbidden outcome seen)" : "ok (no forbidden outcome)";
@@ -1621,6 +1855,9 @@ int main(int argc, char** argv) {
     } else {
       Failed = false;
       Verdict = Forbidden ? "forbidden outcome seen (not required)" : "forbidden outcome not seen (not required)";
+    }
+    if (ExtraSets) {
+      Verdict += "; threads not seen to overlap at first, " + std::to_string(ExtraSets) + " more set(s) of " + std::to_string(Runs) + " runs";
     }
     if (!FinalMessage.empty()) {
       Verdict += "; wrong total in " + std::to_string(FinalFailures) + " run(s), last: " + FinalMessage;
@@ -1639,8 +1876,8 @@ int main(int argc, char** argv) {
                                         "");
       }
     }
-    if (const uint64_t Faults = AlignmentFaults.load() - FaultsBefore) {
-      printf("    misaligned-access faults handled: %llu over %u runs\n", static_cast<unsigned long long>(Faults), Runs);
+    if (Faults) {
+      printf("    misaligned-access faults handled: %llu over %u runs\n", static_cast<unsigned long long>(Faults), RunLimit);
     }
     printf("    %s, %.1fs\n", Verdict.c_str(), Seconds);
   }
