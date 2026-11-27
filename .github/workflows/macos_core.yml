@@ -237,6 +237,8 @@ jobs:
           T="$(find build -name FEXCoreASMTestRunner -type f | head -1)"
           set -o pipefail
           python3 Scripts/macos_asm_tests.py --runner "$T" --out asm-smc --filter SelfModifyingCode --smc mtrack 2>&1 | tee asm-smc-tests.log
+          python3 Scripts/macos_asm_check.py asm-smc-tests.log --modes 4
+          [ "$(grep -c -E '^== jit[^:]*: pass 3$' asm-smc-tests.log)" -eq 4 ]
 
       - name: Run the code cache tests
         # Damaged and mismatched cache files, moving guest code, eight threads loading the
