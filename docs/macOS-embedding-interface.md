@@ -608,44 +608,53 @@ copies ahead and behind by 1, 3, 8 and 31 bytes, a faulting source).
 - **Read-modify-write instructions on memory** change the flags before their store in
   the core's handlers. Two designs, chosen per handler:
   - *Store first, flags after* (`OpcodeDispatcher.cpp`, `__APPLE__`): `add`, `or`, `and`,
-    `sub`, `xor`, `inc`, `dec`, `neg` on memory compute the result, store it, then
-    compute the flags from the operands still in registers (one extra ALU instruction;
-    the logical forms recompute the result for PF, since the register allocator would
-    otherwise compute the stored value straight into the PF register). Their `lock`
-    forms compute the flags after the atomic operation already. No cost measured: a
-    loop of `add [m]; sub [m]; inc [m]; or [m]` runs as on `macos/v1`.
-  - *Undo record* for the forms that consume incoming flags, keep some of them or
-    compute them before the store: `adc`, `sbb`, `rcl`, `rcr`, the shifts and rotates
-    (a zero count keeps every flag), `shld`/`shrd`, `bts`/`btr`/`btc`, `xadd`,
-    `cmpxchg`. Before such an instruction (chosen in `Core.cpp` by opcode name and a
-    memory destination) the translated code stores NZCV, the raw PF and AF, and for an
-    rsp-based `pop` rsp, into `CPUState::UndoNZCV/UndoPF/UndoAF/UndoRSP`, sets
-    `CPUState::UndoMask` to the live slots, and clears it after the instruction. The
-    fault path (`Faults.cpp`, SpillGuestState) uses the saved values when the mask is
-    set. The mask lives in the thread frame rather than in the RIP-entry metadata, so
-    the fault path needs no lookup. Cost: about 2 cycles each in isolation; in a loop of
-    `add [m]; adc [m]; inc [m]` +3% against `macos/v1` (it was +121% while every
-    read-modify-write had a record: the cost was not additive).
+    `sub`, `xor`, `inc`, `dec`, `neg`, `adc`, `sbb` (the result with the incoming carry
+    by a non-flag-setting add), and `shl`/`shr` by an immediate or 1 on memory compute
+    the result, store it, then compute the flags from the operands still in registers
+    (the logical and shift forms recompute the result for the flags, since the register
+    allocator would otherwise compute the stored value straight into the PF register).
+  - *Already in order:* `lock` forms, `xadd` and `cmpxchg` on memory (always atomic) and
+    `bts`/`btr`/`btc` on memory change state only after their single faulting access
+    (checked, also misaligned through the split-lock emulation path).
+  - *Undo record* for the rest: rotates, `sar`, shifts by `cl` (a zero count keeps every
+    flag), `shld`/`shrd`. Before such an instruction (chosen in `Core.cpp` by opcode name,
+    a memory destination and, for shifts, the opcode byte) the translated code stores
+    NZCV, the raw PF and AF (not for rotates, which keep them: saving them makes them
+    live, which was most of the cost), and for an rsp-based `pop` rsp, into
+    `CPUState::UndoNZCV/UndoPF/UndoAF/UndoRSP`, sets `CPUState::UndoMask`, and clears it
+    after the instruction. It is saved after the per-instruction self-modifying-code
+    check, which can leave the block for retranslation (a record left set there would
+    be applied to the next faulting instruction). The fault path (`Faults.cpp`,
+    SpillGuestState) uses the saved values when the mask is set. The mask lives in the
+    thread frame rather than in the RIP-entry metadata, so the fault path needs no
+    lookup.
+  - Cost against `macos/v1`: loops of `add/sub/inc/or`, `adc/sbb/add`, `lock add; lock
+    xadd` and `shl/ror/bts` on memory run at +0 to 4%; a loop of only record-carrying
+    forms (`rol [m],cl; rcl [m],1; sar [m],3`) +15%, of rotates only +13%. With a record on every
+    read-modify-write (the first version of this rework) such loops took +65 to 130%.
   - The flags an instruction overwrites without reading are dead before it, so a block
     that does not read them later does not compute them, and at the fault they are as
     stale as any dead flag (below); the harness compares them at the fault with
     `SMCCHECKS full`, where they are computed, and leaves the status flags out of the
-    at-fault comparison for those forms otherwise. `xadd`/`cmpxchg` write their register
-    only after the store and x87 store-and-pop pops after the store (checked; no record
-    needed). Before this, `stc; sbb qword [m], 1` on 0x100 resumed to 0xff (x86 0xfe).
-- **`rep movs` / `rep stos`** (JIT `MemCpy`/`MemSet`, `EmitRepStringInPlace` in
-  `MemoryOps.cpp`): when the IR passes the guest's own rcx/rsi/rdi static registers (no
-  segment base added), the loop uses them as its induction variables: one element is
-  loaded and stored before the registers move; 32-byte chunks (`ldp`/`stp` of two q
-  registers) only while the destination chunk is 32-byte aligned (so a chunk store cannot
-  cross a page and a faulting one writes nothing) and the source is at least 32 bytes
-  away (so a chunk never reads its own writes; overlapping copies go element by element,
-  in x86's order); the plain and the TSO (`ldapr`/`stlr`, per element) forms; both
-  directions. The interrupt page is written every chunk and every 64 elements, so a stop
-  request lands inside a long `rep` with exact registers and running again continues
-  (`stop-rep-movs`: 32 MB copies and stores, overlapping by 1, 24 and -3 bytes, about 15
-  to 290 stops each, final memory compared with x86's element-by-element result). `rep
-  lods`/`scas`/`cmps` were already exact.
+    at-fault comparison for those forms otherwise (only CF for bit tests). x87
+    store-and-pop pops after the store (checked; no record needed). Before this, `stc; sbb qword [m], 1` on 0x100 resumed to 0xff (x86 0xfe).
+- **`rep movs` / `rep stos`** (JIT `MemCpy`/`MemSet`/`MemCpySrcBase`,
+  `EmitRepStringInPlace` in `MemoryOps.cpp`): the loop uses the guest's own rcx/rsi/rdi
+  static registers as its induction variables (with fs:/gs: on the source, the segment
+  base is added to every source access and rsi keeps counting x86's way). One element is
+  loaded and stored before the registers move. 32-byte chunks (`ldp`/`stp` of two q
+  registers) run in batches during which neither the source nor the destination chunk
+  crosses a 4K page, so a chunk faults whole or not at all, where x86 stops. When the
+  destination is 1 to 32 bytes ahead of the source in the direction of the copy (the copy
+  reads what it wrote), elements go one at a time in x86's order, except a forward byte
+  copy with rdi = rsi + 1, which is a fill with the first byte; a source ahead of the
+  destination is never read after being written, so whole chunks (loads before stores)
+  are used however close. Plain and TSO (`ldapr`/`stlr`, per element) forms; both
+  directions. The interrupt page is written after every batch and every 64 elements, so
+  a stop request lands inside a long `rep` with exact registers (`stop-rep-movs`). A
+  fault reports the first inaccessible byte of the element at rdi (store) or rsi plus
+  base (load), not the host's chunk address (the harness checks it on every rep case).
+  `rep lods`/`scas`/`cmps` were already exact.
 - **Multi-part stores:** a 32-byte store is emitted as two 16-byte stores, the upper half
   first, so a store running into an inaccessible page above writes nothing; `push`,
   `call`, `enter`, 16-byte stores and `cmpxchg16b` across a page write nothing before the
@@ -661,8 +670,6 @@ x86's result in every case):**
   PF and AF, when only CF or ZF is read later) is not computed and is reported as the
   frame held it (`sub-carry-then-load-adc`, `flags-multiblock-edge`). Running again is
   unaffected; a handler that reads EFLAGS sees it.
-- `rep movs`/`rep stos` with a segment-override prefix (rare in 64-bit code) still use the
-  core's general loop: registers from before the instruction, memory partly written.
 
 The embedder may then fix the cause (map or unprotect the page) and run again, which runs
 the same instruction (`fault-mid-block`, `fault-store-loop`, the `guest-*` subtests), or
@@ -974,8 +981,7 @@ mapped as a code range, flushes before exiting and prints the translation counte
 
 - Exact state at the fault (running again is right) for the four entries left in
   `fault_diff_known.txt` (see "Guest memory faults: what is exact"): dead flags, a 32-byte
-  store whose lower page faults, `fxsave` across a page; and `rep movs`/`stos` with a
-  segment-override prefix.
+  store whose lower page faults, `fxsave` across a page.
 - A cheaper stop check (future option, not done): today every block entry, back-edge and
   `rep` loop writes the interrupt fault page; on a loop of two linked blocks without
   multiblock that costs +50% (+18% with multiblock, where the loop's own back-edge check

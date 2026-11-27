@@ -765,6 +765,10 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
           const bool ShiftByConstant = (Name == "SHL" || Name == "SHR") && (ShiftOpcode() & 0xFE) != 0xD2;
           if (IsMemoryDest() && !ShiftByConstant && std::find(std::begin(FlagsRMW), std::end(FlagsRMW), Name) != std::end(FlagsRMW)) {
             UndoMask |= Core::CPUState::UNDO_FLAGS;
+            // Rotates change only CF and OF (NZCV); the others also PF (and AF).
+            if (Name != "ROL" && Name != "ROR" && Name != "RCL" && Name != "RCR") {
+              UndoMask |= Core::CPUState::UNDO_PFAF;
+            }
           }
           // pop [m] and leave are reordered (OpcodeDispatcher.cpp) except pop to an
           // address using rsp.

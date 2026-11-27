@@ -1263,6 +1263,8 @@ public:
   void SaveUndoRecord(uint32_t Mask) {
     if (Mask & Core::CPUState::UNDO_FLAGS) {
       _StoreContextGPR(OpSize::i32Bit, GetNZCV(), offsetof(Core::CPUState, UndoNZCV));
+    }
+    if (Mask & Core::CPUState::UNDO_PFAF) {
       _StoreContextGPR(OpSize::i32Bit, _LoadPF(OpSize::i32Bit), offsetof(Core::CPUState, UndoPF));
       _StoreContextGPR(OpSize::i32Bit, _LoadAF(OpSize::i32Bit), offsetof(Core::CPUState, UndoAF));
     }

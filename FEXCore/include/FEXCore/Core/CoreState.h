@@ -239,6 +239,7 @@ struct alignas(64) CPUState {
   // instruction. A fault while UndoMask is set restores the saved state.
   static constexpr uint32_t UNDO_FLAGS = 1;
   static constexpr uint32_t UNDO_RSP = 2;
+  static constexpr uint32_t UNDO_PFAF = 4; ///< PF and AF too (not for rotates, which keep them).
   uint32_t UndoMask {};
   uint32_t UndoNZCV {};
   uint32_t UndoPF {};

@@ -602,19 +602,20 @@ FEXMAC_EXPORT uint64_t fexmac_memory_code_write_count(fexmac_context* context);
  * SIGBUS a protected one. The guest state (registers, flags, x87, MMX, XMM/YMM, MXCSR) is
  * the state before the faulting instruction, and running it again after fixing the
  * cause gives x86's result. That includes read-modify-write instructions on memory
- * (add/or/and/sub/xor/inc/dec/neg store first and compute the flags after; the others
- * put the flags back from an undo record the translated code saves before them;
- * xadd/cmpxchg write their register only after the store), pop [m] and leave (reordered
- * to move rsp after the access; pop to an rsp-based address puts rsp back from the
- * record), x87 store-and-pop (the stack is popped after the store), push/call/enter
- * and 16- and 32-byte stores across a page (nothing written when the higher page faults),
- * and rep movs / stos / lods / scas / cmps, which stop part-way with rcx, rsi and rdi
- * counting exactly the elements done, as x86 does (rep movs/stos with a segment-override
- * prefix excepted: those report the registers from before the instruction with memory
- * partly written). Not exact, at the fault only (running
- * again is right): a 32-byte store whose LOWER page faults has already written its upper
- * half, fxsave/xsave across a page may be partly written (as on x86), and flags the rest
- * of the block overwrites without reading (PF and AF most often) may be stale. See
+ * (add/or/and/sub/xor/inc/dec/neg/adc/sbb and shl/shr by a constant store first and
+ * compute the flags after; lock forms, xadd, cmpxchg and bit tests change state only
+ * after their single faulting access; rotates, sar, shifts by cl and shld/shrd put the
+ * flags back from an undo record saved before them), pop [m] and leave (reordered to
+ * move rsp after the access; pop to an rsp-based address puts rsp back from the record),
+ * x87 store-and-pop (the stack is popped after the store), push/call/enter and 16- and
+ * 32-byte stores across a page (nothing written when the higher page faults), and rep
+ * movs / stos / lods / scas / cmps, also with fs:/gs: on the source, which stop part-way
+ * with rcx, rsi and rdi counting exactly the elements done, as x86 does, with the fault
+ * address of the faulting element. Not exact, at the fault only (running again is
+ * right): a 32-byte store whose LOWER page faults has already written its upper half,
+ * fxsave/xsave across a page may be partly written (as on x86), and flags the rest of
+ * the block overwrites without reading (PF and AF most often, and the incoming flags an
+ * instruction overwrites) may be stale. See
  * docs/macOS-embedding-interface.md, "Guest memory faults: what is exact".
  *
  * One fault outside these is always a core bug: an access past the end of a code buffer,

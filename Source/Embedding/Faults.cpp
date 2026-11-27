@@ -290,6 +290,8 @@ namespace {
     uint64_t PSTATE = State.__cpsr;
     if (Undo & FEXCore::Core::CPUState::UNDO_FLAGS) {
       PSTATE = Frame->State.UndoNZCV;
+    }
+    if (Undo & FEXCore::Core::CPUState::UNDO_PFAF) {
       Registers[PFRegister] = Frame->State.UndoPF;
       Registers[AFRegister] = Frame->State.UndoAF;
     }
