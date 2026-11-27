@@ -177,11 +177,23 @@ static void TestGuestLoadCallRetLowGuard(void) {
 static void TestGuestStoreCallRetHighGuard(void) {
   GuestTouchesGuard(1, GuardStore, sizeof(GuardStore));
 }
-static void TestGuestLoadScratchGuard(void) {
-  GuestTouchesGuard(2, GuardLoad, sizeof(GuardLoad));
-}
-static void TestGuestStoreScratchGuard(void) {
-  GuestTouchesGuard(2, GuardStore, sizeof(GuardStore));
+/* The scratch-buffer guard is armed only while a block is being emitted; after a run
+ * it is disarmed, so no later access to that page (by the guest or by a callback) can be
+ * taken for the translator's overflow. */
+static void TestScratchGuardDisarmed(void) {
+  fexmac_install_fault_handlers();
+  GuardCode = MapGuestMemory(0x10000);
+  const uint8_t Program[] = {0xB8, 0x01, 0, 0, 0, 0xF4};
+  memcpy(GuardCode, Program, sizeof(Program));
+  fexmac_context* Context = CreateContext(NULL, NULL);
+  GuardThread = CreateThreadAt(Context, (uint64_t)(uintptr_t)GuardCode, 0);
+  const fexmac_stop Stop = Run(GuardThread);
+  uint64_t Low = 0, High = 0, Scratch = 1;
+  fexmac_testing_guard_pages(GuardThread, &Low, &High, &Scratch);
+  Check(Stop.reason == FEXMAC_STOP_HALT && Low != 0, "a block was translated and ran");
+  Check(Scratch == 0, "afterwards the scratch-buffer guard is disarmed");
+  fexmac_thread_destroy(GuardThread);
+  fexmac_context_destroy(Context);
 }
 
 /* The embedder's system call callback touches a guard page (a host bug): the fault is
@@ -230,9 +242,6 @@ static void CallbackTouchesGuard(int Which) {
 static void TestCallbackCallRetGuard(void) {
   CallbackTouchesGuard(0);
 }
-static void TestCallbackScratchGuard(void) {
-  CallbackTouchesGuard(2);
-}
 
 /* ---- a log callback that calls back into the library ---- */
 
@@ -274,10 +283,8 @@ static void TestLogCallbackReentry(void) {
 static const struct Subtest Subtests[] = {
   {"guest-load-callret-low-guard-dies", TestGuestLoadCallRetLowGuard, SIGBUS, GUARD_TEXT, "fault inside", 1},
   {"guest-store-callret-high-guard-dies", TestGuestStoreCallRetHighGuard, SIGBUS, GUARD_TEXT, "fault inside", 1},
-  {"guest-load-scratch-guard-dies", TestGuestLoadScratchGuard, SIGBUS, GUARD_TEXT, "fault inside", 1},
-  {"guest-store-scratch-guard-dies", TestGuestStoreScratchGuard, SIGBUS, GUARD_TEXT, "fault inside", 1},
+  {"scratch-guard-disarmed-after-translation", TestScratchGuardDisarmed, 0, NULL, NULL, 0},
   {"callback-callret-guard-passed-on", TestCallbackCallRetGuard, 0, NULL, "fexmac:", 2},
-  {"callback-scratch-guard-passed-on", TestCallbackScratchGuard, 0, NULL, "fexmac:", 2},
   {"log-callback-reentry", TestLogCallbackReentry, 0, NULL, NULL, 0},
   {"fault-inside-handler-dies", TestFaultInsideHandlerDies, SIGBUS, "fexmac: fault inside the fault handler", NULL, 1},
   {"no-log-callback-in-handler", TestNoLogCallbackInHandler, 0, "core message during fault handling: test message from the fault handler",

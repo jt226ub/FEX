@@ -181,13 +181,14 @@ thread's last exception was a fault at address 0.
 
 Only faults on a host thread that is inside `fexmac_thread_run`, and among those:
 
-1. a write fault inside that thread's translator scratch-buffer guard, from host code
-   (not translated code or the dispatcher), while no system call callback runs on the
-   thread: that is the translator's emitter running past the buffer. The thread resumes
-   at the translator's restart point, which is then disarmed until the core arms it again
-   for the retry. The core does not mark when it is translating, so this is how the
-   translator is recognised; guest addresses are host addresses, and a guest access or a
-   callback bug touching the same page must not jump to a stale restart point;
+1. a fault inside that thread's translator scratch-buffer guard while the translator is
+   emitting a block on the thread. On macOS the core arms the guard when it starts
+   emitting a block and disarms it when the block is emitted (a macOS-only line in
+   `Arm64JITCore::EmitJITCode`), so an armed guard is a real "translating now" marker;
+   guest code and callbacks do not run on the thread then. The thread resumes at the
+   translator's restart point, and the guard is disarmed until the core arms it again for
+   the retry. Guest addresses are host addresses, so without the marker a guest access or
+   a callback bug touching the page would jump to a stale restart point;
 2. a fault inside its call/return stack allocation (guard pages) raised by a load/store
    pair whose base register is `x25` (`REG_CALLRET_SP`), in translated code or the
    dispatcher, at an address within the 16 bytes it moves: the call/return stack's own
@@ -236,29 +237,41 @@ One way per process:
    SIGBUS and SIGSEGV. A return of 1 means the library has edited the context and the
    host must return at once.
 
-### A fault inside a handler crashes instead of hanging
+### A fault inside the library's handler crashes instead of hanging
 
 On macOS a synchronous fault while its signal is blocked hangs the thread; by default a
 signal is blocked while its handler runs, so a bug in a handler used to look like a hang
 (found by package A; a reproducer on the M4 hangs without `SA_NODEFER` and dies with
 SIGBUS at once with it). The library's handler is installed with `SA_NODEFER`, so a
-nested fault re-enters it. Because every asynchronous signal is blocked while it runs,
-the only thing that can interrupt it on its thread is a fault it causes. On entry it
-records its frame and a fresh marker in a local; a later entry is nested only if that
-handler is still running: the interrupted code's frame-pointer chain (Apple's arm64 ABI
-keeps frame records) reaches the recorded frame and the marker is intact. A previous
-handler that leaves with `siglongjmp` (the usual memory-probe idiom) leaves a record
-behind whose frame is on no live chain, so the next fault is handled normally and log
-messages reach the callback again; a flag cleared only on return would have made every
-later fault look nested, and stack depth alone cannot tell because code that runs deeper
-than the dead frame faults below it. A nested entry says whether it was in the library's
-own code or in the previous handler, writes `fexmac: fault inside the fault handler` (or `... inside
-the previously installed handler ...`), restores the default action and returns; the
-fault repeats and kills the process.
+nested fault re-enters it.
 
-What it cannot fix: a previous handler installed without `SA_NODEFER` that faults runs
-with its signal blocked, as the kernel would have run it, and hangs; a host using way 2
-should install its handlers with `SA_NODEFER`.
+Nesting is tracked only for the library's own code: a per-thread depth (a pthread key)
+is raised on entry to the library's claim-and-handle section and in
+`fexmac_handle_fault`, and lowered before the library calls a previous handler or
+returns. That code never leaves by a jump, so the depth cannot go stale. A fault while
+it is raised is a fault inside the library's handler: the library writes `fexmac: fault
+inside the fault handler` (or, if the core was rewriting a misaligned atomic on an
+inaccessible page, the guest memory fault message), restores the default action and
+returns; the fault repeats and kills the process. The same depth diverts log messages to
+`write(2)`.
+
+The library does not police handlers it chains to. While a previous handler runs the
+depth is zero, so a fault inside it re-enters, is not the library's, and goes to the
+previous handler again, exactly as if the library were not installed. A previous handler
+may leave with `siglongjmp` (the usual memory-probe idiom): the library holds no state it
+would skip. A previous handler that faults on every entry recurses until the stack is
+exhausted and macOS ends the process (with SIGILL when it cannot deliver the next
+signal, measured: under 0.1 s); it does not hang, because the library never blocks
+SIGSEGV or SIGBUS around a previous handler, even one installed without `SA_NODEFER`.
+That is the one place where the library does not reproduce the kernel's behaviour, on
+purpose.
+
+Earlier designs tried to also detect faults inside the previous handler, with a flag
+cleared on return (stale after `siglongjmp`), then by stack depth, then by walking the
+frame-pointer chain to a recorded frame with a marker; the last gave a false "nested"
+verdict in 257 of 17,990 stack layouts, where later code had a live frame record at
+exactly the abandoned frame's address. Tracking only the library's own code cannot be
+wrong that way.
 
 ### Invalidation and signals
 
@@ -333,8 +346,10 @@ alarm kills it.
 | `guest-fault-hosted` | with the host owning the signals, the host receives the guest's fault at the guest's address |
 | `callbacks` | from a callback: create a thread, destroy another stopped thread, invalidate; running another thread is `BUSY` |
 | `errors` | missing arguments; unsupported options (`DISKCACHE`, `DISKCACHEPATH`, `JITFEATURES`, `GDBSERVER`, `SINGLESTEP`, `ENABLECODECACHINGWIP`, `FORCESVEWIDTH`, `STRICTINPROCESSSPLITLOCKS`); bad values (`010`, `-5`, `0`, out of range, `true`, unknown names); a second context; destroy with threads; double destroy and use after destroy; a context created again |
-| `chained-mask`, `chained-resethand-dies`, `chained-handler-faults-dies` | the previous handler's mask, `SA_RESETHAND`, and a fault inside it |
+| `chained-mask`, `chained-resethand-dies` | the previous handler's mask (with SIGSEGV/SIGBUS not blocked) and `SA_RESETHAND` |
+| `chained-handler-faults-dies`, `chained-handler-faults-deferring-dies`, `chained-handler-faults-no-frame-pointer-dies` | a previous handler that faults, with and without `SA_NODEFER` and with and without frame pointers: the process dies (stack exhausted) within the subtest's time limit, and is not reported as a fault inside the library's handler |
 | `chained-siglongjmp` | a previous handler that leaves with `siglongjmp`, three times in a row (`ljmp.c`): no fault is taken for nested, a misaligned atomic is still handled, the log callback is still called |
+| `chained-siglongjmp-layouts` | the reviewer's `ljmp4` sequence over 306 stack layouts (a reduced `ljmp2` grid): probe, abandoned handler frame, later probes above, below and at its depth; every layout survives |
 | `sent-signal-ignored`, `sent-signal-default-dies` | `kill(SIGSEGV)` with the previous action "ignore" or the default |
 | `unclaimed-fault-dies` | a host fault outside guest code dies silently with SIGBUS |
 | `invalidate-concurrent` | 8 guest threads invalidating in every one of 20,000 system calls each while the main thread invalidates in a loop, at least 12 runs; a progress watchdog fails it within 5 seconds of a hang. It hung in each of 3 runs before package E's reader-writer lock fix and passed 6 of 6 after it |
@@ -346,8 +361,8 @@ guard-page addresses):
 | Subtest | Checks |
 |---|---|
 | `guest-load-callret-low-guard-dies`, `guest-store-callret-high-guard-dies` | a guest load or store on a call/return guard page dies as a guest memory fault; no reset, no loop (`guard2.c`) |
-| `guest-load-scratch-guard-dies`, `guest-store-scratch-guard-dies` | the same for the scratch-buffer guard; no jump to the restart point |
-| `callback-callret-guard-passed-on`, `callback-scratch-guard-passed-on` | the system call callback reading or writing a guard page: the host's handler receives the fault at that address |
+| `scratch-guard-disarmed-after-translation` | the scratch-buffer guard is disarmed once a block is emitted, so no later access to that page can be taken for the translator's overflow |
+| `callback-callret-guard-passed-on` | the system call callback reading a call/return guard page: the host's handler receives the fault at that address |
 | `log-callback-reentry` | fexmac calls from inside the log callback return `BUSY`; afterwards they work |
 | `fault-inside-handler-dies` | the hook fired exactly once, the process died with SIGBUS, the message was written |
 | `no-log-callback-in-handler`, `log-restored-after-failed-create`, `invalidation-mask` | as named |

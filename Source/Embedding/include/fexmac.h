@@ -328,8 +328,11 @@ FEXMAC_EXPORT fexmac_result fexmac_thread_run(fexmac_thread* thread, fexmac_stop
  *  1. fexmac_install_fault_handlers(): the library installs SIGBUS and SIGSEGV
  *     handlers (SA_SIGINFO | SA_ONSTACK | SA_NODEFER, asynchronous signals blocked while
  *     they run) and remembers whatever was installed before. A fault that is not the
- *     library's is passed to that previous handler, with its sa_mask, SA_NODEFER and
- *     SA_RESETHAND honoured. If the previous action was the default: a fault is let
+ *     library's is passed to that previous handler, with its sa_mask and SA_RESETHAND
+ *     honoured; SIGSEGV, SIGBUS and the other synchronous fault signals are never
+ *     blocked around it (even without SA_NODEFER), because on macOS a fault while its
+ *     signal is blocked hangs the thread. The previous handler may leave with
+ *     siglongjmp. If the previous action was the default: a fault is let
  *     happen again with the default action restored, so the process dies with the usual
  *     signal; a signal sent with kill() is re-sent with the default action, so it does
  *     the same. If the previous action was "ignore": a sent signal is ignored; a fault,
@@ -342,12 +345,22 @@ FEXMAC_EXPORT fexmac_result fexmac_thread_run(fexmac_thread* thread, fexmac_stop
  *     returns 1 the host must return from its handler at once without touching the
  *     context; the library has already edited it.
  *
- * A fault inside the library's handler, or inside a previous handler it chained to, is
- * reported on standard error and turns into an ordinary crash rather than a hang: with
- * SA_NODEFER the nested fault re-enters the handler, which detects the nesting,
- * restores the default action and lets the fault happen again. A host using way 2
- * should install its handlers with SA_NODEFER too; without it a fault while the signal
- * is blocked hangs the thread on macOS.
+ * A fault inside the library's own handling code is reported on standard error and
+ * turns into an ordinary crash rather than a hang: with SA_NODEFER the nested fault
+ * re-enters the handler, which knows it is inside its own code (a per-thread depth that
+ * code keeps; it never leaves by a jump), restores the default action and lets the
+ * fault happen again.
+ *
+ * The library does not police handlers it chains to. While a previous handler runs, the
+ * library is not handling anything: a fault inside that handler re-enters, is not the
+ * library's, and is passed to the previous handler again, as if the library were not
+ * installed. If that repeats, the stack overflows and the process dies (macOS ends it
+ * with SIGILL, SIGSEGV or SIGBUS); it does not hang.
+ *
+ * A host using way 2 should install its handlers with SA_NODEFER; without it a fault
+ * while the signal is blocked hangs the thread on macOS. If such a host leaves a fault
+ * inside fexmac_handle_fault itself with siglongjmp, the library's depth stays raised on
+ * that thread and later log messages from it are written to standard error.
  * --------------------------------------------------------------------------------- */
 
 /* Installs the library's handlers once per process. Returns FEXMAC_OK if they are

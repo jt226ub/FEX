@@ -21,6 +21,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -787,8 +788,9 @@ static void TestErrors(void) {
 static void MaskCheckingHandler(int Signal, siginfo_t* Info, void* Context) {
   sigset_t Current;
   pthread_sigmask(SIG_BLOCK, NULL, &Current);
-  /* Its own mask (SIGUSR1) applied; its own signal blocked (no SA_NODEFER). */
-  Shared[1] = (uint32_t)(sigismember(&Current, SIGUSR1) && sigismember(&Current, Signal));
+  /* Its own mask (SIGUSR1) applied; its own (synchronous) signal never blocked, so a
+   * fault inside it cannot hang. */
+  Shared[1] = (uint32_t)(sigismember(&Current, SIGUSR1) && !sigismember(&Current, Signal));
   HostOwnHandler(Signal, Info, Context);
 }
 
@@ -803,7 +805,7 @@ static void TestChainedMask(void) {
   sigaction(SIGSEGV, &Action, NULL);
   fexmac_install_fault_handlers();
   TouchHostPage();
-  Check(Shared[1] == 1, "the previous handler ran with its sa_mask and its own signal blocked");
+  Check(Shared[1] == 1, "the previous handler ran with its sa_mask, and SIGSEGV/SIGBUS not blocked");
   sigset_t Current;
   pthread_sigmask(SIG_BLOCK, NULL, &Current);
   Check(!sigismember(&Current, SIGUSR1), "the mask is restored afterwards");
@@ -822,6 +824,11 @@ static void TestChainedResetHand(void) {
   exit(1);
 }
 
+/* A previous handler that faults itself. The library does not police handlers it chains
+ * to: the nested fault is passed to the same handler again, which faults again, until
+ * the stack overflows and the process dies. It must die, quickly, not hang, with and
+ * without SA_NODEFER on the previous handler and with and without frame pointers in it
+ * (FaultingHandlerNoFramePointer is compiled with -fomit-frame-pointer). */
 static void FaultingHostHandler(int Signal, siginfo_t* Info, void* Context) {
   (void)Signal;
   (void)Info;
@@ -830,14 +837,101 @@ static void FaultingHostHandler(int Signal, siginfo_t* Info, void* Context) {
   *(volatile int*)HostPage = 1; /* the host's handler has a bug */
 }
 
-static void TestChainedHandlerFaults(void) {
-  InstallHostHandler(FaultingHostHandler, SA_NODEFER);
-  fexmac_install_fault_handlers();
+void FaultingHandlerNoFramePointer(int Signal, siginfo_t* Info, void* Context);
+uint8_t* FaultingHandlerPage(void);
+uint8_t* FaultingHandlerPage(void) {
+  return HostPage;
+}
+
+static void RunFaultingPrevious(void (*Handler)(int, siginfo_t*, void*), int Flags) {
   HostPage = MapGuestMemory((size_t)PageSize);
   mprotect(HostPage, (size_t)PageSize, PROT_NONE);
+  InstallHostHandler(Handler, Flags);
+  fexmac_install_fault_handlers();
   ((volatile uint8_t*)HostPage)[16] = 42;
   printf("  FAIL: survived a fault inside the host's handler\n");
   exit(1);
+}
+
+static void TestChainedHandlerFaults(void) {
+  RunFaultingPrevious(FaultingHostHandler, SA_NODEFER);
+}
+static void TestChainedHandlerFaultsDeferring(void) {
+  RunFaultingPrevious(FaultingHostHandler, 0);
+}
+static void TestChainedHandlerFaultsNoFramePointer(void) {
+  RunFaultingPrevious(FaultingHandlerNoFramePointer, 0);
+}
+
+/* The reviewer's ljmp4/ljmp2: a previous handler that probes memory with siglongjmp,
+ * called from frames of many sizes and depths, so that later faults happen above,
+ * below and exactly at the depth of earlier, abandoned handler frames. Every layout
+ * must survive: no later fault may be mistaken for a fault inside a handler. */
+static sigjmp_buf GridJump;
+static volatile uint8_t* GridBad;
+
+static void GridHandler(int Signal, siginfo_t* Info, void* Context) {
+  (void)Signal;
+  (void)Info;
+  (void)Context;
+  siglongjmp(GridJump, 1);
+}
+
+__attribute__((noinline)) static int GridProbe(void) {
+  if (sigsetjmp(GridJump, 1)) {
+    return 0;
+  }
+  (void)*GridBad;
+  return 1;
+}
+
+__attribute__((noinline)) static int GridRecurse(int Depth, size_t Pad) {
+  volatile char* Space = __builtin_alloca(Pad);
+  (void)Space;
+  if (Depth == 0) {
+    return GridProbe();
+  }
+  return GridRecurse(Depth - 1, Pad) + 0 * (int)Space[0];
+}
+
+__attribute__((noinline)) static int GridFirst(size_t Pad) {
+  volatile char* Space = __builtin_alloca(Pad);
+  (void)Space;
+  return GridProbe();
+}
+
+static void TestSiglongjmpLayouts(void) {
+  int Trials = 0, Bad = 0;
+  for (size_t Pad1 = 0; Pad1 <= 4096; Pad1 += 256) {
+    for (int Depth = 0; Depth <= 5; ++Depth) {
+      for (size_t Pad2 = 16; Pad2 <= 2048; Pad2 += 1016) {
+        const pid_t Child = fork();
+        if (Child == 0) {
+          alarm(5);
+          struct sigaction Action;
+          memset(&Action, 0, sizeof(Action));
+          Action.sa_sigaction = GridHandler;
+          Action.sa_flags = SA_SIGINFO;
+          sigemptyset(&Action.sa_mask);
+          sigaction(SIGSEGV, &Action, NULL);
+          sigaction(SIGBUS, &Action, NULL);
+          fexmac_install_fault_handlers();
+          GridBad = mmap(NULL, (size_t)PageSize, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+          const int Results = GridFirst(Pad1) + GridRecurse(Depth, Pad2) + GridRecurse(Depth + 3, Pad2 / 2 + 16);
+          _exit(Results == 0 ? 0 : 1);
+        }
+        int Status = 0;
+        waitpid(Child, &Status, 0);
+        ++Trials;
+        if (!WIFEXITED(Status) || WEXITSTATUS(Status) != 0) {
+          if (++Bad <= 5) {
+            printf("  layout pad1 %zu depth %d pad2 %zu: status 0x%x\n", Pad1, Depth, Pad2, Status);
+          }
+        }
+      }
+    }
+  }
+  Check(Bad == 0, "%d stack layouts of probe, abandoned handler frame, later probe: %d failed", Trials, Bad);
 }
 
 /* A previous handler that leaves with siglongjmp (the usual memory-probe idiom; the
@@ -1183,8 +1277,11 @@ static const struct Subtest Subtests[] = {
   {"errors", TestErrors, 0, NULL, NULL, 0},
   {"chained-mask", TestChainedMask, 0, NULL, NULL, 0},
   {"chained-resethand-dies", TestChainedResetHand, SIGBUS, NULL, "fexmac:", 1},
-  {"chained-handler-faults-dies", TestChainedHandlerFaults, SIGBUS, "fault inside the previously installed handler", NULL, 1},
+  {"chained-handler-faults-dies", TestChainedHandlerFaults, -1, NULL, "fault inside the fault handler", 1},
+  {"chained-handler-faults-deferring-dies", TestChainedHandlerFaultsDeferring, -1, NULL, "fault inside the fault handler", 1},
+  {"chained-handler-faults-no-frame-pointer-dies", TestChainedHandlerFaultsNoFramePointer, -1, NULL, "fault inside the fault handler", 1},
   {"chained-siglongjmp", TestChainedSiglongjmp, 0, NULL, "fault inside", 0},
+  {"chained-siglongjmp-layouts", TestSiglongjmpLayouts, 0, NULL, "fault inside", 0},
   {"sent-signal-ignored", TestSentSignalIgnored, 0, NULL, NULL, 0},
   {"sent-signal-default-dies", TestSentSignalDefaultDies, SIGSEGV, NULL, "fexmac:", 1},
   {"unclaimed-fault-dies", TestUnclaimedFaultDies, SIGBUS, NULL, "fexmac:", 1},

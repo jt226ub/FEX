@@ -96,8 +96,11 @@ Added for embedders (the core expects these from whatever hosts it):
   used to be sent to the misaligned-access rewrite and loop). They can be installed by
   the library (chaining to handlers installed before, honouring their mask and flags) or
   called from the host's own handlers. They are installed with `SA_NODEFER`, so a fault
-  inside the handler crashes the process instead of hanging it (a reproducer hangs
-  without it on the M4).
+  inside the library's handler crashes the process instead of hanging it (a reproducer
+  hangs without it on the M4); handlers the library chains to are not policed, and a
+  fault inside one ends in a stack overflow rather than a hang. The core disarms the
+  translator's scratch-buffer guard when a block is emitted (macOS only), so only a
+  translation in progress can be restarted.
 - Invalidation discards stale translations when guest code changes, holding the core's
   invalidation lock, for every thread of the context. The self-modifying-code tests
   looped forever until the runner did this. With many threads invalidating at once it
@@ -260,8 +263,8 @@ All of these run in the Mac job on every push to a `macos/**` branch.
 | `FEXCoreASMTestRunner` with `Scripts/macos_asm_tests.py` | Upstream's 2,292 assembly instruction tests, in four modes | 2,253 pass in each mode (before the upstream sync added one test) | 2,264 pass in each mode, both |
 | `FEXCoreOrderingTest` | Multi-thread x86 memory-ordering litmus tests, emulation on (must hold) and off (must break); see above | not yet run | pass, both; off: all required weak outcomes seen |
 | `FEXCoreMutexWakeTest` | The core's reader-writer lock never loses a wake-up | not yet run | pass |
-| `fexmac_c_test` | A C program using only `fexmac.h`, linked as an outside project would be: 30 subtests covering system calls (prefixed, restarted), stops, state, guest faults, invalidation (also from 8 threads at once), misaligned atomics with each signal-handler arrangement, call/return stack overflow and underflow, guest accesses to protected pages, chained handlers (including one that leaves with siglongjmp) and sent signals, garbage struct sizes, lifetime races and error paths | not yet run | pass, both |
-| `fexmac_hook_test` | The same library built with test hooks, 11 subtests: guest and callback accesses to guard pages are not claimed, a log callback cannot re-enter the library, a fault inside the handler crashes with a message instead of hanging, the log callback is never called from a signal handler, a failed create leaves no log hook, invalidation leaves fault signals unblocked | not yet run | pass, both |
+| `fexmac_c_test` | A C program using only `fexmac.h`, linked as an outside project would be: 33 subtests covering system calls (prefixed, restarted), stops, state, guest faults, invalidation (also from 8 threads at once), misaligned atomics with each signal-handler arrangement, call/return stack overflow and underflow, guest accesses to protected pages, chained handlers (one that leaves with siglongjmp, over 306 stack layouts; one that faults itself, which must end the process quickly) and sent signals, garbage struct sizes, lifetime races and error paths | not yet run | pass, both |
+| `fexmac_hook_test` | The same library built with test hooks, 9 subtests: guest and callback accesses to guard pages are not claimed, the scratch-buffer guard is disarmed after each translation, a log callback cannot re-enter the library, a fault inside the handler crashes with a message instead of hanging, the log callback is never called from a signal handler, a failed create leaves no log hook, invalidation leaves fault signals unblocked | not yet run | pass, both |
 | `JITWriteProbe` | Reports how the machine treats executable memory, including writes and switches from a fault handler and instruction-cache flushing | report only | see the facts above |
 | `JITWriteProbe --expect-enforced` | The same, but exits 1 unless every asserted case gives the result the port relies on with write protection enforced, or if a fault-handler case's handler never ran | not run: the hosted Mac does not enforce, so it would fail | pass, as built and hardened |
 | `Scripts/macos_check_linkage.sh` | Fails if the core or a test tool links anything but `libSystem` and `libc++`, if one of them is missing, or if the bundled `fmt` was not compiled. Homebrew's `fmt` is installed first. `otool` shows only that no fmt dylib is linked; the `build.ninja` check covers a static one | not yet run (added after the last hosted run) | pass, both toolchains |

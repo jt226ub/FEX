@@ -182,6 +182,11 @@ int RunSubtests(int argc, char** argv, const struct Subtest* Subtests, size_t Co
     if (Signal == SIGALRM) {
       printf("  FAIL: hung, killed after %u seconds\n", TimeoutSeconds);
       Passed = 0;
+    } else if (T->ExpectSignal == -1) {
+      /* SIGILL is what macOS ends a process with when it cannot deliver a signal because
+       * the stack is exhausted (a handler that faults recursively). */
+      Passed = Signal == SIGSEGV || Signal == SIGBUS || Signal == SIGILL;
+      printf("  %s: process died by signal %d (expected SIGSEGV, SIGBUS or SIGILL)\n", Passed ? "ok  " : "FAIL", Signal);
     } else if (T->ExpectSignal) {
       Passed = Signal == T->ExpectSignal;
       printf("  %s: process died by signal %d (expected %d)\n", Passed ? "ok  " : "FAIL", Signal, T->ExpectSignal);
