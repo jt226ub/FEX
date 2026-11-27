@@ -563,7 +563,16 @@ uint64_t Arm64JITCore::ExitFunctionLink(FEXCore::Core::CpuStateFrame* Frame, FEX
     if (!HostCode) {
       // Hold a reference to the code buffer, to avoid linking unmapped code if compilation triggers a recreation.
       auto CodeBuffer = static_cast<Arm64JITCore*>(Thread->CPUBackend.get())->CurrentCodeBuffer;
+#ifdef __APPLE__
+      HostCode = static_cast<Context::ContextImpl*>(Thread->CTX)->CompileBlockOrFault(Frame, GuestRip, 0);
+      // An untranslatable target gives the fault entry, which must not be linked: the
+      // guest code there may become valid later.
+      if (HostCode == Frame->Pointers.GuestSignal_SynchronousFault) {
+        return HostCode;
+      }
+#else
       HostCode = static_cast<Context::ContextImpl*>(Thread->CTX)->CompileBlock(Frame, GuestRip, 0);
+#endif
       if (Thread->LookupCache->Shared != CodeBuffer->LookupCache.get()) {
         return HostCode;
       }
@@ -622,7 +631,17 @@ uint64_t Arm64JITCore::ExitFunctionLink(FEXCore::Core::CpuStateFrame* Frame, FEX
       std::atomic_ref<uint64_t>(Record->HostCode).store(HostCode, std::memory_order::seq_cst);
 #ifdef ARCHITECTURE_arm64
       // Make memory write visible to other threads reading the same location
+#ifdef __APPLE__
+      // The location written is the record's HostCode field, which the thunk's ldr reads;
+      // upstream passes the field's value (the target block's address) instead, cleaning
+      // the wrong line, and with a value of 0 the instruction faults at address 0. Linux
+      // keeps upstream's operand.
+      // (Cleaning a line needs no alignment, so the packed field's address is fine.)
+      const auto HostCodeField = reinterpret_cast<uintptr_t>(Record) + offsetof(FEXCore::Context::ExitFunctionLinkData, HostCode);
+      asm volatile("dc cvau, %0; dsb ish" : : "r"(HostCodeField) : "memory");
+#else
       asm volatile("dc cvau, %0; dsb ish" : : "r"(Record->HostCode) :);
+#endif
 #endif
       std::atomic_ref<uint32_t>(*reinterpret_cast<uint32_t*>(JumpThunkStartAddress)).store(LdrInst, std::memory_order::relaxed);
     }

@@ -854,6 +854,31 @@ ContextImpl::CompileCodeResult ContextImpl::CompileCode(FEXCore::Core::InternalT
   };
 }
 
+#ifdef __APPLE__
+uintptr_t ContextImpl::CompileBlockOrFault(FEXCore::Core::CpuStateFrame* Frame, uint64_t GuestRIP, uint64_t MaxInst) {
+  if (const auto HostCode = CompileBlock(Frame, GuestRIP, MaxInst)) {
+    return HostCode;
+  }
+  // The frontend could translate no instruction at GuestRIP (for example `int 0x80` in a
+  // 64-bit process, which FEX refuses). CompileBlock returns 0 for that, and both callers
+  // that branch to the result would jump to host address 0: the dispatcher directly, and
+  // ExitFunctionLink after first trying to link the caller to it. Report it to the
+  // embedder as an invalid-opcode fault at that instruction instead, through the same
+  // dispatcher entry translated code uses for a faultless synchronous fault; it expects
+  // the static registers filled, as both callers leave them.
+  Frame->State.rip = GuestRIP;
+  Frame->SynchronousFaultData = {
+    .FaultToTopAndGeneratedException = true,
+    .Signal = SIGILL,
+    .TrapNo = X86State::X86_TRAPNO_UD,
+    .si_code = 2, // ILL_ILLOPN
+    .err_code = 0,
+    .FaultAddress = GuestRIP,
+  };
+  return Frame->Pointers.GuestSignal_SynchronousFault;
+}
+#endif
+
 uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_t GuestRIP, uint64_t MaxInst) {
   if constexpr (BLOCK_DEBUGGING) {
     // Block debugging logic is hand-written and needs to be handled with care.
