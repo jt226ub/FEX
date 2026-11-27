@@ -60,7 +60,7 @@ jobs:
       - name: Build
         run: |
           set -o pipefail
-          ninja -C build -k 0 FEXCore FEXCore_shared Common CommonTools FEXCoreSmokeTest FEXCoreASMTestRunner FEXCoreThreadTest FEXCoreOrderingTest FEXCoreMutexWakeTest 2>&1 | tee build.log
+          ninja -C build -k 0 FEXCore FEXCore_shared Common CommonTools FEXCoreSmokeTest FEXCoreASMTestRunner FEXCoreThreadTest FEXCoreOrderingTest FEXCoreMutexWakeTest fexmac fexmac_shared fexmac_bundle fexmac_c_test fexmac_hook_test 2>&1 | tee build.log
 
       - name: Inspect what was built
         run: |
@@ -116,6 +116,21 @@ jobs:
             [ -n "$R" ] && head -c 6000 "$R" || true
           fi
           exit "$code"
+
+      - name: Run the embedding interface tests
+        # A C program using only fexmac.h, linked against the standalone archive as an
+        # outside project would be.
+        run: |
+          set -o pipefail
+          T=build/Bin/fexmac_c_test
+          echo "=== as built"
+          "$T" 2>&1 | tee fexmac-c-test.log
+          cp "$T" fexmac_c_test-hardened
+          codesign --force --sign - --options runtime --entitlements Data/macOS/jit.entitlements fexmac_c_test-hardened
+          echo "=== hardened runtime"
+          ./fexmac_c_test-hardened 2>&1 | tee fexmac-c-test-hardened.log
+          # Behaviour that needs the library's test hooks (fexmac_testing build only).
+          build/Bin/fexmac_hook_test 2>&1 | tee fexmac-hook-test.log
 
       - name: Run the multi-thread test
         run: |
@@ -257,6 +272,9 @@ jobs:
             probe.log
             asm-tests.log
             thread-test.log
+            fexmac-c-test.log
+            fexmac-c-test-hardened.log
+            fexmac-hook-test.log
             ordering-on.log
             ordering-on-hardened.log
             ordering-off.log

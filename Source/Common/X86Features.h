@@ -1,5 +1,6 @@
 #pragma once
 #include <cstdint>
+#include <functional>
 
 #include <FEXCore/Core/Context.h>
 
@@ -19,6 +20,14 @@ public:
     : CTX {CTX} {
     GetFeatures();
   }
+#ifdef __APPLE__
+  // For a program that reaches the core through the fexmac C interface and has no
+  // Context pointer: answers come from the given function instead.
+  explicit Features(std::function<FEXCore::CPUID::FunctionResults(uint32_t Function, uint32_t Leaf)> CPUIDFn)
+    : CPUIDFn {std::move(CPUIDFn)} {
+    GetFeatures();
+  }
+#endif
 #endif
 
   // Features.
@@ -120,9 +129,17 @@ private:
   }
 #else
   FEXCore::CPUID::FunctionResults cpuid(uint32_t Function, uint32_t Leaf = 0) {
+#ifdef __APPLE__
+    if (CPUIDFn) {
+      return CPUIDFn(Function, Leaf);
+    }
+#endif
     return CTX->RunCPUIDFunction(Function, Leaf);
   }
   FEXCore::Context::Context* CTX {};
+#ifdef __APPLE__
+  std::function<FEXCore::CPUID::FunctionResults(uint32_t, uint32_t)> CPUIDFn;
+#endif
 #endif
 };
 } // namespace FEX::X86

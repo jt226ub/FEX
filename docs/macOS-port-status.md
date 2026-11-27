@@ -77,15 +77,35 @@ Fixed in code on `macos/runtime-fixes`:
 
 Added for embedders (the core expects these from whatever hosts it):
 
-- `Source/Tools/CommonTools/MacOSHostFaults.h`: catches the alignment fault ARM64 raises
-  for a misaligned atomic operation and hands it to the core (53 instruction tests depend
-  on it), and restarts translation when the translator's scratch buffer fills.
-- The test runner implements the callback that discards stale translations when guest
-  code changes, holding the core's invalidation lock. The self-modifying-code tests
-  looped forever until it did both.
-- `Source/Tools/CommonTools/CoreThreadSetup.h`: allocates the per-thread call and return
-  stack and a full descriptor table. Every guest `call` and `ret` depends on the first.
-- `docs/macOS-embedding-interface.md` lists every such duty found so far.
+- **`fexmac`, a C embedding interface** (`Source/Embedding/`, header `fexmac.h`), built
+  as a static library, as a standalone prelinked archive that needs only `libSystem` and
+  `libc++` (`build/Lib/libfexmac_bundle.a`) and as a dylib. It owns context creation and
+  option checking, per-thread setup (call and return stack, descriptor tables, allocator
+  per-thread initialisation), guest state, running guest code, system calls, the host
+  fault handlers and stale-translation invalidation. All three test tools use it; the
+  smoke and thread tests use nothing else. `docs/macOS-embedding-interface.md` describes
+  it, the signal-handler contract and what the instruction-test runner still takes from
+  the core for harness work.
+- The fault handlers tell faults apart by the data abort's fault status code
+  (ESR_EL1.DFSC, which macOS passes in the signal context), because macOS reports a
+  protection fault and an alignment fault alike as SIGBUS with si_code 1. They hand
+  alignment faults in translated code to the core (53 instruction tests depend on it),
+  restart translation when the translator's scratch buffer fills, and reset the
+  call/return stack pointer when deep recursion or unmatched calls and returns run into
+  its guard pages. A guest access to a protected page is passed on, never claimed (it
+  used to be sent to the misaligned-access rewrite and loop). They can be installed by
+  the library (chaining to handlers installed before, honouring their mask and flags) or
+  called from the host's own handlers. They are installed with `SA_NODEFER`, so a fault
+  inside the handler crashes the process instead of hanging it (a reproducer hangs
+  without it on the M4).
+- Invalidation discards stale translations when guest code changes, holding the core's
+  invalidation lock, for every thread of the context. The self-modifying-code tests
+  looped forever until the runner did this. With many threads invalidating at once it
+  hung until package E's reader-writer lock fix; `fexmac_c_test invalidate-concurrent`
+  now passes.
+- `Source/Tools/CommonTools/MacOSHostFaults.h` and `CoreThreadSetup.h`, the previous
+  per-tool versions, are used only by `FEXCoreOrderingTest` (package E) and kept until it
+  is ported; `MacOSHostFaults.h` got the same fault-status check.
 
 Checked and found not to need a change:
 
@@ -130,6 +150,11 @@ with `JITWriteProbe`:
   stale code, which shows the test can detect it. Single thread, one address.
 - **Reading `ctr_el0`, `midr_el1` or `id_aa64isar0_el1` from user space faults**
   (SIGILL); the port uses `sysctl` for all of them. **`dc cvau` is allowed.**
+- **A protection fault and an alignment fault both arrive as SIGBUS with si_code 1**
+  (`BUS_ADRALN`); a sent SIGSEGV arrives with si_code 2 and a sent SIGBUS with 1. The
+  syndrome in the signal context tells them apart: DFSC 0x21 is an alignment fault,
+  0x04 to 0x0F a translation or permission fault, and a signal the thread sent itself
+  carries the SVC exception class. `JITWriteProbe --expect-enforced` asserts the cases.
 - Misaligned atomic loads fault only when they cross a 16-byte boundary: an 8-byte
   `ldar` at offset 4 of a 16-byte-aligned buffer runs, at offset 12 it raises SIGBUS.
 - GitHub's hosted Mac reports `pthread_jit_write_protect_supported_np` as 0 and lets a
@@ -235,6 +260,8 @@ All of these run in the Mac job on every push to a `macos/**` branch.
 | `FEXCoreASMTestRunner` with `Scripts/macos_asm_tests.py` | Upstream's 2,292 assembly instruction tests, in four modes | 2,253 pass in each mode (before the upstream sync added one test) | 2,255 pass in each mode, both |
 | `FEXCoreOrderingTest` | Multi-thread x86 memory-ordering litmus tests, emulation on (must hold) and off (must break); see above | not yet run | pass, both; off: all required weak outcomes seen |
 | `FEXCoreMutexWakeTest` | The core's reader-writer lock never loses a wake-up | not yet run | pass |
+| `fexmac_c_test` | A C program using only `fexmac.h`, linked as an outside project would be: 27 subtests covering system calls (prefixed, restarted), stops, state, guest faults, invalidation (also from 8 threads at once), misaligned atomics with each signal-handler arrangement, call/return stack overflow and underflow, guest accesses to protected pages, chained handlers and sent signals, lifetime races and error paths | not yet run | pass, both |
+| `fexmac_hook_test` | The same library built with test hooks: a fault inside the handler crashes with a message instead of hanging, the log callback is never called from a signal handler, a failed create leaves no log hook, invalidation leaves fault signals unblocked | not yet run | pass, both |
 | `JITWriteProbe` | Reports how the machine treats executable memory, including writes and switches from a fault handler and instruction-cache flushing | report only | see the facts above |
 | `JITWriteProbe --expect-enforced` | The same, but exits 1 unless every asserted case gives the result the port relies on with write protection enforced, or if a fault-handler case's handler never ran | not run: the hosted Mac does not enforce, so it would fail | pass, as built and hardened |
 | `Scripts/macos_check_linkage.sh` | Fails if the core or a test tool links anything but `libSystem` and `libc++`, if one of them is missing, or if the bundled `fmt` was not compiled. Homebrew's `fmt` is installed first. `otool` shows only that no fmt dylib is linked; the `build.ninja` check covers a static one | not yet run (added after the last hosted run) | pass, both toolchains |
@@ -249,7 +276,11 @@ hardened, with either toolchain, the same):
 | Skipped by the runner (host lacks a CPU feature the test needs, or it needs Linux system calls) | 8 |
 | Skipped by upstream's own lists | 6 |
 | Skipped because the test reaches low memory through a 32-bit operand | 5 |
-| Expected failures | 18 |
+| Expected failures | 18 (12 crash, 6 fail) |
+
+Since the runner uses `fexmac`, `TwoByte/0F_02` (a test that makes a Linux system call)
+fails at once instead of timing out: the old runner's handler left `rip` on the
+`syscall`, so the call repeated forever. The totals are otherwise unchanged.
 
 The skip count depends on the CPU: the hosted Mac skips one more test than the M4, and an
 earlier hosted run on a different virtual CPU skipped 16 and passed 2,244 with the same

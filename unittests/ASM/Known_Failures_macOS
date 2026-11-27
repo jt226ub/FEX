@@ -36,6 +36,8 @@ Test_VEX/vmovq_vmovd_reg.asm
 
 # --- Needs something the core-only runner does not provide.
 
-# Makes a Linux system call and loops until it succeeds. The runner's system call handler
-# does nothing. Confirmed by sampling: it spins in the handler.
+# Makes a Linux system call (time). The runner answers no system calls: a system call
+# ends the run and the test fails at once. (Before the runner used the fexmac library its
+# handler left rip on the `syscall`, so the call repeated forever and the test timed out;
+# confirmed by sampling.)
 Test_TwoByte/0F_02.asm
