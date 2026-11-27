@@ -131,6 +131,10 @@ jobs:
           ./fexmac_c_test-hardened 2>&1 | tee fexmac-c-test-hardened.log
           # Behaviour that needs the library's test hooks (fexmac_testing build only).
           build/Bin/fexmac_hook_test 2>&1 | tee fexmac-hook-test.log
+          # The guard pages (code buffer, scratch buffer) as signed for the hardened runtime.
+          cp build/Bin/fexmac_hook_test fexmac_hook_test-hardened
+          codesign --force --sign - --options runtime --entitlements Data/macOS/jit.entitlements fexmac_hook_test-hardened
+          ./fexmac_hook_test-hardened 2>&1 | tee fexmac-hook-test-hardened.log
 
       - name: Run the multi-thread test
         run: |
