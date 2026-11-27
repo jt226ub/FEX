@@ -505,6 +505,8 @@ TranslationCounters ContextImpl::GetTranslationCounters() const {
     .BlocksLoadedFromCache = BlocksLoadedFromCacheCount.load(std::memory_order_relaxed),
     .CacheEntriesRejected = DiskCache.GetRejectedCount(),
     .CacheEntriesQueued = DiskCache.GetQueuedCount(),
+    .CacheReading = DiskCache.IsReadingDiskCache(),
+    .CacheWriting = DiskCache.IsWritingDiskCache(),
   };
 }
 

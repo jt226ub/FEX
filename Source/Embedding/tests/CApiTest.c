@@ -21,6 +21,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -289,11 +290,27 @@ static void TestABI(void) {
   Config.struct_size += 8;
   CheckResult(fexmac_context_create(&Config, &Other), FEXMAC_ERROR_INVALID_ARGUMENT, "config of an unknown (larger) size");
   fexmac_config_init(&Config);
-  Config.code_cache_enabled = 1;
-  CheckResult(fexmac_context_create(&Config, &Other), FEXMAC_ERROR_UNSUPPORTED, "config asking for cached translations (not yet)");
+  Config.code_cache_enabled = 2;
+  CheckResult(fexmac_context_create(&Config, &Other), FEXMAC_ERROR_BAD_CONFIG, "code_cache_enabled other than 0 or 1");
   fexmac_config_init(&Config);
   Config.code_cache_directory = "/tmp";
-  CheckResult(fexmac_context_create(&Config, &Other), FEXMAC_ERROR_UNSUPPORTED, "config naming a cache directory (not yet)");
+  CheckResult(fexmac_context_create(&Config, &Other), FEXMAC_ERROR_BAD_CONFIG, "a cache directory with the cache off");
+  fexmac_config_init(&Config);
+  Config.code_cache_enabled = 1;
+  Config.code_cache_directory = "";
+  CheckResult(fexmac_context_create(&Config, &Other), FEXMAC_ERROR_BAD_CONFIG, "an empty cache directory name");
+  fexmac_config_init(&Config);
+  Config.reserved2 = 1;
+  CheckResult(fexmac_context_create(&Config, &Other), FEXMAC_ERROR_UNSUPPORTED, "a reserved config field set");
+
+  fexmac_translation_counters Counters;
+  memset(&Counters, 0xAA, sizeof(Counters));
+  CheckResult(fexmac_context_get_counters(Context, &Counters), FEXMAC_ERROR_INVALID_ARGUMENT, "counters with an uninitialised struct_size");
+  fexmac_translation_counters_init(&Counters);
+  Counters.struct_size += 8;
+  CheckResult(fexmac_context_get_counters(Context, &Counters), FEXMAC_ERROR_INVALID_ARGUMENT, "counters of an unknown (larger) size");
+  fexmac_translation_counters_init(&Counters);
+  CheckResult(fexmac_context_get_counters(Context, &Counters), FEXMAC_OK, "counters of the known size");
   Check(fexmac_version() == ((2u << 16) | 0u) && FEXMAC_VERSION_MAJOR == 2, "version 2.0, the first with struct_size");
 
   fexmac_thread_destroy(Thread);
@@ -1270,6 +1287,216 @@ static void TestLifetimeRaces(void) {
         BusyContext);
 }
 
+/* ---- code cache: on and off, flush, counters, cold and warm, refusal ---- */
+
+/* A loop of a few blocks that halts with rax = 5050. */
+/* clang-format off */
+static const uint8_t CacheProgram[] = {
+  0x31, 0xC0,                   /*  0: xor eax, eax */
+  0xB9, 0x64, 0x00, 0x00, 0x00, /*  2: mov ecx, 100 */
+  0x01, 0xC8,                   /*  7: add eax, ecx */
+  0xFF, 0xC9,                   /*  9: dec ecx */
+  0x75, 0xFA,                   /* 11: jnz 7 */
+  0x48, 0x8D, 0x1D, 0x00, 0x00, 0x00, 0x00, /* 13: lea rbx, [rip] */
+  0xF4,                         /* 20: hlt */
+};
+/* clang-format on */
+
+static char CacheDir[64];
+
+static void MakeCacheDir(void) {
+  strcpy(CacheDir, "/tmp/fexmac-cache-XXXXXX");
+  if (!mkdtemp(CacheDir)) {
+    fprintf(stderr, "mkdtemp failed\n");
+    exit(2);
+  }
+}
+
+static void RemoveCacheDir(void) {
+  char Command[128];
+  snprintf(Command, sizeof(Command), "chmod -RN %s 2>/dev/null; rm -rf %s", CacheDir, CacheDir);
+  (void)!system(Command);
+}
+
+static fexmac_context* CreateCacheContext(const char* Directory) {
+  fexmac_config Config;
+  fexmac_config_init(&Config);
+  Config.code_cache_enabled = 1;
+  Config.code_cache_directory = Directory;
+  Config.log = QuietLog;
+  fexmac_context* Context = NULL;
+  const fexmac_result Result = fexmac_context_create(&Config, &Context);
+  if (Result != FEXMAC_OK) {
+    fprintf(stderr, "fexmac_context_create: %s\n", fexmac_result_string(Result));
+    exit(2);
+  }
+  return Context;
+}
+
+static fexmac_translation_counters Counters(fexmac_context* Context) {
+  fexmac_translation_counters C;
+  fexmac_translation_counters_init(&C);
+  CheckResult(fexmac_context_get_counters(Context, &C), FEXMAC_OK, "fexmac_context_get_counters");
+  return C;
+}
+
+/* Maps the program (at a different address each time), registers it, runs it to its hlt
+ * and checks the answer. */
+static void RunCacheProgram(fexmac_context* Context, const char* What) {
+  uint8_t* Code = MapGuestMemory(0x4000);
+  memcpy(Code, CacheProgram, sizeof(CacheProgram));
+  const uint64_t Base = (uint64_t)(uintptr_t)Code;
+  CheckResult(fexmac_add_code_range(Context, Base, 0x4000, 0), FEXMAC_OK, "registering the guest code");
+  fexmac_thread* Thread = CreateThreadAt(Context, Base, 0);
+  fexmac_stop Stop = Run(Thread);
+  fexmac_x86_state State = GetState(Thread);
+  Check(Stop.reason == FEXMAC_STOP_HALT && State.gpr[RAX] == 5050 && State.gpr[RBX] == Base + 20, "%s: right answer (rax %" PRIu64 ")",
+        What, State.gpr[RAX]);
+  fexmac_thread_destroy(Thread);
+  fexmac_remove_code_range(Context, Base, 0x4000);
+  munmap(Code, 0x4000);
+}
+
+static void TestCacheOff(void) {
+  fexmac_context* Context = CreateContext(NULL, NULL);
+  RunCacheProgram(Context, "cache off");
+  fexmac_translation_counters C = Counters(Context);
+  Check(C.cache_state == FEXMAC_CACHE_OFF && C.blocks_compiled > 0 && C.blocks_loaded == 0 && C.cache_entries_queued == 0,
+        "cache off: state OFF, blocks compiled (%" PRIu64 "), nothing loaded or queued", C.blocks_compiled);
+  CheckResult(fexmac_context_flush_cache(Context), FEXMAC_ERROR_UNSUPPORTED, "flush with the cache off");
+  fexmac_context_destroy(Context);
+}
+
+static void TestCacheColdWarm(void) {
+  MakeCacheDir();
+  fexmac_context* Context = CreateCacheContext(CacheDir);
+  RunCacheProgram(Context, "cold");
+  fexmac_translation_counters C = Counters(Context);
+  Check(C.cache_state == FEXMAC_CACHE_ACTIVE && C.blocks_compiled > 0 && C.cache_entries_queued > 0,
+        "cold: state ACTIVE, %" PRIu64 " compiled, %" PRIu64 " queued", C.blocks_compiled, C.cache_entries_queued);
+  CheckResult(fexmac_context_flush_cache(Context), FEXMAC_OK, "flush");
+  fexmac_context_destroy(Context);
+
+  /* A new context in the same process loads what the first one saved. */
+  Context = CreateCacheContext(CacheDir);
+  RunCacheProgram(Context, "warm, same process");
+  C = Counters(Context);
+  Check(C.blocks_compiled == 0 && C.blocks_loaded > 0 && C.cache_entries_rejected == 0,
+        "warm in the same process: nothing compiled, %" PRIu64 " loaded", C.blocks_loaded);
+  fexmac_context_destroy(Context);
+  RemoveCacheDir();
+}
+
+static void TestCacheCrossProcess(void) {
+  MakeCacheDir();
+  /* The cold run in a child process, before this one has any context. */
+  const pid_t Child = fork();
+  if (Child == 0) {
+    fexmac_context* Context = CreateCacheContext(CacheDir);
+    RunCacheProgram(Context, "cold, in a child process");
+    const int Ok = fexmac_context_flush_cache(Context) == FEXMAC_OK && Counters(Context).cache_entries_queued > 0;
+    fexmac_context_destroy(Context);
+    _exit(Ok && Failures == 0 ? 0 : 1);
+  }
+  int Status = 0;
+  waitpid(Child, &Status, 0);
+  Check(WIFEXITED(Status) && WEXITSTATUS(Status) == 0, "child process filled the cache");
+  fexmac_context* Context = CreateCacheContext(CacheDir);
+  RunCacheProgram(Context, "warm, another process");
+  fexmac_translation_counters C = Counters(Context);
+  Check(C.blocks_compiled == 0 && C.blocks_loaded > 0, "warm in another process: nothing compiled, %" PRIu64 " loaded", C.blocks_loaded);
+  fexmac_context_destroy(Context);
+  RemoveCacheDir();
+}
+
+static void TestCacheUntrusted(void) {
+  MakeCacheDir();
+  chmod(CacheDir, 0777);
+  fexmac_context* Context = CreateCacheContext(CacheDir);
+  RunCacheProgram(Context, "untrusted directory");
+  fexmac_translation_counters C = Counters(Context);
+  Check(C.cache_state == FEXMAC_CACHE_REFUSED && C.blocks_loaded == 0 && C.cache_entries_queued == 0,
+        "a directory writable by others: state REFUSED, nothing loaded or queued");
+  CheckResult(fexmac_context_flush_cache(Context), FEXMAC_ERROR_UNSUPPORTED, "flush with the cache refused");
+  struct stat Info;
+  Check(stat(CacheDir, &Info) == 0 && (Info.st_mode & 0777) == 0777, "and the directory was left as it was");
+  fexmac_context_destroy(Context);
+  chmod(CacheDir, 0700);
+  RemoveCacheDir();
+}
+
+static void TestCacheOptions(void) {
+  fexmac_context* Context = NULL;
+  CheckResult(CreateWithOption("DISKCACHE", "1", &Context), FEXMAC_ERROR_BAD_CONFIG, "the core's DISKCACHE option");
+  CheckResult(CreateWithOption("DISKCACHEPATH", "/tmp", &Context), FEXMAC_ERROR_BAD_CONFIG, "the core's DISKCACHEPATH option");
+  CheckResult(CreateWithOption("DISKCACHEMAXFILESIZE", "0", &Context), FEXMAC_ERROR_BAD_CONFIG, "a cache size limit of 0");
+  CheckResult(CreateWithOption("DISKCACHEMAXFILESIZE", "1048576", &Context), FEXMAC_OK, "a cache size limit");
+  fexmac_context_destroy(Context);
+  CheckResult(CreateWithOption("DISKCACHEVALIDATION", "1", &Context), FEXMAC_OK, "cache validation");
+  fexmac_context_destroy(Context);
+}
+
+static void TestCacheFork(void) {
+  MakeCacheDir();
+  fexmac_context* Context = CreateCacheContext(CacheDir);
+  RunCacheProgram(Context, "before the fork");
+  CheckResult(fexmac_before_fork(Context), FEXMAC_OK, "fexmac_before_fork");
+  CheckResult(fexmac_before_fork(Context), FEXMAC_ERROR_BUSY, "a second fexmac_before_fork");
+  const pid_t Child = fork();
+  if (Child == 0) {
+    fexmac_after_fork(Context, 1);
+    RunCacheProgram(Context, "in the child");
+    const fexmac_translation_counters C = Counters(Context);
+    const int Ok = C.cache_state == FEXMAC_CACHE_READ_ONLY && fexmac_context_flush_cache(Context) == FEXMAC_ERROR_UNSUPPORTED;
+    _exit(Ok && Failures == 0 ? 0 : 1);
+  }
+  CheckResult(fexmac_after_fork(Context, 0), FEXMAC_OK, "fexmac_after_fork in the parent");
+  int Status = 0;
+  waitpid(Child, &Status, 0);
+  Check(WIFEXITED(Status) && WEXITSTATUS(Status) == 0, "child ran guest code, read-only cache, flush refused");
+  RunCacheProgram(Context, "parent after the fork");
+  CheckResult(fexmac_context_flush_cache(Context), FEXMAC_OK, "parent still flushes");
+  fexmac_context_destroy(Context);
+  RemoveCacheDir();
+}
+
+/* ---- code ranges: only registered memory is code once any range is registered ---- */
+
+static void TestCodeRanges(void) {
+  uint8_t* Code = MapGuestMemory(0x8000);
+  const uint64_t Base = (uint64_t)(uintptr_t)Code;
+  /* First page: mov eax, 1; jmp to the second page. Second page: mov eax, 2; hlt. */
+  const uint8_t First[] = {0xB8, 0x01, 0, 0, 0, 0xE9, 0xF6, 0x3F, 0, 0};
+  const uint8_t Second[] = {0xB8, 0x02, 0, 0, 0, 0xF4};
+  memcpy(Code, First, sizeof(First));
+  memcpy(Code + 0x4000, Second, sizeof(Second));
+  fexmac_context* Context = CreateContext(NULL, NULL);
+
+  CheckResult(fexmac_add_code_range(Context, Base, 0, 0), FEXMAC_ERROR_INVALID_ARGUMENT, "an empty range");
+  CheckResult(fexmac_add_code_range(Context, UINT64_MAX - 10, 100, 0), FEXMAC_ERROR_INVALID_ARGUMENT, "a range that wraps");
+  CheckResult(fexmac_add_code_range(Context, Base, 0x4000, 0), FEXMAC_OK, "registering the first page only");
+  fexmac_thread* Thread = CreateThreadAt(Context, Base, 0);
+  fexmac_stop Stop = Run(Thread);
+  Check(Stop.reason == FEXMAC_STOP_GUEST_FAULT && Stop.instruction_address == Base + 0x4000,
+        "running into unregistered memory stops with a guest fault there (reason %d at 0x%" PRIx64 ")", Stop.reason, Stop.instruction_address);
+
+  CheckResult(fexmac_add_code_range(Context, Base + 0x4000, 0x4000, 0), FEXMAC_OK, "registering the second page");
+  fexmac_x86_state State = GetState(Thread);
+  State.rip = Base;
+  SetState(Thread, &State);
+  Stop = Run(Thread);
+  State = GetState(Thread);
+  Check(Stop.reason == FEXMAC_STOP_HALT && State.gpr[RAX] == 2, "with both pages registered the program runs to its hlt");
+
+  CheckResult(fexmac_remove_code_range(Context, Base + 0x4000, 0x4000), FEXMAC_OK, "removing the second page");
+  State.rip = Base;
+  SetState(Thread, &State);
+  Stop = Run(Thread);
+  Check(Stop.reason == FEXMAC_STOP_GUEST_FAULT, "after removing it (and its translations) it faults again");
+  fexmac_thread_destroy(Thread);
+  fexmac_context_destroy(Context);
+}
+
 /* ---- driver ---- */
 
 #define GUEST_FAULT_TEXT "guest memory access fault in translated code at address 0x"
@@ -1309,6 +1536,13 @@ static const struct Subtest Subtests[] = {
   {"unclaimed-fault-dies", TestUnclaimedFaultDies, SIGBUS, NULL, "fexmac:", 1},
   {"invalidate-concurrent", TestConcurrentInvalidation, 0, NULL, NULL, 0},
   {"lifetime-races", TestLifetimeRaces, 0, NULL, NULL, 0},
+  {"cache-off", TestCacheOff, 0, NULL, NULL, 0},
+  {"cache-cold-warm", TestCacheColdWarm, 0, NULL, NULL, 0},
+  {"cache-cross-process", TestCacheCrossProcess, 0, NULL, NULL, 0},
+  {"cache-untrusted", TestCacheUntrusted, 0, NULL, NULL, 0},
+  {"cache-options", TestCacheOptions, 0, NULL, NULL, 0},
+  {"cache-fork", TestCacheFork, 0, NULL, NULL, 0},
+  {"code-ranges", TestCodeRanges, 0, NULL, NULL, 0},
 };
 
 int main(int argc, char** argv) {

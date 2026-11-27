@@ -304,23 +304,17 @@ Inside: `<machine bucket>/RWCacheDB_<process bucket>.foz` and `..._idx.foz`.
 
 ## The embedder's side
 
-The core does the work; an embedder only switches it on and flushes:
-
-- Configuration: `DiskCache=1` (`FEX_DISKCACHE=1`) and `DiskCachePath`
-  (`FEX_DISKCACHEPATH=<dir>`), set before the context is created. `DiskCacheValidation`
-  compiles as well and compares, for diagnosis.
-- `Context::FlushDiskCache()` before the process exits.
-- `Context::GetTranslationCounters()`: blocks compiled, blocks loaded, entries rejected,
-  entries queued.
-- `QueryGuestExecutableRange` must report the real mapped range of guest code.
-- The core's writer thread needs a thread implementation; on macOS the core now has a
-  plain pthread default (signals blocked, `QOS_CLASS_UTILITY` for low priority), so an
-  embedder need not install one.
-- Around `fork`: `Context::LockBeforeFork(nullptr)` before, `UnlockAfterFork(nullptr,
-  Child)` after, in parent and child.
-
-For the C interface (package C) this means: a cache directory and an on/off switch in
-`fexmac_config`, `fexmac_context_flush_cache()`, and a counters query.
+Through `fexmac` (`docs/macOS-embedding-interface.md`, "Cached translations and guest
+code ranges"): `fexmac_config.code_cache_enabled` and `code_cache_directory` switch the
+cache on (the core's `DISKCACHE`/`DISKCACHEPATH` options stay refused);
+`fexmac_add_code_range` registers the guest's code so that the cache hashes and patches
+only mapped bytes; `fexmac_context_flush_cache` before exiting;
+`fexmac_context_get_counters` for the counters and the cache state (a refused directory
+shows as `FEXMAC_CACHE_REFUSED`, not as an error); `fexmac_before_fork` /
+`fexmac_after_fork` around `fork()`. Under it, the core's `Context::FlushDiskCache`,
+`GetTranslationCounters`, `LockBeforeFork`/`UnlockAfterFork` and the syscall handler's
+`QueryGuestExecutableRange`. The core's writer thread uses the core's default pthread
+implementation on macOS.
 
 ## Measured
 

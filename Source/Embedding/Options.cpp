@@ -4,9 +4,8 @@
 //
 // Only options on the list below are accepted. The core has well over a hundred options;
 // many belong to FEX's Linux front end, which macOS does not build, and some stop the
-// process when set without it (DISKCACHE aborts in context creation because nothing set
-// up thread creation for it), so an option is listed only once its effect on this port is
-// known. Each listed option has its own value rule; the core's own loaders never reject a
+// process when set without it, so an option is listed only once its effect on this port
+// is known. The code cache is switched on through fexmac_config, not DISKCACHE. Each listed option has its own value rule; the core's own loaders never reject a
 // value (a number that does not parse becomes 0), so nothing is left to them.
 //
 // To add an option: put it in SupportedOptions with the narrowest rule that fits, and
@@ -26,6 +25,7 @@ namespace {
   enum class Rule {
     Bool,       // 0 or 1
     Positive32, // 1 to 2^31-1
+    Positive64, // 1 to 2^63-1
     SMCChecks,  // none, mtrack, full (or 0, 1, 2)
     HostFeatures,
     OnlyOne, // "1": IS64BIT_MODE, which may only confirm 64-bit mode
@@ -60,6 +60,11 @@ namespace {
     // RDRAND and RDSEED from the host's random generator (arc4random_buf on macOS) when the
     // CPU has no FEAT_RNG, as no Apple chip so far does; the guest CPUID then offers them.
     OPTION(SOFTWARERNG, SoftwareRNG, Bool),
+    // The code cache (switched on with fexmac_config's code_cache_* fields, never with
+    // DISKCACHE or DISKCACHEPATH): the size limit per cache file, and validation, which
+    // compiles each cached block as well and logs differences.
+    OPTION(DISKCACHEMAXFILESIZE, DiskCacheMaxFileSize, Positive64),
+    OPTION(DISKCACHEVALIDATION, DiskCacheValidation, Bool),
     // Diagnostics.
     OPTION(SILENTLOG, SilentLog, Bool),
     OPTION(DUMPGPRS, DumpGPRs, Bool),
@@ -121,6 +126,13 @@ namespace {
     case Rule::Positive32: {
       const auto Number = ParseUnsigned(Value);
       if (!Number || *Number < 1 || *Number > static_cast<uint64_t>(std::numeric_limits<int32_t>::max())) {
+        return std::nullopt;
+      }
+      return fextl::fmt::format("{}", *Number);
+    }
+    case Rule::Positive64: {
+      const auto Number = ParseUnsigned(Value);
+      if (!Number || *Number < 1 || *Number > static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
         return std::nullopt;
       }
       return fextl::fmt::format("{}", *Number);

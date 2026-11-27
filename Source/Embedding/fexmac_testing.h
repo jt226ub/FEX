@@ -35,6 +35,17 @@ FEXMAC_EXPORT void fexmac_testing_guard_pages(fexmac_thread* thread, uint64_t* c
 /* Logs a core message at info level, outside any fault handler. */
 FEXMAC_EXPORT void fexmac_testing_log(const char* message);
 
+/* Code generation state that the configuration does not carry, for the code cache tests:
+ * a thunk trampoline (a custom IR handler) at `entry` jumping to `target`; the host
+ * claiming hardware x86 memory ordering; instructions forced to TSO. */
+FEXMAC_EXPORT fexmac_result fexmac_testing_add_thunk_trampoline(fexmac_context* context, uint64_t entry, uint64_t target);
+FEXMAC_EXPORT fexmac_result fexmac_testing_set_hardware_tso(fexmac_context* context, int supported);
+FEXMAC_EXPORT fexmac_result fexmac_testing_force_tso(fexmac_context* context, uint64_t begin, uint64_t end, uint64_t instruction);
+
+/* Called (NULL to stop) where the core reports guest code it starts executing, which is
+ * after a block is compiled and before it is stored in the code cache. */
+FEXMAC_EXPORT void fexmac_testing_set_mark_executable_hook(void (*hook)(uint64_t start, uint64_t length, void* user_data), void* user_data);
+
 #ifdef __cplusplus
 }
 #endif

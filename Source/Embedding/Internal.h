@@ -16,8 +16,10 @@
 #include <FEXCore/fextl/string.h>
 #include <FEXCore/fextl/vector.h>
 
+#include <map>
 #include <mutex>
 #include <optional>
+#include <shared_mutex>
 #include <utility>
 
 namespace fexmac {
@@ -35,16 +37,19 @@ public:
   void HandleSyscall(FEXCore::Core::CpuStateFrame* Frame) override;
   void InvalidateGuestCodeRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Start, uint64_t Length) override;
 
-  // EXTENSION POINT (packages D and F): every guest address is treated as executable
-  // and writable code. Once the embedder can register its mapped guest ranges (see the
-  // planned functions in fexmac.h), this reports the real range and its writability;
-  // page-protection self-modifying-code detection (D) and cached-code keying (F) need it.
-  // MarkGuestExecutableRange is where the core reports ranges it starts executing.
-  FEXCore::HLE::ExecutableRangeInfo QueryGuestExecutableRange(FEXCore::Core::InternalThreadState*, uint64_t) override {
-    return {0, UINT64_MAX, true};
-  }
+  // The registered code range holding the address (fexmac_add_code_range), or, with no
+  // range registered, all of memory as executable and writable code. The decoder stops at
+  // a range's end and the disk cache hashes and patches guest bytes inside it only.
+  // EXTENSION POINT (package D): page-protection self-modifying-code detection uses the
+  // writability; MarkGuestExecutableRange is where the core reports ranges it starts
+  // executing.
+  FEXCore::HLE::ExecutableRangeInfo QueryGuestExecutableRange(FEXCore::Core::InternalThreadState*, uint64_t Address) override;
+#ifdef FEXMAC_TESTING
+  void MarkGuestExecutableRange(FEXCore::Core::InternalThreadState*, uint64_t Start, uint64_t Length) override;
+#endif
 
-  // Package F (cached code loading) answers this from the embedder's file mappings.
+  // File-backed cache keys (by file and offset) would come from the embedder's file
+  // mappings; fexmac has none, so the cache keys guest code by its bytes.
   std::optional<FEXCore::ExecutableFileSectionInfo> LookupExecutableFileSection(FEXCore::Core::InternalThreadState*, uint64_t) override {
     return std::nullopt;
   }
@@ -95,6 +100,18 @@ struct fexmac_context {
   // lock may be held when taking this one, never the other way round.
   std::mutex ThreadsMutex;
   fextl::vector<fexmac_thread*> Threads;
+
+  // Registered guest code ranges, begin -> (end, writable), not overlapping. Read by the
+  // core while it compiles, so a shared lock.
+  struct CodeRange {
+    uint64_t End;
+    bool Writable;
+  };
+  std::shared_mutex RangesMutex;
+  std::map<uint64_t, CodeRange> CodeRanges;
+
+  // Whether the embedder asked for the code cache.
+  bool CacheRequested {};
 };
 
 struct fexmac_thread {

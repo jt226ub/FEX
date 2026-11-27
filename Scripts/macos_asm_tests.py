@@ -577,7 +577,9 @@ def report_cache(cold, warm, modes, tests, cache_dir, cold_seconds, warm_seconds
                 if validated:
                     if wc["mismatches"]:
                         mismatched.append((name, wc["mismatches"]))
-                elif wc["compiled"]:
+                elif wc["compiled"] and cold_status == "pass":
+                    # A test that stops at code the translator cannot translate (an
+                    # expected failure) compiles that block every time: it cannot be cached.
                     compiled.append((name, wc["compiled"], wc["loaded"], cc.get("log", []) + wc.get("log", [])))
             print("   %s: cold compiled %d blocks; warm compiled %d, loaded %d; results changed %d; warm runs that compiled %d; "
                   "rejected entries in %d; not finished %d" % (mode, total_cold, total_compiled, total_loaded, len(changed), len(compiled),

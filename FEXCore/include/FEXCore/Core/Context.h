@@ -63,6 +63,10 @@ struct TranslationCounters {
   uint64_t CacheEntriesRejected;
   // Compiled blocks handed to the cache writer to be saved.
   uint64_t CacheEntriesQueued;
+  // Whether the disk cache is being read and written by this context (it may be off,
+  // refused, or read-only in a forked child).
+  bool CacheReading;
+  bool CacheWriting;
 };
 
 class Context {

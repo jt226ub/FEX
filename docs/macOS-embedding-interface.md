@@ -53,6 +53,13 @@ fexmac_result fexmac_thread_run(fexmac_thread*, fexmac_stop*);
 
 fexmac_result fexmac_install_fault_handlers(void);
 int           fexmac_handle_fault(int signal, siginfo_t*, void* ucontext);
+
+fexmac_result fexmac_add_code_range(fexmac_context*, uint64_t address, uint64_t size, int writable);
+fexmac_result fexmac_remove_code_range(fexmac_context*, uint64_t address, uint64_t size);
+fexmac_result fexmac_context_get_counters(fexmac_context*, fexmac_translation_counters*);
+fexmac_result fexmac_context_flush_cache(fexmac_context*);
+fexmac_result fexmac_before_fork(fexmac_context*);
+fexmac_result fexmac_after_fork(fexmac_context*, int child);
 ```
 
 The header documents every function. The design decisions:
@@ -126,7 +133,7 @@ The header documents every function. The design decisions:
 
 ## Options
 
-Only these 15 options are accepted; any other name, and any value that does not fit the
+Only these 17 options are accepted; any other name, and any value that does not fit the
 option's rule, gives `FEXMAC_ERROR_BAD_CONFIG`. Names are the core's environment-variable
 name without `FEX_`, or its configuration-file name. Numbers are decimal or `0x`
 hexadecimal; a leading 0 is refused rather than read as octal.
@@ -140,12 +147,13 @@ hexadecimal; a leading 0 is refused rather than read as octal.
 | `X87REDUCEDPRECISION`, `HIDEHYPERVISORBIT` | 0, 1 | |
 | `HOSTFEATURES` | `off`, or comma-separated `disable*` names the core knows | `enable*` names are refused: they force a feature on whether the host has it or not (`enablesve` dies with SIGILL on an M4) |
 | `SOFTWARERNG` | 0, 1 | RDRAND and RDSEED from `arc4random_buf`; no Apple chip so far has FEAT_RNG, so without it the guest CPUID offers neither |
+| `DISKCACHEMAXFILESIZE` | 1 to 2^63-1 | size limit of each code cache file (default 1GB); only with the cache on |
+| `DISKCACHEVALIDATION` | 0, 1 | compiles each cached block as well and logs differences; diagnosis only |
 | `SILENTLOG`, `DUMPGPRS`, `DISABLETELEMETRY` | 0, 1 | `DISABLETELEMETRY` defaults to 1 |
 | `IS64BIT_MODE` | 1 | 32-bit guests cannot have the memory they need on macOS |
 
-Everything else is refused on purpose, for example `DISKCACHE` (context creation aborts
-without FEX's Linux front end; package F brings cached translations through the
-reserved `code_cache_*` config fields), `STRICTINPROCESSSPLITLOCKS` (makes the fault
+Everything else is refused on purpose, for example `DISKCACHE` and `DISKCACHEPATH` (the
+code cache is switched on with the `code_cache_*` config fields, below), `STRICTINPROCESSSPLITLOCKS` (makes the fault
 handler spin on a lock), `GDBSERVER`, `SINGLESTEP`, `JITFEATURES`. To add one, give it
 the narrowest rule in `Options.cpp` and list it here.
 
@@ -304,18 +312,41 @@ pages protected for self-modifying-code detection, and guest memory faults (clas
 "access" with the PC in translated code) with reconstructed guest state, reported as a
 new stop reason.
 
-## Extension points for cached translations (package F)
+## Cached translations and guest code ranges
 
-Reserved now, implemented when package F's core work lands on `macos/v1`:
+The on-disk code cache (design, keys, checks and trust model:
+`docs/macOS-code-cache-design.md`):
 
-- `fexmac_config.code_cache_directory` and `code_cache_enabled`: must be NULL and 0
-  today; anything else gives `FEXMAC_ERROR_UNSUPPORTED`. The core's `DISKCACHE` and
-  `DISKCACHEPATH` options stay refused.
-- Planned functions, named in the header but not declared until they exist: a cache
-  flush for a context, a query for translation counters (compiled, loaded, rejected),
-  and a way for the embedder to register its mapped guest ranges so that the core's
-  `QueryGuestExecutableRange` reports them (today every address is reported as
-  executable and writable; see `Internal.h`). Package D needs the last one too.
+- **Switching it on:** `fexmac_config.code_cache_enabled = 1`, and
+  `code_cache_directory` the directory (NULL: `~/Library/Caches/fex-emu/DiskCache`).
+  `code_cache_enabled` other than 0 or 1, a directory with the cache off, or an empty
+  name give `FEXMAC_ERROR_BAD_CONFIG`. The core's `DISKCACHE` and `DISKCACHEPATH`
+  options stay refused: the fields are the interface.
+- **Refusal is not an error:** a directory (or its cache files) not private to the user,
+  with an ACL entry granting write, or reached through a symbolic link, leaves the
+  context without a cache; it is still created and runs. `fexmac_context_get_counters`
+  then reports `FEXMAC_CACHE_REFUSED`, and the reason is logged.
+- **Counters:** `fexmac_context_get_counters` fills `fexmac_translation_counters`
+  (versioned by `struct_size`): the cache state (`OFF`, `ACTIVE`, `READ_ONLY`, `REFUSED`),
+  blocks compiled, blocks loaded from the cache, entries rejected, entries queued.
+- **Flush:** `fexmac_context_flush_cache` waits for the cache writer and syncs the files
+  (`F_FULLFSYNC`). Call it before exiting; `FEXMAC_ERROR_UNSUPPORTED` if the context does
+  not write a cache.
+- **Guest code ranges:** `fexmac_add_code_range` / `fexmac_remove_code_range` tell the
+  library which memory holds guest code (and whether the guest can write it). With any
+  range registered, the core's `QueryGuestExecutableRange` reports only registered
+  ranges: decoding stops at their ends, executing outside them stops with a guest fault,
+  and the code cache hashes and patches guest bytes inside them only. With none, every
+  address counts (the behaviour before). Register the guest's code when the cache is on.
+  Package D will use the writability for page-protection self-modifying-code detection.
+- **fork:** `fexmac_before_fork` / `fexmac_after_fork` around `fork()`. They hold the
+  library's and the core's locks (the cache's included) across it; the child loads from
+  the cache but does not write it (state `READ_ONLY`), and must not run threads created
+  before the fork.
+- **Not cached, by design:** code at or reaching an address with a custom IR handler
+  (thunk trampolines), code overlapping instructions forced to TSO, and blocks the
+  translator cannot translate (they stop with `FEXMAC_STOP_UNSUPPORTED_INSTRUCTION` every
+  time). The test-only hooks (`fexmac_testing.h`) set these up for `FEXCoreCacheTest`.
 
 ## The library and how to link it
 
@@ -324,7 +355,7 @@ Reserved now, implemented when package F's core work lands on `macos/v1`:
 | `fexmac` | static library | targets in this build; CMake adds the core and its libraries |
 | `fexmac_bundle` → `build/Lib/libfexmac_bundle.a` | one prelinked object in an archive | projects outside this build: `clang ... libfexmac_bundle.a -lc++` |
 | `fexmac_shared` → `libfexmac.dylib` | dylib exporting only `fexmac_*` | an embedder that signs it and itself with one Team ID |
-| `fexmac_testing` | static library with the test hooks | `fexmac_hook_test` only |
+| `fexmac_testing` | static library with the test hooks | `fexmac_hook_test` and `FEXCoreCacheTest` only |
 
 The standalone archive is made with `ld -r` (Apple's single-object prelink) from the
 library and every archive the core needs, with an exported-symbols list, so only the
@@ -351,7 +382,7 @@ alarm kills it.
 | `syscall-prefix` | `48 0F 05` resumes at the next instruction |
 | `syscall-restart` | `RESTART` runs the call again with the state the callback set |
 | `state` | defaults, lossless round trip, registers, flags, XMM and `ds` set from the host and read by the guest, `ud2` and `int3` as guest faults, CPUID |
-| `abi` | sizes 0, smaller, larger and garbage are refused for state, stop records and config, with nothing written inside or past the structure (the reviewer's `garb.c`); the reserved cache fields; version 2.0 |
+| `abi` | sizes 0, smaller, larger and garbage are refused for state, stop records, config and translation counters, with nothing written inside or past the structure (the reviewer's `garb.c`); bad cache fields and a set reserved field; version 2.0 |
 | `invalidate` | changed code runs after `fexmac_invalidate` |
 | `faults-installed`, `faults-chained`, `faults-hosted` | misaligned `lock xadd` across 16 bytes in each handler arrangement; the host's own fault still reaches the host |
 | `callret-recursion`, `callret-deep-recursion`, `callret-overflow`, `callret-underflow` | recursion 100,000 deep; 1,000,000 deep counting every return (`rec.c`); 200,000 calls never returned; 200,000 returns never called |
@@ -369,6 +400,13 @@ alarm kills it.
 | `unclaimed-fault-dies` | a host fault outside guest code dies silently with SIGBUS |
 | `invalidate-concurrent` | 8 guest threads invalidating in every one of 20,000 system calls each while the main thread invalidates in a loop, at least 12 runs; a progress watchdog fails it within 5 seconds of a hang. It hung in each of 3 runs before package E's reader-writer lock fix and passed 6 of 6 after it |
 | `lifetime-races` | runs racing with destroys of the same thread; context destroy racing with CPUID, invalidation and thread creation |
+| `cache-off` | without the cache: state `OFF`, blocks compiled, nothing loaded or queued, flush `UNSUPPORTED` |
+| `cache-cold-warm` | a cold run queues and flushes; a second context in the same process loads everything and compiles nothing (code at a different address) |
+| `cache-cross-process` | a child process fills the cache; the parent then loads everything and compiles nothing |
+| `cache-untrusted` | a directory writable by others: the context runs with state `REFUSED`, nothing loaded or queued, flush `UNSUPPORTED`, the directory untouched |
+| `cache-options` | `DISKCACHE` and `DISKCACHEPATH` refused; `DISKCACHEMAXFILESIZE` and `DISKCACHEVALIDATION` accepted with their rules |
+| `cache-fork` | `fexmac_before_fork` / `fexmac_after_fork`: a second `before` is `BUSY`; the child runs guest code with state `READ_ONLY` and flush refused; the parent carries on and flushes |
+| `code-ranges` | empty and wrapping ranges refused; jumping to an unregistered page stops with a guest fault there; registering it lets the program finish; removing it again (with its translations) faults again |
 
 `fexmac_hook_test` (linked against `fexmac_testing`, whose hooks also report a thread's
 guard-page addresses):
@@ -388,7 +426,10 @@ running, faults and invalidation; it still uses the core's C++ headers for harne
 only: `HarnessHelpers.h` (test files, register comparison on `CPUState`), the host
 feature checks (`Common/HostFeatures.h`, `Common/X86Features.h`, the latter fed by
 `fexmac_cpuid`), and `fextl::fmt` for its output. It forwards `FEX_*` environment
-variables for supported options only.
+variables for supported options only. With `FEX_DISKCACHE=1` it switches the code cache on through the
+`code_cache_*` fields (directory from `FEX_DISKCACHEPATH`), registers every page it
+mapped as a code range, flushes before exiting and prints the translation counters.
+`FEXCoreCacheTest` uses `fexmac.h` and the test hooks of `fexmac_testing.h` only.
 
 ## Constraints specific to macOS on Apple silicon
 
@@ -415,7 +456,6 @@ variables for supported options only.
   previously installed handler and that handler returns without resolving the fault: the
   library's handler returns too and the instruction faults again, forever. It should end
   in death by the original signal. The test runner avoids it by owning the signals (way 2).
-- Cached translations (package F; reserved fields above).
 - Several contexts in one process (the core's configuration is process-wide).
 - `FEXCoreOrderingTest` (package E) still uses the superseded `CoreThreadSetup.h` and
   `MacOSHostFaults.h` rather than `fexmac.h`; `MacOSHostFaults.h` now uses the same
