@@ -16,7 +16,6 @@
 #include <FEXCore/fextl/string.h>
 #include <FEXCore/fextl/vector.h>
 
-#include <atomic>
 #include <mutex>
 #include <optional>
 #include <utility>
@@ -63,6 +62,13 @@ fextl::unique_ptr<FEXCore::Config::Layer> CreateOptionsLayer(ParsedOptions Optio
 fexmac_thread* GetCurrentThread();
 void SetCurrentThread(fexmac_thread* Thread);
 
+// True while this host thread is inside the library's fault handling (fexmac_handle_fault
+// or the library's own signal handler). Logging is diverted to write(2) then.
+bool InFaultHandling();
+
+// Writes a message to standard error with write(2) only. Async-signal-safe.
+void WriteRaw(const char* Message);
+
 } // namespace fexmac
 
 struct fexmac_context {
@@ -78,8 +84,13 @@ struct fexmac_context {
   static constexpr size_t DescriptorCount = 8192;
   FEXCore::Core::CPUState::gdt_segment* Descriptors {};
 
-  // Live threads. Held while creating or destroying a thread and while invalidating, so
-  // invalidation reaches every thread exactly once.
+  // Calls in progress that use the context without holding the registry lock (thread
+  // creation, CPUID, invalidation). Guarded by the registry lock; the context cannot be
+  // destroyed while it is non-zero.
+  uint32_t ActiveCalls {};
+
+  // Live threads, in the order the core needs for invalidation. Lock order: the registry
+  // lock may be held when taking this one, never the other way round.
   std::mutex ThreadsMutex;
   fextl::vector<fexmac_thread*> Threads;
 };
@@ -89,11 +100,14 @@ struct fexmac_thread {
   FEXCore::Core::InternalThreadState* Thread {};
   void* CallRetAllocation {};
   size_t CallRetAllocationSize {};
+  // Where the call/return stack pointer starts, and is reset to after an overflow or
+  // underflow into a guard page.
+  uint64_t CallRetDefault {};
   void* UserData {};
 
-  // Set while a host thread is inside fexmac_thread_run for this thread.
-  std::atomic<bool> Running {};
-  // Set while the system call callback runs; state access is allowed then.
+  // Both guarded by the registry lock. Running: a host thread is inside
+  // fexmac_thread_run for this thread. InCallback: its system call callback runs.
+  bool Running {};
   bool InCallback {};
 
   // Written just before leaving the dispatcher.

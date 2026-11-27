@@ -1,86 +1,27 @@
 /* SPDX-License-Identifier: MIT */
 /*
- * Tests of the fexmac C interface, written in C against the public header only (plus
- * the library's test hook for the fault-inside-handler case), and linked the way an
- * outside project links the library.
+ * Tests of the fexmac C interface, written in C against the public header only, and
+ * linked the way an outside project links the library (the standalone archive).
  *
  * Each subtest runs in its own child process, because contexts and signal handlers are
- * process-wide and two subtests check what happens when the process dies. A child that
- * hangs is killed by an alarm and reported as hung.
+ * process-wide and several subtests check how the process dies. A child that hangs is
+ * killed by an alarm and reported as hung. See TestSupport.c.
  *
  * Usage: fexmac_c_test            run every subtest
  *        fexmac_c_test <name>     run one subtest in this process
  */
-#include "fexmac.h"
-#include "fexmac_testing.h"
+#include "TestSupport.h"
 
 #include <inttypes.h>
+#include <pthread.h>
 #include <signal.h>
-#include <stdarg.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
-#include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
-
-static int Failures;
-
-static void Check(int Condition, const char* Format, ...) {
-  va_list Args;
-  va_start(Args, Format);
-  printf("  %s: ", Condition ? "ok  " : "FAIL");
-  vprintf(Format, Args);
-  printf("\n");
-  va_end(Args);
-  fflush(stdout);
-  if (!Condition) {
-    ++Failures;
-  }
-}
-
-static void CheckResult(fexmac_result Got, fexmac_result Expected, const char* What) {
-  Check(Got == Expected, "%s returns %s (got %s)", What, fexmac_result_string(Expected), fexmac_result_string(Got));
-}
-
-static uint8_t* MapGuestMemory(size_t Size) {
-  void* Memory = mmap(NULL, Size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-  if (Memory == MAP_FAILED) {
-    fprintf(stderr, "could not map guest memory\n");
-    exit(2);
-  }
-  return (uint8_t*)Memory;
-}
-
-static fexmac_context* CreateContext(fexmac_syscall_fn Syscall, void* UserData) {
-  fexmac_config Config;
-  fexmac_config_init(&Config);
-  Config.syscall = Syscall;
-  Config.syscall_user_data = UserData;
-  fexmac_context* Context = NULL;
-  const fexmac_result Result = fexmac_context_create(&Config, &Context);
-  if (Result != FEXMAC_OK) {
-    fprintf(stderr, "fexmac_context_create: %s\n", fexmac_result_string(Result));
-    exit(2);
-  }
-  return Context;
-}
-
-static fexmac_thread* CreateThreadAt(fexmac_context* Context, uint64_t RIP, uint64_t RSP) {
-  fexmac_thread* Thread = NULL;
-  if (fexmac_thread_create(Context, &Thread) != FEXMAC_OK) {
-    fprintf(stderr, "fexmac_thread_create failed\n");
-    exit(2);
-  }
-  fexmac_x86_state State;
-  fexmac_thread_get_state(Thread, &State);
-  State.rip = RIP;
-  State.gpr[4] = RSP;
-  fexmac_thread_set_state(Thread, &State);
-  return Thread;
-}
-
-enum { RAX = 0, RCX = 1, RDX = 2, RBX = 3, RSP = 4, RSI = 6, RDI = 7 };
 
 /* ---- run: system calls handled in the callback and stopping, then a halt ---- */
 
@@ -108,31 +49,20 @@ struct SyscallRecord {
   int Problems;
   fexmac_result RunFromCallback;
   fexmac_result DestroyFromCallback;
-  fexmac_result CreateFromCallback;
 };
 
 static fexmac_syscall_action RunSyscall(fexmac_thread* Thread, void* UserData) {
   struct SyscallRecord* Record = (struct SyscallRecord*)UserData;
-  fexmac_x86_state State;
-  if (fexmac_thread_get_state(Thread, &State) != FEXMAC_OK) {
-    ++Record->Problems;
-    return FEXMAC_SYSCALL_STOP;
-  }
+  fexmac_x86_state State = GetState(Thread);
   ++Record->Calls;
   if (State.gpr[RAX] == 39) {
-    if (State.gpr[RDI] != 5050 || State.gpr[RCX] != Record->CodeBase + 22) {
+    if (State.gpr[RDI] != 5050 || State.gpr[RCX] != Record->CodeBase + 22 || State.rip != Record->CodeBase + 22) {
       ++Record->Problems;
     }
-    /* Calls the callback must not make. */
     Record->RunFromCallback = fexmac_thread_run(Thread, NULL);
     Record->DestroyFromCallback = fexmac_thread_destroy(Thread);
-    fexmac_thread* Other = NULL;
-    Record->CreateFromCallback = fexmac_thread_create(fexmac_thread_context(Thread), &Other);
-
     State.gpr[RAX] = 1234;
-    if (fexmac_thread_set_state(Thread, &State) != FEXMAC_OK) {
-      ++Record->Problems;
-    }
+    SetState(Thread, &State);
     return FEXMAC_SYSCALL_RESUME;
   }
   return FEXMAC_SYSCALL_STOP;
@@ -151,11 +81,10 @@ static void TestRun(void) {
   Check(fexmac_thread_get_user_data(Thread) == &Record, "user data round trip");
   Check(fexmac_thread_context(Thread) == Context, "thread knows its context");
 
-  fexmac_stop Stop;
-  CheckResult(fexmac_thread_run(Thread, &Stop), FEXMAC_OK, "first run");
-  fexmac_x86_state State;
-  fexmac_thread_get_state(Thread, &State);
+  fexmac_stop Stop = Run(Thread);
+  fexmac_x86_state State = GetState(Thread);
   Check(Stop.reason == FEXMAC_STOP_SYSCALL, "first run stops at a system call (reason %d)", Stop.reason);
+  Check(Stop.instruction_address == Record.CodeBase + 29, "stop names the system call instruction");
   Check(Record.Calls == 2 && Record.Problems == 0, "callback saw both system calls with the right registers (%d calls, %d problems)",
         Record.Calls, Record.Problems);
   Check(State.gpr[RBX] == 1234, "value the callback returned in rax reached the guest (rbx = %" PRIu64 ")", State.gpr[RBX]);
@@ -163,15 +92,88 @@ static void TestRun(void) {
   Check(State.rip == Record.CodeBase + 31, "rip is after the stopping system call");
   CheckResult(Record.RunFromCallback, FEXMAC_ERROR_BUSY, "running the thread from its own callback");
   CheckResult(Record.DestroyFromCallback, FEXMAC_ERROR_BUSY, "destroying the thread from its own callback");
-  CheckResult(Record.CreateFromCallback, FEXMAC_ERROR_BUSY, "creating a thread from a callback");
 
-  CheckResult(fexmac_thread_run(Thread, &Stop), FEXMAC_OK, "second run");
-  fexmac_thread_get_state(Thread, &State);
+  Stop = Run(Thread);
+  State = GetState(Thread);
   Check(Stop.reason == FEXMAC_STOP_HALT, "second run stops at hlt (reason %d)", Stop.reason);
-  Check(State.gpr[RDX] == 0x77 && State.rip == Record.CodeBase + 36, "guest continued after the stop and rip is at hlt");
+  Check(State.gpr[RDX] == 0x77 && State.rip == Record.CodeBase + 36 && Stop.instruction_address == Record.CodeBase + 36,
+        "guest continued after the stop and rip is at hlt");
 
   CheckResult(fexmac_thread_destroy(Thread), FEXMAC_OK, "thread destroy");
   CheckResult(fexmac_context_destroy(Context), FEXMAC_OK, "context destroy");
+}
+
+/* ---- system calls with prefixes, and restarting a system call ---- */
+
+static int PrefixCalls;
+static uint64_t PrefixRip, PrefixRcx;
+
+static fexmac_syscall_action PrefixSyscall(fexmac_thread* Thread, void* UserData) {
+  (void)UserData;
+  fexmac_x86_state State = GetState(Thread);
+  ++PrefixCalls;
+  PrefixRip = State.rip;
+  PrefixRcx = State.gpr[RCX];
+  State.gpr[RAX] = 0;
+  SetState(Thread, &State);
+  return FEXMAC_SYSCALL_RESUME;
+}
+
+static void TestSyscallPrefix(void) {
+  /* mov eax,60 ; rex.w syscall (48 0F 05) ; mov edx,0x77 ; hlt */
+  const uint8_t Program[] = {0xB8, 0x3C, 0, 0, 0, 0x48, 0x0F, 0x05, 0xBA, 0x77, 0, 0, 0, 0xF4};
+  uint8_t* Code = MapGuestMemory(0x10000);
+  memcpy(Code, Program, sizeof(Program));
+  const uint64_t Base = (uint64_t)(uintptr_t)Code;
+  fexmac_context* Context = CreateContext(PrefixSyscall, NULL);
+  fexmac_thread* Thread = CreateThreadAt(Context, Base, 0);
+  const fexmac_stop Stop = Run(Thread);
+  const fexmac_x86_state State = GetState(Thread);
+  Check(PrefixCalls == 1 && PrefixRip == Base + 8 && PrefixRcx == Base + 8, "callback sees rip after the 3-byte instruction (rip +%" PRIu64 ")",
+        PrefixRip - Base);
+  Check(Stop.reason == FEXMAC_STOP_HALT && State.gpr[RDX] == 0x77 && State.rip == Base + 13, "guest resumed at the next instruction");
+  fexmac_thread_destroy(Thread);
+  fexmac_context_destroy(Context);
+}
+
+static int RestartCalls;
+static uint64_t RestartRax[3];
+
+static fexmac_syscall_action RestartSyscall(fexmac_thread* Thread, void* UserData) {
+  (void)UserData;
+  fexmac_x86_state State = GetState(Thread);
+  if (RestartCalls < 3) {
+    RestartRax[RestartCalls] = State.gpr[RAX];
+  }
+  ++RestartCalls;
+  if (RestartCalls == 1) {
+    /* As a kernel restarting an interrupted call: the same call, run again. */
+    State.gpr[RAX] = 39;
+    SetState(Thread, &State);
+    return FEXMAC_SYSCALL_RESTART;
+  }
+  State.gpr[RAX] = 5;
+  SetState(Thread, &State);
+  return FEXMAC_SYSCALL_RESUME;
+}
+
+static void TestSyscallRestart(void) {
+  /* mov eax,7 ; syscall ; mov ebx,eax ; hlt */
+  const uint8_t Program[] = {0xB8, 0x07, 0, 0, 0, 0x0F, 0x05, 0x89, 0xC3, 0xF4};
+  uint8_t* Code = MapGuestMemory(0x10000);
+  memcpy(Code, Program, sizeof(Program));
+  const uint64_t Base = (uint64_t)(uintptr_t)Code;
+  fexmac_context* Context = CreateContext(RestartSyscall, NULL);
+  fexmac_thread* Thread = CreateThreadAt(Context, Base, 0);
+  const fexmac_stop Stop = Run(Thread);
+  const fexmac_x86_state State = GetState(Thread);
+  Check(RestartCalls == 2, "restarted system call ran twice (%d calls)", RestartCalls);
+  Check(RestartRax[0] == 7 && RestartRax[1] == 39, "the restart used the state the callback set (rax %" PRIu64 " then %" PRIu64 ")",
+        RestartRax[0], RestartRax[1]);
+  Check(Stop.reason == FEXMAC_STOP_HALT && State.gpr[RBX] == 5, "after the second call the guest continued (rbx = %" PRIu64 ")",
+        State.gpr[RBX]);
+  fexmac_thread_destroy(Thread);
+  fexmac_context_destroy(Context);
 }
 
 /* ---- state: set registers, guest reads them; get/set round trip; guest faults ---- */
@@ -181,9 +183,10 @@ static const uint8_t StateProgram[] = {
   0x66, 0x48, 0x0F, 0x7E, 0xD8, /* 0: movq rax, xmm3 */
   0x0F, 0x92, 0xC1,             /* 5: setc cl */
   0x48, 0x89, 0xF2,             /* 8: mov rdx, rsi */
-  0xF4,                         /* 11: hlt */
-  0x0F, 0x0B,                   /* 12: ud2 */
-  0xCC,                         /* 14: int3 */
+  0x8C, 0xDF,                   /* 11: mov edi, ds */
+  0xF4,                         /* 13: hlt */
+  0x0F, 0x0B,                   /* 14: ud2 */
+  0xCC,                         /* 16: int3 */
 };
 /* clang-format on */
 
@@ -195,37 +198,41 @@ static void TestState(void) {
   fexmac_context* Context = CreateContext(NULL, NULL);
   fexmac_thread* Thread = CreateThreadAt(Context, Base, 0);
 
-  fexmac_x86_state First, Second;
-  fexmac_thread_get_state(Thread, &First);
+  fexmac_x86_state First = GetState(Thread);
   Check(First.rflags == 0x202, "initial rflags is 0x202 (got 0x%" PRIx64 ")", First.rflags);
-  Check(First.mxcsr == 0x1F80 && First.fcw == 0x37F, "initial mxcsr and fcw are the x86 defaults");
-  fexmac_thread_set_state(Thread, &First);
-  fexmac_thread_get_state(Thread, &Second);
+  Check(First.mxcsr == 0x1F80 && First.fcw == 0x37F && First.mxcsr_mask == 0xFFFF, "initial mxcsr, mxcsr_mask and fcw");
+  Check(First.cs == 0x30, "initial cs is the core's 64-bit code selector (0x%x)", First.cs);
+  SetState(Thread, &First);
+  fexmac_x86_state Second = GetState(Thread);
   Check(memcmp(&First, &Second, sizeof(First)) == 0, "get, set, get gives identical state");
 
   First.xmm[3][0] = 0x1122334455667788ULL;
   First.gpr[RSI] = 0xFEEDFACECAFEBEEFULL;
   First.rflags = 0x202 | 1; /* CF */
   First.fs_base = 0x123450000ULL;
-  fexmac_thread_set_state(Thread, &First);
-  fexmac_stop Stop;
-  fexmac_thread_run(Thread, &Stop);
-  fexmac_thread_get_state(Thread, &Second);
+  First.ds = 0x2B;
+  First.fip = 0x4242;
+  SetState(Thread, &First);
+  fexmac_stop Stop = Run(Thread);
+  Second = GetState(Thread);
   Check(Stop.reason == FEXMAC_STOP_HALT, "program halts");
   Check(Second.gpr[RAX] == 0x1122334455667788ULL, "guest read xmm3 that was set");
   Check((Second.gpr[RCX] & 0xFF) == 1, "guest read the carry flag that was set");
   Check(Second.gpr[RDX] == 0xFEEDFACECAFEBEEFULL, "guest read rsi that was set");
-  Check(Second.fs_base == 0x123450000ULL, "fs base kept");
-
-  Second.rip = Base + 12;
-  fexmac_thread_set_state(Thread, &Second);
-  fexmac_thread_run(Thread, &Stop);
-  Check(Stop.reason == FEXMAC_STOP_GUEST_FAULT && Stop.trap_number == 6 && Stop.signal == SIGILL,
-        "ud2 stops with a guest fault, #UD, SIGILL (reason %d, trap %u, signal %d)", Stop.reason, Stop.trap_number, Stop.signal);
+  Check((Second.gpr[RDI] & 0xFFFF) == 0x2B && Second.ds == 0x2B, "guest read the ds selector that was set");
+  Check(Second.fs_base == 0x123450000ULL && Second.fip == 0x4242, "fs base and fip kept");
+  Check(Second.fop == 0 && Second.fdp == 0, "fop and fdp are reported as 0");
 
   Second.rip = Base + 14;
-  fexmac_thread_set_state(Thread, &Second);
-  fexmac_thread_run(Thread, &Stop);
+  SetState(Thread, &Second);
+  Stop = Run(Thread);
+  Check(Stop.reason == FEXMAC_STOP_GUEST_FAULT && Stop.trap_number == 6 && Stop.signal == SIGILL && Stop.instruction_address == Base + 14,
+        "ud2 stops with a guest fault, #UD, SIGILL, at the instruction (reason %d, trap %u, signal %d)", Stop.reason, Stop.trap_number,
+        Stop.signal);
+
+  Second.rip = Base + 16;
+  SetState(Thread, &Second);
+  Stop = Run(Thread);
   Check(Stop.reason == FEXMAC_STOP_GUEST_FAULT && Stop.trap_number == 3 && Stop.signal == SIGTRAP,
         "int3 stops with a guest fault, #BP, SIGTRAP (reason %d, trap %u, signal %d)", Stop.reason, Stop.trap_number, Stop.signal);
 
@@ -237,37 +244,87 @@ static void TestState(void) {
   fexmac_context_destroy(Context);
 }
 
+/* ---- abi: struct_size rules for caller-allocated structures ---- */
+
+static void TestABI(void) {
+  uint8_t* Code = MapGuestMemory(0x10000);
+  const uint8_t Program[] = {0xB8, 0x2A, 0, 0, 0, 0xF4};
+  memcpy(Code, Program, sizeof(Program));
+  fexmac_context* Context = CreateContext(NULL, NULL);
+  fexmac_thread* Thread = CreateThreadAt(Context, (uint64_t)(uintptr_t)Code, 0);
+
+  fexmac_x86_state State;
+  memset(&State, 0, sizeof(State));
+  CheckResult(fexmac_thread_get_state(Thread, &State), FEXMAC_ERROR_INVALID_ARGUMENT, "get state with struct_size 0");
+  State.struct_size = sizeof(State) - 8;
+  CheckResult(fexmac_thread_get_state(Thread, &State), FEXMAC_ERROR_INVALID_ARGUMENT, "get state with a size smaller than version 1");
+
+  /* A newer header's larger structure. */
+  struct {
+    fexmac_x86_state State;
+    uint64_t Newer[4];
+  } Bigger;
+  memset(&Bigger, 0xAB, sizeof(Bigger));
+  Bigger.State.struct_size = sizeof(Bigger);
+  CheckResult(fexmac_thread_get_state(Thread, &Bigger.State), FEXMAC_OK, "get state into a larger structure");
+  Check(Bigger.Newer[0] == 0 && Bigger.Newer[3] == 0 && Bigger.State.struct_size == sizeof(Bigger), "unknown output fields are zeroed");
+  CheckResult(fexmac_thread_set_state(Thread, &Bigger.State), FEXMAC_OK, "set state from a larger structure with unknown fields zero");
+  Bigger.Newer[2] = 1;
+  CheckResult(fexmac_thread_set_state(Thread, &Bigger.State), FEXMAC_ERROR_UNSUPPORTED, "set state with an unknown field set");
+
+  fexmac_stop Stop;
+  memset(&Stop, 0, sizeof(Stop));
+  CheckResult(fexmac_thread_run(Thread, &Stop), FEXMAC_ERROR_INVALID_ARGUMENT, "run with a stop record of size 0");
+  CheckResult(fexmac_thread_run(Thread, NULL), FEXMAC_OK, "run with no stop record");
+
+  fexmac_config Config;
+  fexmac_config_init(&Config);
+  fexmac_context* Other = NULL;
+  Config.struct_size = 8;
+  CheckResult(fexmac_context_create(&Config, &Other), FEXMAC_ERROR_INVALID_ARGUMENT, "config smaller than version 1");
+  struct {
+    fexmac_config Config;
+    uint64_t Newer;
+  } BigConfig;
+  memset(&BigConfig, 0, sizeof(BigConfig));
+  fexmac_config_init(&BigConfig.Config);
+  BigConfig.Config.struct_size = sizeof(BigConfig);
+  BigConfig.Newer = 5;
+  CheckResult(fexmac_context_create(&BigConfig.Config, &Other), FEXMAC_ERROR_UNSUPPORTED, "config with an unknown field set");
+  BigConfig.Newer = 0;
+  CheckResult(fexmac_context_create(&BigConfig.Config, &Other), FEXMAC_ERROR_BUSY, "a larger config is accepted (then refused as a second context)");
+
+  fexmac_thread_destroy(Thread);
+  fexmac_context_destroy(Context);
+}
+
 /* ---- invalidate: changed guest code is retranslated after fexmac_invalidate ---- */
 
 static void TestInvalidate(void) {
-  /* mov eax, imm32 ; hlt */
   uint8_t* Code = MapGuestMemory(0x10000);
-  const uint8_t Program[] = {0xB8, 0x01, 0x00, 0x00, 0x00, 0xF4};
+  const uint8_t Program[] = {0xB8, 0x01, 0x00, 0x00, 0x00, 0xF4}; /* mov eax, imm32 ; hlt */
   memcpy(Code, Program, sizeof(Program));
   const uint64_t Base = (uint64_t)(uintptr_t)Code;
 
   fexmac_context* Context = CreateContext(NULL, NULL);
   fexmac_thread* Thread = CreateThreadAt(Context, Base, 0);
-  fexmac_stop Stop;
-  fexmac_x86_state State;
-
-  fexmac_thread_run(Thread, &Stop);
-  fexmac_thread_get_state(Thread, &State);
+  Run(Thread);
+  fexmac_x86_state State = GetState(Thread);
   Check(State.gpr[RAX] == 1, "first version of the code returns 1");
 
   Code[1] = 2;
   State.rip = Base;
-  fexmac_thread_set_state(Thread, &State);
-  fexmac_thread_run(Thread, &Stop);
-  fexmac_thread_get_state(Thread, &State);
+  SetState(Thread, &State);
+  Run(Thread);
+  State = GetState(Thread);
   printf("  info: without invalidation the changed code returns %" PRIu64 " (1 means the stale translation ran)\n", State.gpr[RAX]);
 
   Code[1] = 3;
   CheckResult(fexmac_invalidate(Context, Base, sizeof(Program)), FEXMAC_OK, "invalidate");
   State.rip = Base;
-  fexmac_thread_set_state(Thread, &State);
-  fexmac_thread_run(Thread, &Stop);
-  fexmac_thread_get_state(Thread, &State);
+  SetState(Thread, &State);
+  Run(Thread);
+  State = GetState(Thread);
   Check(State.gpr[RAX] == 3, "after invalidation the changed code runs (rax = %" PRIu64 ")", State.gpr[RAX]);
 
   fexmac_thread_destroy(Thread);
@@ -276,16 +333,13 @@ static void TestInvalidate(void) {
 
 /* ---- faults: misaligned atomics, in each signal-handler arrangement ---- */
 
-static volatile sig_atomic_t HostFaults;
 static uint8_t* HostPage;
-static long PageSize;
 
 /* A host handler for faults of its own: makes the page accessible and retries. */
 static void HostOwnHandler(int Signal, siginfo_t* Info, void* Context) {
-  (void)Signal;
   (void)Context;
   if ((uint8_t*)Info->si_addr >= HostPage && (uint8_t*)Info->si_addr < HostPage + PageSize) {
-    ++HostFaults;
+    Shared[0] += 1;
     mprotect(HostPage, (size_t)PageSize, PROT_READ | PROT_WRITE);
     return;
   }
@@ -300,11 +354,11 @@ static void HostForwardingHandler(int Signal, siginfo_t* Info, void* Context) {
   HostOwnHandler(Signal, Info, Context);
 }
 
-static void InstallHostHandler(void (*Handler)(int, siginfo_t*, void*)) {
+static void InstallHostHandler(void (*Handler)(int, siginfo_t*, void*), int Flags) {
   struct sigaction Action;
   memset(&Action, 0, sizeof(Action));
   Action.sa_sigaction = Handler;
-  Action.sa_flags = SA_SIGINFO | SA_NODEFER;
+  Action.sa_flags = SA_SIGINFO | Flags;
   sigemptyset(&Action.sa_mask);
   sigaction(SIGBUS, &Action, NULL);
   sigaction(SIGSEGV, &Action, NULL);
@@ -322,15 +376,13 @@ static void RunMisalignedAtomic(void) {
 
   fexmac_context* Context = CreateContext(NULL, NULL);
   fexmac_thread* Thread = CreateThreadAt(Context, (uint64_t)(uintptr_t)Code, 0);
-  fexmac_x86_state State;
-  fexmac_thread_get_state(Thread, &State);
+  fexmac_x86_state State = GetState(Thread);
   State.gpr[RDI] = (uint64_t)(uintptr_t)Value;
   State.gpr[RAX] = 3;
-  fexmac_thread_set_state(Thread, &State);
+  SetState(Thread, &State);
 
-  fexmac_stop Stop;
-  fexmac_thread_run(Thread, &Stop);
-  fexmac_thread_get_state(Thread, &State);
+  const fexmac_stop Stop = Run(Thread);
+  State = GetState(Thread);
   uint32_t Result;
   memcpy(&Result, Value, sizeof(Result));
   Check(Stop.reason == FEXMAC_STOP_HALT, "misaligned atomic runs to the halt");
@@ -343,9 +395,9 @@ static void RunMisalignedAtomic(void) {
 static void TouchHostPage(void) {
   HostPage = MapGuestMemory((size_t)PageSize);
   mprotect(HostPage, (size_t)PageSize, PROT_NONE);
-  HostFaults = 0;
+  const uint32_t Before = Shared[0];
   ((volatile uint8_t*)HostPage)[16] = 42;
-  Check(HostFaults == 1 && HostPage[16] == 42, "host's own fault reached the host handler (%d faults)", (int)HostFaults);
+  Check(Shared[0] == Before + 1 && HostPage[16] == 42, "host's own fault reached the host handler");
 }
 
 static void TestFaultsInstalled(void) {
@@ -356,7 +408,7 @@ static void TestFaultsInstalled(void) {
 
 /* The host installed handlers first; the library chains to them. */
 static void TestFaultsChained(void) {
-  InstallHostHandler(HostOwnHandler);
+  InstallHostHandler(HostOwnHandler, SA_NODEFER);
   CheckResult(fexmac_install_fault_handlers(), FEXMAC_OK, "install fault handlers over the host's");
   RunMisalignedAtomic();
   TouchHostPage();
@@ -364,31 +416,196 @@ static void TestFaultsChained(void) {
 
 /* The host owns the handlers and forwards to fexmac_handle_fault. */
 static void TestFaultsHosted(void) {
-  InstallHostHandler(HostForwardingHandler);
+  InstallHostHandler(HostForwardingHandler, SA_NODEFER);
   RunMisalignedAtomic();
   TouchHostPage();
 }
 
-/* Without any handler, a fault that is not the library's kills the process normally:
- * run in a child that is expected to die. */
-static void TestUnclaimedFaultDies(void) {
+/* ---- call/return stack: overflow and underflow into its guard pages ---- */
+
+static void RunCallRetProgram(const uint8_t* Program, size_t Size, uint32_t Count, size_t CountOffset, size_t StackSize, uint64_t* Rax,
+                              uint64_t* Rcx) {
+  uint8_t* Code = MapGuestMemory(0x10000);
+  uint8_t* Stack = MapGuestMemory(StackSize);
+  memcpy(Code, Program, Size);
+  memcpy(Code + CountOffset, &Count, sizeof(Count));
   fexmac_install_fault_handlers();
-  uint8_t* Page = MapGuestMemory((size_t)PageSize);
-  mprotect(Page, (size_t)PageSize, PROT_NONE);
-  ((volatile uint8_t*)Page)[0] = 1;
-  printf("  FAIL: survived a fault nobody handles\n");
+  fexmac_context* Context = CreateContext(NULL, NULL);
+  fexmac_thread* Thread = CreateThreadAt(Context, (uint64_t)(uintptr_t)Code, (uint64_t)(uintptr_t)Stack + StackSize - 64);
+  const fexmac_stop Stop = Run(Thread);
+  const fexmac_x86_state State = GetState(Thread);
+  Check(Stop.reason == FEXMAC_STOP_HALT, "program runs to the halt (reason %d)", Stop.reason);
+  *Rax = State.gpr[RAX];
+  *Rcx = State.gpr[RCX];
+  fexmac_thread_destroy(Thread);
+  fexmac_context_destroy(Context);
+}
+
+/* Recursion 100,000 deep: more calls than the call/return stack holds (overflow), then
+ * every return. */
+static void TestCallRetRecursion(void) {
+  /* clang-format off */
+  const uint8_t Program[] = {
+    0xB9, 0, 0, 0, 0,             /*  0: mov ecx, N */
+    0x31, 0xC0,                   /*  5: xor eax, eax */
+    0xE8, 0x01, 0x00, 0x00, 0x00, /*  7: call 13 */
+    0xF4,                         /* 12: hlt */
+    0xFF, 0xC0,                   /* 13: inc eax */
+    0xFF, 0xC9,                   /* 15: dec ecx */
+    0x74, 0x05,                   /* 17: jz 24 */
+    0xE8, 0xF5, 0xFF, 0xFF, 0xFF, /* 19: call 13 */
+    0xC3,                         /* 24: ret */
+  };
+  /* clang-format on */
+  uint64_t Rax, Rcx;
+  RunCallRetProgram(Program, sizeof(Program), 100000, 1, 4 * 1024 * 1024, &Rax, &Rcx);
+  Check(Rax == 100000 && Rcx == 0, "recursion 100,000 deep returns to the top (eax %" PRIu64 ")", Rax);
+}
+
+/* 200,000 calls that never return (the guest stack is rebalanced with pop): overflow. */
+static void TestCallRetOverflow(void) {
+  /* clang-format off */
+  const uint8_t Program[] = {
+    0xB9, 0, 0, 0, 0,             /*  0: mov ecx, N */
+    0xE8, 0x00, 0x00, 0x00, 0x00, /*  5: call 10 (the next instruction) */
+    0x58,                         /* 10: pop rax */
+    0xFF, 0xC9,                   /* 11: dec ecx */
+    0x75, 0xF6,                   /* 13: jnz 5 */
+    0xF4,                         /* 15: hlt */
+  };
+  /* clang-format on */
+  uint64_t Rax, Rcx;
+  RunCallRetProgram(Program, sizeof(Program), 200000, 1, 0x10000, &Rax, &Rcx);
+  Check(Rcx == 0, "200,000 unmatched calls complete");
+}
+
+/* 200,000 returns that were never called (push; ret): underflow. */
+static void TestCallRetUnderflow(void) {
+  /* clang-format off */
+  const uint8_t Program[] = {
+    0xB9, 0, 0, 0, 0,                         /*  0: mov ecx, N */
+    0x48, 0x8D, 0x05, 0x02, 0x00, 0x00, 0x00, /*  5: lea rax, [rip+2] (14) */
+    0x50,                                     /* 12: push rax */
+    0xC3,                                     /* 13: ret */
+    0xFF, 0xC9,                               /* 14: dec ecx */
+    0x75, 0xF3,                               /* 16: jnz 5 */
+    0xF4,                                     /* 18: hlt */
+  };
+  /* clang-format on */
+  uint64_t Rax, Rcx;
+  RunCallRetProgram(Program, sizeof(Program), 200000, 1, 0x10000, &Rax, &Rcx);
+  Check(Rcx == 0, "200,000 unmatched returns complete");
+}
+
+/* ---- guest memory faults in translated code: never claimed, never a loop ---- */
+
+static void RunGuestAccess(const uint8_t* Program, size_t Size, int Protection, const char* TSO) {
+  uint8_t* Code = MapGuestMemory(0x10000);
+  uint8_t* Data = mmap(NULL, (size_t)PageSize, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  memcpy(Code, Program, Size);
+  if (Protection == PROT_READ) {
+    (void)*(volatile uint8_t*)Data; /* touched, so the store is a permission fault */
+  }
+  mprotect(Data, (size_t)PageSize, Protection);
+  const fexmac_option Options[] = {{"TSOENABLED", TSO}};
+  fexmac_context* Context = CreateContextWithOptions(Options, 1, NULL, NULL);
+  fexmac_thread* Thread = CreateThreadAt(Context, (uint64_t)(uintptr_t)Code, 0);
+  fexmac_x86_state State = GetState(Thread);
+  State.gpr[RDI] = (uint64_t)(uintptr_t)Data + 64;
+  Shared[1] = (uint32_t)(State.gpr[RDI] & 0xFFFFFFFF);
+  SetState(Thread, &State);
+  Shared[0] = 1; /* reached the guest run */
+  fexmac_thread_run(Thread, NULL);
+  printf("  FAIL: survived a guest access to a protected page\n");
   exit(1);
 }
 
-/* A bug inside the library's handler must crash, not hang. */
-static void TestFaultInsideHandlerDies(void) {
+static const uint8_t LockXadd[] = {0xF0, 0x0F, 0xC1, 0x07, 0xF4};
+static const uint8_t LockCmpxchg[] = {0xF0, 0x0F, 0xB1, 0x0F, 0xF4};
+static const uint8_t Load[] = {0x8B, 0x07, 0xF4};
+static const uint8_t Store[] = {0x89, 0x07, 0xF4};
+
+static void TestGuestLoadProtNone(void) {
   fexmac_install_fault_handlers();
-  fexmac_testing_fault_inside_handler(1);
-  uint8_t* Page = MapGuestMemory((size_t)PageSize);
-  mprotect(Page, (size_t)PageSize, PROT_NONE);
-  ((volatile uint8_t*)Page)[0] = 1;
-  printf("  FAIL: survived a fault inside the fault handler\n");
-  exit(1);
+  RunGuestAccess(Load, sizeof(Load), PROT_NONE, "1");
+}
+static void TestGuestLockXaddProtNone(void) {
+  fexmac_install_fault_handlers();
+  RunGuestAccess(LockXadd, sizeof(LockXadd), PROT_NONE, "1");
+}
+static void TestGuestLockCmpxchgProtNone(void) {
+  fexmac_install_fault_handlers();
+  RunGuestAccess(LockCmpxchg, sizeof(LockCmpxchg), PROT_NONE, "0");
+}
+static void TestGuestStoreReadOnly(void) {
+  fexmac_install_fault_handlers();
+  RunGuestAccess(Store, sizeof(Store), PROT_READ, "0");
+}
+
+/* With the host owning the signals, fexmac_handle_fault refuses a guest access fault and
+ * the host sees it with the guest's address. */
+static void GuestFaultHostHandler(int Signal, siginfo_t* Info, void* Context) {
+  if (fexmac_handle_fault(Signal, Info, Context)) {
+    return;
+  }
+  const uint32_t Low = (uint32_t)((uintptr_t)Info->si_addr & 0xFFFFFFFF);
+  Shared[0] = Shared[0] == 1 && Low == Shared[1] ? 2 : 3;
+  _exit(0);
+}
+
+static void TestGuestFaultHosted(void) {
+  InstallHostHandler(GuestFaultHostHandler, SA_NODEFER);
+  RunGuestAccess(LockXadd, sizeof(LockXadd), PROT_NONE, "1");
+}
+
+/* ---- callbacks: what a system call callback may and may not do ---- */
+
+static uint8_t* CloneCode;
+static fexmac_thread* Victim;
+static fexmac_thread* Cloned;
+static fexmac_result CloneResults[4];
+
+static fexmac_syscall_action CloneSyscall(fexmac_thread* Thread, void* UserData) {
+  (void)UserData;
+  fexmac_context* Context = fexmac_thread_context(Thread);
+  CloneResults[0] = fexmac_thread_create(Context, &Cloned);
+  if (CloneResults[0] == FEXMAC_OK) {
+    fexmac_x86_state State = GetState(Cloned);
+    State.rip = (uint64_t)(uintptr_t)CloneCode + 16;
+    SetState(Cloned, &State);
+  }
+  CloneResults[1] = fexmac_thread_destroy(Victim);
+  CloneResults[2] = Cloned ? fexmac_thread_run(Cloned, NULL) : FEXMAC_OK;
+  CloneResults[3] = fexmac_invalidate(Context, (uint64_t)(uintptr_t)CloneCode + 0x1000, 16);
+  fexmac_x86_state State = GetState(Thread);
+  State.gpr[RAX] = 1;
+  SetState(Thread, &State);
+  return FEXMAC_SYSCALL_RESUME;
+}
+
+static void TestCallbacks(void) {
+  CloneCode = MapGuestMemory(0x10000);
+  /* 0: mov eax,56 ; syscall ; hlt     16: mov eax,7 ; hlt */
+  const uint8_t Parent[] = {0xB8, 0x38, 0, 0, 0, 0x0F, 0x05, 0xF4};
+  const uint8_t Child[] = {0xB8, 0x07, 0, 0, 0, 0xF4};
+  memcpy(CloneCode, Parent, sizeof(Parent));
+  memcpy(CloneCode + 16, Child, sizeof(Child));
+  fexmac_context* Context = CreateContext(CloneSyscall, NULL);
+  Victim = CreateThreadAt(Context, (uint64_t)(uintptr_t)CloneCode + 16, 0);
+  fexmac_thread* Thread = CreateThreadAt(Context, (uint64_t)(uintptr_t)CloneCode, 0);
+  fexmac_stop Stop = Run(Thread);
+  Check(Stop.reason == FEXMAC_STOP_HALT, "parent ran to its halt");
+  CheckResult(CloneResults[0], FEXMAC_OK, "creating a thread from a callback (a guest clone)");
+  CheckResult(CloneResults[1], FEXMAC_OK, "destroying another, stopped thread from a callback");
+  CheckResult(CloneResults[2], FEXMAC_ERROR_BUSY, "running another thread from a callback");
+  CheckResult(CloneResults[3], FEXMAC_OK, "invalidating from a callback");
+  CheckResult(fexmac_thread_run(Victim, NULL), FEXMAC_ERROR_INVALID_HANDLE, "the destroyed thread is gone");
+  Stop = Run(Cloned);
+  const fexmac_x86_state State = GetState(Cloned);
+  Check(Stop.reason == FEXMAC_STOP_HALT && State.gpr[RAX] == 7, "the thread created in the callback runs afterwards");
+  fexmac_thread_destroy(Cloned);
+  fexmac_thread_destroy(Thread);
+  CheckResult(fexmac_context_destroy(Context), FEXMAC_OK, "context destroy");
 }
 
 /* ---- errors: bad arguments, bad options, lifetime misuse ---- */
@@ -415,30 +632,50 @@ static void TestErrors(void) {
 
   CheckResult(fexmac_context_create(NULL, &Context), FEXMAC_ERROR_INVALID_ARGUMENT, "create with no config");
   CheckResult(fexmac_context_create(&Config, NULL), FEXMAC_ERROR_INVALID_ARGUMENT, "create with no output");
-  Config.struct_size = 8;
-  CheckResult(fexmac_context_create(&Config, &Context), FEXMAC_ERROR_INVALID_ARGUMENT, "create with a wrong struct size");
-  fexmac_config_init(&Config);
   Config.option_count = 1;
   CheckResult(fexmac_context_create(&Config, &Context), FEXMAC_ERROR_INVALID_ARGUMENT, "create with options missing");
 
-  CheckResult(CreateWithOption("NOSUCHOPTION", "1", &Context), FEXMAC_ERROR_BAD_CONFIG, "unknown option");
-  CheckResult(CreateWithOption("MAXINST", "lots", &Context), FEXMAC_ERROR_BAD_CONFIG, "number that does not parse");
-  CheckResult(CreateWithOption("MAXINST", "12abc", &Context), FEXMAC_ERROR_BAD_CONFIG, "number with trailing text");
-  CheckResult(CreateWithOption("MULTIBLOCK", "2", &Context), FEXMAC_ERROR_BAD_CONFIG, "boolean that is not 0 or 1");
-  CheckResult(CreateWithOption("MULTIBLOCK", "true", &Context), FEXMAC_ERROR_BAD_CONFIG, "boolean spelt true");
-  CheckResult(CreateWithOption("SMCCHECKS", "sometimes", &Context), FEXMAC_ERROR_BAD_CONFIG, "unknown named value");
-  CheckResult(CreateWithOption("IS64BIT_MODE", "0", &Context), FEXMAC_ERROR_BAD_CONFIG, "32-bit mode");
-  CheckResult(CreateWithOption(NULL, "1", &Context), FEXMAC_ERROR_BAD_CONFIG, "option without a name");
+  static const struct {
+    const char* Name;
+    const char* Value;
+    const char* Why;
+  } Bad[] = {
+    {"NOSUCHOPTION", "1", "unknown option"},
+    {"DISKCACHE", "1", "core option this port does not support (aborts the process if allowed)"},
+    {"JITFEATURES", "nonsense", "core option not on the supported list"},
+    {"GDBSERVER", "1", "core option not on the supported list"},
+    {"SINGLESTEP", "1", "core option not on the supported list"},
+    {"ENABLECODECACHINGWIP", "1", "code cache option (package F)"},
+    {"FORCESVEWIDTH", "12345", "core option not on the supported list"},
+    {"STRICTINPROCESSSPLITLOCKS", "1", "option that makes the fault handler spin"},
+    {"MAXINST", "lots", "number that does not parse"},
+    {"MAXINST", "12abc", "number with trailing text"},
+    {"MAXINST", "010", "number with a leading zero (would be octal)"},
+    {"MAXINST", "-5", "negative number"},
+    {"MAXINST", "0", "zero instructions per block"},
+    {"MAXINST", "4294967296", "number out of range"},
+    {"MULTIBLOCK", "2", "boolean that is not 0 or 1"},
+    {"MULTIBLOCK", "true", "boolean spelt true"},
+    {"SMCCHECKS", "sometimes", "unknown named value"},
+    {"HOSTFEATURES", "disablesve,nonsense", "unknown host feature name"},
+    {"IS64BIT_MODE", "0", "32-bit mode"},
+    {NULL, "1", "option without a name"},
+  };
+  for (size_t i = 0; i < sizeof(Bad) / sizeof(Bad[0]); ++i) {
+    char What[160];
+    snprintf(What, sizeof(What), "%s=%s (%s)", Bad[i].Name ? Bad[i].Name : "(null)", Bad[i].Value, Bad[i].Why);
+    CheckResult(CreateWithOption(Bad[i].Name, Bad[i].Value, &Context), FEXMAC_ERROR_BAD_CONFIG, What);
+  }
   Check(Context == NULL, "failed creates leave the output NULL");
 
   Check(fexmac_option_known("MULTIBLOCK") && fexmac_option_known("Multiblock"), "option names known in both spellings");
-  Check(!fexmac_option_known("FEX_MULTIBLOCK") && !fexmac_option_known("nope") && !fexmac_option_known(NULL), "other names unknown");
+  Check(!fexmac_option_known("FEX_MULTIBLOCK") && !fexmac_option_known("DISKCACHE") && !fexmac_option_known(NULL), "other names unknown");
 
   /* After all those failures, a good configuration still works. */
-  fexmac_option Good[] = {{"SMCCHECKS", "full"}, {"MaxInst", "0x100"}, {"MULTIBLOCK", "0"}};
+  fexmac_option Good[] = {{"SMCCHECKS", "full"}, {"MaxInst", "0x100"}, {"MULTIBLOCK", "0"}, {"HOSTFEATURES", "disablesve,disablefrintts"}};
   fexmac_config_init(&Config);
   Config.options = Good;
-  Config.option_count = 3;
+  Config.option_count = sizeof(Good) / sizeof(Good[0]);
   Config.log = QuietLog;
   CheckResult(fexmac_context_create(&Config, &Context), FEXMAC_OK, "create with good options");
 
@@ -452,6 +689,7 @@ static void TestErrors(void) {
   CheckResult(fexmac_context_destroy(Context), FEXMAC_ERROR_BUSY, "destroy a context that has a thread");
 
   fexmac_x86_state State;
+  fexmac_x86_state_init(&State);
   CheckResult(fexmac_thread_get_state(Thread, NULL), FEXMAC_ERROR_INVALID_ARGUMENT, "get state with no output");
   CheckResult(fexmac_thread_get_state(NULL, &State), FEXMAC_ERROR_INVALID_HANDLE, "get state of no thread");
   CheckResult(fexmac_thread_run(NULL, NULL), FEXMAC_ERROR_INVALID_HANDLE, "run no thread");
@@ -479,9 +717,8 @@ static void TestErrors(void) {
   memcpy(Code, Program, sizeof(Program));
   Context = CreateContext(NULL, NULL);
   Thread = CreateThreadAt(Context, (uint64_t)(uintptr_t)Code, 0);
-  fexmac_stop Stop;
-  fexmac_thread_run(Thread, &Stop);
-  fexmac_thread_get_state(Thread, &State);
+  const fexmac_stop Stop = Run(Thread);
+  State = GetState(Thread);
   Check(Stop.reason == FEXMAC_STOP_HALT && State.gpr[RAX] == 42, "a second context, created after the first, runs code");
   fexmac_thread_destroy(Thread);
   fexmac_context_destroy(Context);
@@ -489,71 +726,356 @@ static void TestErrors(void) {
   Check(fexmac_version() >> 16 == FEXMAC_VERSION_MAJOR, "library version matches the header");
 }
 
-/* ---- driver ---- */
+/* ---- the previous handler: masks, SA_RESETHAND, faults inside it, sent signals ---- */
 
-struct Subtest {
-  const char* Name;
-  void (*Run)(void);
-  int ExpectSignal; /* 0: must exit 0. Otherwise must die by SIGSEGV or SIGBUS. */
+static void MaskCheckingHandler(int Signal, siginfo_t* Info, void* Context) {
+  sigset_t Current;
+  pthread_sigmask(SIG_BLOCK, NULL, &Current);
+  /* Its own mask (SIGUSR1) applied; its own signal blocked (no SA_NODEFER). */
+  Shared[1] = (uint32_t)(sigismember(&Current, SIGUSR1) && sigismember(&Current, Signal));
+  HostOwnHandler(Signal, Info, Context);
+}
+
+static void TestChainedMask(void) {
+  struct sigaction Action;
+  memset(&Action, 0, sizeof(Action));
+  Action.sa_sigaction = MaskCheckingHandler;
+  Action.sa_flags = SA_SIGINFO;
+  sigemptyset(&Action.sa_mask);
+  sigaddset(&Action.sa_mask, SIGUSR1);
+  sigaction(SIGBUS, &Action, NULL);
+  sigaction(SIGSEGV, &Action, NULL);
+  fexmac_install_fault_handlers();
+  TouchHostPage();
+  Check(Shared[1] == 1, "the previous handler ran with its sa_mask and its own signal blocked");
+  sigset_t Current;
+  pthread_sigmask(SIG_BLOCK, NULL, &Current);
+  Check(!sigismember(&Current, SIGUSR1), "the mask is restored afterwards");
+}
+
+/* SA_RESETHAND: the first fault goes to the host's handler, the second gets the default. */
+static void TestChainedResetHand(void) {
+  InstallHostHandler(HostOwnHandler, SA_RESETHAND);
+  fexmac_install_fault_handlers();
+  TouchHostPage();
+  RunMisalignedAtomic(); /* the library still works after the reset */
+  uint8_t* Page = MapGuestMemory((size_t)PageSize);
+  mprotect(Page, (size_t)PageSize, PROT_NONE);
+  ((volatile uint8_t*)Page)[0] = 1;
+  printf("  FAIL: survived a second fault after SA_RESETHAND\n");
+  exit(1);
+}
+
+static void FaultingHostHandler(int Signal, siginfo_t* Info, void* Context) {
+  (void)Signal;
+  (void)Info;
+  (void)Context;
+  Shared[0] = 1;
+  *(volatile int*)HostPage = 1; /* the host's handler has a bug */
+}
+
+static void TestChainedHandlerFaults(void) {
+  InstallHostHandler(FaultingHostHandler, SA_NODEFER);
+  fexmac_install_fault_handlers();
+  HostPage = MapGuestMemory((size_t)PageSize);
+  mprotect(HostPage, (size_t)PageSize, PROT_NONE);
+  ((volatile uint8_t*)HostPage)[16] = 42;
+  printf("  FAIL: survived a fault inside the host's handler\n");
+  exit(1);
+}
+
+/* A SIGSEGV sent with kill() while the previous action was "ignore" is ignored, and the
+ * library stays armed. */
+static void TestSentSignalIgnored(void) {
+  signal(SIGSEGV, SIG_IGN);
+  fexmac_install_fault_handlers();
+  kill(getpid(), SIGSEGV);
+  Check(1, "survived a sent SIGSEGV that was ignored before the library");
+  RunMisalignedAtomic();
+}
+
+/* A SIGSEGV sent with kill() while the previous action was the default kills. */
+static void TestSentSignalDefaultDies(void) {
+  fexmac_install_fault_handlers();
+  Shared[0] = 1;
+  kill(getpid(), SIGSEGV);
+  sleep(1);
+  printf("  FAIL: survived a sent SIGSEGV with the default action\n");
+  exit(1);
+}
+
+/* A fault nobody handles, outside guest code, kills the process normally and silently. */
+static void TestUnclaimedFaultDies(void) {
+  fexmac_install_fault_handlers();
+  uint8_t* Page = MapGuestMemory((size_t)PageSize);
+  mprotect(Page, (size_t)PageSize, PROT_NONE);
+  Shared[0] = 1;
+  ((volatile uint8_t*)Page)[0] = 1;
+  Shared[0] = 2;
+  printf("  FAIL: survived a fault nobody handles\n");
+  exit(1);
+}
+
+/* ---- concurrency: invalidation from callbacks and another thread ---- */
+
+static fexmac_context* MtContext;
+static uint8_t* MtCode;
+static atomic_int MtDone;
+static atomic_long MtCalls;
+
+static fexmac_syscall_action InvalidatingSyscall(fexmac_thread* Thread, void* UserData) {
+  (void)UserData;
+  atomic_fetch_add(&MtCalls, 1);
+  if (fexmac_invalidate(MtContext, (uint64_t)(uintptr_t)MtCode + 0x100, 16) != FEXMAC_OK) {
+    Shared[2] = 1;
+  }
+  fexmac_x86_state State = GetState(Thread);
+  State.gpr[RAX] = 0;
+  SetState(Thread, &State);
+  return FEXMAC_SYSCALL_RESUME;
+}
+
+static void* InvalidatingWorker(void* Arg) {
+  (void)Arg;
+  fexmac_thread* Thread = NULL;
+  if (fexmac_thread_create(MtContext, &Thread) != FEXMAC_OK) {
+    Shared[2] = 1;
+    atomic_fetch_add(&MtDone, 1);
+    return NULL;
+  }
+  fexmac_x86_state State = GetState(Thread);
+  State.rip = (uint64_t)(uintptr_t)MtCode;
+  SetState(Thread, &State);
+  fexmac_stop Stop;
+  fexmac_stop_init(&Stop);
+  if (fexmac_thread_run(Thread, &Stop) != FEXMAC_OK || Stop.reason != FEXMAC_STOP_HALT) {
+    Shared[2] = 1;
+  }
+  fexmac_thread_destroy(Thread);
+  atomic_fetch_add(&MtDone, 1);
+  return NULL;
+}
+
+/* A hang here is the failure this test exists to catch, so it watches progress itself
+ * and fails within seconds instead of waiting for the driver's alarm. */
+static atomic_long MtInvalidations;
+
+static void* ProgressWatchdog(void* Arg) {
+  (void)Arg;
+  long LastCalls = -1, LastInvalidations = -1;
+  for (;;) {
+    sleep(5);
+    const long Calls = atomic_load(&MtCalls), Invalidations = atomic_load(&MtInvalidations);
+    if (Calls == LastCalls && Invalidations == LastInvalidations) {
+      printf("  FAIL: no progress for 5 seconds (hang): %ld system calls, %ld invalidations so far\n", Calls, Invalidations);
+      fflush(stdout);
+      _exit(3);
+    }
+    LastCalls = Calls;
+    LastInvalidations = Invalidations;
+  }
+  return NULL;
+}
+
+static void TestConcurrentInvalidation(void) {
+  enum { Threads = 8, MinimumIterations = 20, BudgetSeconds = 30 };
+  MtCode = MapGuestMemory(0x10000);
+  /* mov ebx,20000 ; loop: mov eax,1 ; syscall ; dec ebx ; jnz loop ; hlt */
+  const uint8_t Program[] = {0xBB, 0x20, 0x4E, 0, 0, 0xB8, 1, 0, 0, 0, 0x0F, 0x05, 0xFF, 0xCB, 0x75, 0xF5, 0xF4};
+  memcpy(MtCode, Program, sizeof(Program));
+  fexmac_install_fault_handlers();
+  pthread_t Watchdog;
+  pthread_create(&Watchdog, NULL, ProgressWatchdog, NULL);
+  const time_t Start = time(NULL);
+  int Iteration = 0;
+  for (; Iteration < MinimumIterations || time(NULL) - Start < BudgetSeconds; ++Iteration) {
+    MtContext = CreateContext(InvalidatingSyscall, NULL);
+    atomic_store(&MtDone, 0);
+    pthread_t Workers[Threads];
+    for (int i = 0; i < Threads; ++i) {
+      pthread_create(&Workers[i], NULL, InvalidatingWorker, NULL);
+    }
+    while (atomic_load(&MtDone) < Threads) {
+      fexmac_invalidate(MtContext, (uint64_t)(uintptr_t)MtCode, 0x40);
+      atomic_fetch_add(&MtInvalidations, 1);
+    }
+    for (int i = 0; i < Threads; ++i) {
+      pthread_join(Workers[i], NULL);
+    }
+    if (fexmac_context_destroy(MtContext) != FEXMAC_OK) {
+      Shared[2] = 1;
+    }
+  }
+  Check(Shared[2] == 0, "%d runs of %d threads, each invalidating in every system call while the main thread invalidates", Iteration,
+        Threads);
+  printf("  info: %ld system calls, %ld invalidations from the main thread, %ld seconds\n", atomic_load(&MtCalls),
+         atomic_load(&MtInvalidations), (long)(time(NULL) - Start));
+}
+
+/* ---- concurrency: destroy racing with use ---- */
+
+struct RacePair {
+  fexmac_thread* Thread;
+  long Runs;
+  long BusyDestroys;
+  int RunnerEnd;    /* result that ended the runner */
+  int DestroyEnd;   /* result that ended the destroyer */
+  int Unexpected;
 };
 
+static void* RaceRunner(void* Arg) {
+  struct RacePair* Pair = Arg;
+  for (;;) {
+    fexmac_stop Stop;
+    fexmac_stop_init(&Stop);
+    const fexmac_result Result = fexmac_thread_run(Pair->Thread, &Stop);
+    if (Result == FEXMAC_OK) {
+      ++Pair->Runs;
+      continue;
+    }
+    if (Result != FEXMAC_ERROR_INVALID_HANDLE) {
+      Pair->Unexpected = 1;
+    }
+    Pair->RunnerEnd = Result;
+    return NULL;
+  }
+}
+
+static void* RaceDestroyer(void* Arg) {
+  struct RacePair* Pair = Arg;
+  usleep(2000);
+  for (;;) {
+    const fexmac_result Result = fexmac_thread_destroy(Pair->Thread);
+    if (Result == FEXMAC_ERROR_BUSY) {
+      ++Pair->BusyDestroys;
+      continue;
+    }
+    if (Result != FEXMAC_OK) {
+      Pair->Unexpected = 1;
+    }
+    Pair->DestroyEnd = Result;
+    return NULL;
+  }
+}
+
+static fexmac_context* HammerContext;
+static atomic_int HammerStop;
+static atomic_int HammerUnexpected;
+
+static void* ContextHammer(void* Arg) {
+  const int Kind = (int)(intptr_t)Arg;
+  while (!atomic_load(&HammerStop)) {
+    fexmac_result Result;
+    if (Kind == 0) {
+      uint32_t Regs[4];
+      Result = fexmac_cpuid(HammerContext, 1, 0, Regs);
+    } else if (Kind == 1) {
+      Result = fexmac_invalidate(HammerContext, 0x100000000ULL, 0x1000);
+    } else {
+      fexmac_thread* Thread = NULL;
+      Result = fexmac_thread_create(HammerContext, &Thread);
+      if (Result == FEXMAC_OK && fexmac_thread_destroy(Thread) != FEXMAC_OK) {
+        atomic_store(&HammerUnexpected, 1);
+      }
+    }
+    if (Result == FEXMAC_ERROR_INVALID_HANDLE) {
+      return NULL; /* the context was destroyed */
+    }
+    if (Result != FEXMAC_OK) {
+      atomic_store(&HammerUnexpected, 1);
+    }
+  }
+  return NULL;
+}
+
+static void TestLifetimeRaces(void) {
+  enum { Pairs = 6, Hammers = 6 };
+  uint8_t* Code = MapGuestMemory(0x10000);
+  /* mov ecx,2000 ; loop: dec ecx ; jnz loop ; hlt */
+  const uint8_t Program[] = {0xB9, 0xD0, 0x07, 0, 0, 0xFF, 0xC9, 0x75, 0xFC, 0xF4};
+  memcpy(Code, Program, sizeof(Program));
+  fexmac_install_fault_handlers();
+  fexmac_context* Context = CreateContext(NULL, NULL);
+
+  /* Runs racing with destroys. Every thread is created first, so no handle memory is
+   * reused while the race runs. */
+  struct RacePair PairState[Pairs];
+  memset(PairState, 0, sizeof(PairState));
+  pthread_t Runners[Pairs], Destroyers[Pairs];
+  for (int i = 0; i < Pairs; ++i) {
+    PairState[i].Thread = CreateThreadAt(Context, (uint64_t)(uintptr_t)Code, 0);
+  }
+  for (int i = 0; i < Pairs; ++i) {
+    pthread_create(&Runners[i], NULL, RaceRunner, &PairState[i]);
+    pthread_create(&Destroyers[i], NULL, RaceDestroyer, &PairState[i]);
+  }
+  int Bad = 0;
+  long Runs = 0, Busy = 0;
+  for (int i = 0; i < Pairs; ++i) {
+    pthread_join(Runners[i], NULL);
+    pthread_join(Destroyers[i], NULL);
+    Bad |= PairState[i].Unexpected || PairState[i].RunnerEnd != FEXMAC_ERROR_INVALID_HANDLE || PairState[i].DestroyEnd != FEXMAC_OK;
+    Runs += PairState[i].Runs;
+    Busy += PairState[i].BusyDestroys;
+  }
+  Check(!Bad, "each destroy waited for the run in progress, and the run after it found the thread gone (%ld runs, %ld busy destroys)", Runs,
+        Busy);
+
+  /* Context destroy racing with calls that use the context. */
+  HammerContext = Context;
+  pthread_t HammerThreads[Hammers];
+  for (int i = 0; i < Hammers; ++i) {
+    pthread_create(&HammerThreads[i], NULL, ContextHammer, (void*)(intptr_t)(i % 3));
+  }
+  usleep(20000);
+  long BusyContext = 0;
+  fexmac_result Result;
+  while ((Result = fexmac_context_destroy(Context)) == FEXMAC_ERROR_BUSY) {
+    ++BusyContext;
+  }
+  atomic_store(&HammerStop, 1);
+  for (int i = 0; i < Hammers; ++i) {
+    pthread_join(HammerThreads[i], NULL);
+  }
+  CheckResult(Result, FEXMAC_OK, "context destroy, once no call was using it");
+  Check(!atomic_load(&HammerUnexpected), "calls racing with the destroy got success or a dead handle, nothing else (%ld busy destroys)",
+        BusyContext);
+}
+
+/* ---- driver ---- */
+
+#define GUEST_FAULT_TEXT "guest memory access fault in translated code at address 0x"
+
 static const struct Subtest Subtests[] = {
-  {"run", TestRun, 0},
-  {"state", TestState, 0},
-  {"invalidate", TestInvalidate, 0},
-  {"faults-installed", TestFaultsInstalled, 0},
-  {"faults-chained", TestFaultsChained, 0},
-  {"faults-hosted", TestFaultsHosted, 0},
-  {"errors", TestErrors, 0},
-  {"unclaimed-fault-dies", TestUnclaimedFaultDies, 1},
-  {"fault-inside-handler-dies", TestFaultInsideHandlerDies, 1},
+  {"run", TestRun, 0, NULL, NULL, 0},
+  {"syscall-prefix", TestSyscallPrefix, 0, NULL, NULL, 0},
+  {"syscall-restart", TestSyscallRestart, 0, NULL, NULL, 0},
+  {"state", TestState, 0, NULL, NULL, 0},
+  {"abi", TestABI, 0, NULL, NULL, 0},
+  {"invalidate", TestInvalidate, 0, NULL, NULL, 0},
+  {"faults-installed", TestFaultsInstalled, 0, NULL, NULL, 0},
+  {"faults-chained", TestFaultsChained, 0, NULL, NULL, 0},
+  {"faults-hosted", TestFaultsHosted, 0, NULL, NULL, 0},
+  {"callret-recursion", TestCallRetRecursion, 0, NULL, NULL, 0},
+  {"callret-overflow", TestCallRetOverflow, 0, NULL, NULL, 0},
+  {"callret-underflow", TestCallRetUnderflow, 0, NULL, NULL, 0},
+  {"guest-load-prot-none-dies", TestGuestLoadProtNone, SIGBUS, GUEST_FAULT_TEXT, "fault inside", 1},
+  {"guest-lock-xadd-prot-none-dies", TestGuestLockXaddProtNone, SIGBUS, GUEST_FAULT_TEXT, "fault inside", 1},
+  {"guest-lock-cmpxchg-prot-none-dies", TestGuestLockCmpxchgProtNone, SIGBUS, GUEST_FAULT_TEXT, "fault inside", 1},
+  {"guest-store-read-only-dies", TestGuestStoreReadOnly, SIGBUS, GUEST_FAULT_TEXT, "fault inside", 1},
+  {"guest-fault-hosted", TestGuestFaultHosted, 0, NULL, "fexmac:", 2},
+  {"callbacks", TestCallbacks, 0, NULL, NULL, 0},
+  {"errors", TestErrors, 0, NULL, NULL, 0},
+  {"chained-mask", TestChainedMask, 0, NULL, NULL, 0},
+  {"chained-resethand-dies", TestChainedResetHand, SIGBUS, NULL, "fexmac:", 1},
+  {"chained-handler-faults-dies", TestChainedHandlerFaults, SIGBUS, "fault inside the previously installed handler", NULL, 1},
+  {"sent-signal-ignored", TestSentSignalIgnored, 0, NULL, NULL, 0},
+  {"sent-signal-default-dies", TestSentSignalDefaultDies, SIGSEGV, NULL, "fexmac:", 1},
+  {"unclaimed-fault-dies", TestUnclaimedFaultDies, SIGBUS, NULL, "fexmac:", 1},
+  {"invalidate-concurrent", TestConcurrentInvalidation, 0, NULL, NULL, 0},
+  {"lifetime-races", TestLifetimeRaces, 0, NULL, NULL, 0},
 };
 
 int main(int argc, char** argv) {
-  PageSize = sysconf(_SC_PAGESIZE);
-  const size_t Count = sizeof(Subtests) / sizeof(Subtests[0]);
-
-  if (argc > 1) {
-    for (size_t i = 0; i < Count; ++i) {
-      if (strcmp(argv[1], Subtests[i].Name) == 0) {
-        Subtests[i].Run();
-        return Failures ? 1 : 0;
-      }
-    }
-    fprintf(stderr, "unknown subtest %s\n", argv[1]);
-    return 2;
-  }
-
-  int Failed = 0;
-  for (size_t i = 0; i < Count; ++i) {
-    printf("%s\n", Subtests[i].Name);
-    fflush(stdout);
-    const pid_t Child = fork();
-    if (Child == 0) {
-      alarm(60);
-      Subtests[i].Run();
-      fflush(stdout);
-      _exit(Failures ? 1 : 0);
-    }
-    int Status = 0;
-    waitpid(Child, &Status, 0);
-    int Passed;
-    if (WIFSIGNALED(Status) && WTERMSIG(Status) == SIGALRM) {
-      printf("  FAIL: hung, killed after 60 seconds\n");
-      Passed = 0;
-    } else if (Subtests[i].ExpectSignal) {
-      Passed = WIFSIGNALED(Status) && (WTERMSIG(Status) == SIGSEGV || WTERMSIG(Status) == SIGBUS);
-      printf("  %s: process died by signal %d\n", Passed ? "ok  " : "FAIL", WIFSIGNALED(Status) ? WTERMSIG(Status) : 0);
-    } else {
-      Passed = WIFEXITED(Status) && WEXITSTATUS(Status) == 0;
-      if (!Passed) {
-        printf("  FAIL: exit status %d, signal %d\n", WIFEXITED(Status) ? WEXITSTATUS(Status) : -1,
-               WIFSIGNALED(Status) ? WTERMSIG(Status) : 0);
-      }
-    }
-    Failed += Passed ? 0 : 1;
-    fflush(stdout);
-  }
-  printf("%s: %zu subtests, %d failed\n", Failed ? "FAIL" : "PASS", Count, Failed);
-  return Failed ? 1 : 0;
+  return RunSubtests(argc, argv, Subtests, sizeof(Subtests) / sizeof(Subtests[0]), 120);
 }

@@ -31,11 +31,25 @@ endfunction()
 add_library(fexmac STATIC ${FEXMAC_SRCS})
 fexmac_setup(fexmac)
 
+# The same library with the test-only hooks of fexmac_testing.h, for fexmac_hook_test only.
+# The production forms above and below never contain them (checked after each is built).
+add_library(fexmac_testing STATIC ${FEXMAC_SRCS})
+fexmac_setup(fexmac_testing)
+target_compile_definitions(fexmac_testing PRIVATE FEXMAC_TESTING=1)
+
+set(FEXMAC_NO_HOOKS_CHECK "${CMAKE_CURRENT_SOURCE_DIR}/check_no_test_hooks.sh")
+
 add_library(fexmac_shared SHARED ${FEXMAC_SRCS})
 fexmac_setup(fexmac_shared)
 set_target_properties(fexmac_shared PROPERTIES OUTPUT_NAME fexmac)
 target_link_options(fexmac_shared PRIVATE "LINKER:-exported_symbols_list,${FEXMAC_EXPORTS}" "LINKER:-dead_strip")
 set_property(TARGET fexmac_shared APPEND PROPERTY LINK_DEPENDS "${FEXMAC_EXPORTS}")
+add_custom_command(TARGET fexmac_shared POST_BUILD
+  COMMAND sh "${FEXMAC_NO_HOOKS_CHECK}" $<TARGET_FILE:fexmac_shared>
+  VERBATIM)
+add_custom_command(TARGET fexmac POST_BUILD
+  COMMAND sh "${FEXMAC_NO_HOOKS_CHECK}" $<TARGET_FILE:fexmac>
+  VERBATIM)
 
 # The standalone archive. `ld -r` combines the library's objects with every archive the
 # core needs into one object, keeping only what fexmac_* reaches and turning every other
@@ -55,18 +69,28 @@ add_custom_command(
     -Wl,-exported_symbols_list,${FEXMAC_EXPORTS}
   COMMAND ${CMAKE_COMMAND} -E rm -f "${FEXMAC_BUNDLE}"
   COMMAND libtool -static -no_warning_for_no_symbols -o "${FEXMAC_BUNDLE}" "${FEXMAC_PRELINKED}"
+  COMMAND sh "${FEXMAC_NO_HOOKS_CHECK}" "${FEXMAC_BUNDLE}"
   DEPENDS fexmac FEXCore Common JemallocLibs FEXCore_Base cpp-optparse tiny-json fmt xxhash cephes_128bit softfloat_3e rpmalloc
-    "${FEXMAC_EXPORTS}"
+    "${FEXMAC_EXPORTS}" "${FEXMAC_NO_HOOKS_CHECK}"
   COMMENT "Prelinking the standalone fexmac archive"
   VERBATIM)
 add_custom_target(fexmac_bundle ALL DEPENDS "${FEXMAC_BUNDLE}")
 
 # Tests that use the public header only, written in C, linked the way an outside
 # project would link: the standalone archive plus libc++.
-add_executable(fexmac_c_test tests/CApiTest.c)
+add_executable(fexmac_c_test tests/CApiTest.c tests/TestSupport.c)
 set_target_properties(fexmac_c_test PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED ON)
 target_include_directories(fexmac_c_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR})
-target_compile_options(fexmac_c_test PRIVATE -Wall -Wextra -Werror -pedantic)
+target_compile_options(fexmac_c_test PRIVATE -Wall -Wextra -Wshadow -Werror -pedantic)
 add_dependencies(fexmac_c_test fexmac_bundle)
 target_link_libraries(fexmac_c_test PRIVATE "${FEXMAC_BUNDLE}" c++)
 set_property(TARGET fexmac_c_test APPEND PROPERTY LINK_DEPENDS "${FEXMAC_BUNDLE}")
+target_link_libraries(fexmac_c_test PRIVATE Threads::Threads)
+
+# Tests of behaviour that needs the test-only hooks: a fault inside the library's
+# handler, and where core messages go. Linked against the fexmac_testing build.
+add_executable(fexmac_hook_test tests/HookTest.c tests/TestSupport.c)
+set_target_properties(fexmac_hook_test PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED ON LINKER_LANGUAGE CXX)
+target_include_directories(fexmac_hook_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR})
+target_compile_options(fexmac_hook_test PRIVATE -Wall -Wextra -Wshadow -Werror -pedantic)
+target_link_libraries(fexmac_hook_test PRIVATE fexmac_testing)

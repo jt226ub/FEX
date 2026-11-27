@@ -2,47 +2,71 @@
 //
 // Checks the options an embedder passes and turns them into a configuration layer.
 //
-// The core's own configuration loaders never reject a value: a number that does not parse
-// becomes 0, and a value of the wrong kind can stop the process later, when it is first
-// read. The library checks each option when the context is created instead, so a bad
-// option is reported as FEXMAC_ERROR_BAD_CONFIG before anything process-wide changes.
+// Only options on the list below are accepted. The core has well over a hundred options;
+// many belong to FEX's Linux front end, which macOS does not build, and some stop the
+// process when set without it (DISKCACHE aborts in context creation because nothing set
+// up thread creation for it), so an option is listed only once its effect on this port is
+// known. Each listed option has its own value rule; the core's own loaders never reject a
+// value (a number that does not parse becomes 0), so nothing is left to them.
+//
+// To add an option: put it in SupportedOptions with the narrowest rule that fits, and
+// describe it in docs/macOS-embedding-interface.md ("Options").
 #include "Internal.h"
 
 #include <FEXCore/Utils/LogManager.h>
 #include <FEXCore/fextl/fmt.h>
 
-#include <cerrno>
-#include <cstdlib>
+#include <cstdint>
 #include <cstring>
 #include <limits>
 #include <string_view>
 
 namespace fexmac {
 namespace {
-  enum class Kind { Bool, UInt8, Int32, UInt32, UInt64, String, StringArray, StringEnum };
+  enum class Rule {
+    Bool,       // 0 or 1
+    Positive32, // 1 to 2^31-1
+    SMCChecks,  // none, mtrack, full (or 0, 1, 2)
+    HostFeatures,
+    OnlyOne, // "1": IS64BIT_MODE, which may only confirm 64-bit mode
+  };
 
   struct OptionInfo {
     const char* EnvName;
     const char* FileName;
     FEXCore::Config::ConfigOption Option;
-    Kind Type;
+    Rule Check;
   };
 
-#define OPT_BASE(type, group, enum, json, default)
-#define OPT_BOOL(group, enum, json, default) {#enum, #json, FEXCore::Config::CONFIG_##enum, Kind::Bool},
-#define OPT_UINT8(group, enum, json, default) {#enum, #json, FEXCore::Config::CONFIG_##enum, Kind::UInt8},
-#define OPT_INT32(group, enum, json, default) {#enum, #json, FEXCore::Config::CONFIG_##enum, Kind::Int32},
-#define OPT_UINT32(group, enum, json, default) {#enum, #json, FEXCore::Config::CONFIG_##enum, Kind::UInt32},
-#define OPT_UINT64(group, enum, json, default) {#enum, #json, FEXCore::Config::CONFIG_##enum, Kind::UInt64},
-#define OPT_STR(group, enum, json, default) {#enum, #json, FEXCore::Config::CONFIG_##enum, Kind::String},
-#define OPT_STRARRAY(group, enum, json, default) {#enum, #json, FEXCore::Config::CONFIG_##enum, Kind::StringArray},
-#define OPT_STRENUM(group, enum, json, default) {#enum, #json, FEXCore::Config::CONFIG_##enum, Kind::StringEnum},
-  constexpr OptionInfo Options[] = {
-#include <FEXCore/Config/ConfigValues.inl>
+#define OPTION(Enum, File, Check) {#Enum, #File, FEXCore::Config::CONFIG_##Enum, Rule::Check}
+  constexpr OptionInfo SupportedOptions[] = {
+    // Translation.
+    OPTION(MULTIBLOCK, Multiblock, Bool),
+    OPTION(MAXINST, MaxInst, Positive32),
+    // x86 memory-ordering emulation (macOS has no hardware TSO mode for ordinary
+    // processes, so this is software emulation).
+    OPTION(TSOENABLED, TSOEnabled, Bool),
+    OPTION(VECTORTSOENABLED, VectorTSOEnabled, Bool),
+    OPTION(MEMCPYSETTSOENABLED, MemcpySetTSOEnabled, Bool),
+    OPTION(HALFBARRIERTSOENABLED, HalfBarrierTSOEnabled, Bool),
+    // Self-modifying code. "full" validates every block; "mtrack" needs page-protection
+    // tracking, which package D adds; until then it detects nothing and the embedder
+    // calls fexmac_invalidate. "none" detects nothing.
+    OPTION(SMCCHECKS, SMCChecks, SMCChecks),
+    // Guest-visible behaviour.
+    OPTION(X87REDUCEDPRECISION, X87ReducedPrecision, Bool),
+    OPTION(HIDEHYPERVISORBIT, HideHypervisorBit, Bool),
+    OPTION(HOSTFEATURES, HostFeatures, HostFeatures),
+    // Diagnostics.
+    OPTION(SILENTLOG, SilentLog, Bool),
+    OPTION(DUMPGPRS, DumpGPRs, Bool),
+    OPTION(DISABLETELEMETRY, DisableTelemetry, Bool),
+    OPTION(IS64BIT_MODE, IS64BIT_MODE, OnlyOne),
   };
+#undef OPTION
 
   const OptionInfo* FindOption(std::string_view Name) {
-    for (const auto& Info : Options) {
+    for (const auto& Info : SupportedOptions) {
       if (Name == Info.EnvName || Name == Info.FileName) {
         return &Info;
       }
@@ -50,35 +74,97 @@ namespace {
     return nullptr;
   }
 
-  template<typename T>
-  bool ParseInteger(std::string_view Value, T Min, T Max) {
+  // Decimal, or hexadecimal with 0x. A leading 0 is refused: the core's own conversion
+  // reads it as octal, which no one writing "010" means.
+  std::optional<uint64_t> ParseUnsigned(std::string_view Value) {
     if (Value.empty()) {
-      return false;
+      return std::nullopt;
     }
-    const fextl::string Copy {Value};
-    char* End {};
-    errno = 0;
-    if constexpr (std::numeric_limits<T>::is_signed) {
-      const long long Result = std::strtoll(Copy.c_str(), &End, 0);
-      return errno == 0 && *End == '\0' && Result >= Min && Result <= Max;
-    } else {
-      if (Copy[0] == '-') {
-        return false;
+    unsigned Base = 10;
+    if (Value.size() > 2 && Value[0] == '0' && (Value[1] == 'x' || Value[1] == 'X')) {
+      Base = 16;
+      Value.remove_prefix(2);
+    } else if (Value.size() > 1 && Value[0] == '0') {
+      return std::nullopt;
+    }
+    uint64_t Result = 0;
+    for (char C : Value) {
+      unsigned Digit;
+      if (C >= '0' && C <= '9') {
+        Digit = C - '0';
+      } else if (Base == 16 && C >= 'a' && C <= 'f') {
+        Digit = C - 'a' + 10;
+      } else if (Base == 16 && C >= 'A' && C <= 'F') {
+        Digit = C - 'A' + 10;
+      } else {
+        return std::nullopt;
       }
-      const unsigned long long Result = std::strtoull(Copy.c_str(), &End, 0);
-      return errno == 0 && *End == '\0' && Result >= Min && Result <= Max;
+      if (Result > (std::numeric_limits<uint64_t>::max() - Digit) / Base) {
+        return std::nullopt;
+      }
+      Result = Result * Base + Digit;
     }
+    return Result;
   }
 
-  // Applies the named-value conversions the core's environment loader does (for example
-  // SMCCHECKS=full), keyed by the environment-variable name.
-  fextl::string ConvertNamedValue(const OptionInfo& Info, std::string_view Value_View) {
-    const fextl::string KeyString = fextl::fmt::format("FEX_{}", Info.EnvName);
-    const std::string_view Key {KeyString};
-    std::optional<fextl::string> Value;
-#define ENVLOADER
-#include <FEXCore/Config/ConfigOptions.inl>
-    return Value ? *Value : fextl::string {Value_View};
+  // Checks a value and returns the string the core's configuration should receive.
+  std::optional<fextl::string> Convert(const OptionInfo& Info, std::string_view Value) {
+    switch (Info.Check) {
+    case Rule::Bool:
+      if (Value == "0" || Value == "1") {
+        return fextl::string {Value};
+      }
+      return std::nullopt;
+    case Rule::Positive32: {
+      const auto Number = ParseUnsigned(Value);
+      if (!Number || *Number < 1 || *Number > static_cast<uint64_t>(std::numeric_limits<int32_t>::max())) {
+        return std::nullopt;
+      }
+      return fextl::fmt::format("{}", *Number);
+    }
+    case Rule::SMCChecks:
+      if (Value == "none" || Value == "0") {
+        return fextl::string {"0"};
+      }
+      if (Value == "mtrack" || Value == "1") {
+        return fextl::string {"1"};
+      }
+      if (Value == "full" || Value == "2") {
+        return fextl::string {"2"};
+      }
+      return std::nullopt;
+    case Rule::HostFeatures: {
+      // A comma-separated list of the core's names; every name must be known (the core's
+      // own parser skips unknown ones with a message).
+      uint64_t Mask = 0;
+      std::string_view Rest = Value;
+      while (true) {
+        const auto Comma = Rest.find(',');
+        const std::string_view Name = Rest.substr(0, Comma);
+        bool Found = false;
+        for (const auto& [EnumName, Bits] : FEXCore::Config::HostFeatures_EnumPairs) {
+          if (EnumName == Name) {
+            Mask |= Bits;
+            Found = true;
+          }
+        }
+        if (!Found) {
+          return std::nullopt;
+        }
+        if (Comma == std::string_view::npos) {
+          break;
+        }
+        Rest.remove_prefix(Comma + 1);
+      }
+      return fextl::fmt::format("{}", Mask);
+    }
+    case Rule::OnlyOne:
+      if (Value == "1") {
+        return fextl::string {"1"};
+      }
+      return std::nullopt;
+    }
+    return std::nullopt;
   }
 
   void ReportBadOption(const char* Name, const char* Value, const char* Why) {
@@ -93,19 +179,7 @@ namespace {
 
     void Load() override {
       for (const auto& [Option, Value] : Values) {
-        const auto* Info = [&]() -> const OptionInfo* {
-          for (const auto& It : Options) {
-            if (It.Option == Option) {
-              return &It;
-            }
-          }
-          return nullptr;
-        }();
-        if (Info && Info->Type == Kind::StringArray) {
-          AppendStrArrayValue(Option, Value);
-        } else {
-          Set(Option, Value);
-        }
+        Set(Option, Value);
       }
     }
 
@@ -126,47 +200,18 @@ fexmac_result ParseOptions(const fexmac_config& Config, ParsedOptions* Out) {
       ReportBadOption(Name, Value, "name and value must both be set");
       return FEXMAC_ERROR_BAD_CONFIG;
     }
-
     const OptionInfo* Info = FindOption(Name);
     if (!Info) {
-      ReportBadOption(Name, Value, "unknown option");
+      ReportBadOption(Name, Value, "not an option this library supports");
       return FEXMAC_ERROR_BAD_CONFIG;
     }
-
-    fextl::string Converted = ConvertNamedValue(*Info, Value);
-    bool Valid = true;
-    switch (Info->Type) {
-    case Kind::Bool: Valid = Converted == "0" || Converted == "1"; break;
-    case Kind::UInt8: Valid = ParseInteger<uint64_t>(Converted, 0, std::numeric_limits<uint8_t>::max()); break;
-    case Kind::Int32:
-      Valid = ParseInteger<int64_t>(Converted, std::numeric_limits<int32_t>::min(), std::numeric_limits<int32_t>::max());
-      break;
-    case Kind::UInt32: Valid = ParseInteger<uint64_t>(Converted, 0, std::numeric_limits<uint32_t>::max()); break;
-    case Kind::UInt64:
-    case Kind::StringEnum: Valid = ParseInteger<uint64_t>(Converted, 0, std::numeric_limits<uint64_t>::max()); break;
-    case Kind::String:
-    case Kind::StringArray: break;
-    }
-
-    // The environment loader maps an unknown self-modifying-code mode to "none"
-    // silently; here it is an error.
-    if (Valid && Info->Option == FEXCore::Config::CONFIG_SMCCHECKS) {
-      const std::string_view Raw {Value};
-      const bool Named = Raw == "none" || Raw == "mtrack" || Raw == "full";
-      Valid = Named || (ParseInteger<uint64_t>(Raw, 0, 2));
-    }
-    if (!Valid) {
-      ReportBadOption(Name, Value, "value does not parse for this option");
+    auto Converted = Convert(*Info, Value);
+    if (!Converted) {
+      ReportBadOption(Name, Value, Info->Option == FEXCore::Config::CONFIG_IS64BIT_MODE ? "only 64-bit guests are supported on macOS" :
+                                                                                         "value not valid for this option");
       return FEXMAC_ERROR_BAD_CONFIG;
     }
-
-    // Only 64-bit guests: the first 4GB of a macOS process cannot hold guest memory.
-    if (Info->Option == FEXCore::Config::CONFIG_IS64BIT_MODE && Converted != "1") {
-      ReportBadOption(Name, Value, "only 64-bit guests are supported on macOS");
-      return FEXMAC_ERROR_BAD_CONFIG;
-    }
-
-    Out->emplace_back(Info->Option, std::move(Converted));
+    Out->emplace_back(Info->Option, std::move(*Converted));
   }
   return FEXMAC_OK;
 }
