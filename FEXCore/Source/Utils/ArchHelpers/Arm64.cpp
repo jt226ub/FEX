@@ -2106,8 +2106,11 @@ std::optional<int32_t> HandleUnalignedAccess(FEXCore::Core::InternalThreadState*
   // region therefore runs with the thread switched to writable; it is declared before
   // the lock so it ends after the lock is released. Without it the lock's first write
   // faults, and because that happens inside the SIGBUS handler with SIGBUS blocked, the
-  // thread hangs rather than crashing. Only host code runs in this region, and the
-  // instruction cache flushes below need no execute permission.
+  // thread hangs rather than crashing. Only host code runs in this region. The
+  // instruction cache flushes below therefore happen while the thread is still writable;
+  // JITWriteProbe's "rewrite code, flush while writable" case shows on an M4 that such a
+  // flush makes new code visible, and its no-flush control shows the test can see stale
+  // code.
   FEXCore::Allocator::ScopedJITWrite JITWrite;
 
   // Lock code mutex during any SIGBUS handling that potentially changes code.

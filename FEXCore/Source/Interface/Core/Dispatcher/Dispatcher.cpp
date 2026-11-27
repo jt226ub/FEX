@@ -47,7 +47,9 @@ Dispatcher::Dispatcher(FEXCore::Context::ContextImpl* ctx)
   }
 #ifdef __APPLE__
   // EmitDispatcher flushed the instruction cache while this thread still held write
-  // permission. Flush again now that the code is executable.
+  // permission. JITWriteProbe shows on an M4 that a flush made while writable is enough,
+  // so this second flush, now that the code is executable, is not proven needed. It runs
+  // once per context and is kept until that holds on more machines.
   ClearICache(reinterpret_cast<void*>(Start), End - Start);
 #endif
 
