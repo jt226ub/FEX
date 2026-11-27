@@ -431,10 +431,22 @@ private:
   // full separate host-page guard after them; TotalAllocSize() is shared by Alloc/Free so the
   // real mmap'd extent used to unmap always matches what was actually mapped.
   static size_t TotalAllocSize(size_t Size) {
-    static const size_t HostPageSize = static_cast<size_t>(sysconf(_SC_PAGESIZE));
-    return AlignUp(Size, HostPageSize) + HostPageSize;
+    return GuardOffset(Size) + HostPageSize();
   }
 
+  static size_t HostPageSize() {
+    static const size_t Size = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+    return Size;
+  }
+
+public:
+  // Where the inaccessible host page starts in a buffer claimed with this size: every
+  // byte before it is usable, and the guard is exactly one host page long.
+  static size_t GuardOffset(size_t Size) {
+    return AlignUp(Size, HostPageSize());
+  }
+
+private:
   void* Alloc(size_t Size) override {
     const size_t TotalSize = TotalAllocSize(Size);
     auto Ptr = FEXCore::Allocator::VirtualAlloc(TotalSize);

@@ -1145,8 +1145,43 @@ void fexmac_testing_guard_pages(fexmac_thread* thread, uint64_t* callret_low, ui
   const auto Base = reinterpret_cast<uint64_t>(thread->CallRetAllocation);
   *callret_low = Base;
   *callret_high = Base + thread->CallRetAllocationSize - HostPage;
-  const uint64_t Guard = thread->Thread->JITGuardPage;
-  *scratch = Guard ? (Guard + FEXCore::Utils::FEX_PAGE_SIZE + HostPage - 1) & ~(HostPage - 1) : 0;
+  // The core arms JITGuardPage with the exact first address of the guard.
+  *scratch = thread->Thread->JITGuardPage;
+}
+
+uint64_t fexmac_testing_scratch_overflows(fexmac_thread* thread) {
+  return thread ? thread->Thread->JITScratchOverflows : 0;
+}
+
+void fexmac_testing_set_scratch_limit(fexmac_thread* thread, uint64_t limit) {
+  if (thread) {
+    thread->Thread->JITScratchBufferLimit = limit;
+  }
+}
+
+void fexmac_testing_set_scratch_start(fexmac_thread* thread, uint32_t bytes_per_node) {
+  if (thread) {
+    thread->Thread->JITScratchStartMultiplier = bytes_per_node;
+  }
+}
+
+uint64_t fexmac_testing_code_buffer_guard(fexmac_thread* thread) {
+  return thread ? thread->Thread->CTX->GetCodeBufferGuard(thread->Thread) : 0;
+}
+
+void fexmac_testing_overrun_code_buffer(fexmac_thread* thread) {
+  auto* End = reinterpret_cast<uint8_t*>(fexmac_testing_code_buffer_guard(thread));
+  if (!End) {
+    return;
+  }
+  static const uint8_t Bytes[64] {};
+  pthread_jit_write_protect_np(0);
+  // volatile: the store must happen, byte by byte, as an overrunning copy would.
+  volatile uint8_t* Destination = End - 32;
+  for (size_t i = 0; i < sizeof(Bytes); ++i) {
+    Destination[i] = Bytes[i];
+  }
+  pthread_jit_write_protect_np(1);
 }
 
 void fexmac_testing_set_invalidation_hook(void (*hook)(void)) {

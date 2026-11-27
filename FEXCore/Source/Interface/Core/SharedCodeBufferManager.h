@@ -68,7 +68,13 @@ struct CodeBuffer {
 
   // Returns the total number of bytes available for storing code
   size_t UsableSize() const {
-    return AllocatedSize - FEXCore::Utils::FEX_PAGE_SIZE;
+    return AllocatedSize - GuardSize;
+  }
+
+  // Returns whether Address is in the inaccessible page after the usable part.
+  bool IsAddressInGuard(uintptr_t Address) const {
+    const auto Guard = reinterpret_cast<uintptr_t>(Ptr) + UsableSize();
+    return Address >= Guard && Address < Guard + GuardSize;
   }
 
   // Returns the full size of the buffer, including the guard page.
@@ -92,6 +98,12 @@ struct CodeBuffer {
   }
 
 private:
+#ifdef __APPLE__
+  // The guard must be a whole host page there: protection only works on 16K pages.
+  static constexpr size_t GuardSize = FEXCore::Utils::FEX_HOST_PAGE_SIZE;
+#else
+  static constexpr size_t GuardSize = FEXCore::Utils::FEX_PAGE_SIZE;
+#endif
   uint8_t* Ptr;
   uint8_t* CodeBufferEnd;
   size_t AllocatedSize; // including guard page; see UsableSize()

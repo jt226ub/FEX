@@ -320,8 +320,7 @@ namespace {
   // The translator writes each block into a per-thread scratch buffer followed by an
   // inaccessible page. Running into it means the buffer was too small: resume the thread
   // at the translator's restart point, which retries with a larger buffer. On macOS the
-  // inaccessible page is a whole host page placed at the next host page boundary after
-  // JITGuardPage, so the fault can land anywhere from JITGuardPage to the end of it.
+  // inaccessible page is one whole host page and JITGuardPage is exactly where it starts.
   //
   // Only a translation that is running may be restarted: guest addresses are host
   // addresses, so a guest load from that page, or a bug in the embedder's system call
@@ -338,7 +337,7 @@ namespace {
     }
     const uintptr_t HostPage = FEXCore::Utils::FEX_HOST_PAGE_SIZE;
     const uintptr_t GuardBegin = Thread->JITGuardPage;
-    const uintptr_t GuardEnd = ((Thread->JITGuardPage + FEXCore::Utils::FEX_PAGE_SIZE + HostPage - 1) & ~(HostPage - 1)) + HostPage;
+    const uintptr_t GuardEnd = GuardBegin + HostPage;
     const auto Address = reinterpret_cast<uintptr_t>(Info->si_addr);
     if (Address < GuardBegin || Address >= GuardEnd) {
       return false;
@@ -661,6 +660,30 @@ namespace {
              "bracket such writes with fexmac_memory_write_begin and fexmac_memory_write_end\n");
   }
 
+  // The core keeps an inaccessible host page after each code buffer, so an access that
+  // runs past a buffer's end faults instead of landing in whatever is mapped next. Every
+  // write into a code buffer is bounds-checked first, so this never happens in normal
+  // operation: it is a bug in the core, never the guest's doing, and nothing can be
+  // repaired. Reported whatever handles the fault next, then passed on like any other.
+  void ReportCodeBufferOverrun(int Signal, siginfo_t* Info, ucontext_t* Context) {
+    auto* Current = GetCurrentThread();
+    if (!Current) {
+      return;
+    }
+    const auto Kind = ClassifyFault(Context);
+    const auto Address = reinterpret_cast<uintptr_t>(Info->si_addr);
+    if (Kind.Kind != FaultKind::Access || !Current->Thread->CTX->IsAddressInCodeBufferGuard(Current->Thread, Address)) {
+      return;
+    }
+    WriteRaw(Signal == SIGBUS ? "fexmac: SIGBUS" : "fexmac: SIGSEGV");
+    WriteRaw(Kind.Write ? ": write" : ": read");
+    WriteRaw(" past the end of a code buffer, at address ");
+    WriteHex(Address);
+    WriteRaw(" (its guard page) from host pc ");
+    WriteHex(Context->uc_mcontext->__ss.__pc);
+    WriteRaw("; a bug in the translator core, passing it on\n");
+  }
+
   // Calls the action that was installed before the library's: with its mask added and
   // reset to the default first if it had SA_RESETHAND, as the kernel would. One
   // difference, on purpose: SIGSEGV and SIGBUS (and the other synchronous fault signals)
@@ -756,6 +779,9 @@ namespace {
     const bool HasHandler = (Stored->sa_flags & SA_SIGINFO) ? Stored->sa_sigaction != nullptr :
                                                               (Stored->sa_handler != SIG_DFL && Stored->sa_handler != SIG_IGN);
     const bool Ignored = !(Stored->sa_flags & SA_SIGINFO) && Stored->sa_handler == SIG_IGN;
+    if (!Sent) {
+      ReportCodeBufferOverrun(Signal, Info, static_cast<ucontext_t*>(RawContext));
+    }
     if (!HasHandler && !Sent) {
       // Written while still in the library's own code.
       ReportUnhandledFault(Signal, Info, static_cast<ucontext_t*>(RawContext));

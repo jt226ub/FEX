@@ -13,7 +13,10 @@
 // GitHub's hosted Mac does not enforce write protection, so only the first form can run
 // there.
 
+#include <errno.h>
 #include <libkern/OSCacheControl.h>
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdint.h>
@@ -406,6 +409,102 @@ static int StatusUnmapped(void) {
   return OK;
 }
 
+// ---- Guard pages after MAP_JIT memory ----
+//
+// The code buffer wants an inaccessible page directly after it, so a write past its end
+// faults instead of landing in whatever is mapped next. These cases show which ways of
+// placing one macOS accepts. MAP_JIT and MAP_FIXED cannot be combined, and the
+// protection of a page inside a MAP_JIT mapping cannot be changed (mprotect above,
+// mach_vm_protect here), but a MAP_FIXED mapping of ordinary PROT_NONE memory may
+// replace the tail of the program's own MAP_JIT mapping; the rest stays MAP_JIT. That is
+// what FEXCore's CodeBuffer does on macOS.
+
+#define JIT_GUARD_BODY (MAP_SIZE * 4)
+
+// A MAP_JIT mapping of JIT_GUARD_BODY bytes followed by one host page of PROT_NONE
+// non-JIT memory that replaced the mapping's tail, or NULL.
+static char* MapJITWithTailGuard(void) {
+  const size_t Page = (size_t)sysconf(_SC_PAGESIZE);
+  char* P = mmap(NULL, JIT_GUARD_BODY + Page, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS | MAP_JIT, -1, 0);
+  if (P == MAP_FAILED) return NULL;
+  void* G = mmap(P + JIT_GUARD_BODY, Page, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+  return G == (void*)(P + JIT_GUARD_BODY) ? P : NULL;
+}
+
+// Reserve a range as ordinary PROT_NONE memory, then map MAP_JIT over the front of it.
+static int JITFixedOverReservation(void) {
+  char* R = mmap(NULL, MAP_SIZE * 2, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (R == MAP_FAILED) return MAPPING_REFUSED;
+  void* P = mmap(R, MAP_SIZE, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS | MAP_JIT | MAP_FIXED, -1, 0);
+  return P == MAP_FAILED ? (errno == EINVAL ? MAPPING_REFUSED : OTHER_SIGNAL) : OK;
+}
+
+// mach_vm_protect on one page inside a MAP_JIT mapping.
+static int MachProtectInsideJIT(void) {
+  char* P = mmap(NULL, MAP_SIZE * 2, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS | MAP_JIT, -1, 0);
+  if (P == MAP_FAILED) return MAPPING_REFUSED;
+  return mach_vm_protect(mach_task_self(), (mach_vm_address_t)(P + MAP_SIZE), MAP_SIZE, 0, VM_PROT_NONE) == KERN_SUCCESS ? OK : CALL_REFUSED;
+}
+
+// A PROT_NONE mapping replacing the tail of a MAP_JIT mapping: the replacement succeeds
+// and the front still takes and runs code written the correct way, up to its last word.
+static int JITTailGuardRuns(void) {
+  char* P = MapJITWithTailGuard();
+  if (!P) return MAPPING_REFUSED;
+  pthread_jit_write_protect_np(0);
+  memcpy(P, Code, sizeof(Code));
+  Store32(P + JIT_GUARD_BODY - 4, Code[1]);
+  pthread_jit_write_protect_np(1);
+  sys_icache_invalidate(P, sizeof(Code));
+  return ((Fn)P)() == 42 ? OK : WRONG_RESULT;
+}
+
+// The front is still MAP_JIT: written while switched to executable, it faults.
+static int JITTailGuardStillProtected(void) {
+  char* P = MapJITWithTailGuard();
+  if (!P) return MAPPING_REFUSED;
+  pthread_jit_write_protect_np(1);
+  Store32(P + JIT_GUARD_BODY - 4, 0);
+  return OK;
+}
+
+// A write running off the end, with the thread switched to writable (as the translator
+// is while copying code in), faults on the guard; the case reports the fault status.
+static int JITTailGuardFaultsWhileWritable(void) {
+  char* P = MapJITWithTailGuard();
+  if (!P) return MAPPING_REFUSED;
+  InstallHandler(SIGBUS, ReportFaultStatus);
+  InstallHandler(SIGSEGV, ReportFaultStatus);
+  pthread_jit_write_protect_np(0);
+  Store32(P + JIT_GUARD_BODY, 0);
+  return OK;
+}
+
+// One munmap of the whole range releases both mappings.
+static int JITTailGuardUnmap(void) {
+  const size_t Page = (size_t)sysconf(_SC_PAGESIZE);
+  char* P = MapJITWithTailGuard();
+  if (!P) return MAPPING_REFUSED;
+  if (munmap(P, JIT_GUARD_BODY + Page) != 0) return CALL_REFUSED;
+  mach_vm_address_t Address = (mach_vm_address_t)P;
+  mach_vm_size_t Size = 0;
+  vm_region_basic_info_data_64_t Info;
+  mach_msg_type_number_t Count = VM_REGION_BASIC_INFO_COUNT_64;
+  mach_port_t Object;
+  const kern_return_t KR = mach_vm_region(mach_task_self(), &Address, &Size, VM_REGION_BASIC_INFO_64, (vm_region_info_t)&Info, &Count, &Object);
+  // The next region found starts at or after the end of the released range.
+  return (KR != KERN_SUCCESS || Address >= (mach_vm_address_t)(P + JIT_GUARD_BODY + Page)) ? OK : WRONG_RESULT;
+}
+
+// Whether a non-fixed PROT_NONE mapping hinted at the end of a MAP_JIT mapping lands
+// there. Not relied on: a hint can always be ignored.
+static int HintedGuardAfterJIT(void) {
+  char* P = mmap(NULL, MAP_SIZE, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS | MAP_JIT, -1, 0);
+  if (P == MAP_FAILED) return MAPPING_REFUSED;
+  void* G = mmap(P + MAP_SIZE, MAP_SIZE, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  return G == (void*)(P + MAP_SIZE) ? OK : CALL_REFUSED;
+}
+
 // ---- Driver ----
 
 static enum Outcome Run(const char* Name, int (*Case)(void)) {
@@ -423,13 +522,13 @@ static enum Outcome Run(const char* Name, int (*Case)(void)) {
     const int Signal = WTERMSIG(Status);
     O = Signal == SIGALRM ? HANG : (Signal == SIGBUS || Signal == SIGSEGV) ? FAULT : Signal == SIGILL ? ILLEGAL : OTHER_SIGNAL;
     if (O != HANG) {
-      printf("%-52s FAULT (signal %d, %s)", Name, Signal, strsignal(Signal));
+      printf("%-56s FAULT (signal %d, %s)", Name, Signal, strsignal(Signal));
       return O;
     }
   } else {
     O = (enum Outcome)WEXITSTATUS(Status);
   }
-  printf("%-52s %s", Name, OutcomeName(O));
+  printf("%-56s %s", Name, OutcomeName(O));
   return O;
 }
 
@@ -446,7 +545,7 @@ static const struct ProbeCase Cases[] = {
   {"MAP_JIT: write while switched to executable", WriteWhileExecutable, FAULT},
   {"MAP_JIT: run while still switched to writable", RunWhileWritable, FAULT},
   {"MAP_JIT: compare-and-swap while executable", CASWhileExecutable, FAULT},
-  {"MAP_JIT: mprotect one page inside the mapping", MprotectInsideJIT, REPORT_ONLY},
+  {"MAP_JIT: mprotect one page inside the mapping", MprotectInsideJIT, CALL_REFUSED},
   {"Plain writable+executable memory without MAP_JIT", PlainRWX, REPORT_ONLY},
   {"MAP_JIT: rewrite code, flush while writable", FlushWhileWritable, OK},
   {"MAP_JIT: rewrite code, flush after switching back", FlushAfterSwitch, OK},
@@ -466,6 +565,13 @@ static const struct ProbeCase Cases[] = {
   {"Fault status: load from an unmapped address", StatusUnmapped, ACCESS_FAULT},
   {"Fault status: misaligned atomic across 16 bytes", StatusMisalignedAtomic, ALIGNMENT_FAULT},
   {"Fault status: misaligned atomic on a PROT_NONE page", StatusMisalignedAtomicProtNone, ALIGNMENT_FAULT},
+  {"Guard: MAP_JIT|MAP_FIXED over a PROT_NONE reservation", JITFixedOverReservation, MAPPING_REFUSED},
+  {"Guard: mach_vm_protect one page inside MAP_JIT", MachProtectInsideJIT, CALL_REFUSED},
+  {"Guard: PROT_NONE over MAP_JIT tail; front runs code", JITTailGuardRuns, OK},
+  {"Guard: PROT_NONE over MAP_JIT tail; front protected", JITTailGuardStillProtected, FAULT},
+  {"Guard: PROT_NONE over MAP_JIT tail; overrun, writable", JITTailGuardFaultsWhileWritable, ACCESS_FAULT},
+  {"Guard: PROT_NONE over MAP_JIT tail; one munmap frees", JITTailGuardUnmap, OK},
+  {"Guard: PROT_NONE hinted at the end of MAP_JIT", HintedGuardAfterJIT, REPORT_ONLY},
 };
 
 int main(int argc, char** argv) {

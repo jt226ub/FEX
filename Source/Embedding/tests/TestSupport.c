@@ -215,3 +215,42 @@ int RunSubtests(int argc, char** argv, const struct Subtest* Subtests, size_t Co
   printf("%s: %zu subtests, %d failed\n", Failed ? "FAIL" : "PASS", Count, Failed);
   return Failed ? 1 : 0;
 }
+
+/* ---- large blocks ---- */
+
+/* Writes `Count` rep movsq with an `add rax, 1` after every `Every`-th one, then hlt.
+ * Returns the bytes written; *Expected is rax at the hlt when rax starts at 0. */
+size_t WriteBigBlock(uint8_t* Code, size_t Count, size_t Every, uint64_t* Expected) {
+  static const uint8_t RepMovsq[] = {0xF3, 0x48, 0xA5};
+  static const uint8_t AddRax1[] = {0x48, 0x83, 0xC0, 0x01};
+  size_t Offset = 0;
+  *Expected = 0;
+  for (size_t i = 1; i <= Count; ++i) {
+    memcpy(Code + Offset, RepMovsq, sizeof(RepMovsq));
+    Offset += sizeof(RepMovsq);
+    if (i % Every == 0) {
+      memcpy(Code + Offset, AddRax1, sizeof(AddRax1));
+      Offset += sizeof(AddRax1);
+      ++*Expected;
+    }
+  }
+  Code[Offset++] = 0xF4;
+  return Offset;
+}
+
+const fexmac_option BigBlockOptions[2] = {{"MAXINST", "100000"}, {"MULTIBLOCK", "1"}};
+
+/* Runs the block at Code from its start with rax = rcx = 0; returns whether it halted
+ * at its end with the expected rax. */
+int RunBigBlock(fexmac_thread* Thread, uint8_t* Code, size_t Length, uint64_t Expected, uint8_t* Data) {
+  fexmac_x86_state State = GetState(Thread);
+  State.rip = (uint64_t)(uintptr_t)Code;
+  State.gpr[RAX] = 0;
+  State.gpr[RCX] = 0;
+  State.gpr[RSI] = State.gpr[RDI] = (uint64_t)(uintptr_t)Data;
+  SetState(Thread, &State);
+  const fexmac_stop Stop = Run(Thread);
+  State = GetState(Thread);
+  const int Ok = Stop.reason == FEXMAC_STOP_HALT && State.rip == (uint64_t)(uintptr_t)Code + Length - 1 && State.gpr[RAX] == Expected;
+  return Ok;
+}

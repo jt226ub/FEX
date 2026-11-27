@@ -10,6 +10,10 @@
 #ifndef _WIN32
 #include <FEXCore/Utils/PrctlUtils.h>
 #endif
+#ifdef __APPLE__
+#include <cerrno>
+#include <sys/mman.h>
+#endif
 
 namespace FEXCore::CPU {
 static constexpr size_t INITIAL_CODE_SIZE = 1024 * 1024 * 16;
@@ -29,9 +33,18 @@ CodeBuffer::CodeBuffer(size_t Size, bool ShouldBeNamed)
     LogMan::Msg::EFmt("Failed to mprotect last page of code buffer.");
   }
 #else
-  // No guard page on macOS: it refuses to change the protection of part of a
-  // MAP_JIT mapping, and will not place another mapping directly after one.
-  // The usable size still leaves the last page unused.
+  // macOS refuses to change the protection of a page inside a MAP_JIT mapping (mprotect
+  // and mach_vm_protect both fail) and refuses MAP_JIT together with MAP_FIXED, so the
+  // guard cannot be made the Linux way. It can be made by replacing the last host page of
+  // this, the program's own, mapping with a MAP_FIXED mapping of ordinary PROT_NONE
+  // memory: the rest stays MAP_JIT, and a write past the usable end then faults whatever
+  // the thread's JIT write setting is (JITWriteProbe's "Guard:" cases, as built and
+  // hardened). VirtualFree's single munmap releases both. The guard is a whole host
+  // page, so it cannot be stepped over by any single store.
+  void* const Guard = Ptr + Size - FEXCore::Utils::FEX_HOST_PAGE_SIZE;
+  if (::mmap(Guard, FEXCore::Utils::FEX_HOST_PAGE_SIZE, PROT_NONE, MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS, -1, 0) != Guard) {
+    ERROR_AND_DIE_FMT("Couldn't place the guard page after the code buffer: {}", errno);
+  }
 #endif
 
   if (ShouldBeNamed) {

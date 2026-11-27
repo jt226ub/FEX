@@ -427,6 +427,13 @@ void CodeCache::Validate(const ExecutableFileSectionInfo& Section, fextl::set<ui
 
   while (!GuestBlocks.empty()) {
     auto [CompiledBlocks, _, _2, _3, _4] = ValidationCTX->CompileCode(ValidationThread.get(), *GuestBlocks.begin(), 0 /* TODO: Set MaxInst? */);
+#ifdef __APPLE__
+    // The translator gives up on a block that never fits its scratch buffer (EmitJITCode)
+    // and returns no entry points; without this the loop would retry it for ever.
+    if (CompiledBlocks.EntryPoints.empty()) {
+      ERROR_AND_DIE_FMT("Cache validation: the block at {:#x} could not be translated", *GuestBlocks.begin());
+    }
+#endif
     for (auto& Entry : CompiledBlocks.EntryPoints) {
       GuestBlocks.erase(Entry.first);
     }

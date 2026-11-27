@@ -367,7 +367,9 @@ typedef enum fexmac_stop_reason {
    * fs or gs, `o16 iret`, ...) or bytes it cannot decode. A real CPU might run it; this
    * is not the guest's #UD. Filled like an invalid-opcode fault (signal SIGILL, trap 6,
    * si_code 0, fault_address = instruction_address) so a host that only knows
-   * GUEST_FAULT can still deliver it as one. */
+   * GUEST_FAULT can still deliver it as one. Also used, with instruction_address at the
+   * block's start and a core message saying why, for a block the translator gives up
+   * on because its code keeps overflowing the translator's buffer (an emitter bug). */
   FEXMAC_STOP_UNSUPPORTED_INSTRUCTION = 4,
   /* fexmac_thread_request_stop asked the thread to stop. The guest state is at an
    * instruction boundary (or part-way through a rep cmps/scas/lods, with rcx, rsi and rdi
@@ -568,6 +570,10 @@ FEXMAC_EXPORT uint64_t fexmac_memory_code_write_count(fexmac_context* context);
  * written; an overlapping forward copy run again gives a different result). Flags the
  * rest of the block overwrites without reading may be stale. See
  * docs/macOS-embedding-interface.md, "Guest memory faults: what is exact".
+ *
+ * One fault outside these is always a core bug: an access past the end of a code buffer,
+ * which ends in the inaccessible page after it; with the library's handlers installed it
+ * writes a "fexmac:" line naming it before passing the fault on.
  *
  * Two ways to connect it, pick one per process:
  *

@@ -356,5 +356,23 @@ namespace CPU {
     return false;
   }
 
+#ifdef __APPLE__
+  bool CPUBackend::IsAddressInCodeBufferGuard(uintptr_t Address) const {
+    if (CurrentCodeBuffer && CurrentCodeBuffer->IsAddressInGuard(Address)) {
+      return true;
+    }
+    for (const auto& Buffer : SignalHandlerCodeBuffers) {
+      if (Buffer->IsAddressInGuard(Address)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  uintptr_t CPUBackend::GetCodeBufferGuard() const {
+    return CurrentCodeBuffer ? reinterpret_cast<uintptr_t>(CurrentCodeBuffer->GetBufferBase()) + CurrentCodeBuffer->UsableSize() : 0;
+  }
+#endif
+
 } // namespace CPU
 } // namespace FEXCore

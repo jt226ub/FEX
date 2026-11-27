@@ -227,7 +227,14 @@ Only faults on a host thread that is inside `fexmac_thread_run`, and among those
    guest code and callbacks do not run on the thread then. The thread resumes at the
    translator's restart point, and the guard is disarmed until the core arms it again for
    the retry. Guest addresses are host addresses, so without the marker a guest access or
-   a callback bug touching the page would jump to a stale restart point;
+   a callback bug touching the page would jump to a stale restart point. The guard is
+   one 16K host page and the address the core records is exactly its first byte; only
+   that page is claimed. The core disarms it as soon as the emitter stops writing,
+   before the block is copied into the code buffer. A block that keeps overflowing is
+   given up at 64MB of scratch buffer: the run then stops with
+   `FEXMAC_STOP_UNSUPPORTED_INSTRUCTION` at the block's first instruction, with the core
+   message `Block at ... still overflows its translation buffer`, and the thread can be
+   used again;
 2. a fault inside its call/return stack allocation (guard pages) raised by a load/store
    pair whose base register is `x25` (`REG_CALLRET_SP`), in translated code or the
    dispatcher, at an address within the 16 bytes it moves: the call/return stack's own
@@ -252,6 +259,13 @@ for which the library first writes `fexmac: SIGBUS: host code wrote guest addres
 bracket such writes with fexmac_memory_write_begin and fexmac_memory_write_end`. With
 the library's handlers and nothing installed before, the process dies with the signal;
 with a host handler (installed before, or owning the signals) the host receives it.
+
+A fault in the inaccessible page after one of the thread's code buffers is a write (or
+read) running past the end of the buffer: a core bug, never the guest's doing, since
+every write into a code buffer is bounds-checked first. It is not claimed either, but
+the library always writes `fexmac: SIGBUS: write past the end of a code buffer, at
+address ... (its guard page) from host pc ...` to standard error first, also when a
+host handler receives it next.
 
 `fexmac_handle_fault` allocates nothing, takes no lock that code outside a fault handler
 holds and never calls the log callback. If the core meets an atomic instruction it cannot
@@ -796,6 +810,9 @@ alarm kills it.
 | `chained-siglongjmp-layouts` | the reviewer's `ljmp4` sequence over 306 stack layouts (a reduced `ljmp2` grid): probe, abandoned handler frame, later probes above, below and at its depth; every layout survives |
 | `sent-signal-ignored`, `sent-signal-default-dies` | `kill(SIGSEGV)` with the previous action "ignore" or the default |
 | `unclaimed-fault-dies` | a host fault outside guest code dies silently with SIGBUS |
+| `scratch-overflow-sizes` | blocks of 96 to 416 `rep movsq`, one instruction longer each time, each in a fresh context (a fresh, exactly sized scratch buffer), across the size where the first translation starts to overflow, then blocks of 2,048 to 8,192; every result exact |
+| `scratch-overflow-threads` | 8 threads translating and running 12 large blocks each at the same time, sharing the code buffer |
+| `code-buffer-switch`, `code-buffer-switch-cached` | one large block translated 160 times (invalidated in between), well past the first 16MB code buffer, so blocks that do not fit in what is left move to new, larger buffers; the second with the code cache on, so the copies are loaded from the cache by copy |
 | `invalidate-concurrent` | 8 guest threads invalidating in every one of 20,000 system calls each while the main thread invalidates in a loop, at least 12 runs; a progress watchdog fails it within 5 seconds of a hang. It hung in each of 3 runs before package E's reader-writer lock fix and passed 6 of 6 after it |
 | `split-locks-concurrent` | 8 threads at once run 30,000 `lock xadd` each on one qword crossing 16 bytes, a 128-byte line and the 16K page, a `lock cmpxchg` increment loop across 16 bytes (each adding 0x100000001, which changes both halves), and a spin lock taken with `xchg` across 16 bytes and released by a plain store; every total must be exact. With the split-lock lock switched off in a scratch build, the three `lock xadd` totals came out short in 3 of 3 runs |
 | `split-locks-every-form` | every form the core emulates across 16 bytes, from 8 threads at once, 10,000 operations each: `lock xadd` of 16, 32 and 64 bits, `lock add`, `sub`, `xor`, `inc`, `dec`, `not`, `neg`, `or` then `and`, a `cmpxchg8b` increment loop, a `cmpxchg8b` spin lock with a plain release and an `xchg` spin lock whose value spans both halves; operands change both halves where the operation allows it; a host thread meanwhile writes the neighbouring bytes that share the operand's compare-and-swap units with plain stores. Every result exact. Before the split-lock fixes of package E's third round, 7 of the 13 forms came out wrong in each of 2 runs |
@@ -812,12 +829,17 @@ alarm kills it.
 | `code-ranges` | empty and wrapping ranges refused; jumping to an unregistered page stops with a guest fault there; registering it lets the program finish; removing it again (with its translations) faults again |
 
 `fexmac_hook_test` (linked against `fexmac_testing`, whose hooks also report a thread's
-guard-page addresses):
+guard-page addresses and scratch-buffer overflows, set the scratch buffer's first size
+and limit, and overrun a code buffer on purpose):
 
 | Subtest | Checks |
 |---|---|
 | `guest-load-callret-low-guard`, `guest-store-callret-high-guard` | a guest load or store on a call/return guard page is the guest's page fault at that address; no reset of `x25`, no loop (`guard2.c`) |
 | `scratch-guard-disarmed-after-translation` | the scratch-buffer guard is disarmed once a block is emitted, so no later access to that page can be taken for the translator's overflow |
+| `scratch-overflow-many` | with the default first size, 96 `rep movsq` fit and 416 overflow (the premise of `scratch-overflow-sizes`); starting at 1, 6 and 12 bytes per IR node, translations overflow 0, 1, 2 and up to 5 times and every block runs correctly with the guard disarmed afterwards |
+| `scratch-limit-stops` | with a 64K limit a block that does not fit stops with `UNSUPPORTED_INSTRUCTION` at its start after several overflows, with the core's message; the guard is disarmed; with the limit lifted the same thread translates and runs it |
+| `code-buffer-guard-pages` | three code buffers in turn (filled by one large block translated again and again) each end in an inaccessible page with executable code before it |
+| `code-buffer-overrun-dies`, `code-buffer-overrun-chained` | a write running past the end of the code buffer with the thread switched to writable (from the system call callback) faults on the guard page; the process dies with the library's message, or, with a host handler installed before the library, the message is written and the host receives the fault at the guard address |
 | `callback-callret-guard-passed-on` | the system call callback reading a call/return guard page: the host's handler receives the fault at that address |
 | `log-callback-reentry` | fexmac calls from inside the log callback return `BUSY`; afterwards they work |
 | `fault-inside-handler-dies` | the hook fired exactly once, the process died with SIGBUS, the message was written |
