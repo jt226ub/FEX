@@ -37,6 +37,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <map>
 #include <optional>
 #include <set>
 #include <cerrno>
@@ -110,8 +111,46 @@ private:
   fextl::vector<std::pair<std::string_view, std::string_view>> Env;
 };
 
+// Guest memory this runner mapped, as merged [begin, end) ranges.
+class MappedRanges {
+public:
+  void Add(uint64_t Begin, uint64_t End) {
+    auto It = Ranges.upper_bound(Begin);
+    if (It != Ranges.begin() && std::prev(It)->second >= Begin) {
+      --It;
+      Begin = It->first;
+      End = std::max(End, It->second);
+      It = Ranges.erase(It);
+    }
+    while (It != Ranges.end() && It->first <= End) {
+      End = std::max(End, It->second);
+      It = Ranges.erase(It);
+    }
+    Ranges.emplace(Begin, End);
+  }
+
+  // The mapped range holding Address, or an empty range.
+  std::pair<uint64_t, uint64_t> Find(uint64_t Address) const {
+    auto It = Ranges.upper_bound(Address);
+    if (It == Ranges.begin()) {
+      return {0, 0};
+    }
+    --It;
+    if (Address >= It->second) {
+      return {0, 0};
+    }
+    return *It;
+  }
+
+private:
+  std::map<uint64_t, uint64_t> Ranges;
+};
+
 class RunnerSyscallHandler final : public FEXCore::HLE::SyscallHandler, public FEXCore::Allocator::FEXAllocOperators {
 public:
+  // Set once the test's memory is mapped.
+  const MappedRanges* Memory {};
+
   void HandleSyscall(FEXCore::Core::CpuStateFrame*) override {}
 
   // The core calls this when translated code finds that the guest code it came from has
@@ -127,8 +166,15 @@ public:
     return std::nullopt;
   }
 
-  FEXCore::HLE::ExecutableRangeInfo QueryGuestExecutableRange(FEXCore::Core::InternalThreadState*, uint64_t) override {
-    return {0, UINT64_MAX, true};
+  // The disk cache hashes and patches guest bytes from this range, so it must be memory
+  // that is really mapped: the whole address space would let a damaged cache entry make
+  // the core read unmapped memory.
+  FEXCore::HLE::ExecutableRangeInfo QueryGuestExecutableRange(FEXCore::Core::InternalThreadState*, uint64_t Address) override {
+    if (!Memory) {
+      return {0, UINT64_MAX, true};
+    }
+    auto [Begin, End] = Memory->Find(Address);
+    return {Begin, End - Begin, true};
   }
 };
 
@@ -196,11 +242,13 @@ public:
         return MAP_FAILED;
       }
       Mapped.insert(Page);
+      Ranges.Add(Page, Page + PageSize);
     }
     return reinterpret_cast<void*>(Address);
   }
 
   bool Failed {};
+  MappedRanges Ranges;
 
 private:
   uint64_t PageSize;
@@ -298,6 +346,7 @@ int main(int argc, char** argv, char** const envp) {
     fextl::fmt::print("Failed to map the test's memory\n");
     return ExitFail;
   }
+  SyscallHandler->Memory = &Mapper.Ranges;
 
   auto Thread = CTX->CreateThread();
   if (!Thread) {
@@ -351,6 +400,14 @@ int main(int argc, char** argv, char** const envp) {
   }
 
   const bool Passed = !DidFault && Loader.CompareStates(&State, nullptr, SupportsAVX);
+
+  // With the disk cache on (FEX_DISKCACHE=1, FEX_DISKCACHEPATH=<dir>), wait for this run's
+  // translations to be written; the process skips teardown below. The counters line is
+  // what Scripts/macos_asm_tests.py --cache-dir checks.
+  CTX->FlushDiskCache();
+  const auto Counters = CTX->GetTranslationCounters();
+  fextl::fmt::print("Code cache: compiled {} loaded {} rejected {} queued {}\n", Counters.BlocksCompiled, Counters.BlocksLoadedFromCache,
+                    Counters.CacheEntriesRejected, Counters.CacheEntriesQueued);
   fextl::fmt::print("Faulted? {}\nPassed? {}\n", DidFault ? "Yes" : "No", Passed ? "Yes" : "No");
   fflush(nullptr);
   // Skip teardown: the result is known and the process is about to exit.

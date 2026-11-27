@@ -207,6 +207,11 @@ public:
 
   virtual void InitDiskCache() override {}
 
+  TranslationCounters GetTranslationCounters() const override;
+  bool FlushDiskCache() override;
+  std::atomic<uint64_t> BlocksCompiledCount {};
+  std::atomic<uint64_t> BlocksLoadedFromCacheCount {};
+
   CodeCache& GetCodeCache() override {
     return CodeCache;
   }

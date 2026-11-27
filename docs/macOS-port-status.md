@@ -7,7 +7,8 @@ Related documents:
 
 - `docs/macOS-v1.0-plan.md`: what "1.0" means for this port and the work left to get there.
 - `docs/macOS-embedding-interface.md`: what a program hosting the core must provide.
-- `docs/macOS-code-cache-design.md`: design for loading cached translations on macOS.
+- `docs/macOS-code-cache-design.md`: how cached translations are loaded on macOS, keyed and
+  rejected (implemented).
 - `Scripts/macos_sync_upstream.sh` and `docs/macOS-upstream-sync.md`: bring new upstream FEX
   commits into the port. Upstream merged so far: FEX-Emu/FEX `main` at `a92baf073`
   (27 November 2026).
@@ -29,6 +30,11 @@ Related documents:
   it; the branch without the runtime fixes dies at its first write to code memory.
   GitHub's hosted Mac is a virtual machine that does not enforce it.
 - **Runs eight guest threads at once** with correct, separate results.
+- **Fixed: a lost wake-up in the core's reader-writer lock.** On macOS a writer hand-off
+  woke one arbitrary waiter on the shared futex word; if that was a reader, the writer
+  slept forever. Eight threads linking many blocks hung about one run in 30 in
+  `ExitFunctionLink`. Writer hand-offs now wake all waiters
+  (`WritePriorityMutex.h`). Seen with `FEXCoreCacheTest`, cache on or off.
 - **Linux is unaffected.** The core-only Linux build passes with the same changes.
 
 Only the translator core is built on macOS. FEX's Linux process loader, syscall emulation,
@@ -132,6 +138,45 @@ with `JITWriteProbe`:
 - GitHub's hosted Mac reports `pthread_jit_write_protect_supported_np` as 0 and lets a
   thread write and run `MAP_JIT` memory in any state, so it cannot test any of this.
 
+## On-disk code cache
+
+Implemented by copying cached code into the live `MAP_JIT` buffer, using upstream's
+per-block `DiskCache`; details in `docs/macOS-code-cache-design.md`. Switched on with
+`FEX_DISKCACHE=1` and `FEX_DISKCACHEPATH=<dir>` (default `~/Library/Caches/fex-emu/`); an
+embedder calls `Context::FlushDiskCache()` before exiting and can read
+`Context::GetTranslationCounters()`.
+
+Added by this port to upstream's cache: keying on the core's Mach-O UUID, CPU model and
+enumerated options; a checked description per database; an integrity hash and full
+bounds checks on every entry before it reaches executable memory; private directory and
+file permissions; repair of a partly written index; pruning only of idle buckets; a
+default thread implementation for the core's writer thread. Fixed in the frontend: a
+RIP-relative displacement followed by another field (3DNow!) was patched one byte off on
+load.
+
+Physical Mac (M4), as built and hardened, all four modes, 2,292 tests, cold pass then
+warm pass in one directory with six processes at a time: the warm pass compiled **no
+block** in any test that ran to completion (the 13 crashing or timing-out expected
+failures never save), loaded 181,032 / 4,722 / 2,615 / 2,615 blocks (jit_1, jit_500,
+jit_500_m, jit_500_tso), and every result was identical to the cold pass; no entry was
+rejected. 59 MB on disk.
+
+Speed: little gained on these tests. Running all four modes (six processes at a time,
+other work on the machine) took 120.7 s cold and 99.4 s warm hardened, 117.5 s and
+110.6 s as built; the whole script with the cache off took about 120 s including
+assembling the tests. Per process, warm and uncached
+are the same in jit_500 (3.7 ms against 3.2 ms; start-up dominates); in jit_1 a warm run
+costs 8.5 ms against 3.4 ms, because each process reads an index of 87,000 entries to use
+a few. The largest test (`FEX_bugs/XeSS_quadratic`, 65,538 blocks in jit_1) takes 72 ms
+compiling and 79 ms loading. Translating these blocks is as cheap as looking them up;
+a benefit has to be shown with real programs (package G).
+
+`Scripts/macos_code_cache_tests.py` (65 checks, pass as built and hardened): 37 kinds of
+damage to the files, seven configuration changes, a database under another
+configuration's name, a different format version or build in a database's description,
+changed guest bytes at the same address, the same code at three addresses, eight
+threads loading the same blocks at once (20 warm runs), and the directory rules.
+
 Still unproven or open:
 
 1. **Memory-ordering emulation between threads.** The instruction tests pass with it
@@ -144,9 +189,9 @@ Still unproven or open:
 
 ## Not implemented, by decision or for lack of a macOS method
 
-- **On-disk code cache loading.** Linux publishes cached code with `mremap`. macOS has no
-  `mremap` and will not remap `MAP_JIT` memory. The macOS path stops with an error until it
-  has its own design.
+- **Upstream's whole-section code cache (`FXCC`, `EnableCodeCachingWIP`).** It publishes
+  code with `mremap`, which macOS lacks, so its macOS path still stops with an error. It
+  is not needed: the per-block disk cache below does the job by copying.
 - **Hardware memory ordering.** macOS gives ordinary processes no way to switch on the
   x86-style ordering mode, so FEX's software emulation is used. `prctl` is stubbed to
   report "not supported".
@@ -169,6 +214,9 @@ All of these run in the Mac job on every push to a `macos/**` branch.
 |---|---|---|---|
 | `FEXCoreSmokeTest` | Translates and runs a 23-byte loop, as built and under the hardened runtime | pass, both | pass, both |
 | `FEXCoreThreadTest` | Eight host threads share a context, each summing a different count in a long guest loop | pass | pass, both |
+| `FEXCoreCacheTest` | Eight threads run a chain of 200 blocks at once, with the code cache on; checks results that depend on every constant and on the code's address, and the cache counters | added in package F, not yet run there | pass, both; 150 of 150 runs after the mutex fix (hung about one run in 30 before it) |
+| `Scripts/macos_code_cache_tests.py` | Damaged, mismatched and moved caches, threads, directory rules (see above) | added in package F, not yet run there | 65 of 65, both |
+| `Scripts/macos_asm_tests.py --cache-dir DIR --cache-passes 2` | The instruction tests cold then warm; fails if a warm result differs, a finished warm run compiled anything, or an entry was rejected | added in package F, not yet run there (two modes in the job) | pass, all four modes, both |
 | `FEXCoreASMTestRunner` with `Scripts/macos_asm_tests.py` | Upstream's 2,292 assembly instruction tests, in four modes | 2,253 pass in each mode (before the upstream sync added one test) | 2,255 pass in each mode, both |
 | `JITWriteProbe` | Reports how the machine treats executable memory, including writes and switches from a fault handler and instruction-cache flushing | report only | see the facts above |
 | `JITWriteProbe --expect-enforced` | The same, but exits 1 unless every asserted case gives the result the port relies on with write protection enforced, or if a fault-handler case's handler never ran | not run: the hosted Mac does not enforce, so it would fail | pass, as built and hardened |

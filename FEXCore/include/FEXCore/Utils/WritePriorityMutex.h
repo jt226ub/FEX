@@ -282,6 +282,12 @@ private:
   // every wait loop in this class already re-checks the atomic state and tolerates spurious
   // wakeups by design (see the "Can get some spurious wake-ups" comment in lock_shared()) --
   // just occasionally less efficient than Linux's selective wake.
+  //
+  // That only holds if every waiter is woken. Waking a single waiter is not enough: readers
+  // and writers sleep on the same word, so os_sync_wake_by_address_any could pick a reader,
+  // which sees the writer still waiting and sleeps again, and the writer is never woken.
+  // FEXCoreCacheTest (eight threads linking 200 blocks) hung that way about one run in
+  // thirty, in ExitFunctionLink. So writer wake-ups wake all waiters too.
   void FutexWaitForWriteAvailable(uint32_t Expected) {
     os_sync_wait_on_address(&Futex, Expected, sizeof(Futex), OS_SYNC_WAIT_ON_ADDRESS_NONE);
   }
@@ -291,7 +297,7 @@ private:
   }
 
   void FutexWakeWriter() {
-    os_sync_wake_by_address_any(&Futex, sizeof(Futex), OS_SYNC_WAKE_BY_ADDRESS_NONE);
+    os_sync_wake_by_address_all(&Futex, sizeof(Futex), OS_SYNC_WAKE_BY_ADDRESS_NONE);
   }
 
   void FutexWakeReaders() {

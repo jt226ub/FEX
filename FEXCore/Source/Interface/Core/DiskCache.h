@@ -81,6 +81,14 @@ namespace DiskCache {
     uint32_t SmallRelocCount;
     uint32_t ThunkRelocCount;
     XXH128_hash_t GuestHash;
+#ifdef __APPLE__
+    // macOS port: XXH3-128 of the blob up to the guest code copy, with this field zeroed,
+    // seeded with the entry's lookup key. Checked before anything in the blob is used, so
+    // a damaged or misplaced entry is never copied into executable memory. This detects
+    // accidents (torn writes, bit flips, a file from another configuration). It is not a
+    // security boundary: anyone who can write the cache file can recompute it.
+    XXH128_hash_t IntegrityHash;
+#endif
   };
 
   // packed struct for types 0, 2 and 3. type 1 is bigger and separate below
@@ -150,6 +158,10 @@ namespace DiskCache {
     }
     ssize_t Size();
     bool ReadAll(fextl::vector<uint8_t>& Out); // from first blob
+#ifdef __APPLE__
+    bool FlushToDisk();
+    bool TruncateTornTail(); // drops a partly written last record; caller holds the lock
+#endif
     bool ReadBlob(uint64_t Offset, std::span<uint8_t> OutBlob);
     bool WriteBlob(const MesaFOZ::foz_payload_key& Key, std::span<const std::span<const uint8_t>> BlobChunks, uint64_t& OutBlobOffset);
 
@@ -171,6 +183,21 @@ namespace DiskCache {
     bool Full() const {
       return MaxSizeReached;
     }
+#ifdef __APPLE__
+    bool FlushToDisk();
+    // Location of this database's metadata blob (the bucket description), if it has one.
+    uint64_t MetadataOffset = 0;
+    uint32_t MetadataSize = 0;
+    // Both files' locks, for opening a shared read-write database consistently.
+    bool LockForOpen();
+    void UnlockAfterOpen();
+    bool RepairIndex(); // caller holds the locks
+    bool HasEntries();
+    bool Reset(); // empties both files; caller holds the locks
+    bool IsReadOnly() const {
+      return ReadOnly;
+    }
+#endif
 
   private:
     // stores run on the Writer, so returning quick isn't as important
@@ -209,6 +236,15 @@ namespace DiskCache {
       return Validation;
     }
 
+    // Waits for the writer thread to finish every queued store, then flushes the files.
+    bool Flush();
+    uint64_t GetRejectedCount() const {
+      return RejectedCount.load(std::memory_order_relaxed);
+    }
+    uint64_t GetQueuedCount() const {
+      return QueuedCount.load(std::memory_order_relaxed);
+    }
+
   private:
     bool OpenCacheDB(const fextl::string& CacheDBName, bool ReadOnly);
     uint64_t MakeLookupKey(Core::InternalThreadState* Thread, const uint64_t ModuleOffset, bool Writable, bool MonoBackpatcher);
@@ -223,7 +259,17 @@ namespace DiskCache {
     Index Index;
     std::mutex IndexLock;
     bool FoundMetadata = false;
+    std::atomic<uint64_t> RejectedCount {};
+    std::atomic<uint64_t> QueuedCount {};
+#ifdef __APPLE__
+    // The bucket description every database opened here must carry as its metadata blob.
+    fextl::vector<uint8_t> ExpectedMetadata;
+    uint64_t FlushedQueuedCount = 0;
+    bool CheckMetadata(IndexedDB& DB, const fextl::string& Name);
+    bool ValidateHit(const BlobFixedHeader& Header, std::span<const uint8_t> Body, uint64_t LookupKey, uint64_t GuestSizeAvailable);
+#endif
     struct CacheStoreWorkItem;
+    struct FlushWorkItem;
 
     struct PruneMemoryLRUWorkItem;
     std::atomic<uint64_t> MemoryLRUCurrentSize {};

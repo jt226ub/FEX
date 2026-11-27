@@ -18,9 +18,22 @@
 #include <FEXCore/Utils/TypeDefines.h>
 #include <FEXHeaderUtils/Filesystem.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <atomic>
+#include <condition_variable>
+
+#ifdef __APPLE__
+#include <git_version.h>
+
+#include <dlfcn.h>
+#include <fcntl.h>
+#include <mach-o/loader.h>
+#include <sys/stat.h>
+#include <sys/sysctl.h>
+#include <unistd.h>
+#endif
 
 namespace FEXCore {
 
@@ -64,11 +77,38 @@ namespace DiskCache {
     if (!ReadOnly) {
       Modes = Modes | File::FileModes::WRITE | File::FileModes::CREATE;
     }
+#ifdef __APPLE__
+    // A cache file holds code that will be executed. Refuse anything but a plain file
+    // (in particular a symbolic link planted in the cache directory).
+    {
+      struct stat Link;
+      if (lstat(FileName.c_str(), &Link) == 0 && !S_ISREG(Link.st_mode)) {
+        LogMan::Msg::EFmt("DiskCache: {} is not a regular file; not using it", FileName);
+        return false;
+      }
+    }
+#endif
     FD = fextl::make_unique<File::File>(FileName.c_str(), Modes, false);
     if (!FD->IsValid()) {
       FD.reset();
       return false;
     }
+#ifdef __APPLE__
+    {
+      // Only the user may be able to write a cache file. A new file is created with the
+      // default permissions and narrowed here; its directory is already private.
+      struct stat Info;
+      const bool Ok = fstat(FD->GetHandle(), &Info) == 0 && S_ISREG(Info.st_mode) && Info.st_uid == geteuid();
+      if (Ok && !ReadOnly) {
+        fchmod(FD->GetHandle(), S_IRUSR | S_IWUSR);
+      }
+      if (!Ok || (ReadOnly && (Info.st_mode & (S_IWGRP | S_IWOTH)))) {
+        LogMan::Msg::EFmt("DiskCache: {} is not owned by this user or is writable by others; not using it", FileName);
+        FD.reset();
+        return false;
+      }
+    }
+#endif
 
     bool Valid = false;
     bool TookLock = false;
@@ -117,6 +157,52 @@ namespace DiskCache {
     Out.resize((size_t)FileSize - FOZ_REF_MAGIC_SIZE);
     return FD->PRead(Out.data(), Out.size(), FOZ_REF_MAGIC_SIZE) == (ssize_t)Out.size();
   }
+
+#ifdef __APPLE__
+  bool FOZFile::FlushToDisk() {
+    if (!FD) {
+      return false;
+    }
+    // F_FULLFSYNC is the macOS way to push data through the drive's own cache; plain
+    // fsync only reaches the drive.
+    if (fcntl(FD->GetHandle(), F_FULLFSYNC) == 0) {
+      return true;
+    }
+    return fsync(FD->GetHandle()) == 0;
+  }
+
+  bool FOZFile::TruncateTornTail() {
+    // Records are appended as [key][payload header][payload] under the file lock. A
+    // process that dies mid-append leaves a partial last record, and every record
+    // appended after it would then be unreachable. Walk the framing and cut the file at
+    // the end of the last whole record. The caller holds the lock, so no record is
+    // being written right now.
+    ssize_t FileSize = Size();
+    if (FileSize < FOZ_REF_MAGIC_SIZE) {
+      return false;
+    }
+    fextl::vector<uint8_t> Data;
+    if (!ReadAll(Data)) {
+      return false;
+    }
+    // Offsets below are file offsets; Data starts after the magic.
+    uint64_t Offset = FOZ_REF_MAGIC_SIZE;
+    while (Offset + sizeof(MesaFOZ::foz_payload_key) + sizeof(MesaFOZ::foz_payload_header) <= (uint64_t)FileSize) {
+      MesaFOZ::foz_payload_header Header;
+      memcpy(&Header, Data.data() + Offset - FOZ_REF_MAGIC_SIZE + sizeof(MesaFOZ::foz_payload_key), sizeof(Header));
+      const uint64_t RecordEnd = Offset + sizeof(MesaFOZ::foz_payload_key) + sizeof(Header) + Header.payload_size;
+      if (RecordEnd > (uint64_t)FileSize) {
+        break;
+      }
+      Offset = RecordEnd;
+    }
+    if (Offset == (uint64_t)FileSize) {
+      return true;
+    }
+    LogMan::Msg::IFmt("DiskCache: dropping {} bytes of a partly written record at the end of {}", FileSize - Offset, FileName);
+    return ftruncate(FD->GetHandle(), Offset) == 0;
+  }
+#endif
 
   bool FOZFile::ReadBlob(uint64_t Offset, std::span<uint8_t> OutBlob) {
     if (FD->PRead(OutBlob.data(), OutBlob.size(), Offset) != (ssize_t)OutBlob.size()) {
@@ -255,10 +341,61 @@ namespace DiskCache {
         }
       } else {
         FoundMetadata = true;
+#ifdef __APPLE__
+        if (!MetadataSize) {
+          MetadataOffset = IndexBlobCommon->cache_db_file_offset;
+          MetadataSize = IndexBlobCommon->size;
+        }
+#endif
       }
     }
     // could truncate/delete index if we don't end up perfectly at end here
   }
+
+#ifdef __APPLE__
+  bool IndexedDB::FlushToDisk() {
+    if (ReadOnly) {
+      return true;
+    }
+    const bool CacheOk = CacheFOZ.FlushToDisk();
+    return IndexFOZ.FlushToDisk() && CacheOk;
+  }
+
+  bool IndexedDB::LockForOpen() {
+    if (!CacheFOZ.Lock(STORE_LOCK_TIMEOUT_MS)) {
+      return false;
+    }
+    if (!IndexFOZ.Lock(STORE_LOCK_TIMEOUT_MS)) {
+      CacheFOZ.Unlock();
+      return false;
+    }
+    return true;
+  }
+
+  void IndexedDB::UnlockAfterOpen() {
+    CacheFOZ.Unlock();
+    IndexFOZ.Unlock();
+  }
+
+  bool IndexedDB::RepairIndex() {
+    return !ReadOnly && IndexFOZ.TruncateTornTail();
+  }
+
+  bool IndexedDB::HasEntries() {
+    return IndexFOZ.Size() > FOZ_REF_MAGIC_SIZE;
+  }
+
+  bool IndexedDB::Reset() {
+    if (ReadOnly) {
+      return false;
+    }
+    MetadataOffset = 0;
+    MetadataSize = 0;
+    const bool Ok = ftruncate(CacheFOZ.GetHandle(), FOZ_REF_MAGIC_SIZE) == 0 && ftruncate(IndexFOZ.GetHandle(), FOZ_REF_MAGIC_SIZE) == 0;
+    CacheFileSize = CacheFOZ.Size();
+    return Ok;
+  }
+#endif
 
   bool IndexedDB::ReadCacheBlob(uint64_t Offset, std::span<uint8_t> OutBlob) {
     if (CacheFileMapping && (ReadOnly || Offset + OutBlob.size() <= BIG_MAPPING_SIZE)) {
@@ -341,11 +478,74 @@ namespace DiskCache {
     }
 
     if (!CurDB->Open(CacheDBName, ReadOnly)) {
+#ifdef __APPLE__
+      LogMan::Msg::IFmt("DiskCache: could not open {}; translating without it", CacheDBName);
+#endif
       CurDB.reset();
       return false;
     }
 
+#ifdef __APPLE__
+    // macOS port: a database is only used if its metadata blob is exactly the bucket
+    // description of this process (format version, port and build identity, host
+    // features, code-generation options). The directory and file names are hashes of the
+    // same data, so this only fails for a damaged file or one copied under the wrong
+    // name; either way none of its entries may be loaded.
+    //
+    // A read-write database is shared with other processes, which append to it under
+    // the file locks. Holding both locks while reading it means no record is half
+    // written while it is checked.
+    {
+      if (!ReadOnly && !CurDB->LockForOpen()) {
+        LogMan::Msg::IFmt("DiskCache: {} is busy; translating without it", CacheDBName);
+        return false;
+      }
+      if (!ReadOnly) {
+        CurDB->RepairIndex();
+      }
+      ::FEXCore::DiskCache::Index Local;
+      bool LocalFoundMetadata = false;
+      CurDB->PopulateIndex(Local, LocalFoundMetadata);
+      if (!CheckMetadata(*CurDB, CacheDBName)) {
+        RejectedCount.fetch_add(1, std::memory_order_relaxed);
+        if (ReadOnly || !CurDB->Reset()) {
+          if (!ReadOnly) {
+            CurDB->UnlockAfterOpen();
+          }
+          return false;
+        }
+        // The cache directory is disposable: start this database again rather than
+        // translating without a cache from now on.
+        LogMan::Msg::IFmt("DiskCache: emptied {} and starting it again", CacheDBName);
+        Local.clear();
+        LocalFoundMetadata = false;
+      }
+      if (!ReadOnly) {
+        CurDB->UnlockAfterOpen();
+      }
+      FoundMetadata |= LocalFoundMetadata;
+      for (auto It = Local.begin(); It != Local.end(); ++It) {
+        auto& Head = It->second;
+        auto Existing = Index.find(It->first);
+        if (Existing == Index.end()) {
+          Index.emplace(It->first, std::move(Head));
+          continue;
+        }
+        auto& Target = Existing->second;
+        if (!Target.MoreEntries) {
+          Target.MoreEntries = fextl::make_unique<fextl::multimap<uint64_t, IndexEntry>>();
+        }
+        Target.MoreEntries->insert({Head.MainEntryFootprint, std::move(Head.MainEntry)});
+        if (Head.MoreEntries) {
+          for (auto& Entry : *Head.MoreEntries) {
+            Target.MoreEntries->insert({Entry.first, std::move(Entry.second)});
+          }
+        }
+      }
+    }
+#else
     CurDB->PopulateIndex(Index, FoundMetadata);
+#endif
 
     if (ReadOnly) {
       ROCacheDBs.push_back(std::move(CurDB));
@@ -356,9 +556,295 @@ namespace DiskCache {
     return true;
   }
 
+#ifdef __APPLE__
+  bool DiskCache::CheckMetadata(IndexedDB& DB, const fextl::string& Name) {
+    if (DB.MetadataSize == 0) {
+      // A database without a description is acceptable only while it holds nothing,
+      // which is the state of a new file before the description is appended.
+      if (!DB.HasEntries()) {
+        return true;
+      }
+      LogMan::Msg::EFmt("DiskCache: {} has entries but no description; not using it", Name);
+      return false;
+    }
+    if (DB.MetadataSize != ExpectedMetadata.size()) {
+      LogMan::Msg::EFmt("DiskCache: {} was made for a different configuration or build; not using it", Name);
+      return false;
+    }
+    fextl::vector<uint8_t> Stored(DB.MetadataSize);
+    if (!DB.ReadCacheBlob(DB.MetadataOffset, Stored) || memcmp(Stored.data(), ExpectedMetadata.data(), Stored.size()) != 0) {
+      LogMan::Msg::EFmt("DiskCache: {} was made for a different configuration or build, or is damaged; not using it", Name);
+      return false;
+    }
+    return true;
+  }
+
+  // Largest number of bytes each relocation type rewrites at its offset: a 64-bit literal,
+  // or a padded four-instruction constant load.
+  static uint32_t RelocationWriteSize(uint8_t Type) {
+    switch (static_cast<CPU::RelocationTypes>(Type)) {
+    case CPU::RelocationTypes::RELOC_NAMED_SYMBOL_LITERAL:
+    case CPU::RelocationTypes::RELOC_GUEST_RIP_LITERAL:
+    case CPU::RelocationTypes::RELOC_GUEST_PATCHABLE_RIP_LITERAL: return 8;
+    case CPU::RelocationTypes::RELOC_NAMED_THUNK_MOVE:
+    case CPU::RelocationTypes::RELOC_GUEST_RIP_MOVE:
+    case CPU::RelocationTypes::RELOC_GUEST_PATCHABLE_DATA_MOVE:
+    case CPU::RelocationTypes::RELOC_GUEST_PATCHABLE_RIP_MOVE:
+    case CPU::RelocationTypes::RELOC_GUEST_PATCHABLE_CRC_MOVE: return 16;
+    }
+    return 0;
+  }
+
+  // Checks a cache entry before any of it is used. Body is the entry without its guest
+  // code copy, starting with the fixed header. Everything the loader will index or write
+  // through is bounds-checked here, so the relocation code and the copy into executable
+  // memory only ever see a consistent entry.
+  bool DiskCache::ValidateHit(const BlobFixedHeader& Header, std::span<const uint8_t> Body, uint64_t LookupKey, uint64_t GuestSizeAvailable) {
+    // 1. Integrity: the hash covers the header (with the hash field zeroed) and every
+    // byte after it up to the guest code copy, and is seeded with the lookup key.
+    {
+      BlobFixedHeader Zeroed = Header;
+      Zeroed.IntegrityHash = {};
+      XXH3_state_t HashState;
+      XXH3_128bits_reset_withSeed(&HashState, LookupKey);
+      XXH3_128bits_update(&HashState, &Zeroed, sizeof(Zeroed));
+      XXH3_128bits_update(&HashState, Body.data() + sizeof(Header), Body.size() - sizeof(Header));
+      if (!XXH128_isEqual(XXH3_128bits_digest(&HashState), Header.IntegrityHash)) {
+        return false;
+      }
+    }
+
+    // 2. Shape: code size and entry points.
+    if (Header.HostSize == 0 || Header.HostSize % 16 != 0 || Header.EntryPointCount == 0 || Header.GuestSize == 0 ||
+        Header.GuestSize > GuestSizeAvailable) {
+      return false;
+    }
+    const uint8_t* Cursor = Body.data() + sizeof(Header) + Header.HostSize;
+    bool HasBlockEntry = false;
+    for (uint32_t i = 0; i < Header.EntryPointCount; ++i) {
+      uint64_t RIPOffset;
+      memcpy(&RIPOffset, Cursor + i * sizeof(uint64_t), sizeof(RIPOffset));
+      HasBlockEntry |= RIPOffset == 0;
+    }
+    Cursor += Header.EntryPointCount * sizeof(uint64_t);
+    for (uint32_t i = 0; i < Header.EntryPointCount; ++i) {
+      uint32_t HostOffset;
+      memcpy(&HostOffset, Cursor + i * sizeof(uint32_t), sizeof(HostOffset));
+      if (HostOffset >= Header.HostSize || HostOffset % 4 != 0) {
+        return false;
+      }
+    }
+    Cursor += Header.EntryPointCount * sizeof(uint32_t);
+    if (!HasBlockEntry) {
+      return false;
+    }
+
+    // 3. Relocations: known type, write inside the code, operands in range.
+    for (uint32_t i = 0; i < Header.SmallRelocCount; ++i) {
+      BlobSmallRelocation Reloc;
+      memcpy(&Reloc, Cursor + i * sizeof(Reloc), sizeof(Reloc));
+      const uint32_t WriteSize = RelocationWriteSize(Reloc.Type);
+      if (WriteSize == 0 || Reloc.Type == uint8_t(CPU::RelocationTypes::RELOC_NAMED_THUNK_MOVE) || Reloc.Offset % 4 != 0 ||
+          uint64_t(Reloc.Offset) + WriteSize > Header.HostSize) {
+        return false;
+      }
+      switch (static_cast<CPU::RelocationTypes>(Reloc.Type)) {
+      case CPU::RelocationTypes::RELOC_NAMED_SYMBOL_LITERAL:
+        if (Reloc.Named.Symbol > uint32_t(CPU::RelocNamedSymbolLiteral::NamedSymbol::SYMBOL_LITERAL_EXITFUNCTION_LINKER)) {
+          return false;
+        }
+        break;
+      case CPU::RelocationTypes::RELOC_GUEST_RIP_MOVE:
+        if (Reloc.RIPMove.RegisterIndex >= 32) {
+          return false;
+        }
+        break;
+      case CPU::RelocationTypes::RELOC_GUEST_PATCHABLE_DATA_MOVE:
+      case CPU::RelocationTypes::RELOC_GUEST_PATCHABLE_RIP_LITERAL:
+      case CPU::RelocationTypes::RELOC_GUEST_PATCHABLE_RIP_MOVE:
+      case CPU::RelocationTypes::RELOC_GUEST_PATCHABLE_CRC_MOVE: {
+        // These read live guest bytes at the site, which must lie inside the guest code
+        // this entry was hashed over.
+        const auto Size = Reloc.PatchableData.ValueSize;
+        const bool IsCRC = Reloc.Type == uint8_t(CPU::RelocationTypes::RELOC_GUEST_PATCHABLE_CRC_MOVE);
+        const bool SizeOk = IsCRC ? (Size >= 1 && Size <= 15) : (Size == 1 || Size == 2 || Size == 4 || Size == 8);
+        if (!SizeOk || Reloc.PatchableData.RegisterIndex >= 32 || uint64_t(Reloc.PatchableData.SiteOffset) + Size > Header.GuestSize) {
+          return false;
+        }
+        break;
+      }
+      default: break;
+      }
+    }
+    Cursor += Header.SmallRelocCount * sizeof(BlobSmallRelocation);
+    if (Header.ThunkRelocCount) {
+      // Thunks resolve through the thunk handler, which a macOS embedder may not have.
+      if (!CTX->ThunkHandler) {
+        return false;
+      }
+      for (uint32_t i = 0; i < Header.ThunkRelocCount; ++i) {
+        BlobThunkRelocation Reloc;
+        memcpy(&Reloc, Cursor + i * sizeof(Reloc), sizeof(Reloc));
+        if (Reloc.Offset % 4 != 0 || uint64_t(Reloc.Offset) + 16 > Header.HostSize || Reloc.RegisterIndex >= 32) {
+          return false;
+        }
+      }
+    }
+    return true;
+  }
+#endif
+
+  struct DiskCache::FlushWorkItem final : WorkQueueThread::WorkItem {
+    struct State {
+      std::mutex Mutex;
+      std::condition_variable CV;
+      bool Done = false;
+    };
+    fextl::shared_ptr<State> Shared;
+    explicit FlushWorkItem(fextl::shared_ptr<State> Shared)
+      : Shared(std::move(Shared)) {}
+    void Run() override {
+      {
+        std::lock_guard lk {Shared->Mutex};
+        Shared->Done = true;
+      }
+      Shared->CV.notify_all();
+    }
+  };
+
+  bool DiskCache::Flush() {
+    if (!IsWritingDiskCache() || !Writer) {
+      return false;
+    }
+    // The writer runs its queue in order, so once this marker has run every store queued
+    // before it has been written.
+    auto Shared = fextl::make_shared<FlushWorkItem::State>();
+    Writer->QueueWork(fextl::make_unique<FlushWorkItem>(Shared));
+    {
+      std::unique_lock lk {Shared->Mutex};
+      Shared->CV.wait(lk, [&] { return Shared->Done; });
+    }
+#ifdef __APPLE__
+    // A full flush costs milliseconds; skip it when nothing was stored since the last one.
+    const uint64_t Queued = QueuedCount.load(std::memory_order_relaxed);
+    if (Queued == FlushedQueuedCount) {
+      return true;
+    }
+    FlushedQueuedCount = Queued;
+    return RWCacheDB->FlushToDisk();
+#else
+    return true;
+#endif
+  }
+
   FEX_DEFAULT_VISIBILITY void SetFileMapper(FileMapperFunc Func) {
     FileMapper = Func;
   }
+
+#ifdef __APPLE__
+  // The core's build identity: the LC_UUID of the Mach-O image this code is linked into.
+  static void AppendImageUUID(fextl::vector<uint8_t>& Out) {
+    Dl_info Info {};
+    if (!dladdr(reinterpret_cast<const void*>(&AppendImageUUID), &Info) || !Info.dli_fbase) {
+      return;
+    }
+    const auto* Header = static_cast<const mach_header_64*>(Info.dli_fbase);
+    if (Header->magic != MH_MAGIC_64) {
+      return;
+    }
+    const auto* Command = reinterpret_cast<const load_command*>(Header + 1);
+    for (uint32_t i = 0; i < Header->ncmds; ++i) {
+      if (Command->cmd == LC_UUID) {
+        const auto* UUID = reinterpret_cast<const uuid_command*>(Command);
+        Out.insert(Out.end(), UUID->uuid, UUID->uuid + sizeof(UUID->uuid));
+        return;
+      }
+      Command = reinterpret_cast<const load_command*>(reinterpret_cast<const uint8_t*>(Command) + Command->cmdsize);
+    }
+  }
+
+  static fextl::vector<uint8_t> MakePortIdentity(const FEXCore::Context::ContextImpl& CTX) {
+    // Bump when this port changes the cache's contents or checks.
+    constexpr uint32_t PortCacheRevision = 1;
+    fextl::vector<uint8_t> Out;
+    const char Tag[8] = {'F', 'E', 'X', 'M', 'A', 'C', 'O', 'S'};
+    Out.insert(Out.end(), Tag, Tag + sizeof(Tag));
+    Out.insert(Out.end(), reinterpret_cast<const uint8_t*>(&PortCacheRevision),
+               reinterpret_cast<const uint8_t*>(&PortCacheRevision) + sizeof(PortCacheRevision));
+    Out.insert(Out.end(), GIT_HASH.begin(), GIT_HASH.end());
+    AppendImageUUID(Out);
+    char Brand[256] {};
+    size_t BrandSize = sizeof(Brand) - 1;
+    if (sysctlbyname("machdep.cpu.brand_string", Brand, &BrandSize, nullptr, 0) == 0) {
+      Out.insert(Out.end(), Brand, Brand + strnlen(Brand, sizeof(Brand)));
+    }
+    for (uint32_t MIDR : CTX.HostFeatures.CPUMIDRs) {
+      Out.insert(Out.end(), reinterpret_cast<const uint8_t*>(&MIDR), reinterpret_cast<const uint8_t*>(&MIDR) + sizeof(MIDR));
+    }
+    return Out;
+  }
+
+  // Trust model: a cache file is code that will be executed, so the directories holding
+  // it must be writable by this user only. The bucket directory is created by the core
+  // and made private; the base directory may be shared with other things the user owns
+  // but must not be writable by other users. This stops other users, not the user's own
+  // processes: anything running as this user can write the cache, and the integrity
+  // checks cannot tell its writes from the core's.
+  static bool CheckDirectoryTrust(const fextl::string& Path, bool MakePrivate) {
+    struct stat Info;
+    if (lstat(Path.c_str(), &Info) != 0 || !S_ISDIR(Info.st_mode)) {
+      LogMan::Msg::EFmt("DiskCache: {} is not a directory; disk cache disabled", Path);
+      return false;
+    }
+    if (Info.st_uid != geteuid()) {
+      LogMan::Msg::EFmt("DiskCache: {} is not owned by this user; disk cache disabled", Path);
+      return false;
+    }
+    if (MakePrivate && (Info.st_mode & (S_IRWXG | S_IRWXO))) {
+      if (chmod(Path.c_str(), S_IRWXU) != 0) {
+        LogMan::Msg::EFmt("DiskCache: could not make {} private; disk cache disabled", Path);
+        return false;
+      }
+    } else if (Info.st_mode & (S_IWGRP | S_IWOTH)) {
+      LogMan::Msg::EFmt("DiskCache: {} is writable by other users; disk cache disabled", Path);
+      return false;
+    }
+    return true;
+  }
+
+  // True if any file in the bucket directory was written in the last week.
+  static bool BucketRecentlyUsed(const fextl::string& Path) {
+    constexpr time_t KeepSeconds = 7 * 24 * 60 * 60;
+    const time_t Now = time(nullptr);
+    struct stat DirInfo;
+    if (lstat(Path.c_str(), &DirInfo) != 0 || !S_ISDIR(DirInfo.st_mode)) {
+      return true; // not ours to judge; leave it
+    }
+    bool Recent = Now - DirInfo.st_mtime < KeepSeconds;
+    struct Capture {
+      const fextl::string* Path;
+      time_t Now;
+      bool* Recent;
+    } C {&Path, Now, &Recent};
+    FEXCore::FileUtils::WalkDirectory(
+      Path,
+      [](std::string_view Name, bool, const void* UserData) {
+        auto* C = static_cast<const Capture*>(UserData);
+        struct stat Info;
+        if (lstat(fextl::fmt::format("{}/{}", *C->Path, Name).c_str(), &Info) == 0 && C->Now - Info.st_mtime < KeepSeconds) {
+          *C->Recent = true;
+        }
+      },
+      &C);
+    return Recent;
+  }
+
+  // Only directories named like a bucket (16 hex digits) are ever removed, so pointing the
+  // cache path at a directory that holds other things cannot delete them.
+  static bool LooksLikeBucketName(std::string_view Name) {
+    return Name.size() == 16 && std::all_of(Name.begin(), Name.end(), [](char c) { return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'); });
+  }
+#endif
 
   static inline void PruneStaleEntries(std::string_view CacheBase, std::string_view MachineBucketHash) {
     FEXCORE_PROFILE_SCOPED("DiskCache::PruneStaleEntries");
@@ -386,6 +872,16 @@ namespace DiskCache {
 
         // Current behaviour is to remove entries that no longer match the MachineBucketHash.
         // This means that if the Disk Cache version no longer matches, or the FEXCore::HostFeatures differ, then they get removed.
+#ifdef __APPLE__
+        // Processes with different host features or builds use different buckets and may
+        // run at the same time (the instruction tests do), so a bucket is only removed
+        // once nothing has written to it for a while; otherwise processes would delete
+        // each other's caches.
+        if (!LooksLikeBucketName(name) || name == capture->MachineBucketHash ||
+            BucketRecentlyUsed(fextl::fmt::format("{}/{}", capture->CacheBase, name))) {
+          return;
+        }
+#endif
         if (name != capture->MachineBucketHash) {
           FEXCore::FileUtils::RecursiveRemoveDirectory(fextl::fmt::format("{}/{}", capture->CacheBase, name));
         }
@@ -415,18 +911,31 @@ namespace DiskCache {
     LogMan::Msg::IFmt("HostFeatures Hash: 0x{:016x}", HostFeatureHash.HostFeaturesHash);
     LogMan::Msg::IFmt("ProcessFeaturesHash: 0x{:02x}", ProcessFeaturesHash);
 
-    fextl::vector<uint8_t> BucketBytes(sizeof(MachineBucketData) + sizeof(HostFeatureHash.ProcessFeaturesHash) + SerializedConfig.size());
+#ifdef __APPLE__
+    // macOS port: upstream relies on FormatVersion being bumped by hand whenever code
+    // generation changes. This port also keys the cache on the exact build (the core's
+    // Mach-O UUID, which the linker derives from the code), so a rebuilt core never loads
+    // code cached by another one, and on the CPU model, which reaches the guest through
+    // CPUID.
+    const fextl::vector<uint8_t> PortIdentity = MakePortIdentity(*CTX);
+#else
+    const fextl::vector<uint8_t> PortIdentity {};
+#endif
+    const size_t MachineSize = sizeof(MachineBucketData) + PortIdentity.size();
+
+    fextl::vector<uint8_t> BucketBytes(MachineSize + sizeof(HostFeatureHash.ProcessFeaturesHash) + SerializedConfig.size());
     memcpy(BucketBytes.data(), &MachineBucketData, sizeof(MachineBucketData));
+    if (!PortIdentity.empty()) {
+      memcpy(BucketBytes.data() + sizeof(MachineBucketData), PortIdentity.data(), PortIdentity.size());
+    }
 
     // 64-bit mode and HostType is in the ProcessBucket hash only instead of the MachineBucketHash
     // These effect code-gen, but they aren't part of the MachineBucketHash, as it comes from Process state.
-    memcpy(&BucketBytes[sizeof(MachineBucketData)], &HostFeatureHash.ProcessFeaturesHash, sizeof(HostFeatureHash.ProcessFeaturesHash));
-    memcpy(BucketBytes.data() + sizeof(MachineBucketData) + sizeof(HostFeatureHash.ProcessFeaturesHash), SerializedConfig.data(),
-           SerializedConfig.size());
+    memcpy(&BucketBytes[MachineSize], &HostFeatureHash.ProcessFeaturesHash, sizeof(HostFeatureHash.ProcessFeaturesHash));
+    memcpy(BucketBytes.data() + MachineSize + sizeof(HostFeatureHash.ProcessFeaturesHash), SerializedConfig.data(), SerializedConfig.size());
 
-    uint64_t MachineBucketHash = XXH3_64bits(BucketBytes.data(), sizeof(MachineBucketData));
-    uint64_t ProcessBucketHash =
-      XXH3_64bits(BucketBytes.data() + sizeof(MachineBucketData), sizeof(HostFeatureHash.ProcessFeaturesHash) + SerializedConfig.size());
+    uint64_t MachineBucketHash = XXH3_64bits(BucketBytes.data(), MachineSize);
+    uint64_t ProcessBucketHash = XXH3_64bits(BucketBytes.data() + MachineSize, sizeof(HostFeatureHash.ProcessFeaturesHash) + SerializedConfig.size());
     BucketHash.high64 = MachineBucketHash;
     BucketHash.low64 = ProcessBucketHash;
 
@@ -434,12 +943,27 @@ namespace DiskCache {
     if (BasePath.empty()) {
       BasePath = FEXCore::Config::GetCacheDirectory() + "DiskCache/";
     }
+#ifdef __APPLE__
+    if (!BasePath.ends_with('/')) {
+      BasePath += '/';
+    }
+    ExpectedMetadata = BucketBytes;
+    FHU::Filesystem::CreateDirectories(BasePath);
+    if (!CheckDirectoryTrust(BasePath, false)) {
+      return;
+    }
+#endif
 
     const auto MachineBucketHashAsString = fextl::fmt::format("{:016x}", MachineBucketHash);
     PruneStaleEntries(BasePath, MachineBucketHashAsString);
 
     BasePath += MachineBucketHashAsString + "/";
     FHU::Filesystem::CreateDirectories(BasePath);
+#ifdef __APPLE__
+    if (!CheckDirectoryTrust(BasePath, true)) {
+      return;
+    }
+#endif
 
     if (!MapDiskCacheFiles) {
       FileMapper = nullptr;
@@ -800,17 +1324,40 @@ namespace DiskCache {
     }
     BlobFixedHeader Header;
     memcpy(&Header, HitData.Blob.data() + BlobOffset, sizeof(Header));
+#ifdef __APPLE__
+    const std::span<const uint8_t> BlobBody {HitData.Blob.data() + BlobOffset, EntrySizeWithoutGuestCode};
+#endif
     BlobOffset += sizeof(Header);
 
+#ifdef __APPLE__
+    // Computed in 64 bits: a damaged count must not wrap around to a matching size.
+    uint64_t SizeNeeded = sizeof(Header) + uint64_t(Header.HostSize) + uint64_t(Header.EntryPointCount) * (sizeof(uint64_t) + sizeof(uint32_t));
+    SizeNeeded += uint64_t(Header.SmallRelocCount) * sizeof(BlobSmallRelocation) + uint64_t(Header.ThunkRelocCount) * sizeof(BlobThunkRelocation);
+#else
     uint32_t SizeNeeded = sizeof(Header) + Header.HostSize + Header.EntryPointCount * (sizeof(uint64_t) + sizeof(uint32_t));
     SizeNeeded += Header.SmallRelocCount * sizeof(BlobSmallRelocation) + Header.ThunkRelocCount * sizeof(BlobThunkRelocation);
+#endif
     if (EntrySizeWithoutGuestCode != SizeNeeded) {
+#ifdef __APPLE__
+      RejectedCount.fetch_add(1, std::memory_order_relaxed);
+#endif
       return std::nullopt;
     }
 
     if (Entry.GuestSize != Header.GuestSize || !XXH128_isEqual(Header.GuestHash, Entry.GuestHash)) {
+#ifdef __APPLE__
+      RejectedCount.fetch_add(1, std::memory_order_relaxed);
+#endif
       return std::nullopt;
     }
+
+#ifdef __APPLE__
+    if (!ValidateHit(Header, BlobBody, LookupKey, Available)) {
+      RejectedCount.fetch_add(1, std::memory_order_relaxed);
+      LogMan::Msg::EFmt("DiskCache: entry for guest code at {:#x} failed its integrity or sanity check; compiling instead", GuestRIP);
+      return std::nullopt;
+    }
+#endif
 
     bool StoreInMemory = !FoundInLRU;
     if (EntrySizeWithoutGuestCode > MemoryLRUMaxSize) {
@@ -1187,6 +1734,13 @@ namespace DiskCache {
     uint64_t LookupKey =
       MakeLookupKey(Thread, GuestCodeKey, RangeInfo.Writable, GuestRIP == CTX->GetMonoBackPatcherBlock().load(std::memory_order_relaxed));
 
+#ifdef __APPLE__
+    // Seal the entry: see BlobFixedHeader::IntegrityHash. The header already in the blob
+    // has the field zeroed.
+    Header.IntegrityHash = XXH3_128bits_withSeed(BlobData, GuestCodeOffset, LookupKey);
+    memcpy(BlobData + HeaderOffset, &Header, sizeof(Header));
+#endif
+
     // blob done, publish to index as in-memory for now, flush to disk below
     struct IndexEntry NewEntry {nullptr, 0, (uint32_t)TotalSize, Header.GuestSize, Header.GuestHash, BlobRef};
     NewEntry.GuestExtents = ExactGuestCodeExtents;
@@ -1250,6 +1804,7 @@ namespace DiskCache {
     // hand the rest off to the writer thread
     Writer->QueueWork(fextl::make_unique<CacheStoreWorkItem>(this, RWCacheDB.get(), Key, LookupKey, std::span(BlobData, TotalSize),
                                                              std::move(IndexBlob), StoreDisk));
+    QueuedCount.fetch_add(1, std::memory_order_relaxed);
     return true;
   }
 

@@ -756,6 +756,7 @@ if (BUILD_FEXCORE_ONLY)
   add_subdirectory(Source/Tools/CoreSmokeTest/)
   add_subdirectory(Source/Tools/ASMTestRunner/)
   add_subdirectory(Source/Tools/CoreThreadTest/)
+  add_subdirectory(Source/Tools/CoreCacheTest/)
   return()
 endif()
 

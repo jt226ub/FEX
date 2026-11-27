@@ -60,7 +60,7 @@ jobs:
       - name: Build
         run: |
           set -o pipefail
-          ninja -C build -k 0 FEXCore FEXCore_shared Common CommonTools FEXCoreSmokeTest FEXCoreASMTestRunner FEXCoreThreadTest 2>&1 | tee build.log
+          ninja -C build -k 0 FEXCore FEXCore_shared Common CommonTools FEXCoreSmokeTest FEXCoreASMTestRunner FEXCoreThreadTest FEXCoreCacheTest 2>&1 | tee build.log
 
       - name: Inspect what was built
         run: |
@@ -129,6 +129,28 @@ jobs:
           T="$(find build -name FEXCoreASMTestRunner -type f | head -1)"
           set -o pipefail
           python3 Scripts/macos_asm_tests.py --runner "$T" --out asm-out 2>&1 | tee asm-tests.log
+
+      - name: Run the code cache tests
+        # Damaged and mismatched cache files, moving guest code, eight threads loading the
+        # same cached blocks, directory rules. See docs/macOS-code-cache-design.md.
+        run: |
+          set -o pipefail
+          R="$(find build -name FEXCoreASMTestRunner -type f | head -1)"
+          C="$(find build -name FEXCoreCacheTest -type f | head -1)"
+          python3 Scripts/macos_code_cache_tests.py --runner "$R" --cache-test "$C" --work cache-tests 2>&1 | tee cache-tests.log
+          cp "$C" FEXCoreCacheTest-hardened
+          codesign --force --sign - --options runtime --entitlements Data/macOS/jit.entitlements FEXCoreCacheTest-hardened
+          FEX_DISKCACHE=1 FEX_DISKCACHEPATH="$PWD/cache-hardened" ./FEXCoreCacheTest-hardened --threads 8 2>&1 | tail -3 | tee -a cache-tests.log
+          FEX_DISKCACHE=1 FEX_DISKCACHEPATH="$PWD/cache-hardened" ./FEXCoreCacheTest-hardened --threads 8 --expect warm 2>&1 | tail -3 | tee -a cache-tests.log
+
+      - name: Run the instruction tests twice with the code cache
+        # Cold pass fills the cache, warm pass must compile nothing and give the same
+        # results. Two modes here to bound the job's time; every mode on a physical Mac.
+        run: |
+          set -o pipefail
+          T="$(find build -name FEXCoreASMTestRunner -type f | head -1)"
+          python3 Scripts/macos_asm_tests.py --runner "$T" --out asm-cache --modes jit_500,jit_500_tso \
+            --cache-dir asm-code-cache --cache-passes 2 2>&1 | tee asm-cache-tests.log
 
       - name: Diagnose the tests that are not understood
         if: always()
@@ -221,6 +243,9 @@ jobs:
             smoke-hardened.log
             probe.log
             asm-tests.log
+            asm-cache-tests.log
+            asm-cache/cache.tsv
+            cache-tests.log
             thread-test.log
             asm-out/results.tsv
             probe-hardened.log

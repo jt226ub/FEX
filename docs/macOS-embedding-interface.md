@@ -23,6 +23,11 @@ basis for a small, stable C interface, which does not exist yet.
 | Resume the translator at its restart point when it runs into the end of its scratch buffer | Large blocks crash otherwise | `MacOSHostFaults.h` |
 | Map guest memory at the addresses the guest expects | The core uses guest addresses as host addresses | each tool |
 | Call the allocator's per-thread initialisation | Required before a thread allocates | `CoreThreadTest` |
+| Report the real mapped range of guest code from `QueryGuestExecutableRange` | The disk cache hashes and patches guest bytes inside it; reporting the whole address space would let a damaged cache entry make the core read unmapped memory | `ASMTestRunner`, `CoreCacheTest` |
+| To use the code cache: set `DiskCache` and `DiskCachePath` before creating the context, call `Context::FlushDiskCache()` before exiting | Queued entries are written by a background thread and lost at exit otherwise | `ASMTestRunner`, `CoreCacheTest` |
+
+The core's own helper threads (the cache writer) no longer need a thread implementation
+from the embedder on macOS: the core has a plain pthread default.
 
 ## Duties known but not done yet
 

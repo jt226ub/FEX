@@ -492,6 +492,19 @@ void ContextImpl::OnCodeBufferAllocated(const fextl::shared_ptr<CPU::CodeBuffer>
   }
 }
 
+TranslationCounters ContextImpl::GetTranslationCounters() const {
+  return {
+    .BlocksCompiled = BlocksCompiledCount.load(std::memory_order_relaxed),
+    .BlocksLoadedFromCache = BlocksLoadedFromCacheCount.load(std::memory_order_relaxed),
+    .CacheEntriesRejected = DiskCache.GetRejectedCount(),
+    .CacheEntriesQueued = DiskCache.GetQueuedCount(),
+  };
+}
+
+bool ContextImpl::FlushDiskCache() {
+  return DiskCache.Flush();
+}
+
 void ContextImpl::ClearCodeCache(FEXCore::Core::InternalThreadState* Thread, bool NewCodeBuffer) {
   FEXCORE_PROFILE_INSTANT("ClearCodeCache");
 
@@ -912,6 +925,7 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
         LOGMAN_THROW_A_FMT(CachedHostCode != 0, "Couldn't find GuestRIP in Disk Cache entrypoints!");
 
         FEXCORE_PROFILE_INSTANT_INCREMENT(Thread, AccumulatedDiskCacheHitCount, 1);
+        BlocksLoadedFromCacheCount.fetch_add(1, std::memory_order_relaxed);
         Thread->FrontendDecoder->DelayedDisownBuffer();
 
         Thread->FrontendDecoder->ValidateDisownedOrFree();
@@ -924,6 +938,7 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
 
   // Accumulate a JIT count now, as even if another thread raced us, it should count as a compile.
   FEXCORE_PROFILE_INSTANT_INCREMENT(Thread, AccumulatedJITCount, 1);
+  BlocksCompiledCount.fetch_add(1, std::memory_order_relaxed);
 
   auto [CompiledCode, DebugData, StartAddr, Length, NeedsAddGuestCodeRanges] = CompileCode(Thread, GuestRIP, MaxInst);
   auto CodePtr = CompiledCode.EntryPoints[GuestRIP];
@@ -1039,6 +1054,7 @@ uintptr_t ContextImpl::CompileSingleStep(FEXCore::Core::CpuStateFrame* Frame, ui
   auto lk = GuardSignalDeferringSection<std::shared_lock>(CodeInvalidationMutex, Thread);
 
   Thread->FrontendDecoder->SetupDecodeInstructionsAtEntry(Thread, GuestRIP, 1);
+  BlocksCompiledCount.fetch_add(1, std::memory_order_relaxed);
   auto [CompiledCode, DebugData, StartAddr, Length, _] = CompileCode(Thread, GuestRIP, 1);
   auto CodePtr = CompiledCode.EntryPoints[GuestRIP];
   if (CodePtr == nullptr) {
