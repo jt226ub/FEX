@@ -34,6 +34,9 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <iterator>
+#include <ctime>
+#include <signal.h>
 #include <set>
 #include <string>
 #include <string_view>
@@ -44,6 +47,9 @@
 #ifdef __APPLE__
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
+#include <mach-o/dyld.h>
+#include <mach-o/getsect.h>
+#include <sys/ucontext.h>
 #endif
 
 namespace {
@@ -146,19 +152,182 @@ private:
   uint64_t PageSize;
   std::set<uint64_t> Mapped;
 };
-// This runner has no Linux system calls (tests that need them declare it and are
-// skipped). Every call fails with ENOSYS, as a Linux kernel answers an unknown number, and
-// the guest continues after the instruction. Without a callback the run would stop at the
-// first `syscall` and the test would fail although the instruction worked.
+// Whether [Address, Address + Size) is mapped writable in this process (guest addresses
+// are host addresses). Used before writing a system call's result through a guest pointer.
+bool IsWritable(uint64_t Address, uint64_t Size) {
+#ifdef __APPLE__
+  // The range must not wrap past the top of the address space (rdi near 2^64).
+  if (Size == 0 || Address > UINT64_MAX - Size) {
+    return false;
+  }
+  const uint64_t End = Address + Size;
+  uint64_t Cursor = Address;
+  while (Cursor < End) {
+    mach_vm_address_t RegionAddress = Cursor;
+    mach_vm_size_t RegionSize = 0;
+    vm_region_basic_info_data_64_t Info {};
+    mach_msg_type_number_t Count = VM_REGION_BASIC_INFO_COUNT_64;
+    mach_port_t Object = MACH_PORT_NULL;
+    if (mach_vm_region(mach_task_self(), &RegionAddress, &RegionSize, VM_REGION_BASIC_INFO_64, reinterpret_cast<vm_region_info_t>(&Info),
+                       &Count, &Object) != KERN_SUCCESS ||
+        RegionAddress > Cursor || !(Info.protection & VM_PROT_WRITE) || RegionAddress + RegionSize <= Cursor) {
+      return false;
+    }
+    Cursor = RegionAddress + RegionSize;
+  }
+  return true;
+#else
+  return Address != 0;
+#endif
+}
+
+// This runner has no Linux system calls in general (tests that need them declare it and
+// are skipped). It answers `time` (201) honestly, as the one call a test makes
+// (TwoByte/0F_02, macOS/syscall_time), and every other call fails with ENOSYS, as a Linux
+// kernel answers an unknown number; either way the guest continues after the instruction.
+// Without a callback the run would stop at the first `syscall` and the test would fail
+// although the instruction worked.
 fexmac_syscall_action SyscallHandler(fexmac_thread* Thread, void*) {
+  constexpr uint64_t LinuxSysTime = 201;
   constexpr uint64_t LinuxENOSYS = 38;
+  constexpr uint64_t LinuxEFAULT = 14;
   fexmac_x86_state State;
   fexmac_x86_state_init(&State);
-  fexmac_thread_get_state(Thread, &State);
-  State.gpr[0] = -LinuxENOSYS; // rax
-  fexmac_thread_set_state(Thread, &State);
+  if (fexmac_thread_get_state(Thread, &State) != FEXMAC_OK) {
+    // Nothing sensible to answer with; end the run, and the test fails.
+    return FEXMAC_SYSCALL_STOP;
+  }
+  uint64_t& RAX = State.gpr[0];
+  const uint64_t RDI = State.gpr[7];
+  if (RAX == LinuxSysTime) {
+    // time(time_t* tloc): seconds since the epoch, also stored through tloc if non-null.
+    const uint64_t Now = static_cast<uint64_t>(::time(nullptr));
+    if (RDI && !IsWritable(RDI, sizeof(uint64_t))) {
+      RAX = -LinuxEFAULT;
+    } else {
+      if (RDI) {
+        memcpy(reinterpret_cast<void*>(RDI), &Now, sizeof(Now));
+      }
+      RAX = Now;
+    }
+  } else {
+    RAX = -LinuxENOSYS;
+  }
+  if (fexmac_thread_set_state(Thread, &State) != FEXMAC_OK) {
+    return FEXMAC_SYSCALL_STOP;
+  }
   return FEXMAC_SYSCALL_RESUME;
 }
+
+#ifdef __APPLE__
+// The __TEXT ranges of every image loaded at startup (the runner with the core and the
+// library linked in, and the system libraries), so the fault handler can say whether a
+// faulting pc is in host code or, by elimination, in translated code. Collected before
+// any guest code runs; the handler only reads the array.
+struct CodeRange {
+  uint64_t Begin;
+  uint64_t End;
+};
+CodeRange HostCodeRanges[2048];
+size_t HostCodeRangeCount {};
+
+void CollectHostCodeRanges() {
+  const uint32_t Count = _dyld_image_count();
+  for (uint32_t i = 0; i < Count && HostCodeRangeCount < std::size(HostCodeRanges); ++i) {
+    const auto* Header = reinterpret_cast<const mach_header_64*>(_dyld_get_image_header(i));
+    if (!Header) {
+      continue;
+    }
+    unsigned long Size = 0;
+    const auto* Text = getsegmentdata(Header, "__TEXT", &Size);
+    if (Text && Size) {
+      HostCodeRanges[HostCodeRangeCount++] = {reinterpret_cast<uint64_t>(Text), reinterpret_cast<uint64_t>(Text) + Size};
+    }
+  }
+}
+
+bool IsHostCode(uint64_t PC) {
+  for (size_t i = 0; i < HostCodeRangeCount; ++i) {
+    if (PC >= HostCodeRanges[i].Begin && PC < HostCodeRanges[i].End) {
+      return true;
+    }
+  }
+  return false;
+}
+
+thread_local int FaultHandlerDepth {};
+
+// The runner owns SIGBUS and SIGSEGV ("way 2" in fexmac.h): each fault goes to
+// fexmac_handle_fault first, and one the library does not claim is reported here and then
+// kills the process with the original signal. The runner does not use
+// fexmac_install_fault_handlers and chain to this, because the library's handler, when a
+// previous handler returns without resolving the fault, returns too, and the instruction
+// would fault again forever; and a chained handler must not change the process-wide
+// action under the library. As the owner, this handler may: it restores the default
+// action only when the process is about to die of this fault.
+//
+// The line names the fault so results.tsv records it: "runner: unclaimed SIGSEGV at
+// address <a>, pc <p> in host|translated code (ESR class <c>, fault status <s>)". Only
+// write(2) is used; this runs in a signal handler.
+void FaultHandler(int Signal, siginfo_t* Info, void* RawContext) {
+  auto Die = [Signal] {
+    struct sigaction Default {};
+    Default.sa_handler = SIG_DFL;
+    sigemptyset(&Default.sa_mask);
+    sigaction(Signal, &Default, nullptr);
+    // Returning re-executes the faulting instruction, which now kills the process.
+  };
+  if (FaultHandlerDepth) {
+    // Installed with SA_NODEFER, so a fault in here re-enters instead of hanging.
+    constexpr char Message[] = "runner: fault inside the fault handler\n";
+    (void)!write(STDOUT_FILENO, Message, sizeof(Message) - 1);
+    Die();
+    return;
+  }
+  ++FaultHandlerDepth;
+  if (fexmac_handle_fault(Signal, Info, RawContext)) {
+    --FaultHandlerDepth;
+    return;
+  }
+
+  char Buffer[192];
+  size_t Length = 0;
+  auto Append = [&](const char* Text) {
+    while (*Text && Length < sizeof(Buffer)) {
+      Buffer[Length++] = *Text++;
+    }
+  };
+  auto AppendHex = [&](uint64_t Value) {
+    Append("0x");
+    bool Started = false;
+    for (int Shift = 60; Shift >= 0; Shift -= 4) {
+      const auto Digit = (Value >> Shift) & 0xF;
+      if (Digit || Started || Shift == 0) {
+        Started = true;
+        if (Length < sizeof(Buffer)) {
+          Buffer[Length++] = "0123456789abcdef"[Digit];
+        }
+      }
+    }
+  };
+  const auto* Context = static_cast<ucontext_t*>(RawContext);
+  const uint64_t ESR = Context->uc_mcontext->__es.__esr;
+  const uint64_t PC = Context->uc_mcontext->__ss.__pc;
+  Append(Signal == SIGBUS ? "runner: unclaimed SIGBUS at address " : "runner: unclaimed SIGSEGV at address ");
+  AppendHex(reinterpret_cast<uint64_t>(Info->si_addr));
+  Append(", pc ");
+  AppendHex(PC);
+  Append(IsHostCode(PC) ? " in host code" : " in translated code");
+  Append(" (ESR class ");
+  AppendHex((ESR >> 26) & 0x3F);
+  Append(", fault status ");
+  AppendHex(ESR & 0x3F);
+  Append(")\n");
+  (void)!write(STDOUT_FILENO, Buffer, Length);
+  --FaultHandlerDepth;
+  Die();
+}
+#endif
 } // namespace
 
 int main(int argc, char** argv, char** const envp) {
@@ -296,15 +465,44 @@ int main(int argc, char** argv, char** const envp) {
   }
   fexmac_x86_state GuestState;
   fexmac_x86_state_init(&GuestState);
-  fexmac_thread_get_state(Thread, &GuestState);
+  if (const auto Result = fexmac_thread_get_state(Thread, &GuestState); Result != FEXMAC_OK) {
+    fextl::fmt::print("Could not read the thread's state: {}\n", fexmac_result_string(Result));
+    return ExitFail;
+  }
   GuestState.rip = Loader.DefaultRIP();
-  fexmac_thread_set_state(Thread, &GuestState);
+  if (const auto Result = fexmac_thread_set_state(Thread, &GuestState); Result != FEXMAC_OK) {
+    fextl::fmt::print("Could not set the thread's state: {}\n", fexmac_result_string(Result));
+    return ExitFail;
+  }
 
-  // Misaligned atomics and the translator's scratch-buffer restart need these.
+#ifdef __APPLE__
+  {
+    // Misaligned atomics and the translator's scratch-buffer restart need the library's
+    // fault handling; FaultHandler passes every fault to it first.
+    CollectHostCodeRanges();
+    struct sigaction Action {};
+    Action.sa_sigaction = FaultHandler;
+    // As fexmac.h asks of a host that owns the signals: SA_NODEFER, so a fault while
+    // handling one re-enters rather than hanging the thread.
+    Action.sa_flags = SA_SIGINFO | SA_NODEFER | SA_ONSTACK;
+    sigfillset(&Action.sa_mask);
+    sigdelset(&Action.sa_mask, SIGSEGV);
+    sigdelset(&Action.sa_mask, SIGBUS);
+    sigdelset(&Action.sa_mask, SIGILL);
+    sigdelset(&Action.sa_mask, SIGFPE);
+    sigdelset(&Action.sa_mask, SIGTRAP);
+    sigdelset(&Action.sa_mask, SIGSYS);
+    if (sigaction(SIGSEGV, &Action, nullptr) != 0 || sigaction(SIGBUS, &Action, nullptr) != 0) {
+      fextl::fmt::print("Could not install the fault handlers\n");
+      return ExitFail;
+    }
+  }
+#else
   if (const auto Result = fexmac_install_fault_handlers(); Result != FEXMAC_OK) {
     fextl::fmt::print("Could not install the fault handlers: {}\n", fexmac_result_string(Result));
     return ExitFail;
   }
+#endif
 
   // The tests end with `hlt`. Anything else (a guest fault) means the test went wrong;
   // system calls are answered by SyscallHandler and the run continues.
@@ -312,7 +510,16 @@ int main(int argc, char** argv, char** const envp) {
   fexmac_stop_init(&Stop);
   const auto RunResult = fexmac_thread_run(Thread, &Stop);
   const bool DidFault = RunResult != FEXMAC_OK || Stop.reason != FEXMAC_STOP_HALT;
-  fexmac_thread_get_state(Thread, &GuestState);
+  if (DidFault) {
+    // Machine-readable, for Scripts/macos_asm_tests.py's expected-outcome check.
+    fextl::fmt::print("Stopped: result {} reason {} signal {} trap {} si_code {} at 0x{:x} fault address 0x{:x}\n",
+                      fexmac_result_string(RunResult), static_cast<int>(Stop.reason), Stop.signal, Stop.trap_number, Stop.si_code,
+                      Stop.instruction_address, Stop.fault_address);
+  }
+  if (const auto Result = fexmac_thread_get_state(Thread, &GuestState); Result != FEXMAC_OK) {
+    fextl::fmt::print("Could not read the thread's state: {}\n", fexmac_result_string(Result));
+    return ExitFail;
+  }
 
   // The harness compares registers laid out as the core's CPUState, with the vector
   // registers in the layout it expects for this host.
