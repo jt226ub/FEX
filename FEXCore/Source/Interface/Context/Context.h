@@ -237,6 +237,10 @@ public:
   void ConfigureAOTGen(FEXCore::Core::InternalThreadState* Thread, fextl::set<uint64_t>* ExternalBranches, uint64_t SectionMaxAddress) override;
 
   bool IsAddressInCodeBuffer(FEXCore::Core::InternalThreadState* Thread, uintptr_t Address) const override;
+#ifdef __APPLE__
+  bool IsAddressInCodeBufferGuard(FEXCore::Core::InternalThreadState* Thread, uintptr_t Address) const override;
+  uintptr_t GetCodeBufferGuard(FEXCore::Core::InternalThreadState* Thread) const override;
+#endif
 
   // returns false if a handler was already registered
   std::optional<CustomIRResult>

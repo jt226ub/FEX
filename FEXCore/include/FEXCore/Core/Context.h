@@ -201,6 +201,22 @@ public:
    */
   FEX_DEFAULT_VISIBILITY virtual bool IsAddressInCodeBuffer(FEXCore::Core::InternalThreadState* Thread, uintptr_t Address) const = 0;
 
+#ifdef __APPLE__
+  /**
+   * @brief Checks if an address is in the inaccessible guard page after one of the code
+   * buffers the thread uses (the same buffers IsAddressInCodeBuffer checks). Touching it
+   * means a write ran past the end of a code buffer: a bug in the core, never the guest.
+   * Safe to call from a fault handler on that thread.
+   */
+  FEX_DEFAULT_VISIBILITY virtual bool IsAddressInCodeBufferGuard(FEXCore::Core::InternalThreadState* Thread, uintptr_t Address) const = 0;
+
+  /**
+   * @brief The first address of the guard page after the code buffer the thread
+   * currently writes to. For tests.
+   */
+  FEX_DEFAULT_VISIBILITY virtual uintptr_t GetCodeBufferGuard(FEXCore::Core::InternalThreadState* Thread) const = 0;
+#endif
+
   /**
    * @brief Informs the context if hardware TSO is supported.
    * Once hardware TSO is enabled, then TSO emulation through atomics is disabled and relies on the hardware.
