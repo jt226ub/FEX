@@ -3,6 +3,14 @@
 This file tracks what the macOS (Apple silicon) port does and does not do yet. Update it
 in the same change that closes or opens a gap.
 
+Related documents:
+
+- `docs/macOS-v1.0-plan.md`: what "1.0" means for this port and the work left to get there.
+- `docs/macOS-embedding-interface.md`: what a program hosting the core must provide.
+- `docs/macOS-code-cache-design.md`: design for loading cached translations on macOS.
+- `Scripts/macos_sync_upstream.sh`: brings a new upstream FEX release into the port.
+- `Scripts/macos_asm_tests.py`: runs the instruction tests.
+
 ## Where it stands
 
 - **Builds and links on Apple silicon.** The core libraries and the test tools build with
@@ -112,7 +120,7 @@ Still unproven or open:
 The earlier macOS port this work draws on (`alamshafil/fexcore-darwin`, itself built on
 Bachata-S4 and AetherPS4) also carried iOS and Android handling: a double-mapped code
 buffer, a buffer-reuse generation counter, and related diagnostics. Those files were left
-at upstream and are being ported by hand, macOS only.
+at upstream and the macOS parts were written by hand.
 
 ## Tests
 
@@ -144,8 +152,9 @@ x86 memory-ordering emulation off; this mode turns it on.
 
 `unittests/ASM/Known_Failures_macOS` lists 17 of the expected failures: 16 believed to be
 side effects of moving the tests' memory above 4GB (one confirmed in a debugger, the rest
-not checked one by one) and one that needs a Linux system call. The remaining one comes
-from upstream's own list.
+not checked one by one) and one that needs a Linux system call. The eighteenth has not
+been identified; it is presumably covered by one of upstream's lists, and
+`asm-out/results.tsv` from any run will name it.
 
 32-bit guest tests (`unittests/32Bit_ASM`) are not run: they need memory below 4GB.
 

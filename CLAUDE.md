@@ -14,3 +14,10 @@ Rules for anyone, human or AI, working here:
   say why in a comment.
 - Every behaviour change needs a test that runs on Apple silicon.
 - Keep upstream's licence and copyright notices intact.
+
+Where to start:
+
+- `docs/macOS-port-status.md` says what works, what is unproven and how to run the tests.
+- `docs/macOS-v1.0-plan.md` defines the 1.0 target and the remaining work packages.
+- The current port branch is `macos/runtime-fixes`. `main` mirrors upstream and is not
+  changed.
