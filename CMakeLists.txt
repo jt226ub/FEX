@@ -760,9 +760,14 @@ if (BUILD_FEXCORE_ONLY)
   add_subdirectory(Source/Tools/CoreSmokeTest/)
   add_subdirectory(Source/Tools/ASMTestRunner/)
   add_subdirectory(Source/Tools/CoreThreadTest/)
-  add_subdirectory(Source/Tools/CoreOrderingTest/)
-  add_subdirectory(Source/Tools/MutexWakeTest/)
-  add_subdirectory(Source/Tools/CoreBench/)
+  if (APPLE)
+    # macOS only. The ordering test is built on the macOS-only fexmac library. The
+    # wake-up test checks the macOS waiting path of WritePriorityMutex and reads Mach
+    # thread state.
+    add_subdirectory(Source/Tools/CoreOrderingTest/)
+    add_subdirectory(Source/Tools/MutexWakeTest/)
+    add_subdirectory(Source/Tools/CoreBench/)
+  endif()
   return()
 endif()
 
