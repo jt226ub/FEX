@@ -401,6 +401,20 @@ void OpDispatchBuilder::PUSHSegmentOp(OpcodeArgs, uint32_t SegmentReg) {
 }
 
 void OpDispatchBuilder::POPOp(OpcodeArgs) {
+#ifdef __APPLE__
+  // pop [m]: load, store, then move rsp, so that a fault on the store leaves rsp as before
+  // the instruction (macOS embedding library: restartable guest faults). Not when the
+  // address uses rsp, which x86 computes from the incremented rsp; those use the undo
+  // record (Core.cpp).
+  if (!Op->Dest.IsGPR() && !X86Tables::OperandUsesGPR(Op->Dest, X86State::REG_RSP)) {
+    const auto Size = OpSizeFromSrc(Op);
+    Ref OldSP = LoadGPRRegister(X86State::REG_RSP);
+    Ref Loaded = _LoadMemGPR(Size, OldSP, Size);
+    StoreResultGPR(Op, Loaded);
+    StoreGPRRegister(X86State::REG_RSP, Add(OpSize::i64Bit, OldSP, IR::OpSizeToSize(Size)));
+    return;
+  }
+#endif
   Ref Value = Pop(OpSizeFromSrc(Op));
   StoreResultGPR(Op, Value);
 }
@@ -464,6 +478,17 @@ void OpDispatchBuilder::LEAVEOp(OpcodeArgs) {
   const auto GPRSize = GetGPROpSize();
   const auto OperandSize = (Op->Flags & FEXCore::X86Tables::DecodeFlags::FLAG_OPERAND_SIZE) ? OpSize::i16Bit : GPRSize;
 
+#ifdef __APPLE__
+  // Load first, then set rsp and rbp, so that a fault on the load leaves rsp as before the
+  // instruction (macOS embedding library: restartable guest faults).
+  {
+    Ref RBP = LoadGPRRegister(X86State::REG_RBP);
+    Ref Loaded = _LoadMemGPR(OperandSize, RBP, OperandSize);
+    StoreGPRRegister(X86State::REG_RSP, Add(GPRSize, RBP, IR::OpSizeToSize(OperandSize)), GPRSize);
+    StoreGPRRegister(X86State::REG_RBP, Loaded, OperandSize);
+    return;
+  }
+#endif
   // First we move RBP in to RSP and then behave effectively like a pop
   auto SP = _RMWHandle(LoadGPRRegister(X86State::REG_RBP));
   auto NewGPR = Pop(OperandSize, SP);

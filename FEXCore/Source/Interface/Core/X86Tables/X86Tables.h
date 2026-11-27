@@ -224,6 +224,18 @@ struct DecodedOperand {
   OpType Type;
 };
 
+// Whether a memory operand's address uses the register (macOS: restartable faults).
+inline bool OperandUsesGPR(const DecodedOperand& Operand, uint8_t GPR) {
+  switch (Operand.Type) {
+  case DecodedOperand::OpType::GPRDirect: return Operand.Data.GPR.GPR == GPR;
+  case DecodedOperand::OpType::GPRIndirect:
+  case DecodedOperand::OpType::GPRIndirectRelocation: return Operand.Data.GPRIndirect.GPR == GPR;
+  case DecodedOperand::OpType::SIB:
+  case DecodedOperand::OpType::SIBRelocation: return Operand.Data.SIB.Base == GPR || Operand.Data.SIB.Index == GPR;
+  default: return false;
+  }
+}
+
 struct DecodedInst {
   uint64_t PC;
 

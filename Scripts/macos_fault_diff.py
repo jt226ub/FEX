@@ -137,6 +137,12 @@ for ins in ["shld qword ptr [r15], rax, 3", "shrd dword ptr [r15], eax, cl", "xa
             "cmpxchg dword ptr [r15], ebx", "xchg qword ptr [r15], rax", "pop qword ptr [r15]", "pop word ptr [r15]"]:
     RMW_CASES.append(("rmw-" + ins.split()[0] + "-" + ins.split()[1], "stc\npush 77\nFAULT: " + ins + "\nadc rbx, 0\npushfq\npop rdx\nhlt", 1))
 RMW_CASES.append(("leave-rbp-none", "lea rbp, [r15+8]\nFAULT: leave\nhlt", 0))
+RMW_CASES += [
+    ("pop-rsp-based-dst", "lea rsp, [r15-16]\nFAULT: pop qword ptr [rsp+8]\nhlt", 1),
+    ("pop-sib-dst", "lea rsp, [r15-16]\nlea rax, [r15-8]\nFAULT: pop qword ptr [rax+rax*1+8]\nhlt", 1),
+    ("pop-word-mem", "FAULT: pop word ptr [r15]\nhlt", 1),
+    ("leave-word", "lea rbp, [r15+8]\nFAULT: data16 leave\nhlt", 0),
+]
 # Multi-part stores across a page boundary.
 RMW_CASES += [
     ("ystore-cross-low-ro", "FAULT: vmovdqu [r15+0x4000-16], ymm1\nhlt", 1),

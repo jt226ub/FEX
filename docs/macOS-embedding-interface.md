@@ -551,10 +551,16 @@ copies ahead and behind by 1, 3, 8 and 31 bytes, a faulting source).
   frame first (`Core.cpp`, `__APPLE__`). Before this, a fault after `std` reported DF
   clear, after `movq mm0, rax` mm0 was 0, after `vpcmpeqb ymm0` the upper half was stale,
   and after `fld1; fldpi` the x87 stack was empty.
+- **`pop [m]` and `leave`** changed rsp before their faulting access. Pure reorder
+  (`OpcodeDispatcher.cpp`, `__APPLE__`): load, store, then move rsp; `leave` loads from
+  rbp before setting rsp and rbp. `pop` to an address that uses rsp (which x86 computes
+  from the incremented rsp) keeps the core's form and saves rsp in the undo record below.
+  The reorder is also faster: `push; pop [m]` loops as before, a `leave` loop 25% faster
+  than `macos/v1` (no read-modify-write handle).
 - **Read-modify-write instructions on memory** (`add`, `or`, `adc`, `sbb`, `and`, `sub`,
   `xor`, `inc`, `dec`, `neg`, rotates and shifts, `shld`/`shrd`, `bts`/`btr`/`btc`, `xadd`,
-  `cmpxchg`, `lock` forms) and **`pop [m]`, `leave`**: these change the flags (or rsp)
-  before their store. Design: an *undo record*. Before such an instruction (chosen in
+  `cmpxchg`, `lock` forms): these change the flags before their store. Design: an *undo
+  record*. Before such an instruction (chosen in
   `Core.cpp` by opcode name and a memory destination) the translated code stores NZCV, the
   raw PF and AF, and for the stack forms rsp, into `CPUState::UndoNZCV/UndoPF/UndoAF/
   UndoRSP`, sets `CPUState::UndoMask` to the live slots, and clears it after the
@@ -563,8 +569,13 @@ copies ahead and behind by 1, 3, 8 and 31 bytes, a faulting source).
   because the fault path then needs no lookup, and the code cache needs no format change
   for it (its port revision is bumped anyway, to 3, for the new code). `xadd`/`cmpxchg`
   write their register only after the store and x87 store-and-pop pops after the store
-  (checked; no record needed). Cost: three or four stores before and one after each such
-  instruction (see the performance table in `docs/macOS-port-status.md`). Before this,
+  (checked; no record needed). Cost: four stores before and one after each such
+  instruction; on a loop of three of them (`add [m],1; adc [m],0; inc [m]`) 2.2 times the
+  time of `macos/v1`, on ordinary loops nothing (see the performance table in
+  `docs/macOS-port-status.md`). Saving the flags with a raw JIT op that does not make them
+  live, or packed into two stores, was measured and is not cheaper; the cost is in the
+  combination of the flag read with the stores around a memory access, not in their
+  number. A cheaper scheme would reorder each handler (store first, flags after). Before this,
   `stc; sbb qword [m], 1` on 0x100 resumed to 0xff (x86 0xfe) and `pop [m]` resumed with
   rsp off by 8.
 - **`rep movs` / `rep stos`** (JIT `MemCpy`/`MemSet`, `EmitRepStringInPlace` in

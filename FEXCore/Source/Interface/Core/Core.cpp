@@ -747,7 +747,9 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
           if (IsMemoryDest() && std::find(std::begin(FlagsRMW), std::end(FlagsRMW), Name) != std::end(FlagsRMW)) {
             UndoMask |= Core::CPUState::UNDO_FLAGS;
           }
-          if ((Name == "POP" && IsMemoryDest()) || Name == "LEAVE") {
+          // pop [m] and leave are reordered (OpcodeDispatcher.cpp) except pop to an
+          // address using rsp.
+          if (Name == "POP" && IsMemoryDest() && X86Tables::OperandUsesGPR(DecodedInfo->Dest, X86State::REG_RSP)) {
             UndoMask |= Core::CPUState::UNDO_RSP;
           }
         }
