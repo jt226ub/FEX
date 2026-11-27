@@ -171,6 +171,12 @@ RMW_CASES += [
     ("pop-word-mem", "FAULT: pop word ptr [r15]\nhlt", 1),
     ("leave-word", "lea rbp, [r15+8]\nFAULT: data16 leave\nhlt", 0),
 ]
+# Misaligned lock forms across into the read-only page (the split-lock emulation path),
+# with CF live after them.
+for ins in ["lock xadd qword ptr [r15-4], rax", "lock adc qword ptr [r15-4], 1", "lock sbb dword ptr [r15-2], 1",
+            "lock bts qword ptr [r15-4], 40", "lock cmpxchg qword ptr [r15-4], rbx", "lock inc qword ptr [r15-4]",
+            "lock or word ptr [r15-1], 0x100"]:
+    RMW_CASES.append(("split-" + ins.split()[1] + "-" + ins.split()[2], "stc\nFAULT: " + ins + "\nadc rdx, 0\npushfq\npop rcx\nhlt", 1))
 # Multi-part stores across a page boundary.
 RMW_CASES += [
     ("ystore-cross-low-ro", "FAULT: vmovdqu [r15+0x4000-16], ymm1\nhlt", 1),
@@ -246,9 +252,9 @@ def diff(a, b, pa, pb):
 # (CF, PF, AF, ZF, SF, OF); everything else, and the resumed result, is compared in full.
 # With SMCCHECKS full every instruction ends a block, so the flags are computed there and
 # the at-fault comparison is complete: it shows the reorder leaves them untouched.
-DEAD_STATUS_FLAGS_IN = re.compile(r"^(rmw-(add|or|and|sub|xor|neg|lock-add|xadd|cmpxchg|shr)-|rmw-shl-[a-z]+-r15-[15]$|carry-(neg|xadd|cmpxchg)-)")
+DEAD_STATUS_FLAGS_IN = re.compile(r"^(rmw-(add|or|and|sub|xor|neg|lock-add|xadd|cmpxchg|shr)-|rmw-shl-[a-z]+-r15-[15]$|carry-(neg|xadd|cmpxchg)-|split-(xadd|cmpxchg|or)-)")
 # Bit tests on memory overwrite only CF (the others are kept and compared).
-DEAD_CF_IN = re.compile(r"^(rmw-bt[src]-|carry-btc-)")
+DEAD_CF_IN = re.compile(r"^(rmw-bt[src]-|carry-btc-|split-bts-)")
 STATUS_FLAGS = 0x8D5
 
 

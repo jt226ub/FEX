@@ -247,6 +247,9 @@ namespace {
 
   // ---- Guest state ----
 
+  // CF PF AF ZF SF TF IF DF OF IOPL NT RF VM AC VIF VIP ID.
+  constexpr uint32_t X86DefinedFlags = 0x003F7FD5;
+
   void ReadState(fexmac_thread* Thread, fexmac_x86_state* Out) {
     auto* CTX = Thread->Context->CTX.get();
     const auto& State = Thread->Thread->CurrentFrame->State;
@@ -255,7 +258,10 @@ namespace {
     Out->struct_size = Size;
     memcpy(Out->gpr, State.gregs, sizeof(Out->gpr));
     Out->rip = State.rip;
-    Out->rflags = CTX->ReconstructCompactedEFLAGS(Thread->Thread, false, nullptr, 0);
+    // The core's reconstruction also ORs in the bytes where it keeps NZCV (flag slots 24
+    // to 27, shifted into bits 24 to 31), so bit 31 could read as set (0x80000a03 after an
+    // rcl that set OF). Only the bits x86 defines are reported, bit 1 always set.
+    Out->rflags = (CTX->ReconstructCompactedEFLAGS(Thread->Thread, false, nullptr, 0) & X86DefinedFlags) | 2;
     Out->fs_base = State.fs_cached;
     Out->gs_base = State.gs_cached;
     Out->cs = State.cs_idx;
@@ -290,7 +296,8 @@ namespace {
     auto& State = Thread->Thread->CurrentFrame->State;
     memcpy(State.gregs, In->gpr, sizeof(In->gpr));
     State.rip = In->rip;
-    CTX->SetFlagsFromCompactedEFLAGS(Thread->Thread, static_cast<uint32_t>(In->rflags));
+    // Undefined and reserved bits are ignored, as an x86 popf ignores them.
+    CTX->SetFlagsFromCompactedEFLAGS(Thread->Thread, (static_cast<uint32_t>(In->rflags) & X86DefinedFlags) | 2);
     State.fs_cached = In->fs_base;
     State.gs_cached = In->gs_base;
 

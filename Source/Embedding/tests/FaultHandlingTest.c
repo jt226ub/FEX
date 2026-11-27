@@ -1760,6 +1760,34 @@ static void TestStopRepMovs(void) {
   free(Expect);
 }
 
+/* fexmac_thread_get_state reports only the RFLAGS bits x86 defines: after rcl r64,1 that
+ * sets OF the guest's pushfq and the state agree (bit 31 was set in the state before);
+ * a state with reserved bits set is accepted with them dropped. */
+static void TestRflagsReservedBits(void) {
+  static const uint8_t Program[] = {
+    0x48, 0xB8, 0, 0, 0, 0, 0, 0, 0, 0x40, /* mov rax, 0x4000000000000000 */
+    0xF9,                                  /* stc */
+    0x48, 0xD1, 0xD0,                      /* rcl rax, 1: OF set */
+    0x9C,                                  /* pushfq */
+    0x5B,                                  /* pop rbx */
+    0xF4,                                  /* hlt */
+  };
+  fexmac_context* Context = MakeContext(1, 0, NULL, NULL, NULL);
+  uint8_t* Code = MapCode(Context, Program, sizeof(Program), 0);
+  uint8_t* Stack = MapGuestMemory(0x4000);
+  fexmac_thread* Thread = CreateThreadAt(Context, Addr(Code), Addr(Stack) + 0x2000);
+  const fexmac_stop Stop = Run(Thread);
+  fexmac_x86_state State = GetState(Thread);
+  Check(Stop.reason == FEXMAC_STOP_HALT && (State.gpr[RBX] & 0x800) && State.rflags == State.gpr[RBX],
+        "rflags in the state (0x%" PRIx64 ") equals the guest's pushfq (0x%" PRIx64 ")", State.rflags, State.gpr[RBX]);
+  State.rflags = 0xFFFFFFFF00000000ULL | 0x80000a03ULL;
+  SetState(Thread, &State);
+  State = GetState(Thread);
+  Check(State.rflags == 0xa03, "reserved bits written into rflags are dropped (0x%" PRIx64 ")", State.rflags);
+  fexmac_thread_destroy(Thread);
+  fexmac_context_destroy(Context);
+}
+
 const struct Subtest FaultSubtests[] = {
   {"fault-mid-block", TestFaultMidBlock, 0, NULL, "fexmac:", 0},
   {"fault-flags", TestFaultFlags, 0, NULL, "fexmac:", 0},
@@ -1771,6 +1799,7 @@ const struct Subtest FaultSubtests[] = {
   {"fault-fetch", TestFaultFetch, 0, NULL, "fexmac:", 0},
   {"memory-arguments", TestMemoryArguments, 0, NULL, NULL, 0},
   {"stop-latency", TestStopLatency, 0, NULL, "fexmac:", 0},
+  {"rflags-reserved-bits", TestRflagsReservedBits, 0, NULL, NULL, 0},
   {"stop-rep-movs", TestStopRepMovs, 0, NULL, "fexmac:", 0},
   {"stop-rep", TestStopRep, 0, NULL, "fexmac:", 0},
   {"stop-not-running", TestStopNotRunning, 0, NULL, "fexmac:", 0},
