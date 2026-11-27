@@ -565,6 +565,28 @@ ref (package D adds it; the step runs it once `macos_asm_tests.py` has `--smc`).
 minutes with the machine at load 20. Run URLs and the full level are in the umbrella's
 `docs/testing/physical-mac-job-report.md`.
 
+**Physical Mac, full level** (adds the Xcode 26.5 leg and the two-pass cache run in all
+four modes): the Xcode leg passes every step with the same counts. The default leg finds
+two code cache faults, both reproduced by hand outside the job, open for package F:
+
+1. `macos_code_cache_tests.py`, "six processes rotating one database, 72 runs": every
+   answer right, but four generations left on disk where at most three may be (for
+   example `-1`, `-2`, `-45`, `-46`): old generations survive when six processes rotate
+   at once. 2 of 8 runs by hand on `e513ada49`, as built and hardened.
+2. `--cache-passes 2` in all four modes: `FEX_bugs/XeSS_quadratic` in jit_1 times out
+   (60 s) in the cold pass and passes warm. Alone it takes 1.0 s cold (65,538 blocks);
+   with the four-mode cold pass sharing one cache directory it hit the limit in 4 of 5
+   tries, on `9018cb0c1` too. Without the cache the same four-mode run passes. The hosted
+   Mac's two-pass run (two modes, jit_1 on a subset) does not reach it.
+
+**Hosted Mac job changes (this package).** The instruction-test steps now also fail on
+an expected failure that now passes (the script itself exits 0 for that); the old
+diagnosis step, which ran `lldb` and `sample` on three tests that pass since the
+scratch-buffer restart, is replaced by printing the unexpected rows of `results.tsv` when
+a step failed. No step uses `continue-on-error`; the memory-ordering off/scalar runs still
+only warn on the virtual machine when a forbidden outcome is not seen (documented in the
+step), and fail on anything else. Run time about 12 minutes.
+
 **Linux arm64.** On the port (with the fix below) and on its upstream base
 (`a92baf073`): instruction tests 2,285 raw passes, 1 known failure
 (`FEX_bugs/32bit_syscall`), 6 disabled by upstream's lists, in each of the three modes,
