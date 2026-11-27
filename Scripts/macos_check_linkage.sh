@@ -22,7 +22,7 @@ if [ "${#dylibs[@]}" -eq 0 ]; then
   echo "no libFEXCore dylib found under $build"
   bad=1
 fi
-files=(${dylibs[@]+"${dylibs[@]}"} "$build/Bin/FEXCoreSmokeTest" "$build/Bin/FEXCoreThreadTest" "$build/Bin/FEXCoreASMTestRunner" "$build/Bin/fexmac_c_test")
+files=(${dylibs[@]+"${dylibs[@]}"} "$build/Bin/FEXCoreSmokeTest" "$build/Bin/FEXCoreThreadTest" "$build/Bin/FEXCoreASMTestRunner" "$build/Bin/FEXCoreOrderingTest" "$build/Bin/FEXCoreMutexWakeTest" "$build/Bin/fexmac_c_test" "$build/Bin/fexmac_hook_test")
 
 allowed='^[[:space:]]*(/usr/lib/libSystem\.B\.dylib|/usr/lib/libc\+\+\.1\.dylib|@rpath/libFEXCore\.dylib|@rpath/libfexmac\.dylib) '
 for f in "${files[@]}"; do

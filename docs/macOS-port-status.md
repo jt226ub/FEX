@@ -29,6 +29,9 @@ Related documents:
   it; the branch without the runtime fixes dies at its first write to code memory.
   GitHub's hosted Mac is a virtual machine that does not enforce it.
 - **Runs eight guest threads at once** with correct, separate results.
+- **Keeps x86 memory ordering between threads** with the emulation on: multi-thread litmus
+  tests see no forbidden outcome in 100 million tries each, and see them by the million
+  with it off (physical Mac).
 - **Linux is unaffected.** The core-only Linux build passes with the same changes.
 
 Only the translator core is built on macOS. FEX's Linux process loader, syscall emulation,
@@ -146,13 +149,73 @@ with `JITWriteProbe`:
 
 Still unproven or open:
 
-1. **Memory-ordering emulation between threads.** The instruction tests pass with it
-   switched on, but they are single-threaded, so they show the code paths work, not that
-   ordering is preserved between threads.
-2. **The interrupt fault page and guest signals.** Not exercised.
-3. **Self-modifying code detected by write-protecting pages.** Only the
+1. **The interrupt fault page and guest signals.** Not exercised.
+2. **Self-modifying code detected by write-protecting pages.** Only the
    check-on-every-block kind is exercised.
-4. **Speed.** Nothing has been measured.
+3. **Speed.** Nothing has been measured.
+
+## x86 memory ordering between threads
+
+`FEXCoreOrderingTest` runs litmus tests: two guest threads (hand-assembled x86-64) make a
+few accesses to shared memory, many times over, meeting at a barrier in guest code before
+each try and waiting a small random time after it. Four such pairs run at once on the
+same translated code; each run copies the code to a fresh address so it is translated
+again. Outcomes are counted. Pinning threads to cores is not possible on macOS; the
+threads ask for the user-interactive quality of service and the tool relies on numbers.
+
+Results on the Mac mini (M4), hardened runtime, `--soak` (100 million tries per test):
+
+| Test | What it checks | Forbidden by x86, emulation off | Emulation on |
+|---|---|---|---|
+| SB | store buffering; allowed by x86, shows the threads race | relaxed outcome 27.8M | relaxed outcome 0.58M (allowed) |
+| MP, MP+spin | message passing, plain 64-bit moves | 14.3M, 0.52M | 0 |
+| S | store then store against load then store | 185,129 | 0 |
+| 2+2W | two threads each storing twice | 271,950 | 0 |
+| LB | load buffering | 0 | 0 |
+| MP-sse, MP-sse2 | 16-byte `movdqu` data, scalar or `movdqu` flag | 14.0M, 14.3M | 0 |
+| MP-movsb, MP-stosq, MP-movsb-read | data written or read by `rep movsb` / `rep stosq` | 18.6M, 15.2M, 8.6M | 0 |
+| MP-flag-stosq, MP-flag-movsb | flag written or read by a string instruction | 13.2M, 8.0M | 0 |
+| MP-split16, MP-splitline | misaligned data and flag across 16 bytes, across a 128-byte line | 13.4M, 21.2M | 0 |
+| MP-split4K | data across a 4K guest page, flag across a 16K host page | 21.2M | 0 |
+| MP-split16K | data across a 16K host page | 24 | 0 |
+
+So x86 ordering holds between threads with emulation on, and the same harness sees it
+broken with emulation off: Apple M-series cores reorder loads with loads and stores with
+stores. LB is never seen (the cores do not let a store pass an older load), and a load that
+crosses a 16K page almost never completes out of order, so `--expect weak` does not
+require those two. With emulation on, the misaligned tests take 6 to 9 alignment faults
+per run where 4 instructions are patched, so several threads fault on the same
+instruction at once and the back-patching under the block's spin lock is exercised
+concurrently.
+
+`--tso scalar` switches on only the general setting, as upstream's defaults do (vector
+and string-instruction ordering off). Then MP-sse2 (vector flag) and MP-flag-movsb (flag
+read by `rep movsb`) still break; the other tests hold because the release store or
+acquire load of the scalar access next to them orders them.
+
+The default run (`FEXCoreOrderingTest`, emulation on, 3.2 million tries per test) takes
+about 4 seconds; `--tso off` checks the weak side the same way. Both run in the Mac job.
+The hosted Mac is a virtual machine on Apple silicon with three processors: the ordering
+check with emulation on is meaningful there (one pair at a time), but whether the weak
+outcomes appear with emulation off depends on the host, so that run only warns. Only a
+physical Mac has shown the table above.
+
+Found by it and fixed:
+
+- **Lost wake-up in the core's reader-writer lock** (`WritePriorityMutex`, used for the
+  code invalidation lock). On macOS readers and writers wait on the same word with
+  `os_sync_wait_on_address`, which, unlike Linux futex bitsets, cannot wake only writers.
+  A writer's hand-off woke one waiter, which could be a reader; the reader went back to
+  sleep and the writer never woke. Threads that started translating together hung about
+  once in 300 to 1,500 runs of eight threads. A writer hand-off now wakes all waiters.
+  `FEXCoreMutexWakeTest` reproduces the hang deterministically (a reader and then a
+  writer queue behind a writer); 20,000 eight-thread starts ran clean after the fix.
+
+Not found, but noted: when the core back-patches a misaligned release store, it writes the
+barrier into the instruction slot before it and then the plain store. A thread that ran
+the old slot just before the patch and fetches the new store just after would make one
+store without its barrier, once. The window is a few instructions wide, once per patched
+instruction, and was not observed; it is upstream's design.
 
 ## Not implemented, by decision or for lack of a macOS method
 
@@ -182,6 +245,8 @@ All of these run in the Mac job on every push to a `macos/**` branch.
 | `FEXCoreSmokeTest` | Translates and runs a 23-byte loop, as built and under the hardened runtime | pass, both | pass, both |
 | `FEXCoreThreadTest` | Eight host threads share a context, each summing a different count in a long guest loop | pass | pass, both |
 | `FEXCoreASMTestRunner` with `Scripts/macos_asm_tests.py` | Upstream's 2,292 assembly instruction tests, in four modes | 2,253 pass in each mode (before the upstream sync added one test) | 2,255 pass in each mode, both |
+| `FEXCoreOrderingTest` | Multi-thread x86 memory-ordering litmus tests, emulation on (must hold) and off (must break); see above | not yet run | pass, both; off: all required weak outcomes seen |
+| `FEXCoreMutexWakeTest` | The core's reader-writer lock never loses a wake-up | not yet run | pass |
 | `fexmac_c_test` | A C program using only `fexmac.h`, linked as an outside project would be: system calls, stops, state, guest faults, invalidation, misaligned atomics with each signal-handler arrangement, error paths, and a fault inside the handler crashing instead of hanging | | pass, both |
 | `JITWriteProbe` | Reports how the machine treats executable memory, including writes and switches from a fault handler and instruction-cache flushing | report only | see the facts above |
 | `JITWriteProbe --expect-enforced` | The same, but exits 1 unless every asserted case gives the result the port relies on with write protection enforced, or if a fault-handler case's handler never ran | not run: the hosted Mac does not enforce, so it would fail | pass, as built and hardened |
