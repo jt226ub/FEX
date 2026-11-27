@@ -542,11 +542,11 @@ int main(int argc, char** argv) {
   fexmac_translation_counters Counters;
   fexmac_translation_counters_init(&Counters);
   if (fexmac_context_get_counters(Context, &Counters) == FEXMAC_OK) {
-    static const char* const States[] = {"off", "active", "read-only", "refused"};
+    static const char* const States[] = {"off", "active", "read-only", "untrusted", "unavailable"};
     fprintf(stderr, "FEXCoreBench: translation: compiled %llu loaded %llu rejected %llu queued %llu cache %s\n",
             static_cast<unsigned long long>(Counters.blocks_compiled), static_cast<unsigned long long>(Counters.blocks_loaded),
             static_cast<unsigned long long>(Counters.cache_entries_rejected), static_cast<unsigned long long>(Counters.cache_entries_queued),
-            Counters.cache_state <= FEXMAC_CACHE_REFUSED ? States[Counters.cache_state] : "?");
+            Counters.cache_state <= FEXMAC_CACHE_UNAVAILABLE ? States[Counters.cache_state] : "?");
     if (CacheDir && Counters.cache_state != FEXMAC_CACHE_ACTIVE) {
       fprintf(stderr, "FEXCoreBench: the code cache in %s was not used\n", CacheDir);
       ContractBroken = true;
