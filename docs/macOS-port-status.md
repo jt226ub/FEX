@@ -265,18 +265,28 @@ after: the tip.
 
 | Loop | Multiblock | Base | Before | After |
 |---|---|---|---|---|
-| counted `jnz` | off / on | 0.175 / 0.171 s | -5% / -3% | -2% / -2% |
-| memory mixed (ld/st/adc) | off / on | 0.106 / 0.106 s | +2% / +7% | +0% / -1% |
-| memory with carry | off / on | 0.138 / 0.133 s | +1% / +0% | +1% / +3% |
-| flags live across memory | off / on | 0.067 / 0.068 s | -1% / +2% | +2% / -3% |
-| `memjmp` (two linked blocks) | off / on | 0.051 / 0.036 s | +66% / +27% | +53% / +31% |
-| `add [m]; adc [m]; inc [m]` | off / on | 0.193 / 0.174 s | -1% / +1% | +121% / +123% |
-| `push; pop [m]` | on | 0.051 s | +11% | +11% |
-| `push rbp; mov rbp,rsp; store; leave` | on | 0.068 s | +5% | -25% |
-| `rep movsb` 4K | off / on | 0.034 / 0.032 s | +4% / +8% | +15% / +17% |
-| `rep movsq` 4K | off / on | 0.032 / 0.032 s | +7% / +8% | +17% / +17% |
-| `rep stosq` 4K | off / on | 0.032 / 0.032 s | +2% / +2% | +19% / +20% |
+| counted `jnz` | off / on | 0.149 / 0.149 s | -1% / -1% | -1% / -1% |
+| memory mixed (ld/st/adc) | off / on | 0.096 / 0.096 s | +2% / +2% | +2% / +2% |
+| memory with carry | off / on | 0.123 / 0.123 s | +0% / +0% | +0% / +0% |
+| flags live across memory | off / on | 0.063 / 0.064 s | -0% / -0% | -0% / -0% |
+| `memjmp` (two linked blocks) | off / on | 0.050 / 0.035 s | +50% / +18% | +50% / +18% |
+| `add [m]; adc [m]; inc [m]` | off / on | 0.172 / 0.171 s | +2% / +2% | +125% / +125% |
+| `push; pop [m]` | off / on | 0.050 / 0.050 s | +10% / +10% | +11% / +10% |
+| `push rbp; mov rbp,rsp; store; leave` | off / on | 0.081 / 0.067 s | +0% / +21% | +14% / -25% |
+| `rep movsb` 4K | off / on | 0.033 / 0.032 s | +8% / +6% | +17% / +18% |
+| `rep movsq` 4K | off / on | 0.032 / 0.032 s | +6% / +8% | +17% / +19% |
+| `rep stosq` 4K | off / on | 0.032 / 0.031 s | +1% / +2% | +18% / +19% |
 | `rep movsb` 64 bytes | off / on | 0.025 / 0.025 s | +2% / +2% | +26% / +26% |
+| `rep movsb` 4K overlapping by 1 | off / on | 0.20 to 0.47 s | 0.20 s | 0.76 to 0.86 s |
+
+`Scripts/macos_bench.py` `rep_movs` kernel (median of 3 launches x 5 runs, ms): `tso_on`
+331 before, 381 after (+15%); `tso_off` 17.8 before, 21.4 after (+20%); native 16.3.
+`copy_loop` unchanged (655 / 651 `tso_on`). The rep cost is the exactness: registers move
+after every 32-byte chunk and every element, the page-bounded run setup, and an element
+loop that counts elements for the interrupt check. An overlapping byte copy is bound by
+store-to-load forwarding (about 4 cycles a byte); the core's loop sometimes ran at 1 cycle
+a byte (unstable between runs, 0.20 to 0.47 s). Replicating the pattern for a forward
+overlap closer than 32 bytes would remove the chain; not done.
 
 The undo record costs about 3.5 cycles per read-modify-write instruction on memory; packing
 it into fewer stores or saving the flags without making them live was measured and is not

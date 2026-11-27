@@ -1943,7 +1943,6 @@ bool Arm64JITCore::EmitRepStringInPlace(bool Copy, bool IsAtomic, size_t Size, A
     ARMEmitter::BackwardLabel ElementLoop;
     ARMEmitter::BackwardLabel ChunkLoop;
     ARMEmitter::ForwardLabel ElementStep;
-    ARMEmitter::ForwardLabel SkipCheck;
     ARMEmitter::ForwardLabel Finished;
     const bool Back = Direction < 0;
 
@@ -1955,6 +1954,43 @@ bool Arm64JITCore::EmitRepStringInPlace(bool Copy, bool IsAtomic, size_t Size, A
       movi(ARMEmitter::SubRegSize::i64Bit, VTMP2.Q(), 0);
     }
 
+    auto EmitElement = [&]() {
+      ARMEmitter::ForwardLabel SkipCheck;
+      if (Copy) {
+        LoadElement(S);
+        StoreElement(TMP4);
+      } else {
+        StoreElement(Value);
+      }
+      if (Back) {
+        sub(ARMEmitter::Size::i64Bit, D, D, Size);
+        if (Copy) {
+          sub(ARMEmitter::Size::i64Bit, S, S, Size);
+        }
+      } else {
+        add(ARMEmitter::Size::i64Bit, D, D, Size);
+        if (Copy) {
+          add(ARMEmitter::Size::i64Bit, S, S, Size);
+        }
+      }
+      sub(ARMEmitter::Size::i64Bit, R, R, 1);
+      and_(ARMEmitter::Size::i64Bit, TMP1, R, 63);
+      (void)cbnz(ARMEmitter::Size::i64Bit, TMP1, &SkipCheck);
+      EmitSuspendInterruptCheck();
+      (void)Bind(&SkipCheck);
+    };
+    ARMEmitter::ForwardLabel PureEntry;
+    if (!IsAtomic && Copy) {
+      // Source and destination less than 32 bytes apart (an overlapping copy): element by
+      // element throughout, in x86's order. The distance does not change during the copy.
+      ARMEmitter::ForwardLabel Positive;
+      sub(ARMEmitter::Size::i64Bit, TMP1, D, S);
+      (void)tbz(TMP1, 63, &Positive);
+      neg(ARMEmitter::Size::i64Bit, TMP1, TMP1);
+      (void)Bind(&Positive);
+      sub(ARMEmitter::Size::i64Bit, TMP1, TMP1, 32);
+      (void)tbnz(TMP1, 63, &PureEntry);
+    }
     (void)Bind(&ElementLoop);
     if (!IsAtomic) {
       // A run of 32-byte chunks (ldp/stp of two q registers) when at least one chunk is
@@ -1965,17 +2001,9 @@ bool Arm64JITCore::EmitRepStringInPlace(bool Copy, bool IsAtomic, size_t Size, A
       // registers counting the chunks before it. Elements one at a time otherwise, until
       // the page boundary is passed.
       ARMEmitter::ForwardLabel NoChunk;
+      // Fewer elements than a chunk left: only single elements from here.
       sub(ARMEmitter::Size::i64Bit, TMP1, R, ChunkElements);
-      (void)tbnz(TMP1, 63, &NoChunk);
-      if (Copy) {
-        ARMEmitter::ForwardLabel Positive;
-        sub(ARMEmitter::Size::i64Bit, TMP1, D, S);
-        (void)tbz(TMP1, 63, &Positive);
-        neg(ARMEmitter::Size::i64Bit, TMP1, TMP1);
-        (void)Bind(&Positive);
-        sub(ARMEmitter::Size::i64Bit, TMP1, TMP1, 32);
-        (void)tbnz(TMP1, 63, &NoChunk);
-      }
+      (void)tbnz(TMP1, 63, &PureEntry);
       // TMP1 = whole chunks before the page boundary, for one pointer.
       auto Room = [&](ARMEmitter::Register Out, ARMEmitter::XRegister Pointer) {
         and_(ARMEmitter::Size::i64Bit, Out, Pointer, 4095);
@@ -2033,31 +2061,16 @@ bool Arm64JITCore::EmitRepStringInPlace(bool Copy, bool IsAtomic, size_t Size, A
       (void)cbz(ARMEmitter::Size::i64Bit, R, &Finished);
       (void)b(&ElementLoop);
       (void)Bind(&NoChunk);
+      // One element (a page boundary is near), then the chunk test again.
+      EmitElement();
+      (void)cbnz(ARMEmitter::Size::i64Bit, R, &ElementLoop);
+      (void)b(&Finished);
     }
-    // One element.
-    if (Copy) {
-      LoadElement(S);
-      StoreElement(TMP4);
-    } else {
-      StoreElement(Value);
-    }
-    if (Back) {
-      sub(ARMEmitter::Size::i64Bit, D, D, Size);
-      if (Copy) {
-        sub(ARMEmitter::Size::i64Bit, S, S, Size);
-      }
-    } else {
-      add(ARMEmitter::Size::i64Bit, D, D, Size);
-      if (Copy) {
-        add(ARMEmitter::Size::i64Bit, S, S, Size);
-      }
-    }
-    sub(ARMEmitter::Size::i64Bit, R, R, 1);
-    and_(ARMEmitter::Size::i64Bit, TMP1, R, 63);
-    (void)cbnz(ARMEmitter::Size::i64Bit, TMP1, &SkipCheck);
-    EmitSuspendInterruptCheck();
-    (void)Bind(&SkipCheck);
-    (void)cbnz(ARMEmitter::Size::i64Bit, R, &ElementLoop);
+    (void)Bind(&PureEntry);
+    ARMEmitter::BackwardLabel PureLoop;
+    (void)Bind(&PureLoop);
+    EmitElement();
+    (void)cbnz(ARMEmitter::Size::i64Bit, R, &PureLoop);
     (void)Bind(&Finished);
     (void)Log2;
   };
