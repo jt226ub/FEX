@@ -200,6 +200,13 @@ inline void VirtualTHPControl(const void* Ptr, size_t Size, THPControl Control) 
 // These must not be nested: the inner object's destructor would end the outer one's
 // write permission. Only a register write is involved, so it is safe in a signal
 // handler. On other hosts code memory is always writable and this does nothing.
+//
+// Every write counts, including atomic operations on data kept inside the code buffer,
+// such as the lock word in each block's tail. The setting is not saved and restored
+// around a signal handler (JITWriteProbe shows this): a handler that uses one of these
+// leaves the thread executable when it returns, which is only correct if the code it
+// interrupted was not itself inside one. A fault inside a fault handler does not crash
+// either: with the signal blocked the thread hangs.
 class [[nodiscard]] ScopedJITWrite final {
 public:
 #ifdef __APPLE__

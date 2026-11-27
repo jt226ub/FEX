@@ -14,14 +14,19 @@ Related documents:
 ## Where it stands
 
 - **Builds and links on Apple silicon.** The core libraries and the test tools build with
-  no errors on macOS 26 with Apple clang. The dylib depends only on `libSystem` and `libc++`.
-- **Passes 2,253 of upstream's 2,291 instruction tests** on GitHub's hosted Apple silicon
-  Mac, in each of upstream's three translator modes and in a fourth with x86
-  memory-ordering emulation switched on. None of the rest is an unexplained failure;
-  they are listed under "Tests".
+  no errors with the macOS 27 SDK (command line tools, Apple clang 2100.4.1.1) and with
+  Xcode 26.5 (macOS 26.5 SDK). The dylib and the test tools depend only on `libSystem`
+  and `libc++`; the bundled `fmt` and `range-v3` are always used on macOS, even when
+  Homebrew has its own.
+- **Passes on a physical Mac.** On a Mac mini (Apple M4, macOS 27.0.1, 16K pages), as
+  built and signed for the hardened runtime with only the JIT entitlement: the smoke and
+  multi-thread tests pass, and 2,254 of upstream's 2,291 instruction tests pass in each
+  of upstream's three translator modes and in a fourth with x86 memory-ordering emulation
+  switched on, with no unexpected failures. The rest are listed under "Tests".
+- **Write protection is enforced on real hardware and respected.** `JITWriteProbe` shows
+  it; the branch without the runtime fixes dies at its first write to code memory.
+  GitHub's hosted Mac is a virtual machine that does not enforce it.
 - **Runs eight guest threads at once** with correct, separate results.
-- **Nothing has run on a physical Mac.** The hosted Mac is a virtual machine and does not
-  enforce the write protection on translated code that real hardware does.
 - **Linux is unaffected.** The core-only Linux build passes with the same changes.
 
 Only the translator core is built on macOS. FEX's Linux process loader, syscall emulation,
@@ -47,7 +52,11 @@ Fixed in code on `macos/runtime-fixes`:
 1. **Writing translated code.** `FEXCore::Allocator::ScopedJITWrite` wraps
    `pthread_jit_write_protect_np`. It surrounds the dispatcher emit, the copy of compiled
    blocks into the code buffer, block linking and unlinking, cached-code loading and the
-   fault-time patching of memory accesses.
+   fault-time patching of memory accesses. For the patching it covers the whole locked
+   region, because the lock word itself sits in the block's tail inside the code buffer:
+   with only the patch covered, the lock's first write faulted inside the fault handler
+   and the thread hung (24 instruction tests, memory-ordering mode only, physical Mac
+   only).
 2. **Reserved register.** `x18` is removed from the register allocation and from the
    dynamic save lists on macOS.
 3. **Fault page.** The per-thread interrupt fault page and the thread state are aligned to
@@ -89,19 +98,37 @@ Found out about macOS on Apple silicon:
 - A further region of about 12GB appears at a different address near 32GB in each process.
   What it is has not been identified.
 
+Found out on a physical Mac (Apple M4, macOS 27.0.1), identical as built and hardened,
+with `JITWriteProbe`:
+
+- `pthread_jit_write_protect_supported_np` is 1, and write protection is enforced. A
+  thread must switch to writable before writing `MAP_JIT` memory (in its default state or
+  switched to executable, the write faults with SIGBUS) and back before running it
+  (running while writable faults). Atomic operations count as writes.
+- **`mprotect` of a page inside a `MAP_JIT` mapping is refused.** Guard pages and
+  page-protection self-modifying-code detection cannot be built that way inside the code
+  buffer.
+- **A fault inside a SIGBUS handler hangs the thread** instead of killing the process,
+  because the signal is blocked while its handler runs. A hang in a test can be a crash
+  in a fault handler.
+- **Returning from a signal handler does not restore the thread's write setting.** A
+  handler that switches leaves the setting it last chose. The core's handler only runs
+  for faults in translated code, which is always executable, and ends executable.
+- **Reading `ctr_el0` from user space faults** (SIGILL), as do `midr_el1` and the ID
+  registers; the port uses `sysctl` for all of them. **`dc cvau` is allowed.**
+- Misaligned atomic accesses fault only when they cross a 16-byte boundary.
+- GitHub's hosted Mac reports `pthread_jit_write_protect_supported_np` as 0 and lets a
+  thread write and run `MAP_JIT` memory in any state, so it cannot test any of this.
+
 Still unproven or open:
 
-1. **Write protection on real hardware.** `JITWriteProbe` shows the hosted Mac reports
-   `pthread_jit_write_protect_supported_np` as 0 and lets a thread write and run `MAP_JIT`
-   memory in any state. The smoke test passes there with and without fixes 1 to 3.
-2. **Memory-ordering emulation between threads.** The instruction tests pass with it
+1. **Memory-ordering emulation between threads.** The instruction tests pass with it
    switched on, but they are single-threaded, so they show the code paths work, not that
    ordering is preserved between threads.
-3. **The interrupt fault page and guest signals.** Not exercised.
-4. **Self-modifying code detected by write-protecting pages.** Only the
+2. **The interrupt fault page and guest signals.** Not exercised.
+3. **Self-modifying code detected by write-protecting pages.** Only the
    check-on-every-block kind is exercised.
-5. **`dc cvau` from user space.** Allowed on the hosted Mac; not confirmed on hardware.
-6. **Speed.** Nothing has been measured.
+4. **Speed.** Nothing has been measured.
 
 ## Not implemented, by decision or for lack of a macOS method
 
@@ -126,26 +153,29 @@ at upstream and the macOS parts were written by hand.
 
 All of these run in the Mac job on every push to a `macos/**` branch.
 
-| Test | What it does | Hosted Mac result |
-|---|---|---|
-| `FEXCoreSmokeTest` | Translates and runs a 23-byte loop, as built and under the hardened runtime | pass, both |
-| `FEXCoreThreadTest` | Eight host threads share a context, each summing a different count in a long guest loop | pass |
-| `FEXCoreASMTestRunner` with `Scripts/macos_asm_tests.py` | Upstream's 2,291 assembly instruction tests, in four modes | 2,253 pass in each mode |
-| `JITWriteProbe` | Reports how the machine treats executable memory | report only |
-| Low-memory probe | Shows that a program with a small page-zero reservation is killed | report only |
+| Test | What it does | Hosted Mac result | Physical Mac (M4) result |
+|---|---|---|---|
+| `FEXCoreSmokeTest` | Translates and runs a 23-byte loop, as built and under the hardened runtime | pass, both | pass, both |
+| `FEXCoreThreadTest` | Eight host threads share a context, each summing a different count in a long guest loop | pass | pass, both |
+| `FEXCoreASMTestRunner` with `Scripts/macos_asm_tests.py` | Upstream's 2,291 assembly instruction tests, in four modes | 2,253 pass in each mode | 2,254 pass in each mode, both |
+| `JITWriteProbe` | Reports how the machine treats executable memory, including writes from a fault handler | report only | see the facts above |
+| Linkage check | Fails if the core or a test tool links anything but `libSystem` and `libc++` (Homebrew's `fmt` is installed first) | | pass |
+| Low-memory probe | Shows that a program with a small page-zero reservation is killed | report only | same as hosted |
 
-The instruction tests, per mode, on the most recent run:
+The instruction tests, per mode, on the most recent physical-Mac run (as built and
+hardened, with either toolchain, the same):
 
 | Outcome | Count |
 |---|---|
-| Pass | 2,253 |
-| Skipped by the runner (host lacks a CPU feature the test needs, or it needs Linux system calls) | 9 |
+| Pass | 2,254 |
+| Skipped by the runner (host lacks a CPU feature the test needs, or it needs Linux system calls) | 8 |
 | Skipped by upstream's own lists | 6 |
 | Skipped because the test reaches low memory through a 32-bit operand | 5 |
 | Expected failures | 18 |
 
-The skip count depends on which machine GitHub assigns: an earlier run on a different
-virtual CPU skipped 16 and passed 2,244 with the same code paths.
+The skip count depends on the CPU: the hosted Mac skips one more test than the M4, and an
+earlier hosted run on a different virtual CPU skipped 16 and passed 2,244 with the same
+code paths.
 
 The fourth mode, `jit_500_tso`, is this port's addition. Upstream runs these tests with
 x86 memory-ordering emulation off; this mode turns it on.

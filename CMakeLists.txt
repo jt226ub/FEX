@@ -489,7 +489,11 @@ else ()
   file(GENERATE OUTPUT CTestTestfile.cmake CONTENT "# No tests since BUILD_TESTING is disabled")
 endif()
 
-if (MINGW OR BUILD_STEAM_SUPPORT)
+# On macOS always use the bundled fmt. A copy found on the system (Homebrew's, for
+# example) is a separately signed dylib that the hardened runtime refuses to load into
+# a program signed by someone else, and it would add a dependency beyond libSystem and
+# libc++.
+if (MINGW OR BUILD_STEAM_SUPPORT OR APPLE)
   set(FMT_INSTALL OFF)
   add_subdirectory(External/fmt/)
 else()
@@ -501,7 +505,8 @@ else()
   endif()
 endif()
 
-if (NOT BUILD_STEAM_SUPPORT)
+# On macOS always use the bundled range-v3 so the setting below applies to it.
+if (NOT BUILD_STEAM_SUPPORT AND NOT APPLE)
   find_package(range-v3 QUIET)
 endif()
 
@@ -509,6 +514,14 @@ if (NOT range-v3_FOUND)
   add_subdirectory(External/range-v3/)
   target_compile_definitions(range-v3 INTERFACE
     RANGES_DISABLE_DEPRECATED_WARNINGS)
+  if (APPLE)
+    # range-v3's meta.hpp forward-declares standard library templates when it sees
+    # Apple clang, using a libc++ visibility macro that the macOS 27 SDK's libc++ no
+    # longer defines, so every declaration fails. range-v3 provides this switch to turn
+    # the forward declarations off; the standard headers are included where needed.
+    target_compile_definitions(range-v3 INTERFACE
+      META_NO_STD_FORWARD_DECLARATIONS)
+  endif()
 endif()
 
 add_subdirectory(External/tiny-json/)
