@@ -762,6 +762,7 @@ if (BUILD_FEXCORE_ONLY)
   add_subdirectory(Source/Tools/CoreThreadTest/)
   add_subdirectory(Source/Tools/CoreOrderingTest/)
   add_subdirectory(Source/Tools/MutexWakeTest/)
+  add_subdirectory(Source/Tools/CoreBench/)
   return()
 endif()
 
