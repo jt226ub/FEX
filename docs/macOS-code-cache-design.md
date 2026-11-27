@@ -58,9 +58,9 @@ Load (warm run), in `DiskCache::Lookup` and `CompileBlock`:
 2. Read the entry and check it completely (sizes, integrity hash, every offset and
    operand) before using any of it; see "Rejection".
 3. Apply the relocations to the entry in ordinary memory (not executable memory).
-4. Copy it into the code buffer inside one `ScopedJITWrite`, flush the instruction cache
-   while still writable (enough on an M4, per `JITWriteProbe`; `ClearICache` is the same
-   call the compile path uses), switch back.
+4. Copy it into the code buffer inside one `ScopedJITWrite`, end the write scope, then
+   flush the instruction cache for the range (`Arm64JITCore::LoadCachedCode`, the same
+   order and call as the compile path).
 5. Register the entry points and the guest code pages in the lookup cache.
 
 Block links between cached and freshly compiled code need nothing special: both live in
@@ -79,18 +79,35 @@ addresses.
 A cache entry can only be found under the exact combination that produced it.
 
 - **Directory (machine bucket):** hash of the format version, upstream's host-feature
-  bits, and, added by this port, the port identity: a port cache revision, the git hash
-  the core was configured from, the **Mach-O UUID of the image the core is linked into**
-  (the linker derives it from the code, so any rebuilt core gets a new one, even with
-  uncommitted changes), the CPU brand string and the CPU MIDRs.
+  bits, and, added by this port, the port identity: a port cache revision (2), the git
+  hash the core was configured from, the **Mach-O UUID of the image the core's code is
+  in** (the linker derives it from the code, so any rebuilt core gets a new one, even
+  with uncommitted changes), the CPU brand string and the CPU MIDRs. If the image has no
+  `LC_UUID` the cache is switched off rather than keyed without one.
+
+  Which UUID: the identity that matters is that of the code generator. When the core is
+  a dylib, the image is the core alone. When it is linked statically into a host, the
+  image is the host, so rebuilding the host (even without touching the core) starts a
+  new bucket and two different hosts never share one. That costs cold starts, never
+  correctness; a narrower identity (a hash of just the core's objects, made at build
+  time) would need a post-link build step and could be wrong if it missed an input, so
+  the image UUID is kept. Two hosts' buckets live side by side and each is pruned only
+  when unused (below).
 - **File (process bucket):** hash of the 64-bit mode, SVE flags and every configuration
   option marked as affecting code generation: multiblock, maximum instructions per block,
   TSO emulation and each of its sub-switches, self-modifying-code check mode, x87 reduced
   precision, and so on. Upstream skipped enumerated options; this port adds them
   (`JITFeatures` is one that changes code).
 - **Entry:** a hash of the guest bytes of the block with patchable fields left out, plus
-  flags (writable code, trap flag set, Mono hacks), then the full guest hash over the
-  exact byte extents the block was translated from.
+  flags (writable code, trap flag set, Mono hacks, and, added by this port, the effective
+  TSO emulation state: `SetHardwareTSOSupport` changes it after the configuration was
+  hashed), then the full guest hash over the exact byte extents the block was translated
+  from.
+- **Never cached:** blocks overlapping a range given to `AddForceTSOInformation` (their
+  code depends on that per-instruction list), and blocks at or with an entry point at an
+  address with a custom IR handler (`AddCustomIREntrypoint`, `AddThunkTrampolineIRHandler`):
+  a cached block made from the bytes would otherwise shadow the handler. Neither is
+  served from the cache nor stored to it.
 
 Each database's first record is its description: the full bytes the two bucket hashes
 are made from. This port checks it when the database is opened and refuses (and, for the
@@ -102,6 +119,12 @@ Guest code identity, not names: the anonymous key is computed from the bytes, so
 code at the same address with different bytes misses, and stale code is never used after
 guest code changes. In a running process, self-modifying code is still handled by the
 usual invalidation; a block recompiled after a change is looked up by its new bytes.
+
+Upstream hashed the live guest bytes at store time, not the bytes the decoder read, so a
+write between decoding and storing filed the old translation under the new bytes for
+good. The decoded range is now hashed right after decoding, and the store is skipped if
+the bytes have changed since (`FEXCoreCacheTest --race` changes the code at exactly that
+point; without the check its later runs give wrong answers).
 
 ### Patchable fields: a correction found by the tests
 
@@ -124,14 +147,27 @@ compile) reports those blocks.
 Everything read from a cache file is checked before it is used, and nothing is copied into
 executable memory until the whole entry has passed:
 
-- Index records: framing and sizes within both files (upstream), extents within the guest
-  size (upstream).
+- Index records: framing; blob offset and size inside the cache file; guest size non-zero
+  and inside the blob; an even, non-zero number of extent words with the payload size
+  matching it exactly; extents inside the guest size, in order and not overlapping. A
+  record failing any of these is ignored. The record key is only a name (except its last
+  byte, which marks the description); the footprint is only a sort key.
 - Entry sizes computed in 64 bits, so a damaged count cannot wrap to a matching size.
 - **Integrity hash:** XXH3-128 over the entry header (hash field zeroed), host code, entry
-  points and relocations, seeded with the entry's lookup key. Detects torn writes, bit
-  flips and entries moved to another key.
-- Shape: host code size non-zero and 16-byte aligned; at least one entry point, one of
-  them the block entry; host offsets inside the code and instruction-aligned.
+  points, relocations and the index record's guest extents, seeded with the entry's
+  lookup key. So the fields of the index that decide what is executed (key, extents)
+  are covered as well as the blob; the guest size and guest hash are compared with the
+  blob's own. Detects torn writes, bit flips and entries moved to another key.
+  (A stack-allocated hash state used with a seed must be cleared with `XXH3_INITSTATE`;
+  without it, worker threads hashed with a stale secret now and then, which showed up as
+  random rejections.)
+- Shape: host code size 16-byte aligned and large enough for the block header and tail;
+  the header's tail offset aligned and inside the code; the tail's recorded size equal to
+  the code size.
+- Entry points: at least one, one of them the block entry; every guest entry point inside
+  the extents the block was translated from (so it lies in the guest pages the block is
+  registered under and is removed by self-modifying-code invalidation); every host entry
+  point after the block header and before the tail, instruction-aligned.
 - Relocations: known type, write fully inside the code, symbol index known, register
   index below 32, patchable sites inside the guest bytes that were hashed, thunk
   relocations only if the embedder has a thunk handler.
@@ -141,23 +177,42 @@ executable memory until the whole entry has passed:
 Any failure counts as a rejection (`TranslationCounters::CacheEntriesRejected`) and the
 block is compiled instead. `Scripts/macos_code_cache_tests.py` damages files in 37 ways
 (zero length, truncation at several points, bit flips in headers, code, entry points,
-relocations and the index, length fields set huge) and requires the right result every
-time.
+relocations and the index, length fields set huge), runs 300 randomly damaged caches,
+writes re-sealed entries with a correct hash but bad entry points or tails, and appends
+index records with odd, unordered or oversized extents; it requires the right result
+every time.
+
+What the checks cannot do: tell a well-formed entry with valid-looking entry points
+inside the code from one whose entry points were moved to the middle of an instruction
+sequence. Only someone who can write the file can produce that (see the trust model).
 
 ### Trust model, stated plainly
 
 A cache file is executable code. Whoever can write it can make this process run anything.
-The rules are therefore about who can write it:
+The rules are about who can write it, and are enforced on the open descriptors, never by
+path:
 
-- The bucket directory is made private (0700) and cache files 0600. A file that is not a
-  regular file (for example a symbolic link), is not owned by this user, or (read-only
-  databases) is writable by others, is not used. The base directory must be owned by
-  this user and not writable by other users, or the cache is switched off.
+- **Base directory** (`DiskCachePath` or the default): opened with `O_NOFOLLOW` (a
+  symbolic link is refused), must be a directory owned by this user, with no group or
+  other write bit and no ACL entry that allows anyone to write, append, add or delete
+  entries, change attributes, security or owner. Created 0700 if missing. Otherwise the
+  cache is off for the run, with a log line.
+- **Bucket directory:** created with `mkdirat` 0700 and opened with `openat(O_NOFOLLOW)`
+  relative to the base directory's descriptor. It must be owned by this user, have no
+  group or other bits at all, and no such ACL entry. Otherwise the cache is off for the
+  run. It is never narrowed with `chmod`.
+- **Cache files:** opened with `openat(O_NOFOLLOW)` relative to the bucket's descriptor
+  (new files are created 0600). Each must be a regular file with one link, owned by this
+  user, with no group or other bits and no such ACL entry. A refused read-write database
+  is removed (`unlinkat` in the verified bucket, which only this user can change) and
+  started again, once; a refused read-only database is not used. Files are never
+  narrowed with `fchmod`.
+- Deny ACL entries are accepted (macOS puts `everyone deny delete` on some folders).
+- Directories above the base directory are not checked.
 - The integrity hash is **not a security boundary**. It is an unkeyed checksum: any
   process running as the same user can rewrite a cache file and its hash. The cache
   protects against accidents and against other users, not against code already running
   with the user's rights (which could equally patch the program itself).
-- Directories above the base directory are not checked.
 
 ## Writing files: atomicity
 
@@ -167,21 +222,79 @@ safe instead:
 
 - Every append takes an exclusive `flock` on both files; the blob is written before its
   index record, so a reader never sees an index record for a blob that is not there.
-- Opening a read-write database takes both locks, cuts a partly written last index
-  record (a process that died mid-append), reads the index and checks the description.
+- Opening a read-write database takes both locks, reads the index once, cuts a partly
+  written last index record (a process that died mid-append), and checks the
+  description.
+- Every append first does the same for whatever other processes appended since this
+  process last looked (under the locks, reading only those bytes). Without it, a
+  process that died mid-append (the crashing instruction tests do, with their writer
+  thread busy) left a partial record that later appends went behind, and the next open
+  cut them all off: warm runs then compiled a few blocks at random.
+  (`FEXCoreCacheTest --tear-index` writes such a record after opening.)
+- A database is emptied by replacing its two files (`unlinkat` and create), never by
+  truncating them, so a process still appending to the old files never sees records it
+  wrote move.
+- **Size limit:** `DiskCacheMaxFileSize` (default 1GB) applies to each file. Upstream
+  only enforced it with a file mapper, which macOS embedders do not install; here each
+  append checks both files' real sizes under the locks and stops storing at the limit,
+  and a database found larger than the limit at open is emptied and started again.
 - A torn or damaged blob that an index record does point to fails the integrity check.
 - `Context::FlushDiskCache()` waits for the writer thread to finish every queued store and
-  then calls `fcntl(F_FULLFSYNC)` (the macOS way through the drive cache) on both files.
-  Entries queued but not flushed when a process exits are lost, never half-used.
+  then calls `fcntl(F_FULLFSYNC)` (the macOS way through the drive cache) on both files,
+  skipping the sync only if no store was queued since the last one (stores count
+  themselves after they are queued, and the count is read before the flush marker is,
+  under a mutex). Entries queued but not flushed when a process exits are lost, never
+  half-used.
+- While choosing a candidate entry, the lookup copies it under the index lock; the
+  writer thread fills in the file offset of a just-stored entry under the same lock.
+
+### Reading the index at start-up
+
+Upstream reads the whole index and builds the full in-memory index (one allocation per
+entry) when a process starts. With the instruction tests' 85,000-entry jit_1 database
+(10.7MB of index) that took about 9ms per process: 1.7ms reading the file for the
+torn-record check and 7.3ms reading it again and parsing it. Each test uses a few dozen
+entries.
+
+Chosen: read the index once (under the locks) and build only a flat open-addressed table
+of (lookup key, record offset), 16 bytes a slot with no allocation per entry; a record is
+parsed (and checked) the first time its key is looked up, the records of one key in file
+order, as upstream adds them. This keeps upstream's file
+format and its index code above the lookup unchanged, and it costs the same whatever the
+size of the database. Not chosen: mapping the index (another process may truncate it,
+which would turn a read into SIGBUS), an on-disk sorted or hashed index (a format of our
+own, and a rewrite to keep sorted under concurrent appends), or a per-database cap with
+rotation (it limits the cost by throwing away entries a long-running program would want).
+
+### fork
+
+`Context::LockBeforeFork` / `UnlockAfterFork` (which an embedder calls around `fork`) now
+also take the disk cache's index and in-memory-cache locks, after the code invalidation
+lock, so no thread is in a lookup or store and the writer thread is not inside the index
+at the moment of the fork. In the child, which has no writer thread and shares the
+parent's open files (and so their `flock` locks), writing is switched off: the child
+keeps loading from the cache but stores nothing, `FlushDiskCache` returns at once, and a
+fresh work queue replaces the abandoned one. `FEXCoreCacheTest --fork` forks with a warm
+and with a cold cache; the child runs guest code and exits.
+
+
 - Several processes and threads can use one database at once: this is what the
-  instruction-test run does (six processes per mode, four modes, one directory).
+  instruction-test run does (six processes per mode, four modes, one directory). Lock
+  waits are 5 s on macOS (upstream: 0.1 s to open, 1 s to store): on a busy machine a
+  lock holder can be descheduled, and a timeout silently costs a cold start or an entry.
+- Workaround, with no native alternative: when several processes create the same new
+  file at once, APFS can fail a loser's `openat(O_CREAT)` with ENOENT although the
+  directory exists (a ten-line C program shows it about one round in five with six
+  processes; with or without `O_NOFOLLOW`). Such a create is retried for up to 0.1 s.
 - Files are read with `pread`; 16K pages play no part in the format.
 
 Stale buckets: upstream removes every other bucket directory when a process starts. With
 processes of different builds or host-feature settings running together (the instruction
 tests set host features per test) they deleted each other's caches mid-run. On macOS a
 bucket directory is only removed if it is named like a bucket (16 hex digits, so a cache
-path that holds other things is safe) and nothing in it was written for seven days.
+path that holds other things is safe) and it has not been used for seven days. Use, not
+writes: a process that opens a bucket touches its `last-used` file (one `futimens` per
+start), so a cache in daily read-only use is kept.
 
 ## Where files live
 
@@ -203,6 +316,8 @@ The core does the work; an embedder only switches it on and flushes:
 - The core's writer thread needs a thread implementation; on macOS the core now has a
   plain pthread default (signals blocked, `QOS_CLASS_UTILITY` for low priority), so an
   embedder need not install one.
+- Around `fork`: `Context::LockBeforeFork(nullptr)` before, `UnlockAfterFork(nullptr,
+  Child)` after, in parent and child.
 
 For the C interface (package C) this means: a cache directory and an on/off switch in
 `fexmac_config`, `fexmac_context_flush_cache()`, and a counters query.

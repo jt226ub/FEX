@@ -82,11 +82,9 @@ namespace DiskCache {
     uint32_t ThunkRelocCount;
     XXH128_hash_t GuestHash;
 #ifdef __APPLE__
-    // macOS port: XXH3-128 of the blob up to the guest code copy, with this field zeroed,
-    // seeded with the entry's lookup key. Checked before anything in the blob is used, so
-    // a damaged or misplaced entry is never copied into executable memory. This detects
-    // accidents (torn writes, bit flips, a file from another configuration). It is not a
-    // security boundary: anyone who can write the cache file can recompute it.
+    // macOS port: see DiskCacheMacOS.cpp, SealEntry. Covers this header (with the field
+    // zeroed), the entry up to its guest code copy and the guest extents, seeded with
+    // the lookup key.
     XXH128_hash_t IntegrityHash;
 #endif
   };
@@ -159,14 +157,25 @@ namespace DiskCache {
     ssize_t Size();
     bool ReadAll(fextl::vector<uint8_t>& Out); // from first blob
 #ifdef __APPLE__
+    // Opens Leaf inside the directory DirFD without following a symbolic link, creating
+    // it private to the user when read-write. Refused is set when the file exists but may
+    // not be trusted (see DiskCacheMacOS.cpp).
+    bool OpenAt(int DirFD, const fextl::string& Leaf, bool ReadOnly, bool& Refused);
     bool FlushToDisk();
-    bool TruncateTornTail(); // drops a partly written last record; caller holds the lock
+    bool Truncate(uint64_t Size);
 #endif
     bool ReadBlob(uint64_t Offset, std::span<uint8_t> OutBlob);
     bool WriteBlob(const MesaFOZ::foz_payload_key& Key, std::span<const std::span<const uint8_t>> BlobChunks, uint64_t& OutBlobOffset);
 
   private:
+#ifdef __APPLE__
+    // Generous: several processes share one database and a lock holder may be descheduled
+    // on a busy machine. A timeout only means this process runs without the cache (or
+    // drops an entry), which a warm run then has to compile.
+    static constexpr uint32_t OPEN_LOCK_TIMEOUT_MS = 5000;
+#else
     static constexpr uint32_t OPEN_LOCK_TIMEOUT_MS = 100;
+#endif
 
     fextl::string FileName;
     fextl::unique_ptr<File::File> FD;
@@ -184,24 +193,53 @@ namespace DiskCache {
       return MaxSizeReached;
     }
 #ifdef __APPLE__
-    bool FlushToDisk();
-    // Location of this database's metadata blob (the bucket description), if it has one.
-    uint64_t MetadataOffset = 0;
-    uint32_t MetadataSize = 0;
-    // Both files' locks, for opening a shared read-write database consistently.
+    // macOS port (DiskCacheMacOS.cpp). The index is read once, at open, into IndexData;
+    // only a table of (lookup key, record offset) is built, and records are parsed when
+    // their key is first looked up.
+    bool OpenAt(int DirFD, const fextl::string& Leaf, bool ReadOnly, uint64_t MaxFileSize);
+    bool LoadIndex(uint64_t MaxFileSize, bool& FoundMetadata);
+    void ResolveKey(uint64_t LookupKey, Index& CacheIndex);
     bool LockForOpen();
     void UnlockAfterOpen();
-    bool RepairIndex(); // caller holds the locks
-    bool HasEntries();
-    bool Reset(); // empties both files; caller holds the locks
+    bool Reset();
+    bool FlushToDisk();
+    bool WithinSizeLimit(uint64_t BlobSize, uint64_t IndexRecordSize);
+    bool RepairIndexTail();
+    void NoteAppended() {
+      IndexKnownEnd = IndexFOZ.Size();
+    }
     bool IsReadOnly() const {
       return ReadOnly;
     }
+    fextl::string Name;
+    uint64_t MetadataOffset = 0;
+    uint32_t MetadataSize = 0;
+    uint64_t DataRecords = 0;
+
+  private:
+    struct LazySlot {
+      uint64_t Key;
+      uint32_t Offset; // into IndexData; EmptySlot or ResolvedSlot otherwise
+    };
+    static constexpr uint32_t EmptySlot = ~0U;
+    static constexpr uint32_t ResolvedSlot = ~0U - 1;
+    fextl::vector<uint8_t> IndexData;
+    fextl::vector<LazySlot> LazyTable;
+    uint64_t CacheFOZSizeAtOpen = 0;
+    uint64_t IndexKnownEnd = 0;
+    int DirFD = -1;
+    bool ParseRecord(uint32_t Offset, Index& CacheIndex);
+
+  public:
 #endif
 
   private:
     // stores run on the Writer, so returning quick isn't as important
+#ifdef __APPLE__
+    static constexpr uint32_t STORE_LOCK_TIMEOUT_MS = 5000; // see OPEN_LOCK_TIMEOUT_MS
+#else
     static constexpr uint32_t STORE_LOCK_TIMEOUT_MS = 1000;
+#endif
     static constexpr uint64_t BIG_MAPPING_SIZE = 1ULL << 33;
 
     FOZFile CacheFOZ;
@@ -244,6 +282,10 @@ namespace DiskCache {
     uint64_t GetQueuedCount() const {
       return QueuedCount.load(std::memory_order_relaxed);
     }
+#ifdef __APPLE__
+    void LockBeforeFork();
+    void UnlockAfterFork(bool Child);
+#endif
 
   private:
     bool OpenCacheDB(const fextl::string& CacheDBName, bool ReadOnly);
@@ -261,15 +303,27 @@ namespace DiskCache {
     bool FoundMetadata = false;
     std::atomic<uint64_t> RejectedCount {};
     std::atomic<uint64_t> QueuedCount {};
+    struct FlushWorkItem;
 #ifdef __APPLE__
-    // The bucket description every database opened here must carry as its metadata blob.
+    // macOS port, DiskCacheMacOS.cpp.
+    void InitMacOS(const fextl::vector<uint8_t>& BucketBytes, size_t MachineDataSize, uint64_t ProcessBucketHash);
+    bool OpenCacheDBMacOS(const fextl::string& Leaf, bool ReadOnly);
+    bool CheckMetadata(IndexedDB& DB);
+    void ResolveLazyLocked(uint64_t LookupKey);
+    bool ValidateHit(const BlobFixedHeader& Header, std::span<const uint8_t> Body, uint64_t LookupKey, uint64_t GuestSizeAvailable,
+                     std::span<const uint32_t> GuestExtents);
+    bool MayUseCache(uint64_t GuestRIP, uint64_t GuestSize, std::span<const uint64_t> EntryPoints);
+    bool FlushToDiskMacOS(uint64_t QueuedBeforeFlush);
+    uint8_t CodeGenStateFlags() const;
     fextl::vector<uint8_t> ExpectedMetadata;
+    int BaseDirFD = -1;
+    int BucketDirFD = -1;
+    std::mutex FlushMutex;
     uint64_t FlushedQueuedCount = 0;
-    bool CheckMetadata(IndexedDB& DB, const fextl::string& Name);
-    bool ValidateHit(const BlobFixedHeader& Header, std::span<const uint8_t> Body, uint64_t LookupKey, uint64_t GuestSizeAvailable);
+    bool ForkedChild = false;
+    bool ForkLocksHeld = false;
 #endif
     struct CacheStoreWorkItem;
-    struct FlushWorkItem;
 
     struct PruneMemoryLRUWorkItem;
     std::atomic<uint64_t> MemoryLRUCurrentSize {};
@@ -298,6 +352,15 @@ namespace DiskCache {
   static constexpr uint16_t FormatVersion = 49;
 
   static constexpr uint32_t LOOKUP_KEY_MAX_BUCKET_DEPTH = 500;
+
+#ifdef __APPLE__
+  namespace MacOS {
+    // Seals an entry: the integrity hash over [Blob, Blob + Size) with the hash field zeroed,
+    // followed by the guest extents, seeded with the lookup key.
+    XXH128_hash_t EntryHash(const uint8_t* Blob, size_t Size, std::span<const uint32_t> GuestExtents, uint64_t LookupKey);
+    bool KeepBucket(std::string_view CacheBase, std::string_view Name);
+  } // namespace MacOS
+#endif
 
 } // namespace DiskCache
 

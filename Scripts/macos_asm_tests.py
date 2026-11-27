@@ -146,6 +146,9 @@ def run_one(runner, name, mode, binary, config, timeout, cache_env=None):
     if match:
         cache = dict(zip(("compiled", "loaded", "rejected", "queued"), map(int, match.groups())))
         cache["mismatches"] = len(VALIDATE_MISMATCH.findall(result.stdout + result.stderr))
+        # The cache's own messages (a database that could not be opened, an entry that
+        # could not be written), to explain a warm run that had to compile.
+        cache["log"] = [line[:200] for line in (result.stdout + result.stderr).splitlines() if "DiskCache:" in line and "features" not in line][:3]
     if result.returncode == 0:
         return "pass", "", cache
     if result.returncode == SKIP_CODE:
@@ -185,7 +188,7 @@ def main():
     parser.add_argument("--jobs", type=int, default=os.cpu_count() or 2)
     parser.add_argument("--timeout", type=int, default=60)
     parser.add_argument("--modes", default=",".join(MODES))
-    parser.add_argument("--filter", default="", help="only run tests whose name contains this text")
+    parser.add_argument("--filter", default="", help="only run tests whose name contains this text (several: separate with commas)")
     parser.add_argument("--cache-dir", default="", help="switch the on-disk code cache on, kept in this directory")
     parser.add_argument("--cache-passes", type=int, default=1, choices=(1, 2),
                         help="2: empty the cache directory, run cold, then run warm and compare")
@@ -221,7 +224,7 @@ def main():
     low_memory = []
     for source in sources:
         name = "Test_" + os.path.relpath(source, asm_dir)
-        if args.filter and args.filter not in name:
+        if args.filter and not any(part in name for part in args.filter.split(",") if part):
             continue
         if name in disabled:
             continue
@@ -337,14 +340,14 @@ def report_cache(cold, warm, modes, tests, cache_dir, cold_seconds, warm_seconds
                     if wc["mismatches"]:
                         mismatched.append((name, wc["mismatches"]))
                 elif wc["compiled"]:
-                    compiled.append((name, wc["compiled"], wc["loaded"]))
+                    compiled.append((name, wc["compiled"], wc["loaded"], cc.get("log", []) + wc.get("log", [])))
             print("   %s: cold compiled %d blocks; warm compiled %d, loaded %d; results changed %d; warm runs that compiled %d; "
                   "rejected entries in %d; not finished %d" % (mode, total_cold, total_compiled, total_loaded, len(changed), len(compiled),
                                                              len(rejected), len(unfinished)))
             for name, before, after, detail in changed[:50]:
                 print("   CHANGED %s: cold %s, warm %s %s" % (name, before, after, detail[:200]))
-            for name, count, loaded in compiled[:50]:
-                print("   COMPILED %s: %d blocks compiled, %d loaded" % (name, count, loaded))
+            for name, count, loaded, log in compiled[:50]:
+                print("   COMPILED %s: %d blocks compiled, %d loaded %s" % (name, count, loaded, " | ".join(log)))
             for name in rejected[:50]:
                 print("   REJECTED %s" % name)
             for name, count in mismatched[:50]:

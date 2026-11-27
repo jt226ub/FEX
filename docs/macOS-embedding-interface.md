@@ -25,6 +25,7 @@ basis for a small, stable C interface, which does not exist yet.
 | Call the allocator's per-thread initialisation | Required before a thread allocates | `CoreThreadTest` |
 | Report the real mapped range of guest code from `QueryGuestExecutableRange` | The disk cache hashes and patches guest bytes inside it; reporting the whole address space would let a damaged cache entry make the core read unmapped memory | `ASMTestRunner`, `CoreCacheTest` |
 | To use the code cache: set `DiskCache` and `DiskCachePath` before creating the context, call `Context::FlushDiskCache()` before exiting | Queued entries are written by a background thread and lost at exit otherwise | `ASMTestRunner`, `CoreCacheTest` |
+| Around `fork`: `Context::LockBeforeFork(nullptr)` before it, `UnlockAfterFork(nullptr, Child)` after it in both processes | The cache's locks must not be held by a thread that does not exist in the child; the child then reads the cache but does not write it | `CoreCacheTest --fork` |
 
 The core's own helper threads (the cache writer) no longer need a thread implementation
 from the embedder on macOS: the core has a plain pthread default.

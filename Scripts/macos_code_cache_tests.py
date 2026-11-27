@@ -137,17 +137,242 @@ def load_asm_helper(root):
     return module
 
 
+XXH_HELPER_SOURCE = r"""
+#define XXH_INLINE_ALL
+#include "xxhash.h"
+#include <stdio.h>
+#include <stdlib.h>
+int main(int argc, char** argv) {
+  unsigned long long seed = strtoull(argv[1], 0, 16);
+  static unsigned char buf[1 << 24];
+  size_t n = fread(buf, 1, sizeof buf, stdin);
+  XXH128_hash_t h = XXH3_128bits_withSeed(buf, n, seed);
+  fwrite(&h, 1, 16, stdout);
+  return 0;
+}
+"""
+
+
+def build_xxh_helper(root, work):
+    """XXH3-128 with a seed, from the bundled xxhash, to re-seal crafted entries."""
+    source = os.path.join(work, "xxh.c")
+    binary = os.path.join(work, "xxh")
+    with open(source, "w") as handle:
+        handle.write(XXH_HELPER_SOURCE)
+    subprocess.run(["cc", "-O1", "-I", os.path.join(root, "External", "xxhash"), "-o", binary, source], check=True)
+    return binary
+
+
+class CraftDB:
+    """Reads entries of a database and writes re-sealed copies (after the reviewer's craft.py)."""
+
+    def __init__(self, bucket, xxh):
+        self.index = [os.path.join(bucket, f) for f in os.listdir(bucket) if f.endswith("_idx.foz")][0]
+        self.cache = self.index[:-len("_idx.foz")] + ".foz"
+        self.xxh = xxh
+
+    def entries(self):
+        data = open(self.index, "rb").read()
+        result = []
+        for record in parse_index(self.index):
+            if record["metadata"]:
+                continue
+            body = record["body"]
+            key, size, _, offset = struct.unpack_from("<QIQQ", data, body)
+            _, guest_size, count = struct.unpack_from("<QII", data, body + MESA_ENTRY + 16)
+            extents = list(struct.unpack_from("<%dI" % count, data, body + MESA_ENTRY + INDEX_EXTRA))
+            result.append(dict(record=record["record"], body=body, key=key, size=size, offset=offset, extents=extents))
+        return result
+
+    def blob(self, entry):
+        data = open(self.cache, "rb").read()[entry["offset"]:entry["offset"] + entry["size"]]
+        guest_size, host_size, count, small, thunk = struct.unpack_from("<5I", data, 0)
+        p = BLOB_HEADER
+        code = bytearray(data[p:p + host_size])
+        p += host_size
+        rips = list(struct.unpack_from("<%dQ" % count, data, p))
+        p += 8 * count
+        hoffs = list(struct.unpack_from("<%dI" % count, data, p))
+        p += 4 * count
+        rest = data[p:p + small * 14 + thunk * 37]
+        p += small * 14 + thunk * 37
+        return dict(gs=guest_size, gh=data[20:36], code=code, rips=rips, hoffs=hoffs, small=small, thunk=thunk, rest=rest, guest=data[p:])
+
+    def write(self, entry, blob, extents=None):
+        extents = entry["extents"] if extents is None else extents
+        count = len(blob["rips"])
+        header = struct.pack("<5I", blob["gs"], len(blob["code"]), count, blob["small"], blob["thunk"]) + blob["gh"]
+        body = bytes(blob["code"]) + struct.pack("<%dQ" % count, *[r & 0xFFFFFFFFFFFFFFFF for r in blob["rips"]]) + \
+            struct.pack("<%dI" % count, *blob["hoffs"]) + bytes(blob["rest"])
+        sealed = subprocess.run([self.xxh, "%x" % entry["key"]], input=header + b"\0" * 16 + body + struct.pack("<%dI" % len(extents), *extents),
+                                capture_output=True, check=True).stdout
+        new_blob = header + sealed + body + bytes(blob["guest"])
+        with open(self.cache, "r+b") as handle:
+            handle.seek(0, 2)
+            handle.write(b"K" * FOZ_KEY + struct.pack("<4I", len(new_blob), 1, 0, len(new_blob)))
+            offset = handle.tell()
+            handle.write(new_blob)
+        with open(self.index, "r+b") as handle:
+            handle.seek(entry["body"] + 8)
+            handle.write(struct.pack("<I", len(new_blob)))
+            handle.seek(entry["body"] + 20)
+            handle.write(struct.pack("<Q", offset))
+
+
+def craft_tests(work, cache_test, base):
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    xxh = build_xxh_helper(root, work)
+    pristine = os.path.join(work, "craft-pristine")
+    cmd = [cache_test, "--threads", "1", "--base", base]
+    cold = run(cmd, pristine)
+    warm = run(cmd, pristine)
+
+    def craft(name, change, expect_reject):
+        target = fresh_copy(pristine, work, "craft-" + re.sub(r"\W+", "-", name))
+        bucket = [os.path.join(target, d) for d in os.listdir(target) if os.path.isdir(os.path.join(target, d))][0]
+        db = CraftDB(bucket, xxh)
+        for entry in db.entries():
+            change(db, entry, db.blob(entry))
+        info = run(cmd, target)
+        if expect_reject == "fallback":
+            # Not loaded: either a miss (the live guest bytes hash differently over the
+            # changed extents) or a rejection; the block is compiled.
+            ok = info["rc"] == 0 and info.get("compiled", 0) > 0 and "PASS" in info["out"]
+        elif expect_reject:
+            ok = info["rc"] == 0 and info.get("rejected", 0) >= 1 and "PASS" in info["out"]
+        else:
+            ok = info["rc"] == 0 and info.get("rejected") == 0 and info.get("loaded") == warm.get("loaded") and info.get("compiled") == 0
+        check(name, ok, summary(info) + " " + info["out"][-200:])
+
+    check("craft baseline: cold then warm", cold["rc"] == 0 and warm["rc"] == 0 and warm.get("compiled") == 0, summary(warm))
+
+    def reseal(db, e, b):
+        db.write(e, b)
+
+    def extra_entry(offset):
+        def change(db, e, b):
+            b["rips"].append(offset)
+            b["hoffs"].append(b["hoffs"][0])
+            db.write(e, b)
+        return change
+
+    def host_offset(fn):
+        def change(db, e, b):
+            b["hoffs"][0] = fn(b)
+            db.write(e, b)
+        return change
+
+    def tail_size(db, e, b):
+        tail = struct.unpack_from("<I", b["code"], 0)[0]
+        struct.pack_into("<Q", b["code"], tail, len(b["code"]) + 16)
+        db.write(e, b)
+
+    def extents_unsealed(db, e, b):
+        # Change the index's extents without re-sealing: the hash covers them.
+        with open(db.index, "r+b") as handle:
+            handle.seek(e["body"] + MESA_ENTRY + INDEX_EXTRA + 4)
+            handle.write(struct.pack("<I", max(1, e["extents"][1] - 1)))
+
+    craft("re-sealed unchanged entries still load (the crafting is right)", reseal, False)
+    craft("an extra guest entry point beyond the block (+0x100000) is rejected", extra_entry(0x100000), True)
+    craft("an extra guest entry point before the block (-0x8000000000) is rejected", extra_entry(-0x8000000000), True)
+    craft("a host entry point inside the block tail is rejected", host_offset(lambda b: len(b["code"]) - 16), True)
+    craft("a host entry point on the block header is rejected", host_offset(lambda b: 0), True)
+    craft("a block tail whose size disagrees is rejected", tail_size, True)
+    craft("guest extents changed in the index (not re-sealed) are not used", extents_unsealed, "fallback")
+
+    # A process that died while appending leaves a partial index record. The next process
+    # to store must cut it off first, or the records it appends after it are lost.
+    target = fresh_copy(pristine, work, "torn-then-append")
+    first = run(cmd + ["--variant", "sub", "--tear-index"], target)
+    second = run(cmd + ["--variant", "sub"], target)
+    original = run(cmd, target)
+    check("entries stored after a partly written record are kept",
+          first["rc"] == 0 and first.get("queued", 0) > 0 and second.get("compiled") == 0 and original.get("compiled") == 0,
+          "%s / %s / %s" % (summary(first), summary(second), summary(original)))
+
+    # Index records with an odd extent count, or extents out of order: never parsed into use.
+    for name, extents in [("odd extent count", [0, 4, 6]), ("extents out of order", [6, 3, 0, 2]), ("extent past the guest size", [0, 0x7FFFFFFF])]:
+        target = fresh_copy(pristine, work, "index-" + re.sub(r"\W+", "-", name))
+        bucket = [os.path.join(target, d) for d in os.listdir(target) if os.path.isdir(os.path.join(target, d))][0]
+        db = CraftDB(bucket, xxh)
+        data = open(db.index, "rb").read()
+        for entry in db.entries():
+            body = data[entry["body"]:entry["body"] + MESA_ENTRY + INDEX_EXTRA - 4] + struct.pack("<I", len(extents))
+            payload = body + struct.pack("<%dI" % len(extents), *extents)
+            # Same lookup key, appended: a second candidate for the same code.
+            with open(db.index, "ab") as handle:
+                handle.write(b"0" * (FOZ_KEY - 1) + b"\0" + struct.pack("<4I", len(payload), 1, 0, len(payload)) + payload)
+        info = run(cmd, target)
+        check("an index record with an %s is ignored" % name if name[0] in "aeiou" else "an index record with %s is ignored" % name,
+              info["rc"] == 0 and "PASS" in info["out"] and info.get("compiled") == 0, summary(info))
+
+
+FUZZ_VALUES = [0, 1, 2, 3, 4, 8, 12, 14, 16, 0x7F, 0x80, 0xFF, 0x100, 0x7FFF, 0x8000, 0xFFFF, 0x10000, 0x7FFFFFFF, 0x80000000, 0xFFFFFFF0,
+               0xFFFFFFFC, 0xFFFFFFFF]
+
+
+def fuzz(work, cache_test, base, iterations):
+    """Random damage to a database (after the reviewer's fuzz2.py). Every run must pass."""
+    import random
+    random.seed(1234)
+    pristine = os.path.join(work, "fuzz-pristine")
+    cmd = [cache_test, "--threads", "1", "--blocks", "20", "--base", base]
+    run(cmd, pristine)
+    bucket_name = [d for d in os.listdir(pristine) if os.path.isdir(os.path.join(pristine, d))][0]
+    files = sorted(f for f in os.listdir(os.path.join(pristine, bucket_name)) if f.endswith(".foz"))
+    bad = []
+    for iteration in range(iterations):
+        target = fresh_copy(pristine, work, "fuzz-work")
+        done = []
+        for _ in range(random.randint(1, 4)):
+            path = os.path.join(target, bucket_name, random.choice(files))
+            data = bytearray(open(path, "rb").read())
+            if not data:
+                continue
+            kind = random.random()
+            if kind < 0.35:
+                offset = random.randrange(len(data))
+                data[offset] ^= 1 << random.randrange(8)
+                done.append("flip %s %d" % (path[-8:], offset))
+            elif kind < 0.75 and len(data) >= 4:
+                offset = random.randrange(len(data) - 3)
+                value = random.choice(FUZZ_VALUES) if random.random() < 0.7 else random.getrandbits(32)
+                data[offset:offset + 4] = struct.pack("<I", value)
+                done.append("poke %s %d %x" % (path[-8:], offset, value))
+            elif kind < 0.85:
+                offset = random.randrange(len(data))
+                data = data[:offset]
+                done.append("truncate %s %d" % (path[-8:], offset))
+            elif kind < 0.95 and len(data) > 64:
+                source, dest, count = random.randrange(len(data) - 32), random.randrange(len(data) - 32), random.randint(1, 32)
+                data[dest:dest + count] = data[source:source + count]
+                done.append("copy %s %d->%d %d" % (path[-8:], source, dest, count))
+            else:
+                offset = random.randrange(len(data))
+                data[offset] = random.getrandbits(8)
+                done.append("byte %s %d" % (path[-8:], offset))
+            open(path, "wb").write(data)
+        info = run(cmd, target)
+        if info["rc"] != 0 or "PASS" not in info["out"]:
+            bad.append("%d: %s %s" % (iteration, done, summary(info)))
+            shutil.copytree(target, os.path.join(work, "fuzz-bad-%d" % iteration))
+    check("%d randomly damaged caches all give the right answer" % iterations, not bad, "; ".join(bad[:3]))
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--runner", required=True)
     parser.add_argument("--cache-test", required=True)
     parser.add_argument("--work", required=True)
     parser.add_argument("--test", default="TwoByte/0F_B0_3.asm", help="instruction test used for the file-damage cases")
+    parser.add_argument("--fuzz", type=int, default=300, help="number of randomly damaged caches to run")
     args = parser.parse_args()
 
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     work = os.path.abspath(args.work)
     if os.path.exists(work):
+        subprocess.run(["chmod", "-RN", work])  # ACLs from an earlier run
         shutil.rmtree(work)
     os.makedirs(work)
     runner = os.path.abspath(args.runner)
@@ -331,42 +556,160 @@ def main():
     check("8 threads, multiblock: its own database, cold then warm", info["rc"] == 0 and warm["rc"] == 0,
           "%s / %s" % (summary(info), summary(warm)))
 
-    # 6. Directory and file rules.
+    # 6. Directory and file rules: anything not private to the user is refused, never
+    # narrowed. A refused read-write database in a private bucket is removed and started
+    # again; a refused directory switches the cache off for the run.
     print("== directory and file rules")
+    def bucket_of(target):
+        return os.path.dirname(os.path.join(target, cache_rel))
+
     target = fresh_copy(pristine, work, "shared-dir")
     os.chmod(target, 0o777)
     info = run(test_cmd, target)
-    check("a cache directory writable by other users is not used",
-          info["rc"] == 0 and info.get("loaded") == 0 and info.get("queued") == 0, summary(info))
+    check("a base directory writable by other users switches the cache off",
+          info["rc"] == 0 and info.get("loaded") == 0 and info.get("queued") == 0 and os.stat(target).st_mode & 0o777 == 0o777, summary(info))
     os.chmod(target, 0o755)
-    target = fresh_copy(pristine, work, "symlink")
+
+    target = fresh_copy(pristine, work, "bucket-open")
+    os.chmod(bucket_of(target), 0o755)
+    info = run(test_cmd, target)
+    check("a bucket directory that is not private switches the cache off and is left as it was",
+          info["rc"] == 0 and info.get("loaded") == 0 and info.get("queued") == 0 and os.stat(bucket_of(target)).st_mode & 0o777 == 0o755,
+          summary(info))
+
+    target = fresh_copy(pristine, work, "file-open")
     path = os.path.join(target, cache_rel)
-    os.rename(path, path + ".real")
-    os.symlink(path + ".real", path)
+    os.chmod(path, 0o666)
+    before = os.stat(path).st_ino
     info = run(test_cmd, target)
-    check("a symbolic link in place of a cache file is not used", info["rc"] == 0 and info.get("loaded") == 0, summary(info))
-    target = fresh_copy(pristine, work, "permissions")
-    bucket = os.path.dirname(os.path.join(target, cache_rel))
-    os.chmod(bucket, 0o755)
-    os.chmod(os.path.join(target, cache_rel), 0o666)
+    after = os.stat(path)
+    check("a cache file writable by others is not used: it is removed and the database started again",
+          info["rc"] == 0 and info.get("loaded") == 0 and after.st_ino != before and after.st_mode & 0o777 == 0o600, summary(info))
+
+    target = fresh_copy(pristine, work, "file-acl")
+    path = os.path.join(target, cache_rel)
+    subprocess.run(["chmod", "+a", "everyone allow write", path], check=True)
     info = run(test_cmd, target)
-    modes = (os.stat(bucket).st_mode & 0o777, os.stat(os.path.join(target, cache_rel)).st_mode & 0o777)
-    check("the bucket directory and files are made private to the user", info["rc"] == 0 and modes == (0o700, 0o600), "modes %o %o" % modes)
+    acl = subprocess.run(["ls", "-le", path], capture_output=True, text=True).stdout
+    check("a cache file with an ACL entry granting write is not used", info["rc"] == 0 and info.get("loaded") == 0 and "allow write" not in acl,
+          summary(info))
+
+    target = fresh_copy(pristine, work, "bucket-acl")
+    subprocess.run(["chmod", "+a", "everyone allow add_file,delete_child", bucket_of(target)], check=True)
+    info = run(test_cmd, target)
+    check("a bucket with an ACL entry granting add/delete switches the cache off",
+          info["rc"] == 0 and info.get("loaded") == 0 and info.get("queued") == 0, summary(info))
+
+    target = fresh_copy(pristine, work, "base-acl")
+    subprocess.run(["chmod", "+a", "everyone allow add_subdirectory", target], check=True)
+    info = run(test_cmd, target)
+    check("a base directory with an ACL entry granting add switches the cache off",
+          info["rc"] == 0 and info.get("loaded") == 0 and info.get("queued") == 0, summary(info))
+
+    target = fresh_copy(pristine, work, "deny-acl")
+    subprocess.run(["chmod", "+a", "everyone deny delete", bucket_of(target)], check=True)
+    info = run(test_cmd, target)
+    check("a deny-only ACL entry is accepted", info["rc"] == 0 and info.get("compiled") == 0 and info.get("loaded", 0) > 0, summary(info))
+    subprocess.run(["chmod", "-N", bucket_of(target)], check=True)  # so the work directory can be removed
+
+    target = fresh_copy(pristine, work, "file-symlink")
+    path = os.path.join(target, cache_rel)
+    real = os.path.join(work, "symlink-target.foz")
+    shutil.move(path, real)
+    os.symlink(real, path)
+    real_before = open(real, "rb").read()
+    info = run(test_cmd, target)
+    check("a symbolic link in place of a cache file is not followed: removed, database started again, target untouched",
+          info["rc"] == 0 and info.get("loaded") == 0 and not os.path.islink(path) and open(real, "rb").read() == real_before, summary(info))
+
+    target = fresh_copy(pristine, work, "bucket-symlink")
+    bucket = bucket_of(target)
+    elsewhere = os.path.join(work, "bucket-elsewhere")
+    shutil.move(bucket, elsewhere)
+    os.chmod(elsewhere, 0o755)
+    os.symlink(elsewhere, bucket)
+    info = run(test_cmd, target)
+    check("a symbolic link in place of the bucket directory switches the cache off and its target is not changed",
+          info["rc"] == 0 and info.get("loaded") == 0 and info.get("queued") == 0 and os.stat(elsewhere).st_mode & 0o777 == 0o755, summary(info))
+
+    target = fresh_copy(pristine, work, "hardlink")
+    path = os.path.join(target, cache_rel)
+    os.link(path, os.path.join(work, "second-name.foz"))
+    info = run(test_cmd, target)
+    check("a cache file with a second name is not used", info["rc"] == 0 and info.get("loaded") == 0, summary(info))
+
     target = fresh_copy(pristine, work, "prune")
     old_bucket = os.path.join(target, "0123456789abcdef")
+    used_bucket = os.path.join(target, "00112233445566ff")
     new_bucket = os.path.join(target, "fedcba9876543210")
     other = os.path.join(target, "not-a-bucket")
-    for folder in (old_bucket, new_bucket, other):
+    for folder in (old_bucket, used_bucket, new_bucket, other):
         os.makedirs(folder)
         open(os.path.join(folder, "file"), "w").close()
+    open(os.path.join(used_bucket, "last-used"), "w").close()
     old = time.time() - 30 * 24 * 3600
-    for path in (os.path.join(old_bucket, "file"), old_bucket, os.path.join(other, "file"), other):
+    for path in (os.path.join(old_bucket, "file"), old_bucket, os.path.join(used_bucket, "file"), used_bucket, os.path.join(other, "file"), other):
         os.utime(path, (old, old))
     info = run(test_cmd, target)
-    check("pruning removes only idle bucket directories",
-          info["rc"] == 0 and not os.path.exists(old_bucket) and os.path.exists(new_bucket) and os.path.exists(other),
-          "%s old=%s new=%s other=%s" % (summary(info), os.path.exists(old_bucket), os.path.exists(new_bucket), os.path.exists(other)))
+    exists = [os.path.exists(p) for p in (old_bucket, used_bucket, new_bucket, other)]
+    marker = os.path.join(bucket_of(target), "last-used")
+    check("pruning removes only bucket directories nobody used for a week; opening a bucket marks it used",
+          info["rc"] == 0 and exists == [False, True, True, True] and os.path.exists(marker) and time.time() - os.stat(marker).st_mtime < 600,
+          "%s exists=%s" % (summary(info), exists))
 
+    # 7. Size limit: stores stop at DiskCacheMaxFileSize; the files never grow past it.
+    print("== size limit")
+    target = os.path.join(work, "size-limit")
+    limit = 2048
+    info = run([cache_test, "--threads", "1", "--blocks", "300"], target, {"FEX_DISKCACHEMAXFILESIZE": str(limit)})
+    sizes = [os.path.getsize(f) for pair in db_files(target) for f in pair]
+    check("cache files stay within the size limit", info["rc"] == 0 and sizes and max(sizes) <= limit, "%s sizes=%s" % (summary(info), sizes))
+    info = run([cache_test, "--threads", "1", "--blocks", "300"], target, {"FEX_DISKCACHEMAXFILESIZE": "16"})
+    check("a database larger than the limit is emptied and the run is right", info["rc"] == 0, summary(info))
+
+    # 8. Code generation state that is not in the configuration.
+    print("== code generation state outside the configuration")
+    sdir = os.path.join(work, "state")
+    base = "0x8000000000"
+    run([cache_test, "--threads", "1", "--base", base], sdir)
+    info = run([cache_test, "--threads", "1", "--base", base, "--trampoline"], sdir)
+    check("a custom IR handler (thunk trampoline) is not shadowed by a cached block", info["rc"] == 0, summary(info))
+    for flag, env in [("--hardware-tso", {"FEX_TSOENABLED": "1"}), ("--force-tso", {})]:
+        sdir = os.path.join(work, "state" + flag)
+        run([cache_test, "--threads", "1", "--base", base], sdir, env)
+        info = run([cache_test, "--threads", "1", "--base", base, flag], sdir, env)
+        empty = run([cache_test, "--threads", "1", "--base", base, flag], os.path.join(work, "empty" + flag), env)
+        same = all(info.get(k) == empty.get(k) for k in ("compiled", "loaded", "queued"))
+        check("cached code is not used with %s" % flag, info["rc"] == 0 and same, "%s; empty cache: %s" % (summary(info), summary(empty)))
+
+    # 9. Guest code changing between decoding and storing (the first time a page is
+    # reported executable, which the core does between the two) must not be filed
+    # under the new bytes.
+    print("== guest code changed while compiling")
+    rdir = os.path.join(work, "race")
+    info = run([cache_test, "--threads", "1", "--base", base, "--race"], rdir)
+    add = run([cache_test, "--threads", "1", "--base", base], rdir)
+    sub = run([cache_test, "--threads", "1", "--base", base, "--variant", "sub"], rdir)
+    check("no translation is stored under bytes it was not made from", info["rc"] == 0 and add["rc"] == 0 and sub["rc"] == 0,
+          "%s / %s / %s" % (summary(info), summary(add), summary(sub)))
+
+    # 10. fork while the cache is in use, cold and warm: the child runs guest code,
+    # flushes (at once: it does not write) and exits; the parent carries on.
+    print("== fork")
+    fdir = os.path.join(work, "fork")
+    for name in ("cold", "warm"):
+        info = run([cache_test, "--threads", "4", "--fork"], fdir)
+        ok = info["rc"] == 0 and "child: 0 wrong, flush skipped" in info["out"]
+        check("fork with a %s cache" % name, ok, summary(info) + " " + info["out"][-300:])
+
+    # 11. Entries re-sealed with a correct integrity hash but bad contents (what a process
+    # running as the user could write), and index records outside the hash.
+    print("== re-sealed entries and index records")
+    craft_tests(work, cache_test, base)
+
+    # 12. Random damage.
+    print("== fuzz")
+    fuzz(work, cache_test, base, args.fuzz)
     print("\n%d passed, %d failed" % (passes, len(failures)))
     for name in failures:
         print("  FAILED: %s" % name)

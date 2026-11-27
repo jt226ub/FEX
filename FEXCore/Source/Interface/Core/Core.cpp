@@ -453,6 +453,9 @@ void ContextImpl::DestroyThread(FEXCore::Core::InternalThreadState* Thread) {
 #ifndef _WIN32
 void ContextImpl::UnlockAfterFork(FEXCore::Core::InternalThreadState* LiveThread, bool Child) {
   Allocator::UnlockAfterFork(LiveThread, Child);
+#ifdef __APPLE__
+  DiskCache.UnlockAfterFork(Child);
+#endif
 
   Profiler::PostForkAction(Child);
   if (Child) {
@@ -474,6 +477,10 @@ void ContextImpl::UnlockAfterFork(FEXCore::Core::InternalThreadState* LiveThread
 
 void ContextImpl::LockBeforeFork(FEXCore::Core::InternalThreadState* Thread) {
   CodeInvalidationMutex.lock();
+#ifdef __APPLE__
+  // After the invalidation lock, so no thread is compiling (and so storing) any more.
+  DiskCache.LockBeforeFork();
+#endif
   Allocator::LockBeforeFork(Thread);
   if (Config.StrictInProcessSplitLocks) {
     FEXCore::Utils::SpinWaitLock::lock(&StrictSplitLockMutex);
@@ -559,6 +566,13 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
     const auto* GuestCode = reinterpret_cast<const uint8_t*>(GuestRIP);
 
     Thread->FrontendDecoder->DecodeLoop(GuestCode);
+#ifdef __APPLE__
+    if (DiskCache.IsWritingDiskCache()) {
+      const auto Min = Thread->FrontendDecoder->DecodedMinAddress;
+      const auto Max = Thread->FrontendDecoder->DecodedMaxAddress;
+      Thread->FrontendDecoder->DecodedBytesHash = XXH3_64bits(reinterpret_cast<const void*>(Min), Max - Min);
+    }
+#endif
 
     const auto* BlockInfo = Thread->FrontendDecoder->GetDecodedBlockInfo();
     const auto& CodeBlocks = BlockInfo->Blocks;

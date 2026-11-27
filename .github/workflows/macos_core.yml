@@ -151,6 +151,10 @@ jobs:
           T="$(find build -name FEXCoreASMTestRunner -type f | head -1)"
           python3 Scripts/macos_asm_tests.py --runner "$T" --out asm-cache --modes jit_500,jit_500_tso \
             --cache-dir asm-code-cache --cache-passes 2 2>&1 | tee asm-cache-tests.log
+          # jit_1 found the 3DNow! displacement patching bug (Frontend.cpp): keep it covered.
+          python3 Scripts/macos_asm_tests.py --runner "$T" --out asm-cache-jit1 --modes jit_1 \
+            --filter 3DNow/,TwoByte/,SelfModifyingCode/,FEX_bugs/ \
+            --cache-dir asm-code-cache-jit1 --cache-passes 2 2>&1 | tee -a asm-cache-tests.log
 
       - name: Diagnose the tests that are not understood
         if: always()
