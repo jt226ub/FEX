@@ -223,6 +223,12 @@ namespace DiskCache {
     bool NamesMatch() const {
       return CacheFOZ.NameMatches(DirFD) && IndexFOZ.NameMatches(DirFD);
     }
+    ino_t CacheIno() const {
+      return CacheFOZ.Ino;
+    }
+    ino_t IndexIno() const {
+      return IndexFOZ.Ino;
+    }
     // false: the index is larger than MaxSize (WriteRefused is then set) or unreadable.
     bool LoadIndex(uint64_t MaxSize, bool& FoundMetadata);
     void ResolveKey(uint64_t LookupKey, Index& CacheIndex);
@@ -385,6 +391,8 @@ namespace DiskCache {
     std::atomic<State> CurrentState = State::Off;
     // Set when the next generation is over this process's limit: stop rotating, drop stores.
     std::atomic<bool> WritesStopped {};
+    // A database that failed its checks once, to tell a race from damage (OpenGeneration).
+    std::pair<ino_t, ino_t> SuspectPair {};
     std::atomic<uint64_t> DroppedCount {};
     std::atomic<uint32_t> UntrustedReplaced {};
     std::atomic<uint32_t> DamagedReset {};

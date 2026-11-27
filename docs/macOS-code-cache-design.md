@@ -256,7 +256,11 @@ safe instead:
   being opened or locked, is a race with a process deleting an old generation; the open
   looks at the directory again instead of calling the file untrusted or damaged, a file
   is removed only if its name still refers to the file that was judged, and a new
-  database's description is written before its locks are let go. Six processes
+  database's description is written before its locks are let go. APFS can show a link
+  count of 2 for a while on a name being deleted, so a link count other than 1 is a
+  second name only if the name still leads to the file. A database whose two files fail
+  their checks is looked at again before it is called damaged (an old cache file paired
+  with a new index while a generation was being replaced looks the same). Six processes
   rotating one database 72 times report no untrusted or damaged file. A generation number
   is believed only if it is the lowest found or its predecessor exists (at most 2^24), and
   only generations found in the directory are deleted, so a planted name far ahead is

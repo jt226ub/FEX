@@ -89,17 +89,33 @@ namespace {
   // user, private to it (0600 or tighter) and without an ACL that grants write. No name
   // at all (another process just deleted this generation) is a race, not a verdict.
   enum class FileVerdict { Trusted, Untrusted, Race };
-  FileVerdict JudgeFile(int FD, std::string_view Name, ino_t& Ino, dev_t& Dev) {
+  FileVerdict JudgeFile(int DirFD, int FD, std::string_view Name, ino_t& Ino, dev_t& Dev) {
     struct stat Info;
+    if (fstat(FD, &Info) != 0) {
+      LogMan::Msg::EFmt("DiskCache: {} cannot be examined; not using it", Name);
+      return FileVerdict::Untrusted;
+    }
+    Ino = Info.st_ino;
+    Dev = Info.st_dev;
+    if (S_ISREG(Info.st_mode) && Info.st_nlink != 1) {
+      // While another process deletes this name (an old generation) APFS can show a link
+      // count other than 1, even 2, for a while before 0. If the name no longer leads to
+      // this file it was being deleted: a race. A second name that stays is refused.
+      for (int Tries = 0; Tries < 50; ++Tries) {
+        struct stat Named;
+        const fextl::string Leaf(Name);
+        if (fstatat(DirFD, Leaf.c_str(), &Named, AT_SYMLINK_NOFOLLOW) != 0 || Named.st_ino != Info.st_ino || Named.st_dev != Info.st_dev ||
+            (fstat(FD, &Info) == 0 && Info.st_nlink == 0)) {
+          return FileVerdict::Race;
+        }
+        if (Info.st_nlink == 1) {
+          break;
+        }
+        usleep(2000);
+      }
+    }
     const char* Why = nullptr;
-    if (fstat(FD, &Info) == 0) {
-      Ino = Info.st_ino;
-      Dev = Info.st_dev;
-    }
-    if (fstat(FD, &Info) == 0 && S_ISREG(Info.st_mode) && Info.st_nlink == 0) {
-      return FileVerdict::Race;
-    }
-    if (fstat(FD, &Info) != 0 || !S_ISREG(Info.st_mode)) {
+    if (!S_ISREG(Info.st_mode)) {
       Why = "is not a regular file";
     } else if (Info.st_uid != geteuid()) {
       Why = "is not owned by this user";
@@ -329,7 +345,7 @@ bool FOZFile::OpenAt(int DirFD, const fextl::string& Leaf, bool ReadOnly, bool C
     }
     return false;
   }
-  switch (JudgeFile(Handle, Leaf, Ino, Dev)) {
+  switch (JudgeFile(DirFD, Handle, Leaf, Ino, Dev)) {
   case FileVerdict::Trusted: break;
   case FileVerdict::Race:
     close(Handle);
@@ -347,7 +363,7 @@ bool FOZFile::OpenAt(int DirFD, const fextl::string& Leaf, bool ReadOnly, bool C
   bool TookLock = false;
   ssize_t Size = FD->Size();
   if (Size < FOZ_REF_MAGIC_SIZE && !ReadOnly) {
-    if (!FD->Lock(OPEN_LOCK_TIMEOUT_MS)) {
+    if (!FD->LockUntil(std::chrono::steady_clock::now() + std::chrono::milliseconds(STORE_DEADLINE_MS))) {
       LogMan::Msg::IFmt("DiskCache: {} stayed locked by another process", Leaf);
       FD.reset();
       return false;
@@ -355,14 +371,32 @@ bool FOZFile::OpenAt(int DirFD, const fextl::string& Leaf, bool ReadOnly, bool C
     TookLock = true;
     Size = FD->Size();
   }
-  if (Size == 0 && !ReadOnly) {
-    Valid = FD->PWrite(MesaFOZ::stream_reference_magic_and_version, FOZ_REF_MAGIC_SIZE, 0) == FOZ_REF_MAGIC_SIZE;
-  } else {
+  auto CheckMagic = [&] {
     uint8_t magic[FOZ_REF_MAGIC_SIZE];
     if (FD->PRead(magic, FOZ_REF_MAGIC_SIZE, 0) == FOZ_REF_MAGIC_SIZE &&
         memcmp(magic, MesaFOZ::stream_reference_magic_and_version, FOZ_REF_MAGIC_SIZE - 1) == 0) {
       int version = magic[FOZ_REF_MAGIC_SIZE - 1];
-      Valid = version <= MesaFOZ::FOSSILIZE_FORMAT_VERSION && version >= MesaFOZ::FOSSILIZE_FORMAT_MIN_COMPAT_VERSION;
+      return version <= MesaFOZ::FOSSILIZE_FORMAT_VERSION && version >= MesaFOZ::FOSSILIZE_FORMAT_MIN_COMPAT_VERSION;
+    }
+    return false;
+  };
+  if (Size == 0 && !ReadOnly) {
+    Valid = FD->PWrite(MesaFOZ::stream_reference_magic_and_version, FOZ_REF_MAGIC_SIZE, 0) == FOZ_REF_MAGIC_SIZE;
+  } else {
+    Valid = CheckMagic();
+    if (!Valid && !ReadOnly && !TookLock) {
+      // Another process may be writing the magic of a file it just created (the size can
+      // show 16 before the bytes are there). It writes it under the lock, so look again
+      // holding it before calling the file damaged.
+      if (FD->LockUntil(std::chrono::steady_clock::now() + std::chrono::milliseconds(STORE_DEADLINE_MS))) {
+        TookLock = true;
+        Valid = CheckMagic() || (FD->Size() == 0 && FD->PWrite(MesaFOZ::stream_reference_magic_and_version, FOZ_REF_MAGIC_SIZE, 0) ==
+                                                         FOZ_REF_MAGIC_SIZE);
+      } else {
+        LogMan::Msg::IFmt("DiskCache: {} stayed locked by another process", Leaf);
+        FD.reset();
+        return false;
+      }
     }
   }
   if (TookLock) {
@@ -909,6 +943,18 @@ fextl::unique_ptr<IndexedDB> DiskCache::OpenGeneration(uint32_t Generation, bool
     Ok = false;
   }
   if (!Ok) {
+    // An old cache file paired with a new index (another process was deleting this
+    // generation's two names while it was opened) looks like this too. A race goes away;
+    // damage stays: only a pair that fails twice with the same files is damaged.
+    const std::pair<ino_t, ino_t> Pair {DB->CacheIno(), DB->IndexIno()};
+    if (SuspectPair != Pair) {
+      SuspectPair = Pair;
+      DB->UnlockAfterOpen();
+      usleep(20000);
+      Raced = true;
+      return nullptr;
+    }
+    SuspectPair = {};
     RejectedCount.fetch_add(1, std::memory_order_relaxed);
     // Damaged or made for something else under this name: the directory is disposable,
     // so start this database again (new files, so a process still appending to the old
