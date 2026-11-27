@@ -4,7 +4,9 @@
  * x86-64 (run under Rosetta 2) or arm64, using libc and pthreads. Every thread runs at
  * the user-interactive quality of service, as FEXCoreBench's threads do.
  *
- *   bench-native [--quick] [--reps N] [--only name,name]
+ *   bench-native [--quick] [--literal] [--reps N] [--only name,name]
+ *
+ * Exit status: 0 if every checksum is right, 1 otherwise, 2 for bad arguments.
  */
 #include "bench.h"
 
@@ -78,20 +80,23 @@ void bench_thread_join(int handle) {
 }
 
 int main(int argc, char** argv) {
-  int quick = 0, reps = 5;
+  int flags = 0, reps = 5;
   const char* only = NULL;
   for (int i = 1; i < argc; ++i) {
     if (!strcmp(argv[i], "--quick")) {
-      quick = 1;
+      flags |= BENCH_QUICK;
+    } else if (!strcmp(argv[i], "--literal")) {
+      flags |= BENCH_LITERAL;
     } else if (!strcmp(argv[i], "--reps") && i + 1 < argc) {
       reps = atoi(argv[++i]);
     } else if (!strcmp(argv[i], "--only") && i + 1 < argc) {
       only = argv[++i];
     } else {
-      fprintf(stderr, "usage: %s [--quick] [--reps N] [--only name,name]\n", argv[0]);
+      fprintf(stderr, "usage: %s [--quick] [--literal] [--reps N] [--only name,name]\n", argv[0]);
       return 2;
     }
   }
   pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
-  return bench_main(quick, reps, only);
+  int ran = 0;
+  return bench_main(flags, reps, only, &ran) == 0 ? 0 : 1;
 }

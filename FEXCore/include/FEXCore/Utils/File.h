@@ -208,6 +208,22 @@ public:
 #endif
   }
 
+#ifdef __APPLE__
+  // Like Lock, but gives up at a point in time rather than after a number of 1ms sleeps,
+  // which can each take much longer on a loaded machine.
+  bool LockUntil(std::chrono::steady_clock::time_point Deadline) {
+    while (true) {
+      if (TryLock()) {
+        return true;
+      }
+      if (std::chrono::steady_clock::now() >= Deadline) {
+        return false;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+  }
+#endif
+
   bool Lock(uint32_t TimeoutMS) {
     for (uint32_t i = 0;; ++i) {
       if (TryLock()) {

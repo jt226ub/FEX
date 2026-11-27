@@ -172,7 +172,7 @@ hexadecimal; a leading 0 is refused rather than read as octal.
 | `X87REDUCEDPRECISION`, `HIDEHYPERVISORBIT` | 0, 1 | |
 | `HOSTFEATURES` | `off`, or comma-separated `disable*` names the core knows | `enable*` names are refused: they force a feature on whether the host has it or not (`enablesve` dies with SIGILL on an M4) |
 | `SOFTWARERNG` | 0, 1 | RDRAND and RDSEED from `arc4random_buf`; no Apple chip so far has FEAT_RNG, so without it the guest CPUID offers neither |
-| `DISKCACHEMAXFILESIZE` | 1 to 2^63-1 | size limit of each code cache file (default 1GB); only with the cache on |
+| `DISKCACHEMAXFILESIZE` | 1 to 2^63-1 | size limit of each code cache file (default 256MB, set by the library); only with the cache on |
 | `DISKCACHEVALIDATION` | 0, 1 | compiles each cached block as well and logs differences; diagnosis only |
 | `SILENTLOG`, `DUMPGPRS`, `DISABLETELEMETRY` | 0, 1 | `DISABLETELEMETRY` defaults to 1 |
 | `IS64BIT_MODE` | 1 | 32-bit guests cannot have the memory they need on macOS |
@@ -265,13 +265,17 @@ The handler can take two spin locks, both the core's, and nothing else:
 - **The per-block patch lock** (in the block's tail), around the rewrite of a misaligned
   acquire load or release store. Held for the few instructions of a patch; no guest
   memory is touched while it is held.
-- **The split-lock lock** (`StrictInProcessSplitLocks`, one word per context), around
-  the emulation of one locked operation (`lock xadd`, `lock cmpxchg`, `xchg`, ...) on a
-  word that crosses 16 bytes. The core emulates those with two compare-and-swaps; without
-  the lock two emulations interleave and lose updates (`fexmac_c_test
-  split-locks-concurrent` fails 3 of 3 runs without it). The library always sets it on;
-  the option is not one an embedder can set, because switching it off only loses updates
-  and buys nothing measurable.
+- **The split-lock lock** (`StrictInProcessSplitLocks`, one word per context, so per
+  process since there is one context), around each attempt of the emulation of one
+  locked operation (`lock xadd`, `lock add`, `cmpxchg`, `cmpxchg8b`, `xchg`, ...) on an
+  operand that crosses 16 bytes. The core emulates those with two compare-and-swaps;
+  without the lock two emulations interleave and lose updates (`fexmac_c_test
+  split-locks-concurrent` fails 3 of 3 runs without it). On macOS the lock is released
+  and taken again between attempts, so an attempt (bounded: two compare-and-swaps, plus
+  at most 16 rewrites of the lower half when only neighbouring bytes changed) is all it
+  covers; plain stores that keep changing the word make the emulating thread retry, not
+  hold the lock. The library always sets it on; the option is not one an embedder can
+  set, because switching it off only loses updates and buys nothing measurable.
 
 Why holding them cannot deadlock or hang, from the code (`HandleUnalignedAccess`,
 `HandleAtomicMemOp`, `HandleCASAL`, `HandleCASPAL` and the `DoCAS*` helpers in
@@ -284,10 +288,18 @@ Why holding them cannot deadlock or hang, from the code (`HandleUnalignedAccess`
 - Only the fault handler takes them. A guest stop (`hlt`, a guest exception, a system
   call) is reached from the dispatcher, never from inside the handler, so neither lock is
   held when `fexmac_thread_run` returns or a callback runs.
-- No asynchronous signal can interrupt the holder with the library's handlers (way 1):
-  every asynchronous signal is blocked while they run. With way 2 the host chooses the
-  mask, but nothing an asynchronous handler may call takes either lock: both are reached
-  only through `fexmac_handle_fault` for an alignment fault in translated code.
+- No asynchronous signal can interrupt the holder, in either arrangement:
+  `fexmac_handle_fault` blocks every asynchronous signal (all but SIGSEGV, SIGBUS,
+  SIGILL, SIGFPE, SIGTRAP and SIGSYS) itself, with `pthread_sigmask`, around the core's
+  handling of a misaligned access (the only path that takes either lock or switches the
+  thread to writing code), and restores the previous mask afterwards. With the library's
+  own handlers they were already blocked; with way 2 the host's handler runs with the
+  host's mask, and an asynchronous handler that left by a jump, or stopped the thread,
+  while a lock was held would have left it held (and the thread in write mode).
+  `fexmac_c_test split-locks-signal-storm` interrupts a guest thread doing split locked
+  operations with a signal handler that waits for another thread's progress: with the
+  blocking removed it stalls in 3 of 3 runs, with it never. A signal that arrives while
+  blocked is delivered when the mask is restored, after the locks are released.
 - The holder cannot need the same lock again: the emulation's own accesses are aligned
   atomics, which cannot take an alignment fault, and the patch path touches only code.
 - No fault is taken while a lock is held, by construction. Before the core emulates a
@@ -327,8 +339,8 @@ Why holding them cannot deadlock or hang, from the code (`HandleUnalignedAccess`
   contract allows.
 
 A thread spinning for either lock is in a fault handler with asynchronous signals
-blocked (way 1); the holder is another thread doing a bounded step, so the wait ends
-unless the holder's process is dying.
+blocked; the holder is another thread doing one bounded step (a patch, or one attempt of
+an emulation), so the wait ends unless the holder's process is dying.
 
 ### Connecting the library
 
@@ -628,15 +640,25 @@ The on-disk code cache (design, keys, checks and trust model:
   `code_cache_enabled` other than 0 or 1, a directory with the cache off, or an empty
   name give `FEXMAC_ERROR_BAD_CONFIG`. The core's `DISKCACHE` and `DISKCACHEPATH`
   options stay refused: the fields are the interface.
-- **Refusal is not an error:** a directory (or its cache files) not private to the user,
-  with an ACL entry granting write, or reached through a symbolic link, leaves the
-  context without a cache; it is still created and runs. `fexmac_context_get_counters`
-  then reports `FEXMAC_CACHE_REFUSED`, and the reason is logged.
+- **Problems are not errors:** whatever goes wrong with the cache, the context is
+  created and runs; `fexmac_context_get_counters` says what the cache is doing:
+  `ACTIVE`, `READ_ONLY` (a fork child, or a database another process filled past this
+  process's size limit), `UNTRUSTED` (the directory is not private to the user, has an ACL
+  entry granting write, or is a link), `UNAVAILABLE` (the database stayed locked at open,
+  the directory cannot be written, I/O error, no build identity). An untrusted cache file
+  in a trusted directory is removed and started again: the state stays `ACTIVE` and
+  `untrusted_files_replaced` counts it. The reason is always logged.
 - **Counters:** `fexmac_context_get_counters` fills `fexmac_translation_counters`
-  (versioned by `struct_size`): the cache state (`OFF`, `ACTIVE`, `READ_ONLY`, `REFUSED`),
-  blocks compiled, blocks loaded from the cache, entries rejected, entries queued.
+  (versioned by `struct_size`): the cache state, blocks compiled, blocks loaded from the
+  cache, entries rejected, entries queued, entries dropped (not saved: the database stayed
+  locked past one wait, or could not grow), untrusted files replaced, damaged databases
+  emptied.
+- **Size:** each cache file is limited by `DISKCACHEMAXFILESIZE`, 256MB by default; a full
+  file continues in a new generation, the previous one is still read, older ones are
+  deleted. See the design document for why.
 - **Flush:** `fexmac_context_flush_cache` waits for the cache writer and syncs the files
   (`F_FULLFSYNC`). Call it before exiting; `FEXMAC_ERROR_UNSUPPORTED` if the context does
+<<<<<<< HEAD
   not write a cache.
 - **Which memory is code** comes from the guest memory map (`fexmac_memory_map` with
   `FEXMAC_PROT_EXEC`; see "Guest memory"): the code cache hashes and patches guest bytes
@@ -645,6 +667,16 @@ The on-disk code cache (design, keys, checks and trust model:
   `fexmac_remove_code_range`, which package F added as a second registry, are replaced by
   it; there is one registry and "nothing registered" has one meaning: all memory is
   executable code.)
+=======
+  not write a cache. It waits for another process's lock at most once per process.
+- **Guest code ranges:** `fexmac_add_code_range` / `fexmac_remove_code_range` tell the
+  library which memory holds guest code (and whether the guest can write it). With any
+  range registered, the core's `QueryGuestExecutableRange` reports only registered
+  ranges: decoding stops at their ends, executing outside them stops with a guest fault,
+  and the code cache hashes and patches guest bytes inside them only. With none, every
+  address counts (the behaviour before). Register the guest's code when the cache is on.
+  Package D will use the writability for page-protection self-modifying-code detection.
+>>>>>>> macos/v1
 - **fork:** `fexmac_before_fork` / `fexmac_after_fork` around `fork()`. They hold the
   library's and the core's locks (the cache's included) across it; the child loads from
   the cache but does not write it (state `READ_ONLY`), and must not run threads created
@@ -714,11 +746,15 @@ alarm kills it.
 | `unclaimed-fault-dies` | a host fault outside guest code dies silently with SIGBUS |
 | `invalidate-concurrent` | 8 guest threads invalidating in every one of 20,000 system calls each while the main thread invalidates in a loop, at least 12 runs; a progress watchdog fails it within 5 seconds of a hang. It hung in each of 3 runs before package E's reader-writer lock fix and passed 6 of 6 after it |
 | `split-locks-concurrent` | 8 threads at once run 30,000 `lock xadd` each on one qword crossing 16 bytes, a 128-byte line and the 16K page, a `lock cmpxchg` increment loop across 16 bytes (each adding 0x100000001, which changes both halves), and a spin lock taken with `xchg` across 16 bytes and released by a plain store; every total must be exact. With the split-lock lock switched off in a scratch build, the three `lock xadd` totals came out short in 3 of 3 runs |
+| `split-locks-every-form` | every form the core emulates across 16 bytes, from 8 threads at once, 10,000 operations each: `lock xadd` of 16, 32 and 64 bits, `lock add`, `sub`, `xor`, `inc`, `dec`, `not`, `neg`, `or` then `and`, a `cmpxchg8b` increment loop, a `cmpxchg8b` spin lock with a plain release and an `xchg` spin lock whose value spans both halves; operands change both halves where the operation allows it; a host thread meanwhile writes the neighbouring bytes that share the operand's compare-and-swap units with plain stores. Every result exact. Before the split-lock fixes of package E's third round, 7 of the 13 forms came out wrong in each of 2 runs |
+| `split-locks-signal-storm` | the host owns the fault signals with an empty mask and a signal handler keeps interrupting one of 8 threads doing split `lock xadd`; the handler waits for another thread's progress, which cannot come if the interrupted thread holds the split-lock lock. No stall, exact total. With `fexmac_handle_fault`'s signal blocking removed: a stall in 3 of 3 runs |
 | `lifetime-races` | runs racing with destroys of the same thread; context destroy racing with CPUID, invalidation and thread creation |
 | `cache-off` | without the cache: state `OFF`, blocks compiled, nothing loaded or queued, flush `UNSUPPORTED` |
 | `cache-cold-warm` | a cold run queues and flushes; a second context in the same process loads everything and compiles nothing (code at a different address) |
 | `cache-cross-process` | a child process fills the cache; the parent then loads everything and compiles nothing |
-| `cache-untrusted` | a directory writable by others: the context runs with state `REFUSED`, nothing loaded or queued, flush `UNSUPPORTED`, the directory untouched |
+| `cache-untrusted` | a directory writable by others: the context runs with state `UNTRUSTED`, nothing loaded or queued, flush `UNSUPPORTED`, the directory untouched |
+| `cache-untrusted-file` | an index file opened up to others: removed and started again, `untrusted_files_replaced` 1, state `ACTIVE` |
+| `cache-unavailable` | a directory that cannot be written, and a database another process keeps locked: state `UNAVAILABLE`, the context runs |
 | `cache-options` | `DISKCACHE` and `DISKCACHEPATH` refused; `DISKCACHEMAXFILESIZE` and `DISKCACHEVALIDATION` accepted with their rules |
 | `cache-fork` | `fexmac_before_fork` / `fexmac_after_fork`: a second `before` is `BUSY`; the child runs guest code with state `READ_ONLY` and flush refused; the parent carries on and flushes |
 | `code-ranges` | empty and wrapping ranges refused; jumping to an unregistered page stops with a guest fault there; registering it lets the program finish; removing it again (with its translations) faults again |

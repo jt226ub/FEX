@@ -566,6 +566,9 @@ fexmac_result fexmac_context_create(const fexmac_config* config, fexmac_context*
   // The code cache: the core reads these when the context is created. Its own options
   // for them are refused in ParseOptions; the config fields are the interface.
   if (config->code_cache_enabled) {
+    // Before the embedder's options, so DISKCACHEMAXFILESIZE overrides it. 256MB a file:
+    // every process reads the whole index at start (fexmac.h, code_cache_enabled).
+    Parsed.insert(Parsed.begin(), {FEXCore::Config::CONFIG_DISKCACHEMAXFILESIZE, "268435456"});
     Parsed.emplace_back(FEXCore::Config::CONFIG_DISKCACHE, "1");
     if (config->code_cache_directory) {
       Parsed.emplace_back(FEXCore::Config::CONFIG_DISKCACHEPATH, config->code_cache_directory);
@@ -721,14 +724,13 @@ fexmac_result fexmac_context_get_counters(fexmac_context* context, fexmac_transl
   counters->blocks_loaded = Counters.BlocksLoadedFromCache;
   counters->cache_entries_rejected = Counters.CacheEntriesRejected;
   counters->cache_entries_queued = Counters.CacheEntriesQueued;
-  if (!context->CacheRequested) {
-    counters->cache_state = FEXMAC_CACHE_OFF;
-  } else if (Counters.CacheWriting) {
-    counters->cache_state = FEXMAC_CACHE_ACTIVE;
-  } else if (Counters.CacheReading) {
-    counters->cache_state = FEXMAC_CACHE_READ_ONLY;
-  } else {
-    counters->cache_state = FEXMAC_CACHE_REFUSED;
+  counters->cache_entries_dropped = Counters.CacheEntriesDropped;
+  counters->untrusted_files_replaced = Counters.UntrustedFilesReplaced;
+  counters->damaged_databases_reset = Counters.DamagedDatabasesReset;
+  // The core's states, in fexmac_cache_state's order.
+  counters->cache_state = context->CacheRequested ? static_cast<fexmac_cache_state>(Counters.CacheState) : FEXMAC_CACHE_OFF;
+  if (counters->cache_state > FEXMAC_CACHE_UNAVAILABLE) {
+    counters->cache_state = FEXMAC_CACHE_UNAVAILABLE;
   }
   return FEXMAC_OK;
 }

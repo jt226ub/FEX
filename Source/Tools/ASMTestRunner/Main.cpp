@@ -588,6 +588,8 @@ int main(int argc, char** argv, char** const envp) {
     fexmac_context_get_counters(Context, &Counters);
     fextl::fmt::print("Code cache: compiled {} loaded {} rejected {} queued {}\n", Counters.blocks_compiled, Counters.blocks_loaded,
                       Counters.cache_entries_rejected, Counters.cache_entries_queued);
+    fextl::fmt::print("Code cache state: {} dropped {} replaced {} reset {}\n", static_cast<int>(Counters.cache_state),
+                      Counters.cache_entries_dropped, Counters.untrusted_files_replaced, Counters.damaged_databases_reset);
   }
   fextl::fmt::print("Faulted? {}\nPassed? {}\n", DidFault ? "Yes" : "No", Passed ? "Yes" : "No");
   fflush(nullptr);

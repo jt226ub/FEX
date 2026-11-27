@@ -186,11 +186,15 @@ jobs:
 
       - name: Run the guest benchmark (checksums only)
         # A freestanding x86-64 program (unittests/macOS/Bench) run through fexmac by
-        # FEXCoreBench, in quick mode: every kernel's checksum must match the recorded
-        # value and the native arm64 build (and Rosetta 2's, where the runner has it). No
-        # timing is checked here; docs/macOS-benchmarks.md has the measured numbers.
+        # FEXCoreBench, in quick mode, as built and hardened: the literal mode (no system
+        # call but exit; exit criterion 7) must report every checksum right, and in the
+        # timed mode every kernel's checksum must match the recorded value and the native
+        # arm64 build (and Rosetta 2's, where the runner has it). No timing is checked
+        # here; docs/macOS-benchmarks.md has the measured numbers. The mutation test
+        # checks that each checksum sees the work its kernel does.
         run: |
           set -o pipefail
+          python3 Scripts/macos_bench_mutations.py --out bench-mutations 2>&1 | tee bench-mutations.log
           python3 Scripts/macos_bench.py --loader build/Bin/FEXCoreBench --out bench-quick --quick 2>&1 | tee bench-quick.log
           python3 Scripts/macos_bench.py --loader build/Bin/FEXCoreBench --out bench-quick-hardened --quick --hardened 2>&1 | tee bench-quick-hardened.log
 
@@ -341,6 +345,7 @@ jobs:
             mutex-wake.log
             bench-quick.log
             bench-quick-hardened.log
+            bench-mutations.log
             asm-out/results.tsv
             probe-hardened.log
             build/CMakeFiles/CMakeConfigureLog.yaml
