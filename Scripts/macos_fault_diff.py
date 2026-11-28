@@ -20,8 +20,9 @@ review's harness.
 
     python3 Scripts/macos_fault_diff.py --tool build/Bin/fexmac_fault_diff [--filter text] [--option NAME=VALUE]...
 
---option passes a further fexmac option to every run (for example VECTORTSOENABLED=1, so
-that the TSO modes also order vector accesses, and VECTORTSOSPLIT=1).
+--option passes further fexmac options to every run (they take effect where they apply:
+the string-ordering options only in the modes with TSOENABLED=1; VECTORTSOENABLED=1 makes
+the TSO modes order vector accesses too, and VECTORTSOSPLIT/TSOBARRIERMERGE then apply).
 """
 
 import argparse
@@ -103,6 +104,20 @@ for ins, size in (("rep movsb", 1), ("rep movsw", 2), ("rep movsd", 4), ("rep mo
         # Backward (DF=1) into it from above.
         REP_CASES.append(rep_case("%s-back-%d" % (ins.replace(" ", "-"), k),
                                   "std\nlea rdi, [r15+0x4000+%d]\nlea rsi, [rdi+0x2000]" % (k - size), ins, done, 128))
+# Source and destination aligned differently within 8 bytes (with MEMCPYSETTSOWIDE the
+# source is read as aligned words and each destination word assembled from two), forward
+# and backward into the read-only page, at counts below, at and past one 32-byte chunk.
+for ins, size, skew in (("rep movsb", 1, 3), ("rep movsb", 1, 7), ("rep movsw", 2, 6), ("rep movsd", 4, 4)):
+    for k in (40, 64, 100, 1000):
+        name = "%s-skew%d" % (ins.replace(" ", "-"), skew)
+        REP_CASES.append(rep_case("%s-fwd-%d" % (name, k), "lea rdi, [r15-%d]\nlea rsi, [rdi-0x2000-%d]" % (k, skew), ins, k // size, k // size + 128))
+        REP_CASES.append(rep_case("%s-back-%d" % (name, k), "std\nlea rdi, [r15+0x4000+%d]\nlea rsi, [rdi+0x2000+%d]" % (k - size, skew), ins,
+                                  k // size, k // size + 128))
+# Backward memmove (destination above the source, overlapping, by more than the element
+# loop's distance): whole units downward.
+for d in (5, 65):
+    REP_CASES.append(rep_case("rep-movsb-back-dst-above-%d" % d, "std\nlea rdi, [r15+0x4000+99]\nlea rsi, [rdi-%d]" % d, "rep movsb", 100,
+                              228))
 # Overlapping copies (memmove patterns), forward and backward, element by element.
 for d in (1, 3, 8, 31):
     REP_CASES.append(rep_case("rep-movsb-overlap-ahead-%d" % d, "lea rdi, [r15-40]\nlea rsi, [rdi-%d]" % d, "rep movsb", 40, 128))
@@ -346,12 +361,14 @@ def main():
     parser.add_argument("--jobs", type=int, default=4)
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--option", action="append", default=[], metavar="NAME=VALUE",
-                        help="a further fexmac option for every run (EXTRA_OPTIONS), e.g. VECTORTSOENABLED=1")
+                        help="a further fexmac option for every run (repeatable), e.g. MEMCPYSETTSOENABLED=1")
     args = parser.parse_args()
+    for o in args.option:
+        if "=" not in o or "," in o:
+            parser.error("--option takes NAME=VALUE (no commas): " + o)
     if args.option:
-        # Read by fexmac_fault_diff in every run (run() passes os.environ on).
-        os.environ["EXTRA_OPTIONS"] = ",".join(args.option)
-        print("further options: " + ",".join(args.option))
+        os.environ["FAULTDIFF_OPTIONS"] = ",".join(args.option)
+        print("options for every run: " + ",".join(args.option))
     known = set()
     if os.path.exists(KNOWN_FILE):
         for line in open(KNOWN_FILE):

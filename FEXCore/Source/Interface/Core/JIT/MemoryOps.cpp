@@ -2238,6 +2238,231 @@ bool Arm64JITCore::EmitRepStringInPlace(bool Copy, bool IsAtomic, size_t Size, A
     }
   };
 
+  // MemcpySetTSOWide: rep movs / rep stos (either direction) with ordering on, in 8-byte acquire
+  // loads (ldapur) and release stores (stlur) instead of one pair per element. Why this
+  // and not plain stores between two barriers: Intel lets the stores within one fast
+  // string operation become visible out of order (SDM vol. 3A 253668-093US, 11.2.4.1,
+  // principle 1), but AMD documents no such exception ("Successive stores from a single
+  // processor are committed to system memory and visible to other processors in program
+  // order", APM vol. 2 24593 rev. 3.38, 7.2), and Intel documents none for the loads
+  // ("Reads are not reordered with other reads", 11.2.2), which AMD relaxes. The guest
+  // may rely on either, so every store stays a release and every load an acquire, as in
+  // the element loop; what changes is only that up to eight elements share one access:
+  //  - a unit is an aligned 8-byte word, single-copy atomic (Arm ARM B2.2.1): an observer
+  //    sees all of its bytes or none, which is one of the outcomes of storing (loading)
+  //    those elements one after the other in order with no observation between them;
+  //  - elements are never split between two units: the wide path is taken only when the
+  //    destination and source are aligned to the element size; the destination is then
+  //    brought to 8-byte alignment element by element;
+  //  - a source not 8-aligned relative to the destination is read as aligned words, each
+  //    exactly once and in the copy's order, and each destination word is assembled with
+  //    extr from two of them (one loop per source offset, an immediate in extr);
+  //  - loads run at most two words (16 bytes) ahead of the stores, i.e. a load is
+  //    performed before an earlier store to a different address, which TSO allows (and
+  //    ldapr allows after stlr); the destination 1 to 64 bytes ahead of the source in the
+  //    copy's direction (where a later element reads
+  //    what an earlier one wrote) goes element by element, as before;
+  //  - runs of 32-byte chunks within one 4K page of the destination and of the source (as
+  //    the plain chunk path): any fault is on the run's first access to that page, before
+  //    any store of the run, and rcx/rsi/rdi count whole chunks, so progress at a fault is
+  //    exact; the interrupt check follows every run;
+  //  - backward copies (DF=1) are the mirror image (units and words taken from the top);
+  //    tails shorter than a chunk and anything not eligible use the element loop
+  //    unchanged. No barrier is added anywhere.
+  const bool Wide = IsAtomic && CTX->IsMemcpyWideTSOEnabled() && CTX->HostFeatures.SupportsTSOImm9;
+  auto EmitWide = [&](bool Back, ARMEmitter::ForwardLabel& ElementTail, ARMEmitter::ForwardLabel& Done, auto&& EmitElement) {
+    const uint32_t ChunkElements = 32 / Size;
+    ARMEmitter::BackwardLabel Head;
+    ARMEmitter::BiDirectionalLabel RunStart;
+    ARMEmitter::ForwardLabel One;
+    if (Copy) {
+      // A later element would read what an earlier one wrote (the destination 1 to 64
+      // bytes ahead of the source in the direction of the copy): element by element.
+      if (Back) {
+        sub(ARMEmitter::Size::i64Bit, TMP1, SrcAddress(TMP1), D);
+      } else {
+        sub(ARMEmitter::Size::i64Bit, TMP1, D, SrcAddress(TMP1));
+      }
+      sub(ARMEmitter::Size::i64Bit, TMP1, TMP1, 1);
+      lsr(ARMEmitter::Size::i64Bit, TMP1, TMP1, 6);
+      (void)cbz(ARMEmitter::Size::i64Bit, TMP1, &ElementTail);
+    }
+    if (Size > 1) {
+      // An element not aligned to its size would be split between two units.
+      if (Copy) {
+        orr(ARMEmitter::Size::i64Bit, TMP1, D, SrcAddress(TMP1));
+        and_(ARMEmitter::Size::i64Bit, TMP1, TMP1, Size - 1);
+      } else {
+        and_(ARMEmitter::Size::i64Bit, TMP1, D, Size - 1);
+      }
+      (void)cbnz(ARMEmitter::Size::i64Bit, TMP1, &ElementTail);
+    }
+    // rep stos: the element replicated into a 64-bit pattern (TMP4; nothing below uses it).
+    ARMEmitter::XRegister Pattern = TMP4;
+    if (!Copy) {
+      if (Value == ARMEmitter::Reg::zr) {
+        Pattern = ARMEmitter::XReg::zr;
+      } else if (Size == 8) {
+        Pattern = Value.X();
+      } else {
+        if (Size == 4) {
+          mov(ARMEmitter::Size::i32Bit, TMP4, Value);
+        } else {
+          and_(ARMEmitter::Size::i64Bit, TMP4, Value.X(), Size == 1 ? 0xFF : 0xFFFF);
+          if (Size == 1) {
+            orr(ARMEmitter::Size::i64Bit, TMP4, TMP4, TMP4, ARMEmitter::ShiftType::LSL, 8);
+          }
+          orr(ARMEmitter::Size::i64Bit, TMP4, TMP4, TMP4, ARMEmitter::ShiftType::LSL, 16);
+        }
+        orr(ARMEmitter::Size::i64Bit, TMP4, TMP4, TMP4, ARMEmitter::ShiftType::LSL, 32);
+      }
+    }
+    // The first byte of the next unit to write: rdi forward, rdi + size - 8 backward.
+    // Elements one at a time until it is 8-aligned.
+    (void)Bind(&Head);
+    if (Back) {
+      add(ARMEmitter::Size::i64Bit, TMP1, D, Size);
+      and_(ARMEmitter::Size::i64Bit, TMP1, TMP1, 7);
+    } else {
+      and_(ARMEmitter::Size::i64Bit, TMP1, D, 7);
+    }
+    (void)cbz(ARMEmitter::Size::i64Bit, TMP1, &RunStart);
+    EmitElement();
+    (void)cbnz(ARMEmitter::Size::i64Bit, R, &Head);
+    (void)b(&Done);
+
+    (void)Bind(&RunStart);
+    // Fewer elements than a chunk left: the element loop finishes.
+    sub(ARMEmitter::Size::i64Bit, TMP1, R, ChunkElements);
+    (void)tbnz(TMP1, 63, &ElementTail);
+    // TMP1 = whole chunks before the 4K boundary of the destination, of the source, and
+    // in rcx, whichever is least (as the plain chunk path counts them).
+    auto Room = [&](ARMEmitter::Register Out, ARMEmitter::XRegister Pointer) {
+      and_(ARMEmitter::Size::i64Bit, Out, Pointer, 4095);
+      if (Back) {
+        add(ARMEmitter::Size::i64Bit, Out, Out, Size);
+      } else {
+        neg(ARMEmitter::Size::i64Bit, Out, Out);
+        add(ARMEmitter::Size::i64Bit, Out, Out, 4096);
+      }
+      lsr(ARMEmitter::Size::i64Bit, Out, Out, 5);
+    };
+    auto Min = [&](ARMEmitter::Register Out, ARMEmitter::Register Other) {
+      ARMEmitter::ForwardLabel Keep;
+      sub(ARMEmitter::Size::i64Bit, TMP3, Other, Out);
+      (void)tbz(TMP3, 63, &Keep);
+      mov(Out.X(), Other.X());
+      (void)Bind(&Keep);
+    };
+    Room(TMP1, D);
+    if (Copy) {
+      Room(TMP2, SrcAddress(TMP2));
+      Min(TMP1, TMP2);
+    }
+    lsr(ARMEmitter::Size::i64Bit, TMP2, R, 5 - Log2);
+    Min(TMP1, TMP2);
+    (void)cbz(ARMEmitter::Size::i64Bit, TMP1, &One);
+
+    // Unit u (0 to 3, in x86's order) of the chunk at the current rdi.
+    auto DstOff = [&](int32_t u) -> int32_t {
+      return Back ? int32_t(Size) - 8 - 8 * u : 8 * u;
+    };
+    auto EndChunk = [&](ARMEmitter::BackwardLabel* Loop) {
+      if (Back) {
+        sub(ARMEmitter::Size::i64Bit, D, D, 32);
+        if (Copy) {
+          sub(ARMEmitter::Size::i64Bit, S, S, 32);
+        }
+      } else {
+        add(ARMEmitter::Size::i64Bit, D, D, 32);
+        if (Copy) {
+          add(ARMEmitter::Size::i64Bit, S, S, 32);
+        }
+      }
+      sub(ARMEmitter::Size::i64Bit, R, R, ChunkElements);
+      sub(ARMEmitter::Size::i64Bit, TMP1, TMP1, 1);
+      (void)cbnz(ARMEmitter::Size::i64Bit, TMP1, Loop);
+      // At most a page per run: the interrupt check, then the next run.
+      EmitSuspendInterruptCheck();
+      (void)cbz(ARMEmitter::Size::i64Bit, R, &Done);
+      (void)b(&RunStart);
+    };
+    if (!Copy) {
+      ARMEmitter::BackwardLabel Loop;
+      (void)Bind(&Loop);
+      for (int32_t u = 0; u < 4; ++u) {
+        stlur(Pattern, D, DstOff(u));
+      }
+      EndChunk(&Loop);
+    } else {
+      // One loop per offset B of the source unit's first byte above its 8-byte word
+      // (multiples of the element size; forward the unit starts at rsi, backward it
+      // ends at rsi + size).
+      const uint32_t Offsets = 8 / Size;
+      ARMEmitter::ForwardLabel OffsetLoop[8];
+      if (Back) {
+        add(ARMEmitter::Size::i64Bit, TMP2, SrcAddress(TMP2), Size);
+        and_(ARMEmitter::Size::i64Bit, TMP2, TMP2, 7);
+      } else {
+        and_(ARMEmitter::Size::i64Bit, TMP2, SrcAddress(TMP2), 7);
+      }
+      for (uint32_t k = 1; k < Offsets; ++k) {
+        sub(ARMEmitter::Size::i64Bit, TMP3, TMP2, k * Size);
+        (void)cbz(ARMEmitter::Size::i64Bit, TMP3, &OffsetLoop[k]);
+      }
+      for (uint32_t k = 0; k < Offsets; ++k) {
+        const int32_t B = k * Size;
+        // Source word m (0 = the one holding the chunk's first byte in x86's order, then
+        // on in that order): its offset from rsi.
+        auto Word = [&](int32_t m) -> int32_t {
+          return Back ? int32_t(Size) - B - 8 * m : 8 * m - B;
+        };
+        ARMEmitter::BackwardLabel Loop;
+        if (k != 0) {
+          (void)Bind(&OffsetLoop[k]);
+          ldapur(TMP3, SrcAddress(TMP2), Word(0));
+        }
+        (void)Bind(&Loop);
+        const auto Base = SrcAddress(TMP2);
+        if (k == 0) {
+          // Source and destination units aligned alike: unit u is source word u, read
+          // and written in x86's order.
+          const int32_t First = Back ? int32_t(Size) - 8 : 0;
+          const int32_t Step = Back ? -8 : 8;
+          ldapur(TMP3, Base, First);
+          ldapur(TMP4, Base, First + Step);
+          stlur(TMP3, D, DstOff(0));
+          stlur(TMP4, D, DstOff(1));
+          ldapur(TMP3, Base, First + 2 * Step);
+          ldapur(TMP4, Base, First + 3 * Step);
+          stlur(TMP3, D, DstOff(2));
+          stlur(TMP4, D, DstOff(3));
+        } else {
+          // TMP3 holds source word u; unit u is assembled from words u and u + 1:
+          // forward (word u+1 : word u) >> 8B, backward (word u : word u+1) >> 8B.
+          ARMEmitter::XRegister Prev = TMP3, Next = TMP4;
+          for (int32_t u = 0; u < 4; ++u) {
+            ldapur(Next, Base, Word(u + 1));
+            if (Back) {
+              extr(ARMEmitter::Size::i64Bit, Prev, Prev, Next, 8 * B);
+            } else {
+              extr(ARMEmitter::Size::i64Bit, Prev, Next, Prev, 8 * B);
+            }
+            stlur(Prev, D, DstOff(u));
+            std::swap(Prev, Next);
+          }
+          // Four swaps: TMP3 again holds the word that starts the next chunk.
+        }
+        EndChunk(&Loop);
+      }
+    }
+    // A page boundary is near: one element, then the alignment test again.
+    (void)Bind(&One);
+    EmitElement();
+    (void)cbnz(ARMEmitter::Size::i64Bit, R, &Head);
+    (void)b(&Done);
+  };
+
   auto Emit = [&](int32_t Direction) {
     ARMEmitter::BackwardLabel ElementLoop;
     ARMEmitter::BackwardLabel ChunkLoop;
@@ -2280,6 +2505,9 @@ bool Arm64JITCore::EmitRepStringInPlace(bool Copy, bool IsAtomic, size_t Size, A
     };
     ARMEmitter::ForwardLabel PureEntry;
     ARMEmitter::ForwardLabel OverlapEntry;
+    if (Wide) {
+      EmitWide(Back, PureEntry, Finished, EmitElement);
+    }
     if (!IsAtomic && Copy) {
       // The destination 1 to 32 bytes ahead of the source in the direction of the copy
       // (the copy reads what it wrote, x86 propagates it): element by element, in x86's

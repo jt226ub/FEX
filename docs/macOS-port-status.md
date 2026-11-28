@@ -288,7 +288,7 @@ again still gives x86's result, and the 4K-within-16K rule in its last row.
 | Misaligned atomics | `faults-*`, `split-locks-concurrent`, `split-lock-faults`, `split-lock-unmap-race`, `guest-misaligned-atomic-prot-none`, `split-emulation-fault-*-dies` | pass; with the second half on an inaccessible page each thread stops with a page fault before anything is written, totals exact after the fix |
 | Scratch-buffer restart | `scratch-guard-disarmed-after-translation`, `scratch-overflow-*`; `CodeBufferOverflow` | pass |
 | Self-modifying code by page protection | `smc-*`, `split-lock-on-code-page`, `SelfModifyingCode/*` with `--smc mtrack`, the harness's write-protection path | pass; **the default once memory is registered** (no memory registered: nothing detected, as before package D); writes through aliases and to non-writable guest pages sharing a host page with writable ones are not seen |
-| Stopping a thread from another thread | `stop-*`, `stop-rep-movs` | pass; median 4 to 6 us request to return; also inside a long `rep movs`/`stos` (32 MB, thousands of stops, registers exact at each, final memory x86's) |
+| Stopping a thread from another thread | `stop-*`, `stop-rep-movs`, `stop-rep-movs-string-tso`, `stop-rep-movs-string-tso-wide` | pass; median 4 to 6 us request to return; also inside a long `rep movs`/`stos` (32 MB, thousands of stops, registers exact at each, final memory x86's), with string ordering off, on, and on with `MEMCPYSETTSOWIDE` (25 shapes each: forward and backward, skewed sources, every element size, overlaps either side of the wide path's limit) |
 | Guest fault with correct guest state | `fault-*`, `guest-*`, `Scripts/macos_fault_diff.py` (368 programs, each also with three flag preludes, x 4 modes x 4 ways including the get/set-state round trip) | **exact, and running again gives x86's result, for loads, stores, push/pop/call/ret, `pop [m]`, `leave`, `enter`, every read-modify-write form on memory (also locked and misaligned), `xadd`/`cmpxchg`, vector and x87 accesses, 16- and 32-byte stores across a page, and every `rep` string form part-way (also with fs:/gs:), with x86's fault address**; RFLAGS at the fault is the pre-instruction value, every flag; 2 memory-at-the-fault differences remain in `fault_diff_known.txt`: a 32-byte store whose lower page faults, `fxsave` across a page |
 | 4K protections within a 16K host page | `memory-arguments` | refused unless `FEXMAC_PROT_ALLOW_UNENFORCED`; accepted ones are counted and NOT enforced (guard pages, read-only next to writable, SMC protection of the non-writable page): the 1.0 limit, stated in `fexmac.h` and the embedding document with the sound scheme as future work |
 
@@ -556,6 +556,81 @@ store and a later plain (vector with vector ordering off, or stack) store, may b
 visible out of order. (x87 loads of 32 and 64 bits are ordered loads; the 80-bit load's
 first part is plain but the barrier after its second part orders both.) Not covered by a
 litmus test yet.
+
+**String instructions in wider ordered units (`MEMCPYSETTSOWIDE`, round 2 task E2; off by
+default).** What one `rep movs`/`rep stos` must guarantee with string ordering on is what
+both vendors' manuals guarantee together, because the intended guest runs on AMD hardware
+while the port reports GenuineIntel:
+
+- Intel lets the stores of one fast string operation be seen out of order (SDM vol. 3A,
+  253668-093US, September 2026, 11.2.4.1: "Stores within a single string operation may be
+  executed out of order or be repeated in the case of a fast string operation"; vol. 1,
+  253665-093US, 7.3.9.3), but not relative to other stores ("Stores from separate string
+  operations ... do not execute out of order", "String operations are not reordered with
+  other store operations"; an interrupted operation's completed iterations are visible
+  before the handler's stores). It gives loads no such exception ("Reads are not
+  reordered with other reads", 11.2.2).
+- AMD documents no exception for string stores: "Successive stores from a single
+  processor are committed to system memory and visible to other processors in program
+  order", with exceptions only for write-combining memory and non-temporal stores
+  (APM vol. 2, 24593 rev. 3.38, November 2021, 7.1.2 and 7.2; the newest revision could
+  not be fetched: amd.com returns 404 for 24593.pdf as of 27 November 2026). It relaxes
+  string loads instead: "Load A cannot read 0 when Load B reads 1. (This rule may be
+  violated in the case of loads as part of a string operation, in which one iteration of
+  the string reads 0 for Load A while another iteration reads 1 for Load B.)" (7.2).
+
+So neither the stores nor the loads of one string operation may be reordered for a guest
+that may rely on either vendor, and the plain-copy-between-barriers relaxation (Intel only)
+was not implemented. The option instead keeps every load an acquire (`ldapur`) and every
+store a release (`stlur`), as the element loop does, and makes each access cover up to
+eight elements: aligned 8-byte units, single-copy atomic, so an observer sees all of a
+unit's bytes or none, which is one of the outcomes of the element-by-element sequence.
+In Arm's formal model (herdtools7 `aarch64hwreqs.cat`, commit fd0d0aa75e39, the
+executable form of Arm ARM B2.3) `[(Exp & R & A) | (Exp & R & Q)]; po; [Exp & M]` orders
+each acquire (also RCpc) load before every later access and `[Exp & M]; po; [Exp & W & L]`
+orders every earlier access before each release store, which is TSO's load-load,
+load-store and store-store order; a release store followed by an RCpc load is not ordered
+(only `[Exp & W & L]; po; [Exp & R & A]` is), which is TSO's one relaxation. Details
+(`EmitRepStringInPlace` in `MemoryOps.cpp`):
+
+- Taken forward and backward when the elements are aligned to their size (an element is
+  never split between two units) and the copy does not read what it wrote (destination
+  1 to 64 bytes ahead of the source in the copy's direction: element by element, as
+  before). The destination is brought to 8-byte alignment element by element. A source
+  at another offset within 8 bytes is read as aligned 8-byte acquire loads, each word
+  once and in the copy's order, and each destination word is assembled with `extr`
+  (one loop per offset); loads run at most one word ahead of the stores, a load passing
+  an earlier store to another address, which TSO allows.
+- Runs of 32-byte chunks within one 4K page of the destination and of the source, as the
+  plain chunk path: a fault can only be the run's first access to a page, before any of
+  its stores, and rcx/rsi/rdi count whole chunks, so progress at faults and stops is
+  exact; the interrupt check follows every run. Fewer than 32 bytes, misaligned elements,
+  overlapping copies and `fs:`/`gs:` sources with a base not keeping the alignment use the
+  element loop unchanged. No barrier is added; nothing changes with string ordering off.
+  The option acts only on macOS (the in-place loops exist only there; elsewhere it is
+  accepted and does nothing), only with `TSOENABLED` and `MEMCPYSETTSOENABLED`, and only
+  on hosts with FEAT_LRCPC2 (`ldapur`/`stlur`); it is in the code-cache key (the
+  configuration hash) and on `fexmac`'s option list.
+
+Tests: `fexmac_c_test stop-rep-movs-string-tso` and `stop-rep-movs-string-tso-wide`
+(25 runs of 32MB each, stopped part-way thousands of times, every stop exact, memory
+x86's result); the fault differential with `--option MEMCPYSETTSOENABLED=1 --option
+MEMCPYSETTSOWIDE=1` and new skewed-source and backward-memmove rep cases (1,608 cases,
+the same 2 known differences); `FEXCoreOrderingTest --option MEMCPYSETTSOWIDE=1` with
+the round 2 string tests: `REP-order-*` (stores of one string seen in order: across a
+128-byte line inside one 4K run, across the 16K page, first and last of 20K, forward,
+backward, skewed source, `stos` and `movs`), `REP-order-read-*` (loads of one `rep
+movsb` in order), `MP-movsb-long-skew`, `MP-std-movsb-long`, `MP-std-stosb-long`,
+`MP-stosq-huge` (64K + 8 bytes), `MP-movsb-1`, `MP-flag-movsb-1`, and `--stop-storm`,
+which stops every guest thread every 20 to 200 microseconds and resumes it, so string
+operations are also ended part-way. `REP-order-within` now has to hold with emulation
+on. The `-line` and `-page` tests are required to break with `--tso off` and `--tso
+scalar`; with plain loads and stores in the wide loops (a scratch build, not committed)
+eight of them break, and with a `dmb ish` before and after every page-bounded run (the
+Intel-only relaxation) the six `-line` tests break: the tests tell that relaxation from
+what the port promises. Numbers, the scratch-build logs and the measurement commands
+are in the round 2 report; the effect on the benchmark is in `docs/macOS-benchmarks.md`
+("Candidates").
 
 The default run (`FEXCoreOrderingTest`, emulation on, 3.2 million tries per litmus test)
 takes about 15 seconds, of which the counting tests are about 10: every locked operation
@@ -1225,6 +1300,13 @@ Of memory ordering (criterion 5):
   cross-modifying code that the architecture does not guarantee; at most one access per
   thread per patched instruction, once, can miss its barrier. Never observed. Kept as
   upstream's design ("x86 memory ordering between threads", "Known gap").
+- `rep movs`/`rep stos` with string ordering on stay ordered element by element (also with
+  `MEMCPYSETTSOWIDE`, which only widens the ordered accesses): the Intel-only relaxation
+  of a fast string's stores is not used, since AMD documents none ("String instructions in
+  wider ordered units"). Misaligned elements (a `rep movsd` at an address not a multiple of
+  4, for one) keep one acquire load and release store per element, and an element across
+  16 bytes takes the alignment fault and is back-patched to a barrier and a plain access,
+  after which every element of that loop pays a `dmb ish`.
 - Split locked operations (operands across 16 bytes) have five stated limits, none seen
   in the tests ("Remaining limits of split locked operations"), among them that the
   split-lock lock is per process.

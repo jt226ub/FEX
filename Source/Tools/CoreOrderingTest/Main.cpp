@@ -295,6 +295,16 @@ struct Asm {
     U8(0x48);
     U8(0xAB);
   }
+  void RepStosb() {
+    U8(0xF3);
+    U8(0xAA);
+  }
+  void Std() {
+    U8(0xFD);
+  }
+  void Cld() {
+    U8(0xFC);
+  }
   void Hlt() {
     U8(0xF4);
   }
@@ -385,7 +395,7 @@ constexpr uint32_t DELAY_ENTRIES = 4096;
 
 // The shared area: constants first, then the counting tests' operands at misaligned
 // addresses (0x1000 on, and across the page boundary at 0x4000), then their ticket.
-constexpr size_t SHARED_SIZE = 0x10000; // four 16K pages
+constexpr size_t SHARED_SIZE = 0x2C000; // eleven 16K pages (ConstLong reaches the end)
 constexpr int ConstFull = 0;           // 16 bytes of FULL
 constexpr int ConstCopy = 64;          // 64 bytes of COPY_BYTE
 constexpr int ConstOne = 128;          // the qword 1
@@ -1386,7 +1396,7 @@ std::vector<LitmusTest> MakeTests() {
       // strings (Intel SDM vol. 1, "Fast-String Operation"; vol. 3A, Example "Stores
       // Within a String Operation May be Reordered"), so reported only, in every mode.
       // The reader reads the last qword, then the first.
-      LitmusTest t {"REP-order-within", "one 20K rep stosq: last qword seen before the first (allowed by x86, reported only)", L};
+      LitmusTest t {"REP-order-within", "one 20K rep stosq: last qword seen before the first", L};
       t.Labels = {"last=0 first=0", "last=0 first=set", "last=set first=0", "last=set first=set"};
       t.Forbidden = {2};
       t.Interleaved = {1};
@@ -1409,9 +1419,327 @@ std::vector<LitmusTest> MakeTests() {
       t.Classify = [](const uint64_t*, const uint64_t* R1) {
         return int(R1[0] == STOS_VALUE) * 2 + int(R1[1] == STOS_VALUE);
       };
-      t.On = t.Off = t.Scalar = Expect::Either;
+      // AMD gives string stores no exception (see the E2 tests below), so with emulation on
+      // the port holds this; with it off or scalar only it is reported.
+      t.Off = t.Scalar = Expect::Either;
       T.push_back(std::move(t));
     }
+    // Round 2, E2 (MEMCPYSETTSOWIDE): what the port promises for one string operation
+    // with emulation on is AMD's and Intel's guarantees together. AMD documents no
+    // exception for string stores ("Successive stores from a single processor are
+    // committed to system memory and visible to other processors in program order", APM
+    // vol. 2 rev. 3.38, 7.2) and relaxes string loads; Intel relaxes string stores (SDM
+    // vol. 3A 11.2.4.1) and not loads ("Reads are not reordered with other reads",
+    // 11.2.2). So with emulation on, stores within a string operation must be seen in
+    // order (REP-order-*), and so must its loads (REP-order-read-*); a translation that
+    // relaxes either (plain stores between two barriers, say) fails these, which is what
+    // they are for. In every mode they also cover the paths the option adds: a source
+    // off the destination's alignment (extr), backward copies and fills, and tails.
+    // Weak: what --tso off and --tso scalar require (Break only where an M4 showed it in
+    // 40 runs of each mode: the pairs either side of the 16K page).
+    auto RepOrder = [&](const char* Name, const char* Desc, std::function<void(Asm&)> Writer, int32_t LaterOff, int32_t EarlierOff,
+                        uint64_t Value, Expect Weak = Expect::Either, int32_t Trigger = -1) {
+      // The reader reads first the qword written later, then the one written earlier.
+      LitmusTest t {Name, Desc, L};
+      t.Labels = {"later=0 earlier=0", "later=0 earlier=set", "later=set earlier=0", "later=set earlier=set"};
+      t.Forbidden = {2};
+      t.Interleaved = {1};
+      t.Reset = {L.Y};
+      t.Pre = [ClearAhead, LaterOff, EarlierOff](Asm& A, int Role) {
+        ClearAhead(A, Role);
+        WarmData(A, Role, LaterOff);
+        WarmData(A, Role, EarlierOff);
+      };
+      t.IterationDivisor = 20;
+      // Trigger: a qword the string writes shortly before the pair. The reader waits for it
+      // (on odd iterations, as FlagThen), so that its two loads fall while the writer is at
+      // the pair, which in a 20K string it reaches long after the reader's first look.
+      t.Body = [FlagThen, Writer, LaterOff, EarlierOff, Trigger](Asm& A, int Role) {
+        if (Role == 0) {
+          Writer(A);
+        } else if (Trigger >= 0) {
+          FlagThen(A, [Trigger](Asm& A) { A.Load(RAX, RBX, Trigger); });
+          A.Load(RAX, RBX, LaterOff);
+          A.Load(RDX, RBX, EarlierOff);
+          A.Store(R12, 0, RAX);
+          A.Store(R12, 8, RDX);
+        } else {
+          FlagThen(A, [LaterOff](Asm& A) { A.Load(RAX, RBX, LaterOff); });
+          A.Load(RDX, RBX, EarlierOff);
+          A.Store(R12, 0, RAX);
+          A.Store(R12, 8, RDX);
+        }
+      };
+      t.Classify = [Value](const uint64_t*, const uint64_t* R1) {
+        return int(R1[0] == Value) * 2 + int(R1[1] == Value);
+      };
+      t.Off = t.Scalar = Weak;
+      return t;
+    };
+    // rep movsb of LongBytes from the long constant + SrcSkew to the slot, either way.
+    auto MovsbLong = [](int32_t SrcSkew, bool Back) {
+      return [SrcSkew, Back](Asm& A) {
+        A.Mov(RSI, R8);
+        A.AluImm(ADD, RSI, ConstLong + SrcSkew + (Back ? LongBytes - 1 : 0));
+        A.Mov(RDI, RBX);
+        if (Back) {
+          A.AluImm(ADD, RDI, LongBytes - 1);
+          A.Std();
+        }
+        A.MovImm(RCX, LongBytes);
+        A.RepMovsb();
+        if (Back) {
+          A.Cld();
+        }
+      };
+    };
+    auto StosLong = [](bool Bytes, bool Back) {
+      return [Bytes, Back](Asm& A) {
+        A.MovImm(RAX, STOS_VALUE);
+        A.Mov(RDI, RBX);
+        if (Back) {
+          A.AluImm(ADD, RDI, LongBytes - (Bytes ? 1 : 8));
+          A.Std();
+        }
+        A.MovImm(RCX, Bytes ? LongBytes : LongBytes / 8);
+        if (Bytes) {
+          A.RepStosb();
+        } else {
+          A.RepStosq();
+        }
+        if (Back) {
+          A.Cld();
+        }
+      };
+    };
+    const uint64_t CopyQ = COPY_BYTE * FULL;
+    T.push_back(RepOrder("REP-order-movsb", "one 20K rep movsb, source 3 bytes off: last qword seen before the first", MovsbLong(3, false),
+                         LongBytes - 8, 0, CopyQ));
+    T.push_back(RepOrder("REP-order-movsb-page", "one 20K rep movsb, source 3 bytes off: qword after the 16K page before the one before it",
+                         MovsbLong(3, false), 16384, 16376, CopyQ, Expect::Break, 15864));
+    T.push_back(RepOrder("REP-order-std-movsb", "one 20K std; rep movsb, source 3 bytes off: lowest qword (written last) before the highest",
+                         MovsbLong(3, true), 0, LongBytes - 8, CopyQ));
+    T.push_back(RepOrder("REP-order-stosb", "one 20K rep stosb: last qword seen before the first", StosLong(true, false), LongBytes - 8, 0,
+                         STOS_VALUE));
+    // Within one page-bounded run of the translation (4K), across a 128-byte line: what a
+    // translation that put barriers only around each run would let through.
+    T.push_back(RepOrder("REP-order-movsb-line", "one 20K rep movsb, source 3 bytes off: qword after a line inside a 4K page before the one before",
+                         MovsbLong(3, false), 2048, 2040, CopyQ, Expect::Break, 1528));
+    T.push_back(RepOrder("REP-order-stosb-line", "one 20K rep stosb: qword after a line inside a 4K page before the one before",
+                         StosLong(true, false), 2048, 2040, STOS_VALUE, Expect::Break, 1528));
+    T.push_back(RepOrder("REP-order-std-stosq-line", "one 20K std; rep stosq: qword a line below another in the first 4K run before that one",
+                         StosLong(false, true), 18304, 18432, STOS_VALUE, Expect::Break, 18944));
+    T.push_back(RepOrder("REP-order-stosb-page", "one 20K rep stosb: qword after the 16K page seen before the one before it",
+                         StosLong(true, false), 16384, 16376, STOS_VALUE, Expect::Break, 15864));
+    T.push_back(RepOrder("REP-order-std-movsb-page", "one 20K std; rep movsb, source 3 bytes off: qword below the 16K page before the one above",
+                         MovsbLong(3, true), 16376, 16384, CopyQ, Expect::Break, 16896));
+    T.push_back(RepOrder("REP-order-std-stosq-page", "one 20K std; rep stosq: qword below the 16K page before the one above",
+                         StosLong(false, true), 16376, 16384, STOS_VALUE, Expect::Break, 16896));
+    T.push_back(RepOrder("REP-order-std-stosq", "one 20K std; rep stosq: lowest qword (written last) before the highest",
+                         StosLong(false, true), 0, LongBytes - 8, STOS_VALUE));
+
+    // Loads within one rep movsb: the writer stores the source's last qword, then its first
+    // (scalar stores); the reader copies the source with one rep movsb, which reads the
+    // first before the last, then looks at its copy. Seeing the first written means the
+    // last was written before it was read. Backward, the other way round.
+    auto RepReadOrder = [&](const char* Name, const char* Desc, bool Back, int32_t DstSkew, int32_t Low = 0, int32_t High = LongBytes - 8,
+                            Expect Weak = Expect::Either) {
+      LitmusTest t {Name, Desc, L};
+      t.Labels = {"read first=0 second=0", "read first=0 second=set", "read first=set second=0", "read first=set second=set"};
+      t.Forbidden = {2};
+      t.Interleaved = {1};
+      t.Reset = {L.Y};
+      t.Pre = ClearAhead;
+      t.IterationDivisor = 20;
+      const int32_t FirstRead = Back ? High : Low;
+      const int32_t SecondRead = Back ? Low : High;
+      t.Body = [Back, DstSkew, FirstRead, SecondRead](Asm& A, int Role) {
+        if (Role == 0) {
+          A.StoreImm(RBX, SecondRead, 1);
+          A.StoreImm(RBX, FirstRead, 1);
+        } else {
+          A.Mov(RSI, RBX);
+          A.Mov(RDI, RBX);
+          A.AluImm(ADD, RDI, Scratch + DstSkew);
+          if (Back) {
+            A.AluImm(ADD, RSI, LongBytes - 1);
+            A.AluImm(ADD, RDI, LongBytes - 1);
+            A.Std();
+          }
+          A.MovImm(RCX, LongBytes);
+          A.RepMovsb();
+          if (Back) {
+            A.Cld();
+          }
+          // The copied bytes 0 and LongBytes - 8 of the qwords the writer set.
+          A.MovzxByte(RAX, RBX, Scratch + DstSkew + FirstRead);
+          A.MovzxByte(RDX, RBX, Scratch + DstSkew + SecondRead);
+          A.Store(R12, 0, RAX);
+          A.Store(R12, 8, RDX);
+        }
+      };
+      t.Classify = [](const uint64_t*, const uint64_t* R1) {
+        return int(R1[0] == 1) * 2 + int(R1[1] == 1);
+      };
+      t.Off = t.Scalar = Weak;
+      return t;
+    };
+    T.push_back(RepReadOrder("REP-order-read-movsb", "loads within one 20K rep movsb: first source qword read new, last old", false, 0));
+    T.push_back(RepReadOrder("REP-order-read-movsb-skew", "as REP-order-read-movsb, destination 3 bytes off (source read as words)", false, 3));
+    T.push_back(RepReadOrder("REP-order-read-std-movsb", "loads within one 20K std; rep movsb: highest read new, lowest old", true, 0));
+    T.push_back(RepReadOrder("REP-order-read-std-movsb-page", "loads within one 20K std; rep movsb: qword 128 bytes above the 16K page read new, one below old",
+                             true, 0, 16256, 16512, Expect::Break));
+    T.push_back(RepReadOrder("REP-order-read-movsb-line", "loads within one 20K rep movsb: qword below a line in a 4K page read new, above old",
+                             false, 0, 2040, 2048, Expect::Break));
+    T.push_back(RepReadOrder("REP-order-read-std-movsb-line", "loads within one 20K std; rep movsb: qword a line above another in the first 4K run read new, that one old",
+                             true, 0, 18304, 18432, Expect::Break));
+    T.push_back(RepReadOrder("REP-order-read-movsb-skew-line", "as REP-order-read-movsb-line, destination 3 bytes off", false, 3, 2040, 2048, Expect::Break));
+
+    // Message passing with the data written by the forms the option adds (a scalar flag
+    // after them; the samples straddle the 16K page).
+    {
+      auto t = Long("MP-movsb-long-skew", "message passing, 20K of data by rep movsb with the source 3 bytes off, scalar flag");
+      t.Body = [Samples, FlagThen](Asm& A, int Role) {
+        if (Role == 0) {
+          A.Mov(RSI, R8);
+          A.AluImm(ADD, RSI, ConstLong + 3);
+          A.Mov(RDI, RBX);
+          A.MovImm(RCX, LongBytes);
+          A.RepMovsb();
+          A.StoreImm(RBX, L.Y, 1);
+        } else {
+          FlagThen(A, [](Asm& A) { A.Load(RAX, RBX, L.Y); });
+          Samples(A, RBX, 0);
+        }
+      };
+      t.Off = t.Scalar = Expect::Either;
+      t.Classify = Classify(CopyQ);
+      T.push_back(std::move(t));
+    }
+    {
+      auto t = Long("MP-std-movsb-long", "message passing, 20K of data by std; rep movsb (source 3 bytes off), scalar flag");
+      t.Body = [Samples, FlagThen, MovsbLong](Asm& A, int Role) {
+        if (Role == 0) {
+          MovsbLong(3, true)(A);
+          A.StoreImm(RBX, L.Y, 1);
+        } else {
+          FlagThen(A, [](Asm& A) { A.Load(RAX, RBX, L.Y); });
+          Samples(A, RBX, 0);
+        }
+      };
+      t.Off = t.Scalar = Expect::Either;
+      t.Classify = Classify(CopyQ);
+      T.push_back(std::move(t));
+    }
+    {
+      auto t = Long("MP-std-stosb-long", "message passing, 20K of data by std; rep stosb, scalar flag");
+      t.Body = [Samples, FlagThen, StosLong](Asm& A, int Role) {
+        if (Role == 0) {
+          StosLong(true, true)(A);
+          A.StoreImm(RBX, L.Y, 1);
+        } else {
+          FlagThen(A, [](Asm& A) { A.Load(RAX, RBX, L.Y); });
+          Samples(A, RBX, 0);
+        }
+      };
+      t.Off = t.Scalar = Expect::Either;
+      t.Classify = Classify(STOS_VALUE);
+      T.push_back(std::move(t));
+    }
+  }
+
+  // Message passing over 64K + 8 bytes written by one rep stosq (seventeen 4K pages, five
+  // 16K pages, so many page-bounded runs), the flag a scalar store after it; and a one-byte
+  // rep movsb (the element loop, which the option keeps for anything shorter than a
+  // 32-byte chunk) as data and as flag.
+  {
+    constexpr Layout H {262144, 4, 0, 196608};
+    constexpr int32_t HugeBytes = 65544;
+    auto t = MP("MP-stosq-huge", "message passing, 64K + 8 bytes of data by rep stosq, scalar flag", H);
+    t.Reset = {H.Y};
+    t.IterationDivisor = 50;
+    t.Pre = [](Asm& A, int Role) {
+      if (Role == 0) {
+        A.Mov(RDI, RAX);
+        A.MovImm(RAX, 0);
+        A.MovImm(RCX, HugeBytes / 8);
+        A.RepStosq();
+      }
+      for (int32_t Off : {0, 32760, 32768, HugeBytes - 8}) {
+        WarmData(A, Role, Off);
+      }
+    };
+    t.Body = [](Asm& A, int Role) {
+      if (Role == 0) {
+        A.MovImm(RAX, STOS_VALUE);
+        A.Mov(RDI, RBX);
+        A.MovImm(RCX, HugeBytes / 8);
+        A.RepStosq();
+        A.StoreImm(RBX, H.Y, 1);
+      } else {
+        A.Load(RAX, RBX, H.Y);
+        A.Load(RDX, RBX, 0);
+        A.Load(RCX, RBX, 32760);
+        A.Load(RSI, RBX, 32768);
+        A.Load(RDI, RBX, HugeBytes - 8);
+        A.Store(R12, 0, RAX);
+        A.Store(R12, 8, RDX);
+        A.Store(R12, 16, RCX);
+        A.Store(R12, 24, RSI);
+        A.Store(R12, 32, RDI);
+      }
+    };
+    t.Off = t.Scalar = Expect::Either;
+    t.Classify = [](const uint64_t*, const uint64_t* R1) {
+      return State(R1[0], 1) * 3 + StateAll({R1[1], R1[2], R1[3], R1[4]}, STOS_VALUE);
+    };
+    T.push_back(std::move(t));
+  }
+  {
+    auto t = MP("MP-movsb-1", "message passing, one data byte by rep movsb (count 1), scalar flag");
+    t.Reset = {D.X, D.Y};
+    t.Pre = [](Asm& A, int Role) {
+      WarmData(A, Role, D.X);
+    };
+    t.Body = [](Asm& A, int Role) {
+      if (Role == 0) {
+        RepMovsbFrom(A, R8, ConstCopy, RBX, D.X, 1);
+        A.StoreImm(RBX, D.Y, 1);
+      } else {
+        A.Load(RAX, RBX, D.Y);
+        A.MovzxByte(RDX, RBX, D.X);
+        A.Store(R12, 0, RAX);
+        A.Store(R12, 8, RDX);
+      }
+    };
+    t.Off = t.Scalar = Expect::Either;
+    t.Classify = [](const uint64_t*, const uint64_t* R1) {
+      return State(R1[0], 1) * 3 + State(R1[1], COPY_BYTE);
+    };
+    T.push_back(std::move(t));
+  }
+  {
+    auto t = MP("MP-flag-movsb-1", "message passing, scalar data, flag one byte by rep movsb (count 1)");
+    t.Reset = {D.X, D.Y};
+    t.Pre = [](Asm& A, int Role) {
+      WarmData(A, Role, D.X);
+    };
+    t.Body = [](Asm& A, int Role) {
+      if (Role == 0) {
+        A.StoreImm(RBX, D.X, 1);
+        RepMovsbFrom(A, R8, ConstCopy, RBX, D.Y, 1);
+      } else {
+        A.MovzxByte(RAX, RBX, D.Y);
+        A.Load(RDX, RBX, D.X);
+        A.Store(R12, 0, RAX);
+        A.Store(R12, 8, RDX);
+      }
+    };
+    t.Off = t.Scalar = Expect::Either;
+    t.Classify = [](const uint64_t*, const uint64_t* R1) {
+      return State(R1[0], COPY_BYTE) * 3 + State(R1[1], 1);
+    };
+    T.push_back(std::move(t));
   }
 
   // Misaligned message passing. Both data and flag are full qwords written and read at
@@ -2003,7 +2331,20 @@ struct GuestThread {
   // 0 not started, 1 thread created, 2 running guest code, 3 returned, 4 cleaned up.
   std::atomic<int> Stage {};
   pthread_t Handle {};
+  // --stop-storm: the fexmac thread while it may be asked to stop (under StopLock), and the
+  // number of stop requests that ended a run part-way.
+  std::mutex StopLock;
+  fexmac_thread* Running {};
+  uint64_t StopsTaken {};
 };
+
+// --stop-storm: every guest thread is asked to stop at random intervals of 20 to 200
+// microseconds, and runs again from where it stopped. A stop lands at an interrupt check:
+// after every page-bounded run of a long rep and every 64 elements of an element loop, and
+// at block ends, so the litmus tests then also cover a string operation ended part-way
+// (rcx/rsi/rdi exact), the thread leaving translated code and the signal path, and the
+// rest of the operation and the instructions after it running after the resume.
+bool StopStorm = false;
 
 // A start barrier for every guest thread of a run, after its state is set and before it
 // runs. The guest barrier lines up only the two threads of one group, and those run
@@ -2078,10 +2419,26 @@ void RunGuest(fexmac_context* Context, GuestThread* Self) {
   while (StartArrived.load(std::memory_order_acquire) < StartTotal.load(std::memory_order_relaxed)) {
   }
 
+  {
+    std::lock_guard Lock {Self->StopLock};
+    Self->Running = Thread;
+  }
   Self->Stage = 2;
   fexmac_stop Stop;
   fexmac_stop_init(&Stop);
-  const fexmac_result Result = fexmac_thread_run(Thread, &Stop);
+  fexmac_result Result;
+  for (;;) {
+    Result = fexmac_thread_run(Thread, &Stop);
+    if (Result == FEXMAC_OK && Stop.reason == FEXMAC_STOP_REQUESTED) {
+      ++Self->StopsTaken;
+      continue;
+    }
+    break;
+  }
+  {
+    std::lock_guard Lock {Self->StopLock};
+    Self->Running = nullptr;
+  }
   NoteCpu();
   Self->Stage = 3;
 
@@ -2125,15 +2482,15 @@ struct Options {
   bool List = false;
   qos_class_t Qos = QOS_CLASS_USER_INTERACTIVE;
   std::vector<std::string> Only;
-  // --option NAME=VALUE: further fexmac options, after the three ordering switches.
-  std::vector<std::pair<std::string, std::string>> Extra;
+  std::vector<std::string> ExtraOptions; // --option NAME=VALUE
+  bool StopStorm = false;
 };
 
 [[noreturn]]
 void Usage() {
   fprintf(stderr, "usage: FEXCoreOrderingTest [--tso on|off|scalar] [--expect tso|weak|scalar|report] [--iterations N] [--runs R]\n"
                   "                           [--groups G] [--soak] [--only name[,name...]] [--list]\n"
-                  "                           [--qos interactive|utility|background] [--option NAME=VALUE]...\n");
+                  "                           [--qos interactive|utility|background] [--option NAME=VALUE]... [--stop-storm]\n");
   _exit(2);
 }
 
@@ -2195,11 +2552,12 @@ Options Parse(int argc, char** argv) {
       O.List = true;
     } else if (A == "--option") {
       const auto V = Next();
-      const size_t Eq = V.find('=');
-      if (Eq == std::string::npos || Eq == 0) {
+      if (V.find('=') == std::string::npos || V.find('=') == 0) {
         Usage();
       }
-      O.Extra.emplace_back(V.substr(0, Eq), V.substr(Eq + 1));
+      O.ExtraOptions.push_back(V);
+    } else if (A == "--stop-storm") {
+      O.StopStorm = true;
     } else if (A == "--only") {
       std::string V = Next();
       size_t Pos = 0;
@@ -2269,9 +2627,9 @@ int main(int argc, char** argv) {
   pthread_key_create(&ThreadIndexKey, nullptr);
 
   const Options Opt = Parse(argc, argv);
-  for (const auto& [Name, Value] : Opt.Extra) {
-    if (Name == "VECTORTSOSPLIT" && Opt.Mode == Options::TSO::On) {
-      VectorSplitMask = static_cast<unsigned>(strtoul(Value.c_str(), nullptr, 10));
+  for (const auto& O : Opt.ExtraOptions) {
+    if (O.starts_with("VECTORTSOSPLIT=") && Opt.Mode == Options::TSO::On) {
+      VectorSplitMask = static_cast<unsigned>(strtoul(O.c_str() + strlen("VECTORTSOSPLIT="), nullptr, 0));
     }
   }
   auto Tests = MakeTests();
@@ -2306,19 +2664,30 @@ int main(int argc, char** argv) {
   }
   const bool ScalarTSO = Opt.Mode != Options::TSO::Off;
   const bool OtherTSO = Opt.Mode == Options::TSO::On;
-  const fexmac_option TSOOptions[] = {
+  std::vector<fexmac_option> TSOOptions = {
     {"TSOENABLED", ScalarTSO ? "1" : "0"},
     {"VECTORTSOENABLED", OtherTSO ? "1" : "0"},
     {"MEMCPYSETTSOENABLED", OtherTSO ? "1" : "0"},
   };
-  std::vector<fexmac_option> AllOptions(std::begin(TSOOptions), std::end(TSOOptions));
-  for (const auto& [Name, Value] : Opt.Extra) {
-    AllOptions.push_back({Name.c_str(), Value.c_str()});
+  // --option NAME=VALUE: further fexmac options (MEMCPYSETTSOWIDE=1, for one); a name the
+  // mode sets is replaced.
+  std::vector<std::pair<std::string, std::string>> Extra;
+  for (const auto& O : Opt.ExtraOptions) {
+    Extra.emplace_back(O.substr(0, O.find('=')), O.substr(O.find('=') + 1));
   }
+  for (const auto& [Name, Value] : Extra) {
+    auto It = std::find_if(TSOOptions.begin(), TSOOptions.end(), [&](const fexmac_option& F) { return Name == F.name; });
+    if (It != TSOOptions.end()) {
+      It->value = Value.c_str();
+    } else {
+      TSOOptions.push_back({Name.c_str(), Value.c_str()});
+    }
+  }
+  StopStorm = Opt.StopStorm;
   fexmac_config Config;
   fexmac_config_init(&Config);
-  Config.options = AllOptions.data();
-  Config.option_count = AllOptions.size();
+  Config.options = TSOOptions.data();
+  Config.option_count = TSOOptions.size();
   fexmac_context* Context {};
   if (const auto Result = fexmac_context_create(&Config, &Context); Result != FEXMAC_OK) {
     fprintf(stderr, "FAIL: could not create the context: %s\n", fexmac_result_string(Result));
@@ -2336,15 +2705,18 @@ int main(int argc, char** argv) {
   }
 
   const char* ModeName = Opt.Mode == Options::TSO::On ? "on" : (Opt.Mode == Options::TSO::Off ? "off" : "scalar only");
+  for (const auto& F : TSOOptions) {
+    printf("option %s=%s\n", F.name, F.value);
+  }
+  if (StopStorm) {
+    printf("stop storm: every guest thread asked to stop every 20 to 200 microseconds and resumed\n");
+  }
   printf("memory-ordering emulation: %s; expecting %s; %u groups x %u runs x %llu iterations per test\n", ModeName,
          Opt.Want == Options::Expect::TSO  ? "TSO (no forbidden outcome)" :
          Opt.Want == Options::Expect::Weak ? "weak behaviour (forbidden outcomes seen)" :
          Opt.Want == Options::Expect::Scalar ? "the vector and string tests to break, the rest to hold" :
                                              "nothing (report only)", Groups, Runs,
          static_cast<unsigned long long>(AllIterations));
-  for (const auto& [Name, Value] : Opt.Extra) {
-    printf("further option: %s=%s\n", Name.c_str(), Value.c_str());
-  }
 
   {
     struct sigaction Action {};
@@ -2419,6 +2791,7 @@ int main(int argc, char** argv) {
     std::vector<uint64_t> Counts(T.Labels.size(), 0);
     bool Broken = false;
     uint64_t FinalFailures = 0;
+    uint64_t StormStops = 0;
     std::string FinalMessage;
 
     // A test whose threads were never seen to overlap gets up to two more sets of runs
@@ -2556,6 +2929,21 @@ int main(int argc, char** argv) {
       for (auto& GT : Threads) {
         Host.emplace_back(RunGuest, Context, &GT);
       }
+      std::atomic<bool> StormDone {false};
+      std::thread Storm;
+      if (StopStorm) {
+        Storm = std::thread([&] {
+          while (!StormDone.load()) {
+            for (auto& GT : Threads) {
+              std::lock_guard Lock {GT.StopLock};
+              if (GT.Running) {
+                fexmac_thread_request_stop(GT.Running);
+              }
+            }
+            usleep(20 + RandomBelow(180));
+          }
+        });
+      }
       // Poll instead of blocking in join (see GuestQos), then join the finished threads.
       for (auto& GT : Threads) {
         while (GT.Stage.load() < 4) {
@@ -2564,6 +2952,13 @@ int main(int argc, char** argv) {
       }
       for (auto& H : Host) {
         H.join();
+      }
+      if (StopStorm) {
+        StormDone = true;
+        Storm.join();
+        for (auto& GT : Threads) {
+          StormStops += GT.StopsTaken;
+        }
       }
 
       for (unsigned G = 0; G < Groups; ++G) {
@@ -2672,6 +3067,9 @@ int main(int argc, char** argv) {
                IsInterleaved          ? "  (threads overlapped)" :
                                         "");
       }
+    }
+    if (StopStorm) {
+      printf("    stop requests that ended a run part-way and were resumed: %llu\n", static_cast<unsigned long long>(StormStops));
     }
     if (Faults) {
       printf("    misaligned-access faults handled: %llu over %u runs, at %zu instructions, up to %d distinct threads at one\n",

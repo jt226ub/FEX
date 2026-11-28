@@ -49,6 +49,8 @@ namespace {
     OPTION(TSOENABLED, TSOEnabled, Bool),
     OPTION(VECTORTSOENABLED, VectorTSOEnabled, Bool),
     OPTION(MEMCPYSETTSOENABLED, MemcpySetTSOEnabled, Bool),
+    // rep movs/stos with string ordering on: 8-byte acquire/release units (round 2, E2).
+    OPTION(MEMCPYSETTSOWIDE, MemcpySetTSOWide, Bool),
     OPTION(HALFBARRIERTSOENABLED, HalfBarrierTSOEnabled, Bool),
     // Experimental cheaper forms of the vector ordering (off by default; effective only
     // with VECTORTSOENABLED): vector accesses as general-register acquire/release

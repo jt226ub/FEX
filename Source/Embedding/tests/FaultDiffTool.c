@@ -98,17 +98,17 @@ int main(int argc, char** argv) {
   const int Resume = argc > 5 && !strcmp(argv[5], "resume");
   const char* SMC = getenv("SMC") ? getenv("SMC") : "full";
   const int Warm = getenv("WARM") && !strcmp(getenv("WARM"), "1");
-  /* EXTRA_OPTIONS: further options as NAME=VALUE,NAME=VALUE (macos_fault_diff.py --option). */
-  enum { MAX_OPTIONS = 16 };
-  fexmac_option Options[MAX_OPTIONS] = {{"MULTIBLOCK", argv[2]}, {"TSOENABLED", argv[3]}, {"SMCCHECKS", SMC}};
+  /* FAULTDIFF_OPTIONS="NAME=VALUE,NAME=VALUE": further options from the harness's
+   * --option (for example the string-ordering settings). */
+  fexmac_option Options[3 + 16] = {{"MULTIBLOCK", argv[2]}, {"TSOENABLED", argv[3]}, {"SMCCHECKS", SMC}};
   size_t OptionCount = 3;
   static char Extra[1024];
-  if (getenv("EXTRA_OPTIONS")) {
-    snprintf(Extra, sizeof(Extra), "%s", getenv("EXTRA_OPTIONS"));
-    for (char* Item = strtok(Extra, ","); Item && OptionCount < MAX_OPTIONS; Item = strtok(NULL, ",")) {
+  if (getenv("FAULTDIFF_OPTIONS")) {
+    snprintf(Extra, sizeof(Extra), "%s", getenv("FAULTDIFF_OPTIONS"));
+    for (char *Save = NULL, *Item = strtok_r(Extra, ",", &Save); Item; Item = strtok_r(NULL, ",", &Save)) {
       char* Eq = strchr(Item, '=');
-      if (!Eq) {
-        fprintf(stderr, "EXTRA_OPTIONS: %s is not NAME=VALUE\n", Item);
+      if (!Eq || OptionCount == sizeof(Options) / sizeof(Options[0])) {
+        fprintf(stderr, "bad FAULTDIFF_OPTIONS item: %s\n", Item);
         return 2;
       }
       *Eq = 0;
