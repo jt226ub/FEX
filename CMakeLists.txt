@@ -766,6 +766,7 @@ if (BUILD_FEXCORE_ONLY)
     # wake-up test checks the macOS waiting path of WritePriorityMutex and reads Mach
     # thread state.
     add_subdirectory(Source/Tools/CoreOrderingTest/)
+    add_subdirectory(Source/Tools/CoreOrderingSwitchTest/)
     add_subdirectory(Source/Tools/MutexWakeTest/)
     add_subdirectory(Source/Tools/CoreBench/)
   endif()

@@ -326,7 +326,7 @@ static void TestABI(void) {
   CheckResult(fexmac_context_get_counters(Context, &Counters), FEXMAC_ERROR_INVALID_ARGUMENT, "counters of an unknown (larger) size");
   fexmac_translation_counters_init(&Counters);
   CheckResult(fexmac_context_get_counters(Context, &Counters), FEXMAC_OK, "counters of the known size");
-  Check(fexmac_version() == ((2u << 16) | 0u) && FEXMAC_VERSION_MAJOR == 2, "version 2.0, the first with struct_size");
+  Check(fexmac_version() == ((2u << 16) | 1u) && FEXMAC_VERSION_MAJOR == 2, "version 2.1 (2.0 was the first with struct_size)");
 
   fexmac_thread_destroy(Thread);
   fexmac_context_destroy(Context);
@@ -2232,11 +2232,16 @@ static const struct Subtest Subtests[] = {
 /* FaultHandlingTest.c */
 extern const struct Subtest FaultSubtests[];
 extern const size_t FaultSubtestCount;
+/* OrderingSwitchTest.c */
+extern const struct Subtest OrderingSubtests[];
+extern const size_t OrderingSubtestCount;
 
 int main(int argc, char** argv) {
   enum { Own = sizeof(Subtests) / sizeof(Subtests[0]) };
-  struct Subtest* All = malloc(sizeof(struct Subtest) * (Own + FaultSubtestCount));
+  const size_t Total = Own + FaultSubtestCount + OrderingSubtestCount;
+  struct Subtest* All = malloc(sizeof(struct Subtest) * Total);
   memcpy(All, Subtests, sizeof(Subtests));
   memcpy(All + Own, FaultSubtests, sizeof(struct Subtest) * FaultSubtestCount);
-  return RunSubtests(argc, argv, All, Own + FaultSubtestCount, 120);
+  memcpy(All + Own + FaultSubtestCount, OrderingSubtests, sizeof(struct Subtest) * OrderingSubtestCount);
+  return RunSubtests(argc, argv, All, Total, 120);
 }

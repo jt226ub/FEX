@@ -637,6 +637,16 @@
           "Can be dangerous due to aligned loadstores through the same code now become non-atomic."
         ]
       },
+      "TSODeferred": {
+        "Type": "bool",
+        "Default": "false",
+        "AffectsCodeGen": "false",
+        "Desc": [
+          "macOS embedding (fexmac) only: translate without TSO emulation while the context has a single guest thread,",
+          "and switch it on, discarding every translation, when a second thread is created or memory is declared shared.",
+          "Not in the code cache key: the effective TSO state is."
+        ]
+      },
       "StrictInProcessSplitLocks": {
         "Type": "bool",
         "Default": "@FEX_STRICT_SPLIT_LOCKS_DEFAULT@",

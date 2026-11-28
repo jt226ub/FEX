@@ -377,6 +377,9 @@ namespace {
   // compiling and before storing to the code cache.
   std::atomic<void (*)(uint64_t, uint64_t, void*)> TestMarkHook {};
   std::atomic<void*> TestMarkHookData {};
+  // fexmac_testing_break_ordering_switch: deliberately wrong switches, to show that the
+  // switch tests can fail.
+  std::atomic<uint32_t> TestBreakOrdering {};
 #endif
 
   void Invalidate(fexmac_context* Context, FEXCore::Core::InternalThreadState* CallingThread, uint64_t Start, uint64_t Length) {
@@ -392,6 +395,102 @@ namespace {
     }
 #endif
     InvalidateLocked(Context, Start, Length);
+  }
+
+  // ---- Ordering deferred while single-threaded (TSODEFERRED) ----
+  //
+  // With the option, the context starts with the core's TSO emulation deferred: code is
+  // translated without ordering. x86 ordering is only observable by another agent
+  // touching the same memory at the same time, so while one guest thread exists and no
+  // memory is declared shared nothing can tell. When a second thread is created, or the
+  // embedder declares memory shared, EnableOrderingLocked switches ordering on for good:
+  //
+  //  1. With ThreadsMutex and the core's invalidation lock held exclusively: the core's
+  //     flags flip and every translation of every thread and code buffer is discarded.
+  //     Translation (and the code cache lookup and store, whose key carries the effective
+  //     ordering) runs under that lock shared, so a block is either finished and inserted
+  //     before step 1 (and discarded by it) or made entirely with ordering on.
+  //  2. Under the registry lock: every thread running translated code (Running and not in
+  //     its system call callback) is counted in OrderingAcksPending, marked
+  //     OrderingAckPending and asked to resync (interrupt fault page made read-only).
+  //     Every other thread is in host code that returns to the dispatcher's lookup, and
+  //     its call/return stack is cleared here, where it cannot be pushed to.
+  //  3. OrderingDeferred becomes false.
+  //
+  // A counted thread acknowledges (AcknowledgeOrdering) on its own host thread at its
+  // next resync (a block entry or loop back-edge: Faults.cpp), system call or end of run,
+  // each a point where it next looks code up anew; it first clears its own call/return
+  // stack, which may hold return addresses into discarded code that it pushed after
+  // step 1 (a return lands inside a block, past any check). fexmac_thread_run does not
+  // start guest code while OrderingAcksPending is non-zero, and
+  // fexmac_context_mark_memory_shared does not return until it is zero. So once any
+  // other agent can run, no thread can reach code made without ordering. The argument in
+  // full is in docs/macOS-embedding-interface.md ("Ordering deferred while
+  // single-threaded").
+  void ClearCallRet(fexmac_thread* Thread) {
+    FEXCore::Allocator::VirtualDontNeed(Thread->Thread->CallRetStackBase, FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE);
+  }
+
+  // The caller holds OrderingSwitchMutex.
+  void EnableOrderingLocked(fexmac_context* Context) {
+    if (!Context->OrderingDeferred.load(std::memory_order_acquire)) {
+      return;
+    }
+#ifdef FEXMAC_TESTING
+    const uint32_t Break = TestBreakOrdering.load();
+#else
+    constexpr uint32_t Break = 0;
+#endif
+    auto* Current = GetCurrentThread();
+    auto* Calling = Current && Current->Context == Context ? Current->Thread : nullptr;
+    {
+      std::lock_guard ThreadsLock {Context->ThreadsMutex};
+      auto Lock =
+        FEXCore::GuardSignalDeferringSectionWithFallback(Context->CTX->GetCodeInvalidationMutex(), Calling, InvalidationSignalMask());
+      Context->CTX->SetTSOEmulationDeferred(false);
+      if (!(Break & BreakOrderingNoDiscard)) {
+        InvalidateLocked(Context, 0, GuestMemory::AddressLimit);
+      }
+    }
+    {
+      std::lock_guard Registry {RegistryMutex};
+      std::lock_guard ThreadsLock {Context->ThreadsMutex};
+      for (auto* Thread : Context->Threads) {
+        if (!LiveThreads.contains(Thread)) {
+          continue;
+        }
+        if (Thread->Running && !Thread->InCallback) {
+          if (Break & BreakOrderingNoWait) {
+            continue;
+          }
+          // Counted before the mark, so the count never drops below the marks.
+          Context->OrderingAcksPending.fetch_add(1, std::memory_order_seq_cst);
+          Thread->OrderingAckPending.store(1, std::memory_order_seq_cst);
+          Thread->ResyncRequested.store(1, std::memory_order_seq_cst);
+          ProtectInterruptPage(Thread, true);
+        } else if (!(Break & BreakOrderingKeepCallRet)) {
+          ClearCallRet(Thread);
+        }
+      }
+    }
+    Context->OrderingSwitches.fetch_add(1, std::memory_order_relaxed);
+    Context->OrderingDeferred.store(false, std::memory_order_release);
+  }
+
+  // Until no thread may still be running code made without ordering. Holds no lock.
+  void WaitForOrdering(fexmac_context* Context) {
+    if (Context->OrderingAcksPending.load(std::memory_order_acquire) == 0) {
+      return;
+    }
+    Context->OrderingWaits.fetch_add(1, std::memory_order_relaxed);
+    for (unsigned Round = 0; Context->OrderingAcksPending.load(std::memory_order_acquire) != 0; ++Round) {
+      if (Round < 64) {
+        sched_yield();
+      } else {
+        const timespec Pause {0, 20'000};
+        nanosleep(&Pause, nullptr);
+      }
+    }
   }
 
   void SetInCallback(fexmac_thread* Thread, bool Value) {
@@ -410,6 +509,24 @@ uint64_t InvalidationSignalMask() {
     Mask &= ~(1ULL << (Signal - 1));
   }
   return Mask;
+}
+
+bool AcknowledgeOrdering(fexmac_thread* Thread) {
+  if (Thread->OrderingAckPending.load(std::memory_order_seq_cst) == 0) {
+    return false;
+  }
+#ifdef FEXMAC_TESTING
+  if (!(TestBreakOrdering.load() & BreakOrderingKeepCallRet))
+#endif
+  {
+    ClearCallRet(Thread);
+  }
+  // Only this thread clears its mark, and the switch sets it once.
+  Thread->OrderingAckPending.store(0, std::memory_order_seq_cst);
+  // Release: every access this thread made before (unordered ones included) is visible
+  // to a thread that then sees the count drop.
+  Thread->Context->OrderingAcksPending.fetch_sub(1, std::memory_order_seq_cst);
+  return true;
 }
 
 void InvalidateLocked(fexmac_context* Context, uint64_t Start, uint64_t Length) {
@@ -433,6 +550,14 @@ void SyscallHandler::HandleSyscall(FEXCore::Core::CpuStateFrame* Frame) {
   // the callback, so it sees the same rip as the guest's rcx.
   const uint64_t InstructionAddress = Frame->State.rip;
   Frame->State.rip = Frame->State.gregs[FEXCore::X86State::REG_RCX];
+
+  // The system call ended the block (the core's Syscall op does not return to it) and the
+  // dispatcher looks the next block up after this handler: a safe point for the ordering
+  // switch, taken before the callback so that a callback that waits for another guest
+  // thread (or calls fexmac_context_mark_memory_shared) cannot wait for this one.
+  if (AcknowledgeOrdering(Thread)) {
+    Context->OrderingAcksAtExit.fetch_add(1, std::memory_order_relaxed);
+  }
 
   fexmac_syscall_action Action = FEXMAC_SYSCALL_STOP;
   if (Context->SyscallFn) {
@@ -618,6 +743,12 @@ fexmac_result fexmac_context_create(const fexmac_config* config, fexmac_context*
     delete Context;
     return Fail(FEXMAC_ERROR_INIT_FAILED, true);
   }
+  // TSODEFERRED: no ordering until a second thread or shared memory. Nothing to defer
+  // when the configuration has no ordering emulation at all.
+  if (FEXCore::Config::Get_TSODEFERRED() && FEXCore::Config::Get_TSOENABLED()) {
+    Context->CTX->SetTSOEmulationDeferred(true);
+    Context->OrderingDeferred.store(true, std::memory_order_release);
+  }
 
   Context->Descriptors = new (std::nothrow) FEXCore::Core::CPUState::gdt_segment[fexmac_context::DescriptorCount] {};
   if (!Context->Descriptors) {
@@ -762,6 +893,35 @@ fexmac_result fexmac_context_flush_cache(fexmac_context* context) {
   return context->CTX->FlushDiskCache() ? FEXMAC_OK : FEXMAC_ERROR_INTERNAL;
 }
 
+fexmac_result fexmac_context_mark_memory_shared(fexmac_context* context) {
+  if (InLogCallback) {
+    return FEXMAC_ERROR_BUSY;
+  }
+  ContextUse Use {context};
+  if (!Use) {
+    return FEXMAC_ERROR_INVALID_HANDLE;
+  }
+  {
+    std::lock_guard Switch {context->OrderingSwitchMutex};
+    EnableOrderingLocked(context);
+  }
+  // A guest thread calling from its system call callback is not waited for: it has
+  // acknowledged at the system call, or was in it when the switch was made.
+  WaitForOrdering(context);
+  return FEXMAC_OK;
+}
+
+int fexmac_context_ordering_deferred(fexmac_context* context) {
+  if (InLogCallback) {
+    return 0;
+  }
+  ContextUse Use {context};
+  if (!Use) {
+    return 0;
+  }
+  return context->OrderingDeferred.load(std::memory_order_acquire) ? 1 : 0;
+}
+
 namespace {
   // The context whose locks fexmac_before_fork holds, until fexmac_after_fork. Checked
   // before taking the registry lock: the caller of a second fexmac_before_fork may be the
@@ -822,6 +982,21 @@ fexmac_result fexmac_thread_create(fexmac_context* context, fexmac_thread** out_
     return FEXMAC_ERROR_INVALID_HANDLE;
   }
   InitializeAllocatorForThisThread();
+
+  // While ordering is deferred, creation is serialised with the switch, and a second
+  // live thread switches it on before it exists (Ordering deferred while single-threaded).
+  std::unique_lock<std::mutex> SwitchLock;
+  if (context->OrderingDeferred.load(std::memory_order_acquire)) {
+    SwitchLock = std::unique_lock {context->OrderingSwitchMutex};
+    bool HaveThread;
+    {
+      std::lock_guard Lock {context->ThreadsMutex};
+      HaveThread = !context->Threads.empty();
+    }
+    if (HaveThread) {
+      EnableOrderingLocked(context);
+    }
+  }
 
   auto* Thread = new (std::nothrow) fexmac_thread {};
   if (!Thread) {
@@ -1003,6 +1178,13 @@ fexmac_result fexmac_thread_run(fexmac_thread* thread, fexmac_stop* stop) {
   auto* Previous = GetCurrentThread();
   SetCurrentThread(thread);
   thread->PendingStop = {};
+  // Marked by an ordering switch that came between this run being entered and now: it has
+  // run nothing yet. Then no guest code until every thread that may still be running
+  // code made without ordering has left it (Ordering deferred while single-threaded).
+  if (AcknowledgeOrdering(thread)) {
+    thread->Context->OrderingAcksAtStart.fetch_add(1, std::memory_order_relaxed);
+  }
+  WaitForOrdering(thread->Context);
 
   if (thread->StopRequested.exchange(0)) {
     // A stop requested while the thread was not running (or one that arrived as the last
@@ -1022,6 +1204,11 @@ fexmac_result fexmac_thread_run(fexmac_thread* thread, fexmac_stop* stop) {
   const fexmac_stop Result = thread->PendingStop;
   {
     std::lock_guard Lock {RegistryMutex};
+    // Under the lock that the switch marks running threads under, so a mark made after
+    // the run ended is not left pending.
+    if (AcknowledgeOrdering(thread)) {
+      thread->Context->OrderingAcksAtExit.fetch_add(1, std::memory_order_relaxed);
+    }
     thread->Running = false;
   }
 
@@ -1283,6 +1470,24 @@ fexmac_result fexmac_testing_force_tso(fexmac_context* context, uint64_t begin, 
   fextl::set<uint64_t> Instructions {instruction};
   context->CTX->AddForceTSOInformation(Ranges, std::move(Instructions));
   return FEXMAC_OK;
+}
+
+fexmac_result fexmac_testing_ordering_state(fexmac_context* context, uint32_t* effective, uint64_t stats[5]) {
+  ContextUse Use {context};
+  if (!Use || !effective || !stats) {
+    return FEXMAC_ERROR_INVALID_HANDLE;
+  }
+  *effective = context->CTX->GetEffectiveTSOEmulation();
+  stats[0] = context->OrderingSwitches.load();
+  stats[1] = context->OrderingAcksAtResync.load();
+  stats[2] = context->OrderingAcksAtExit.load();
+  stats[3] = context->OrderingAcksAtStart.load();
+  stats[4] = context->OrderingWaits.load();
+  return FEXMAC_OK;
+}
+
+void fexmac_testing_break_ordering_switch(uint32_t flags) {
+  TestBreakOrdering.store(flags);
 }
 
 void fexmac_testing_set_mark_executable_hook(void (*hook)(uint64_t start, uint64_t length, void* user_data), void* user_data) {

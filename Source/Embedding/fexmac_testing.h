@@ -84,6 +84,22 @@ FEXMAC_EXPORT fexmac_result fexmac_testing_force_tso(fexmac_context* context, ui
  * after a block is compiled and before it is stored in the code cache. */
 FEXMAC_EXPORT void fexmac_testing_set_mark_executable_hook(void (*hook)(uint64_t start, uint64_t length, void* user_data), void* user_data);
 
+/* The ordering switch (option TSODEFERRED): the TSO emulation the core translates with
+ * now (bit 0 scalar, 1 vector, 2 string instructions), and counts since the context was
+ * created: stats[0] switches, [1] threads that acknowledged at a resync, [2] at a system
+ * call or the end of a run, [3] at the start of a run, [4] waits by
+ * fexmac_thread_run or fexmac_context_mark_memory_shared for acknowledgements. */
+FEXMAC_EXPORT fexmac_result fexmac_testing_ordering_state(fexmac_context* context, uint32_t* effective, uint64_t stats[5]);
+
+/* Deliberately wrong ordering switches, to show the switch tests can fail (0: correct).
+ * NO_WAIT: running threads are neither asked to resync nor waited for, so a new thread
+ * may run while another keeps running code made without ordering. NO_DISCARD: the
+ * translations are kept. KEEP_CALLRET: call/return stacks are not cleared. */
+#define FEXMAC_TESTING_ORDERING_NO_WAIT 1u
+#define FEXMAC_TESTING_ORDERING_NO_DISCARD 2u
+#define FEXMAC_TESTING_ORDERING_KEEP_CALLRET 4u
+FEXMAC_EXPORT void fexmac_testing_break_ordering_switch(uint32_t flags);
+
 #ifdef __cplusplus
 }
 #endif

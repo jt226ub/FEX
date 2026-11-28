@@ -245,6 +245,22 @@ public:
    */
   FEX_DEFAULT_VISIBILITY virtual void SetHardwareTSOSupport(bool HardwareTSOSupported) = 0;
 
+#ifdef __APPLE__
+  /**
+   * @brief macOS embedding (fexmac, TSODEFERRED): while deferred, code is translated
+   * without TSO emulation whatever the configuration says (CPUID still reports what the
+   * configuration gives). Set before the first thread; cleared with the code invalidation
+   * lock held exclusively, after which the caller discards every translation.
+   */
+  FEX_DEFAULT_VISIBILITY virtual void SetTSOEmulationDeferred(bool Deferred) = 0;
+
+  /**
+   * @brief The TSO emulation translations are made with now: bit 0 scalar, bit 1 vector,
+   * bit 2 string instructions. For tests.
+   */
+  FEX_DEFAULT_VISIBILITY virtual uint32_t GetEffectiveTSOEmulation() const = 0;
+#endif
+
   /**
    * @brief Adds a new Thunk trampoline handler
    *

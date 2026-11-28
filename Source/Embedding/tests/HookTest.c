@@ -895,6 +895,15 @@ static const struct Subtest Subtests[] = {
   {"host-features-rcpc", TestRcpcFeatures, 0, NULL, NULL, 0},
 };
 
+/* OrderingSwitchTest.c, with its hook-only checks. */
+extern const struct Subtest OrderingSubtests[];
+extern const size_t OrderingSubtestCount;
+
 int main(int argc, char** argv) {
-  return RunSubtests(argc, argv, Subtests, sizeof(Subtests) / sizeof(Subtests[0]), 60);
+  enum { Own = sizeof(Subtests) / sizeof(Subtests[0]) };
+  const size_t Total = Own + OrderingSubtestCount;
+  struct Subtest* All = malloc(sizeof(struct Subtest) * Total);
+  memcpy(All, Subtests, sizeof(Subtests));
+  memcpy(All + Own, OrderingSubtests, sizeof(struct Subtest) * OrderingSubtestCount);
+  return RunSubtests(argc, argv, All, Total, 60);
 }
