@@ -178,6 +178,8 @@ hexadecimal; a leading 0 is refused rather than read as octal.
 | `MULTIBLOCK` | 0, 1 | |
 | `MAXINST` | 1 to 2^31-1 | instructions per block |
 | `TSOENABLED`, `VECTORTSOENABLED`, `MEMCPYSETTSOENABLED`, `HALFBARRIERTSOENABLED` | 0, 1 | x86 memory-ordering emulation (software; macOS has no hardware mode for ordinary processes) |
+| `VECTORTSOSPLIT` | 0 to 31 (bit mask) | experimental, off by default: vector-register accesses under `VECTORTSOENABLED` as general-register acquire/release accesses. 1 loads, 2 stores of 8 bytes or less (one access each); 4, 8: 16-byte loads, stores as two 8-byte halves, which breaks x86's aligned 16-byte atomicity (experiment only); 16 keeps aligned-form 16-byte accesses whole. See `docs/macOS-port-status.md` |
+| `TSOBARRIERMERGE` | 0, 1 | experimental, off by default: one `dmb ish` instead of a vector load's `dmb ishld` and the next vector store's `dmb ish` when only register-only operations lie between |
 | `SMCCHECKS` | `none`, `mtrack`, `full` (or 0, 1, 2) | default `mtrack`: with no guest memory registered nothing is detected (the embedder calls `fexmac_invalidate`, as before package D); with memory registered, translated pages are write-protected (see "Self-modifying code"). `full`: a check of the guest bytes before every instruction, everywhere. `none`: nothing |
 | `X87REDUCEDPRECISION`, `HIDEHYPERVISORBIT` | 0, 1 | |
 | `HOSTFEATURES` | `off`, or comma-separated `disable*` names the core knows | `enable*` names are refused: they force a feature on whether the host has it or not (`enablesve` dies with SIGILL on an M4) |

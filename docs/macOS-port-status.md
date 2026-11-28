@@ -483,6 +483,72 @@ frequency); the main thread waits for guest threads by polling, because a thread
 in `pthread_join` lends its priority to the thread it waits for, which then ran on the
 performance cores.
 
+**Cheaper vector ordering (round 2, task E2; options, all off by default).** Two options
+change how vector ordering (`VECTORTSOENABLED`) is emitted; both are in the code-cache key
+(marked `AffectsCodeGen`; mismatch cases in `Scripts/macos_code_cache_tests.py`) and accepted
+by `fexmac`. Neither is the default, and nothing changes without them.
+
+- `VECTORTSOSPLIT` (bit mask, needs FEAT_LRCPC2; `UseVectorTSOSplit` in
+  `FEXCore/Source/Interface/Core/JIT/MemoryOps.cpp`). Bits 1 and 2: vector-register loads
+  and stores of 8 bytes or less (`movsd`, `movq`, `movss`, `movd`, MMX `movq`, x87 `fld`
+  m32/m64, `pextrw`-style 2-byte forms) become one acquire load (`ldapur`, `ldapurh`,
+  `ldapurb`) into a general register and an `fmov`, or a `fmov`/`umov` and one release store
+  (`stlur`...), with no barrier: the same instructions, offsets (signed 9-bit, the address
+  materialised when out of range) and `nop` slots as the scalar path, so the
+  misaligned-access handler rewrites a form that crosses 16 bytes exactly as a scalar one
+  (`ldur` + `dmb ishld`, `dmb ish` + `stur`). Each access stays one access of the same size,
+  so it is as atomic as the plain `ldr d`/`str d` it replaces (Arm ARM B2.2.1: aligned
+  accesses of 64 bits or less are single-copy atomic). `VECTORTSOSPLIT=3` is the form
+  proposed for use. Bits 4 and 8 make 16-byte loads and stores two 8-byte halves (lower
+  then upper for loads, upper then lower for stores; a 16-byte store across a 4K boundary
+  keeps the barrier form so that a fault never leaves one half written); bit 16 keeps the
+  barrier form for instructions that require 16-byte alignment. **Bits 4 and 8 break x86's
+  16-byte atomicity** and are recorded as a measured experiment only, not proposed: Intel
+  SDM vol. 3A 11.1.1 ("Guaranteed Atomic Operations", 253668-093US) guarantees that "the
+  16-byte memory operations performed by" `MOVAPD`, `MOVAPS`, `MOVDQA` (and their VEX.128 and
+  EVEX.128 forms) "will always be carried out atomically" on processors that report AVX,
+  and AMD APM vol. 2 7.3.2 (rev. 3.46) extends atomicity "for cacheable, naturally-aligned
+  single loads or stores from a quadword to a double quadword" on such processors; the
+  guest CPUID reports AVX. With `VECTORTSOSPLIT=15`, `TEAR-sse` saw 25,638 torn reads in 3.2
+  million and `TEAR-sse-st`/`TEAR-sse-ld` failed too (`--tso on`, M4); without it, none.
+  (The Arm ARM itself, B2.2.1, treats a 128-bit SIMD&FP access as "a pair of single-copy
+  atomic 64-bit" accesses, also with FEAT_LSE2, so the 16-byte atomicity the barrier form
+  shows on the M4 is the chip's behaviour, not an architectural promise; see Known limits.)
+- `TSOBARRIERMERGE` (`EmitVectorTSOBarrier`, `IsBarrierTransparentOp`). A vector load's
+  trailing `dmb ishld` is dropped (turned into a `nop`, or replaced in place when adjacent)
+  when the next vector store's leading `dmb ish` follows in the same block with only
+  register-only IR ops between: a fixed list of ALU and vector arithmetic ops, none of
+  which accesses memory, branches, calls or can fault; anything else, and every block
+  start, ends the chance. The single `dmb ish` then sits between the load and the store
+  with no memory access between it and either, so it orders the load (and everything
+  earlier) before the store (and everything later), which is both barriers' obligation.
+  Two loads still need a barrier each; a store's `dmb ish` is never merged with anything
+  after it (a store is a memory access).
+
+The ordering argument, what was measured and the commands are in the round 2 report (task
+E2) and `docs/macOS-benchmarks.md` ("Candidates"). Tests: `fexmac_c_test vector-tso-forms`
+(every emitted form, offsets at both edges of the unscaled range and beyond, index
+registers, misalignment 0 to 15 for input and output, run twice so the second pass runs
+back-patched code, aligned forms, results compared with the run without ordering, in
+eleven option combinations) and `vector-tso-page-faults` (stores and loads across a 16K page
+whose lower or upper half faults: the fault is at the instruction and nothing is written
+before it, as with the barrier form; the only write is the known 32-byte case), litmus
+tests `MP-sd`, `MP-sse-merge`, `MP-sse-split16`, `MP-sse-split8`, `MP-sse-split16K`, and
+`--option NAME=VALUE` in `FEXCoreOrderingTest`, `--option` in `Scripts/macos_fault_diff.py`,
+modes `jit_500_tso_split` (`VECTORTSOSPLIT=3`), `jit_500_tso_merge`, `jit_500_tso_split_merge`
+and `jit_500_tso_split16` in `Scripts/macos_asm_tests.py` (not in the default four), and
+configurations `--configs e2` in `Scripts/macos_bench.py` (with `--qos background`).
+
+Found while doing it (not changed): x87 stores are plain stores whatever the ordering
+settings say. `fst`/`fstp` to memory go through the x87 stack pass
+(`x87StackOptimizationPass.cpp`: `StoreStackMem` becomes `_StoreMemFPR`, and the 80-bit
+form a plain 8-byte `_StoreMemFPR` and a 2-byte `_StoreMemGPR`), not through
+`_StoreMemAutoTSO`. A later release store still orders them, but two x87 stores, or an x87
+store and a later plain (vector with vector ordering off, or stack) store, may become
+visible out of order. (x87 loads of 32 and 64 bits are ordered loads; the 80-bit load's
+first part is plain but the barrier after its second part orders both.) Not covered by a
+litmus test yet.
+
 The default run (`FEXCoreOrderingTest`, emulation on, 3.2 million tries per litmus test)
 takes about 15 seconds, of which the counting tests are about 10: every locked operation
 on a misaligned operand is a fault. `--tso off` and `--tso scalar` take the same. All three run
@@ -1154,6 +1220,15 @@ Of memory ordering (criterion 5):
 - Split locked operations (operands across 16 bytes) have five stated limits, none seen
   in the tests ("Remaining limits of split locked operations"), among them that the
   split-lock lock is per process.
+- **16-byte atomicity rests on the M4, not on the architecture.** x86 with AVX guarantees
+  aligned 16-byte `movdqa`-class accesses to be atomic (Intel SDM vol. 3A 11.1.1, AMD APM
+  vol. 2 7.3.2). The port emits them as one `ldr q`/`str q`, which the Arm ARM (B2.2.1,
+  "Reads to SIMD and floating-point registers of a 128-bit value that is 64-bit aligned in
+  memory are treated as a pair of single-copy atomic 64-bit reads"; FEAT_LSE2 extends
+  16-byte atomicity only to `LDP`/`STP` of two 64-bit registers) does not promise to be
+  atomic. The M4 has not torn one (`TEAR-sse`). A host that did would tear them; `LDP`/`STP`
+  of two general registers would be architecturally atomic when aligned (not done).
+  `VECTORTSOSPLIT` bits 4 and 8 tear them by design (experiment only).
 
 Of the code cache: a cache directory is trusted only if it is private to the user (same
 user only, by design); upstream's whole-section cache (`FXCC`) is not implemented on

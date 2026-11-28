@@ -449,9 +449,31 @@ do the same. FEX is faster than Rosetta 2 at full precision, and much faster wit
   chips were not checked. The port's macOS feature detection asks for it and records it
   without using it (`fexmac_hook_test host-features-rcpc` prints the value), so a host
   that has it would be noticed.
-- Cheaper vector ordering on hosts without them: drop a `dmb ishld` that is followed by
-  a `dmb ish` with no memory access between them (`copy_loop`'s block has this pattern),
-  and merge barriers between consecutive vector accesses where x86 ordering allows it.
+- Cheaper vector ordering on hosts without them (round 2, task E2): tried, behind
+  options that are off by default (`docs/macOS-port-status.md`, "Cheaper vector
+  ordering"); `Scripts/macos_bench.py --configs e2` measures them. The generated table
+  above does not include them; the provisional figures, taken while other work loaded the
+  machine, are in the round 2 report (task E2), and the final ones are to be taken on an
+  idle machine with
+  `python3 Scripts/macos_bench.py --loader build/Bin/FEXCoreBench --out bench-e2 --configs e2`
+  (and with `--qos background --out bench-e2-ecores` for the efficiency cores). In short:
+  - `VECTORTSOSPLIT=3` (`tso_on_fp64`): vector-register accesses of 8 bytes or less as one
+    acquire load or release store, no barrier. Every access stays one access. It lowers
+    the headline and clearly helps `matmul_f64`, `nbody` and `fft`; `copy_loop` (16-byte
+    `movdqa`) is unchanged.
+  - `TSOBARRIERMERGE=1` (`tso_on_merge`): within noise. In `copy_loop`'s loop (`movdqa`
+    load, `pxor`, `movdqa` load, `pxor`, `movdqa` store, `movdqa` store) only the second
+    load's `dmb ishld` is followed by a store's `dmb ish` with only register operations
+    between, so three of the four barriers remain.
+  - For the record, 16-byte accesses as two 8-byte halves (`VECTORTSOSPLIT=15`,
+    `tso_on_split16`) gave the largest gain (`copy_loop` most of all) but made
+    `matmul_f32x4` slower, and is dropped: it breaks the 16-byte atomicity x86
+    guarantees for aligned accesses on processors with AVX (Intel SDM vol. 3A 11.1.1,
+    AMD APM vol. 2 7.3.2), and `TEAR-sse`, `TEAR-sse-st` and `TEAR-sse-ld` see torn values
+    under it.
+  - Not done: merging barriers between consecutive loads or consecutive stores (each load
+    needs its own barrier after it, each store one before it; nothing there is
+    redundant).
 - Treat provably thread-private memory (beyond the stack, which is already exempt) as
   needing no ordering.
 - `rep movs`/`rep stos` with string ordering: x86 makes no promise about the order of
