@@ -57,7 +57,8 @@
 //
 //   FEXCoreOrderingTest [--tso on|off|scalar] [--expect tso|weak|scalar|report]
 //                       [--iterations N] [--runs R] [--groups G] [--soak]
-//                       [--only name[,name...]] [--list] [--option NAME=VALUE]...
+//                       [--only name[,name...]] [--list] [--qos interactive|utility|background]
+//                       [--option NAME=VALUE]...
 //
 // --tso on (default) switches on all three emulation settings, off switches all off, and
 // scalar switches on only the general one (vector and string-instruction accesses stay
@@ -229,6 +230,21 @@ struct Asm {
     U8(0x6F);
     Mem(X, Base, Disp);
   }
+  // movsd (F2 0F 10 load, F2 0F 11 store): 8-byte vector-register accesses.
+  void MovsdLoad(int X, int Base, int32_t Disp) {
+    U8(0xF2);
+    Rex(false, X, Base);
+    U8(0x0F);
+    U8(0x10);
+    Mem(X, Base, Disp);
+  }
+  void MovsdStore(int Base, int32_t Disp, int X) {
+    U8(0xF2);
+    Rex(false, X, Base);
+    U8(0x0F);
+    U8(0x11);
+    Mem(X, Base, Disp);
+  }
   void MovdquStore(int Base, int32_t Disp, int X) {
     U8(0xF3);
     Rex(false, X, Base);
@@ -236,9 +252,43 @@ struct Asm {
     U8(0x7F);
     Mem(X, Base, Disp);
   }
+  // movdqa (aligned; faults on a misaligned address).
+  void MovdqaLoad(int X, int Base, int32_t Disp) {
+    U8(0x66);
+    Rex(false, X, Base);
+    U8(0x0F);
+    U8(0x6F);
+    Mem(X, Base, Disp);
+  }
+  void MovdqaStore(int Base, int32_t Disp, int X) {
+    U8(0x66);
+    Rex(false, X, Base);
+    U8(0x0F);
+    U8(0x7F);
+    Mem(X, Base, Disp);
+  }
+  // vmovdqu ymm (VEX.256.F3.0F 6F/7F), three-byte VEX so that any base register works.
+  void Vex256F3(int X, int Base, uint8_t Opcode, int32_t Disp) {
+    U8(0xC4);
+    U8(((~X >> 3) & 1) << 7 | 1 << 6 | ((~Base >> 3) & 1) << 5 | 0x01);
+    U8(0xF << 3 | 1 << 2 | 0x2);
+    U8(Opcode);
+    Mem(X, Base, Disp);
+  }
+  void VmovdquLoad(int Y, int Base, int32_t Disp) {
+    Vex256F3(Y, Base, 0x6F, Disp);
+  }
+  void VmovdquStore(int Base, int32_t Disp, int Y) {
+    Vex256F3(Y, Base, 0x7F, Disp);
+  }
   void RepMovsb() {
     U8(0xF3);
     U8(0xA4);
+  }
+  void RepMovsq() {
+    U8(0xF3);
+    U8(0x48);
+    U8(0xA5);
   }
   void RepStosq() {
     U8(0xF3);
@@ -335,10 +385,13 @@ constexpr uint32_t DELAY_ENTRIES = 4096;
 
 // The shared area: constants first, then the counting tests' operands at misaligned
 // addresses (0x1000 on, and across the page boundary at 0x4000), then their ticket.
-constexpr size_t SHARED_SIZE = 0x8000; // two 16K pages
+constexpr size_t SHARED_SIZE = 0x10000; // four 16K pages
 constexpr int ConstFull = 0;           // 16 bytes of FULL
 constexpr int ConstCopy = 64;          // 64 bytes of COPY_BYTE
 constexpr int ConstOne = 128;          // the qword 1
+constexpr int ConstPattern = 256;      // TEAR tests: pattern k (1..4) is 32 bytes of 0x11 * k at 256 + 32 * (k - 1)
+constexpr int ConstLong = 0x8000;      // 32K of COPY_BYTE, the source of the long rep movsq tests
+constexpr uint64_t PATTERN = 0x1111'1111'1111'1111ULL;
 constexpr int Increments = 4; // locked operations per thread per iteration
 // Added by each locked increment. It changes both halves of a word that crosses 16 bytes
 // at its middle, so that two emulations' compare-and-swaps can interleave: without the
@@ -379,6 +432,10 @@ struct LitmusTest {
   // it is only reported. Break is set only where an M4 has been measured to show it.
   Expect Off = Expect::Break;
   Expect Scalar = Expect::Hold;
+  // With emulation on (--expect tso): Hold for every test whose forbidden outcome x86
+  // forbids; Either for the tests that only report something x86 allows (torn unaligned or
+  // 32-byte accesses, stores inside one rep seen out of order).
+  Expect On = Expect::Hold;
   std::function<int(const uint64_t* R0, const uint64_t* R1)> Classify;
   // Counting tests: checks the shared area after a run in which every thread did
   // `ThreadIterations` iterations in all; returns an empty string if it is right. A wrong
@@ -938,6 +995,425 @@ std::vector<LitmusTest> MakeTests() {
     T.push_back(std::move(t));
   }
 
+  // Tearing of 16- and 32-byte accesses (round 2, E3; the acceptance tests for splitting a
+  // vector access into 8-byte acquire loads or release stores). The writer stores patterns
+  // 1 to 4 in turn to one location (pattern k: every byte 0x11 * k); the reader reads it
+  // four times. x86 (Intel SDM vol. 3A, "Guaranteed Atomic Operations": processors with
+  // AVX carry out the 16-byte accesses of MOVDQA and friends atomically when 16-byte
+  // aligned) forbids a 16-byte aligned movdqa load that returns parts of two different
+  // stores. It does not promise that for an unaligned movdqu, nor for any 32-byte access:
+  // those tests only report (On = Either). The reader's first loads touch the line, so
+  // later loads may see the writer's stores in progress.
+  {
+    auto Pattern = [](int K) {
+      return ConstPattern + 32 * (K - 1);
+    };
+    // Index of a qword among the patterns: 0 for zero, k for pattern k, -1 otherwise.
+    auto Which = [](uint64_t V) {
+      if (V == 0) {
+        return 0;
+      }
+      for (int K = 1; K <= 4; ++K) {
+        if (V == PATTERN * K) {
+          return K;
+        }
+      }
+      return -1;
+    };
+    const std::vector<std::string> TearLabels = {"one value seen", "values changed, none torn", "torn", "unexpected value"};
+    // Groups of qwords that were read by one access: torn if they do not agree.
+    auto TearClassify = [Which](const uint64_t* R, int Reads, int Qwords) {
+      bool Changed = false, Torn = false;
+      int First = Which(R[0]);
+      for (int i = 0; i < Reads; ++i) {
+        const int Lead = Which(R[i * Qwords]);
+        for (int q = 0; q < Qwords; ++q) {
+          const int W = Which(R[i * Qwords + q]);
+          if (W < 0) {
+            return 3;
+          }
+          Torn |= W != Lead;
+        }
+        Changed |= Lead != First;
+      }
+      return Torn ? 2 : (Changed ? 1 : 0);
+    };
+    auto Tear = [&](const char* Name, const char* Desc, int32_t Off, int Bytes, bool Aligned) {
+      LitmusTest t {Name, Desc, D};
+      t.Labels = TearLabels;
+      t.Forbidden = {2, 3};
+      t.Interleaved = {1};
+      t.Reset = {D.X, D.X + 8, D.X + 16, D.X + 24, D.X + 32, D.X + 40};
+      t.Pre = [](Asm& A, int Role) {
+        WarmData(A, Role, D.X);
+      };
+      t.Body = [Off, Bytes, Aligned, Pattern](Asm& A, int Role) {
+        if (Role == 0) {
+          for (int K = 1; K <= 4; ++K) {
+            if (Bytes == 32) {
+              A.VmovdquLoad(0, R8, Pattern(K));
+              A.VmovdquStore(RBX, Off, 0);
+            } else {
+              A.MovdquLoad(0, R8, Pattern(K));
+              Aligned ? A.MovdqaStore(RBX, Off, 0) : A.MovdquStore(RBX, Off, 0);
+            }
+          }
+        } else {
+          for (int i = 0; i < (Bytes == 32 ? 2 : 4); ++i) {
+            if (Bytes == 32) {
+              A.VmovdquLoad(1, RBX, Off);
+              A.VmovdquStore(R12, i * 32, 1);
+            } else {
+              Aligned ? A.MovdqaLoad(1, RBX, Off) : A.MovdquLoad(1, RBX, Off);
+              A.MovdquStore(R12, i * 16, 1);
+            }
+          }
+        }
+      };
+      t.Classify = [TearClassify, Bytes](const uint64_t*, const uint64_t* R1) {
+        return TearClassify(R1, Bytes == 32 ? 2 : 4, Bytes / 8);
+      };
+      if (!Aligned || Bytes == 32) {
+        t.On = t.Off = t.Scalar = Expect::Either;
+      } else {
+        // Measured on the M4 before and after: see the round 2 report.
+        t.Off = t.Scalar = Expect::Either;
+      }
+      return t;
+    };
+    T.push_back(Tear("TEAR-sse", "16-byte aligned movdqa stores read by movdqa loads: no torn read", D.X, 16, true));
+    T.push_back(Tear("TEAR-sse-unaligned", "movdqu at +8 (crosses 16 bytes): torn reads only reported", D.X + 8, 16, false));
+    T.push_back(Tear("TEAR-avx", "32-byte vmovdqu stores and loads: torn reads only reported", D.X, 32, true));
+
+    // The store side alone: aligned movdqa stores, read by two ordered qword loads, low then
+    // high and high then low. An atomic 16-byte store cannot be seen half done by ordered
+    // loads: once one half of store k is seen, a later load of the other half sees store k
+    // or a later one. (Splitting the store into two release stores, low first, allows "low
+    // newer than high" to be seen by a high-then-low reader.)
+    {
+      LitmusTest t {"TEAR-sse-st", "movdqa stores read by ordered qword loads: never one half older than the half read before it", D};
+      t.Labels = TearLabels;
+      t.Labels[2] = "half older than the half read first";
+      t.Forbidden = {2, 3};
+      t.Interleaved = {1};
+      t.Reset = {D.X, D.X + 8};
+      t.Pre = [](Asm& A, int Role) {
+        WarmData(A, Role, D.X);
+      };
+      t.Body = [Pattern](Asm& A, int Role) {
+        if (Role == 0) {
+          for (int K = 1; K <= 4; ++K) {
+            A.MovdquLoad(0, R8, Pattern(K));
+            A.MovdqaStore(RBX, D.X, 0);
+          }
+        } else {
+          // (low, high) twice, then (high, low) twice; results in read order.
+          for (int i = 0; i < 4; ++i) {
+            const bool HighFirst = i >= 2;
+            A.Load(RAX, RBX, D.X + (HighFirst ? 8 : 0));
+            A.Load(RDX, RBX, D.X + (HighFirst ? 0 : 8));
+            A.Store(R12, i * 16, RAX);
+            A.Store(R12, i * 16 + 8, RDX);
+          }
+        }
+      };
+      t.Classify = [Which](const uint64_t*, const uint64_t* R1) {
+        bool Changed = false, Older = false;
+        for (int i = 0; i < 8; ++i) {
+          const int W = Which(R1[i]);
+          if (W < 0) {
+            return 3;
+          }
+          Changed |= W != Which(R1[0]);
+        }
+        for (int i = 0; i < 4; ++i) {
+          Older |= Which(R1[i * 2 + 1]) < Which(R1[i * 2]);
+        }
+        return Older ? 2 : (Changed ? 1 : 0);
+      };
+      t.Off = t.Scalar = Expect::Either;
+      T.push_back(std::move(t));
+    }
+
+    // The load side alone: the writer stores the low then the high qword of each pattern
+    // (ordered scalar stores); the reader's aligned movdqa loads must never return a high
+    // half newer than the low half (the high half of k is stored after the low half of
+    // k). Splitting the load into two acquire loads, low first, allows it.
+    {
+      LitmusTest t {"TEAR-sse-ld", "qword stores low then high, read by movdqa: never the high half newer than the low", D};
+      t.Labels = TearLabels;
+      t.Labels[2] = "high half newer than low";
+      t.Forbidden = {2, 3};
+      t.Interleaved = {1};
+      t.Reset = {D.X, D.X + 8};
+      t.Pre = [](Asm& A, int Role) {
+        WarmData(A, Role, D.X);
+      };
+      t.Body = [](Asm& A, int Role) {
+        if (Role == 0) {
+          for (int K = 1; K <= 4; ++K) {
+            A.MovImm(RAX, PATTERN * K);
+            A.Store(RBX, D.X, RAX);
+            A.Store(RBX, D.X + 8, RAX);
+          }
+        } else {
+          for (int i = 0; i < 4; ++i) {
+            A.MovdqaLoad(1, RBX, D.X);
+            A.MovdquStore(R12, i * 16, 1);
+          }
+        }
+      };
+      t.Classify = [Which](const uint64_t*, const uint64_t* R1) {
+        bool Changed = false, Newer = false;
+        for (int i = 0; i < 8; ++i) {
+          const int W = Which(R1[i]);
+          if (W < 0) {
+            return 3;
+          }
+          Changed |= W != Which(R1[0]);
+        }
+        for (int i = 0; i < 4; ++i) {
+          Newer |= Which(R1[i * 2 + 1]) > Which(R1[i * 2]);
+        }
+        return Newer ? 2 : (Changed ? 1 : 0);
+      };
+      t.Off = Expect::Either; // the writer's stores are plain with emulation off
+      t.Scalar = Expect::Either;
+      T.push_back(std::move(t));
+    }
+  }
+
+  // Message passing with 32-byte AVX data and flag on both sides (vector-to-vector order
+  // of 32-byte accesses, which the core makes of two 16-byte halves).
+  {
+    auto t = MP("MP-avx", "message passing, 32-byte vmovdqu data and flag, both sides");
+    t.Reset = {D.X, D.X + 8, D.X + 16, D.X + 24, D.Y, D.Y + 8, D.Y + 16, D.Y + 24};
+    t.Pre = [](Asm& A, int Role) {
+      WarmData(A, Role, D.X);
+    };
+    t.Body = [](Asm& A, int Role) {
+      if (Role == 0) {
+        A.VmovdquLoad(0, R8, ConstPattern);
+        A.VmovdquStore(RBX, D.X, 0);
+        A.VmovdquStore(RBX, D.Y, 0);
+      } else {
+        A.VmovdquLoad(1, RBX, D.Y);
+        A.VmovdquLoad(2, RBX, D.X);
+        A.VmovdquStore(R12, 0, 1);
+        A.VmovdquStore(R12, 32, 2);
+      }
+    };
+    t.Scalar = Expect::Break;
+    t.Classify = [](const uint64_t*, const uint64_t* R1) {
+      return StateAll({R1[0], R1[1], R1[2], R1[3]}, PATTERN) * 3 + StateAll({R1[4], R1[5], R1[6], R1[7]}, PATTERN);
+    };
+    T.push_back(std::move(t));
+  }
+
+  // String operations longer than a page (Intel SDM vol. 3A, "Memory-Ordering Model for
+  // String Operations on Write-Back (WB) Memory": stores within one string operation may be
+  // seen out of order, but string operations are not reordered with other stores, and all
+  // stores of an earlier string operation complete before any store of a later one). Data
+  // of 20K (crossing 4K guest pages and the 16K host page at 16384) in 64K slots, sampled
+  // at its first qword, either side of the 16K boundary and its last qword. Thread 0
+  // clears the data of the slot two ahead with rep stosq before the barrier (ordered by
+  // the barrier's mfence in every mode).
+  {
+    constexpr Layout L {65536, 4, 0, 32768};
+    constexpr int32_t LongBytes = 20480;
+    constexpr int32_t Scratch = 40960; // reader's copy, in its own slot area
+    auto ClearAhead = [](Asm& A, int Role) {
+      if (Role == 0) {
+        // rax holds the slot two ahead (BuildProgram), before Reset is applied.
+        A.Mov(RDI, RAX);
+        A.MovImm(RAX, 0);
+        A.MovImm(RCX, LongBytes / 8);
+        A.RepStosq();
+      }
+      // The reader keeps stale copies of the lines it samples.
+      for (int32_t Off : {0, 16376, 16384, LongBytes - 8}) {
+        WarmData(A, Role, Off);
+      }
+    };
+    // Loads the flag into rax with LoadFlag, once on even iterations and, on odd ones,
+    // again and again (at most 65536 times) until it is non-zero: the odd iterations read
+    // the data just after the flag appears, where reordering shows; the even ones overlap
+    // the writer at any point. rdx counts.
+    auto FlagThen = [](Asm& A, const std::function<void(Asm&)>& LoadFlag) {
+      A.Mov(RDX, R15);
+      A.AluImm(AND, RDX, 1);
+      A.Shl(RDX, 16);
+      A.Inc(RDX);
+      const size_t Loop = A.Here();
+      LoadFlag(A);
+      A.Test(RAX, RAX);
+      const size_t Got = A.JccFwd(CC_NZ);
+      A.Dec32(RDX);
+      A.JccBack(CC_NZ, Loop);
+      A.Bind(Got);
+    };
+    auto Samples = [](Asm& A, int Base, int32_t Off) {
+      // flag already in rax; data samples at 0, 16376, 16384, LongBytes - 8.
+      A.Load(RDX, Base, Off + 0);
+      A.Load(RCX, Base, Off + 16376);
+      A.Load(RSI, Base, Off + 16384);
+      A.Load(RDI, Base, Off + LongBytes - 8);
+      A.Store(R12, 0, RAX);
+      A.Store(R12, 8, RDX);
+      A.Store(R12, 16, RCX);
+      A.Store(R12, 24, RSI);
+      A.Store(R12, 32, RDI);
+    };
+    auto Classify = [](uint64_t Value) {
+      return [Value](const uint64_t*, const uint64_t* R1) {
+        return State(R1[0], 1) * 3 + StateAll({R1[1], R1[2], R1[3], R1[4]}, Value);
+      };
+    };
+    auto Long = [&](const char* Name, const char* Desc) {
+      auto t = MP(Name, Desc, L);
+      t.Reset = {L.Y};
+      t.Pre = ClearAhead;
+      t.IterationDivisor = 20;
+      return t;
+    };
+    {
+      auto t = Long("MP-stosq-long", "message passing, 20K of data by rep stosq, flag by rep stosq");
+      t.Body = [Samples, FlagThen](Asm& A, int Role) {
+        if (Role == 0) {
+          A.MovImm(RAX, STOS_VALUE);
+          A.Mov(RDI, RBX);
+          A.MovImm(RCX, LongBytes / 8);
+          A.RepStosq();
+          RepStosqTo(A, L.Y, 1, 1);
+        } else {
+          FlagThen(A, [](Asm& A) { A.Load(RAX, RBX, L.Y); });
+          Samples(A, RBX, 0);
+        }
+      };
+      t.Scalar = Expect::Break;
+      t.Classify = Classify(STOS_VALUE);
+      T.push_back(std::move(t));
+    }
+    {
+      auto t = Long("MP-movsq-long", "message passing, 20K of data by rep movsq, flag by rep movsq");
+      t.Body = [Samples, FlagThen](Asm& A, int Role) {
+        if (Role == 0) {
+          A.Mov(RSI, R8);
+          A.AluImm(ADD, RSI, ConstLong);
+          A.Mov(RDI, RBX);
+          A.MovImm(RCX, LongBytes / 8);
+          A.RepMovsq();
+          A.Mov(RSI, R8);
+          A.AluImm(ADD, RSI, ConstOne);
+          A.Mov(RDI, RBX);
+          A.AluImm(ADD, RDI, L.Y);
+          A.MovImm(RCX, 1);
+          A.RepMovsq();
+        } else {
+          FlagThen(A, [](Asm& A) { A.Load(RAX, RBX, L.Y); });
+          Samples(A, RBX, 0);
+        }
+      };
+      t.Scalar = Expect::Break;
+      t.Classify = Classify(COPY_BYTE * FULL);
+      T.push_back(std::move(t));
+    }
+    {
+      auto t = Long("MP-movsq-long-read", "message passing, scalar flag after 20K rep stosq; reader copies flag and data with rep movsq");
+      t.Body = [Samples, FlagThen](Asm& A, int Role) {
+        if (Role == 0) {
+          A.MovImm(RAX, STOS_VALUE);
+          A.Mov(RDI, RBX);
+          A.MovImm(RCX, LongBytes / 8);
+          A.RepStosq();
+          A.StoreImm(RBX, L.Y, 1);
+        } else {
+          // Copy the flag, then the data, into the reader's scratch area of the slot.
+          FlagThen(A, [](Asm& A) {
+            A.Mov(RSI, RBX);
+            A.AluImm(ADD, RSI, L.Y);
+            A.Mov(RDI, RBX);
+            A.AluImm(ADD, RDI, Scratch - 8);
+            A.MovImm(RCX, 1);
+            A.RepMovsq();
+            A.Load(RAX, RBX, Scratch - 8);
+          });
+          A.Mov(RSI, RBX);
+          A.Mov(RDI, RBX);
+          A.AluImm(ADD, RDI, Scratch);
+          A.MovImm(RCX, LongBytes / 8);
+          A.RepMovsq();
+          A.Load(RAX, RBX, Scratch - 8);
+          Samples(A, RBX, Scratch);
+        }
+      };
+      // Architecturally breakable with string ordering off (plain loads may pass each
+      // other), but not seen on an M4 in either mode (MP-movsb-read2 does break): reported.
+      t.Off = t.Scalar = Expect::Either;
+      t.Classify = Classify(STOS_VALUE);
+      T.push_back(std::move(t));
+    }
+    {
+      // A store before a long string operation: no store of the string may be seen
+      // before it (Intel's "String Operations Are not Reordered with Earlier Stores").
+      // The reader reads the string's last qword, then the earlier store.
+      auto t = Long("MP-before-stosq-long", "scalar store, then 20K rep stosq; the string's last qword seen means the store is seen");
+      t.Body = [FlagThen](Asm& A, int Role) {
+        if (Role == 0) {
+          A.StoreImm(RBX, L.Y, 1);
+          A.MovImm(RAX, STOS_VALUE);
+          A.Mov(RDI, RBX);
+          A.MovImm(RCX, LongBytes / 8);
+          A.RepStosq();
+        } else {
+          FlagThen(A, [](Asm& A) { A.Load(RAX, RBX, LongBytes - 8); });
+          A.Load(RDX, RBX, L.Y);
+          A.Store(R12, 0, RAX);
+          A.Store(R12, 8, RDX);
+        }
+      };
+      // Outcome as MP with the string's last qword as the flag and the store as the data.
+      t.Classify = [](const uint64_t*, const uint64_t* R1) {
+        return State(R1[0], STOS_VALUE) * 3 + State(R1[1], 1);
+      };
+      // A plain store after a release store may pass it architecturally; not seen on an M4
+      // with string ordering off or scalar only (MP-flag-stosq, the short form, is the same).
+      t.Off = t.Scalar = Expect::Either;
+      T.push_back(std::move(t));
+    }
+    {
+      // Stores inside one string operation seen out of order: allowed by x86 for fast
+      // strings (Intel SDM vol. 1, "Fast-String Operation"; vol. 3A, Example "Stores
+      // Within a String Operation May be Reordered"), so reported only, in every mode.
+      // The reader reads the last qword, then the first.
+      LitmusTest t {"REP-order-within", "one 20K rep stosq: last qword seen before the first (allowed by x86, reported only)", L};
+      t.Labels = {"last=0 first=0", "last=0 first=set", "last=set first=0", "last=set first=set"};
+      t.Forbidden = {2};
+      t.Interleaved = {1};
+      t.Reset = {L.Y};
+      t.Pre = ClearAhead;
+      t.IterationDivisor = 20;
+      t.Body = [FlagThen](Asm& A, int Role) {
+        if (Role == 0) {
+          A.MovImm(RAX, STOS_VALUE);
+          A.Mov(RDI, RBX);
+          A.MovImm(RCX, LongBytes / 8);
+          A.RepStosq();
+        } else {
+          FlagThen(A, [](Asm& A) { A.Load(RAX, RBX, LongBytes - 8); });
+          A.Load(RDX, RBX, 0);
+          A.Store(R12, 0, RAX);
+          A.Store(R12, 8, RDX);
+        }
+      };
+      t.Classify = [](const uint64_t*, const uint64_t* R1) {
+        return int(R1[0] == STOS_VALUE) * 2 + int(R1[1] == STOS_VALUE);
+      };
+      t.On = t.Off = t.Scalar = Expect::Either;
+      T.push_back(std::move(t));
+    }
+  }
+
   // Misaligned message passing. Both data and flag are full qwords written and read at
   // misaligned addresses. With emulation on, these accesses take an alignment fault.
   auto Unaligned = [](const char* Name, const char* Desc, Layout L, int32_t DataOff, int32_t FlagOff) {
@@ -1243,9 +1719,36 @@ std::vector<LitmusTest> MakeTests() {
         A.Store(R12, 8, RDX);
       }
     };
-    // Not measured to break with emulation off or scalar only: reported there.
-    t.Off = Expect::Either;
+    // Breaks with emulation off (measured on the M4); with scalar ordering only the
+    // scalar store's release does not order the later plain vector store: reported.
     t.Scalar = Expect::Either;
+    t.Classify = [](const uint64_t*, const uint64_t* R1) {
+      return State(R1[0], FULL) * 3 + State(R1[1], FULL);
+    };
+    T.push_back(std::move(t));
+  }
+  // MP-sd: 8-byte vector-register accesses (movsd) for data and flag, both sides: with
+  // VECTORTSOSPLIT=3 each is one acquire load or release store through a general register.
+  {
+    auto t = MP("MP-sd", "message passing, movsd data and movsd flag, both sides");
+    t.Reset = {D.X, D.Y};
+    t.Pre = [](Asm& A, int Role) {
+      WarmData(A, Role, D.X);
+    };
+    t.Body = [](Asm& A, int Role) {
+      if (Role == 0) {
+        A.MovsdLoad(0, R8, ConstFull);
+        A.MovsdStore(RBX, D.X, 0);
+        A.MovsdStore(RBX, D.Y, 0);
+      } else {
+        A.MovsdLoad(1, RBX, D.Y);
+        A.MovsdLoad(2, RBX, D.X);
+        A.MovsdStore(R12, 0, 1);
+        A.MovsdStore(R12, 8, 2);
+      }
+    };
+    // Measured on the M4 to break with emulation off and with scalar ordering only.
+    t.Scalar = Expect::Break;
     t.Classify = [](const uint64_t*, const uint64_t* R1) {
       return State(R1[0], FULL) * 3 + State(R1[1], FULL);
     };
@@ -1491,10 +1994,37 @@ struct {
   std::vector<const GuestThread*> Threads;
 } Progress;
 
+// The quality of service of every guest thread (--qos). macOS has no way to pin a thread to
+// a core: user-interactive (the default) makes the scheduler prefer the performance cores
+// and not park the thread; background keeps it on the efficiency cores, provided no
+// higher-priority thread blocks waiting for it (a thread waiting in pthread_join lends its
+// priority to the thread it waits for, which then ran on the performance cores on the
+// M4; the main thread therefore waits by polling, see WaitForGuests).
+qos_class_t GuestQos = QOS_CLASS_USER_INTERACTIVE;
+// The CPU numbers (pthread_cpu_number_np) guest threads were seen on, bit per CPU, sampled
+// when a thread starts and when it returns from the guest.
+std::atomic<uint64_t> CpusSeen {};
+
+void NoteCpu() {
+  size_t Cpu = 0;
+  if (pthread_cpu_number_np(&Cpu) == 0 && Cpu < 64) {
+    CpusSeen.fetch_or(1ULL << Cpu, std::memory_order_relaxed);
+  }
+}
+
+std::string CpuList(uint64_t Mask) {
+  std::string S;
+  for (int c = 0; c < 64; ++c) {
+    if (Mask & (1ULL << c)) {
+      S += (S.empty() ? "" : ",") + std::to_string(c);
+    }
+  }
+  return S.empty() ? "none" : S;
+}
+
 void RunGuest(fexmac_context* Context, GuestThread* Self) {
-  // macOS has no way to pin a thread to a core. Ask for the highest quality of service so
-  // the scheduler prefers performance cores and does not park the thread.
-  pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+  pthread_set_qos_class_self_np(GuestQos, 0);
+  NoteCpu();
   Self->Handle = pthread_self();
 
   pthread_setspecific(ThreadIndexKey, reinterpret_cast<void*>(static_cast<uintptr_t>(Self->Index + 1)));
@@ -1523,6 +2053,7 @@ void RunGuest(fexmac_context* Context, GuestThread* Self) {
   fexmac_stop Stop;
   fexmac_stop_init(&Stop);
   const fexmac_result Result = fexmac_thread_run(Thread, &Stop);
+  NoteCpu();
   Self->Stage = 3;
 
   // Each guest loop ends at its hlt.
@@ -1563,6 +2094,7 @@ struct Options {
   unsigned Groups = 0;
   bool Soak = false;
   bool List = false;
+  qos_class_t Qos = QOS_CLASS_USER_INTERACTIVE;
   std::vector<std::string> Only;
   // --option NAME=VALUE: further fexmac options, after the three ordering switches.
   std::vector<std::pair<std::string, std::string>> Extra;
@@ -1572,7 +2104,7 @@ struct Options {
 void Usage() {
   fprintf(stderr, "usage: FEXCoreOrderingTest [--tso on|off|scalar] [--expect tso|weak|scalar|report] [--iterations N] [--runs R]\n"
                   "                           [--groups G] [--soak] [--only name[,name...]] [--list]\n"
-                  "                           [--option NAME=VALUE]...\n");
+                  "                           [--qos interactive|utility|background] [--option NAME=VALUE]...\n");
   _exit(2);
 }
 
@@ -1617,6 +2149,17 @@ Options Parse(int argc, char** argv) {
       O.Runs = static_cast<unsigned>(strtoul(Next().c_str(), nullptr, 0));
     } else if (A == "--groups") {
       O.Groups = static_cast<unsigned>(strtoul(Next().c_str(), nullptr, 0));
+    } else if (A == "--qos") {
+      const auto V = Next();
+      if (V == "interactive") {
+        O.Qos = QOS_CLASS_USER_INTERACTIVE;
+      } else if (V == "utility") {
+        O.Qos = QOS_CLASS_UTILITY;
+      } else if (V == "background") {
+        O.Qos = QOS_CLASS_BACKGROUND;
+      } else {
+        Usage();
+      }
     } else if (A == "--soak") {
       O.Soak = true;
     } else if (A == "--list") {
@@ -1647,6 +2190,42 @@ Options Parse(int argc, char** argv) {
     O.Want = O.Mode == Options::TSO::On ? Options::Expect::TSO : (O.Mode == Options::TSO::Off ? Options::Expect::Weak : Options::Expect::Scalar);
   }
   return O;
+}
+
+// Clock frequency seen by a thread of the guests' QoS class: 64 dependent adds per loop
+// turn, one cycle each on Apple's performance and efficiency cores. Run on its own thread,
+// waited for by polling (see GuestQos). Returns GHz and the CPU number it ended on.
+std::pair<double, int> CalibrateAtGuestQos() {
+  std::atomic<int> Done {};
+  double GHz = 0;
+  int Cpu = -1;
+  std::thread T([&] {
+    pthread_set_qos_class_self_np(GuestQos, 0);
+#if defined(__aarch64__)
+    auto Run = [](uint64_t N) {
+      const auto T0 = std::chrono::steady_clock::now();
+      uint64_t X = 0;
+      for (uint64_t i = 0; i < N; ++i) {
+        __asm__ volatile(".rept 64\nadd %0, %0, #1\n.endr\n" : "+r"(X));
+      }
+      return std::chrono::duration<double, std::nano>(std::chrono::steady_clock::now() - T0).count();
+    };
+    Run(2'000'000); // ramp up
+    for (int i = 0; i < 20; ++i) {
+      GHz = std::max(GHz, 64.0 * 100'000 / Run(100'000));
+    }
+#endif
+    size_t C = 0;
+    if (pthread_cpu_number_np(&C) == 0) {
+      Cpu = static_cast<int>(C);
+    }
+    Done = 1;
+  });
+  while (!Done.load()) {
+    usleep(1000);
+  }
+  T.join();
+  return {GHz, Cpu};
 }
 
 unsigned HostCPUs() {
@@ -1687,6 +2266,14 @@ int main(int argc, char** argv) {
   if ((fexmac_version() >> 16) != FEXMAC_VERSION_MAJOR) {
     fprintf(stderr, "FAIL: fexmac version %x, built against %x\n", fexmac_version(), FEXMAC_VERSION);
     return 1;
+  }
+  GuestQos = Opt.Qos;
+  const char* QosName = Opt.Qos == QOS_CLASS_BACKGROUND ? "background" : (Opt.Qos == QOS_CLASS_UTILITY ? "utility" : "user-interactive");
+  {
+    const auto [GHz, Cpu] = CalibrateAtGuestQos();
+    printf("guest threads: QoS %s; a thread of that class measured %.2f GHz (best of 20) on CPU %d\n"
+           "  (on the M4 Mac mini: CPUs 0-5 are efficiency cores, at most about 2.9 GHz; 6-9 performance cores, about 4.4 GHz)\n",
+           QosName, GHz, Cpu);
   }
   const bool ScalarTSO = Opt.Mode != Options::TSO::Off;
   const bool OtherTSO = Opt.Mode == Options::TSO::On;
@@ -1789,6 +2376,7 @@ int main(int argc, char** argv) {
 
   const auto Start = std::chrono::steady_clock::now();
   int Failures = 0;
+  uint64_t AllCpus = 0;
 
   for (auto& T : Tests) {
     if (!Opt.Only.empty() && std::find(Opt.Only.begin(), Opt.Only.end(), T.Name) == Opt.Only.end()) {
@@ -1797,6 +2385,7 @@ int main(int argc, char** argv) {
     const uint64_t Iterations = std::max<uint64_t>(16, AllIterations / T.IterationDivisor);
     const auto TestStart = std::chrono::steady_clock::now();
     const uint64_t FaultsBefore = AlignmentFaults.load();
+    const uint64_t CpusBefore = CpusSeen.exchange(0);
     ResetFaultSites();
     std::vector<uint64_t> Counts(T.Labels.size(), 0);
     bool Broken = false;
@@ -1863,6 +2452,10 @@ int main(int argc, char** argv) {
         memcpy(Shared + ConstFull + i * 8, &FULL, 8);
       }
       memset(Shared + ConstCopy, COPY_BYTE, 64);
+      for (int k = 1; k <= 4; ++k) {
+        memset(Shared + ConstPattern + 32 * (k - 1), 0x11 * k, 32);
+      }
+      memset(Shared + ConstLong, COPY_BYTE, SHARED_SIZE - ConstLong);
       const uint64_t One = 1;
       memcpy(Shared + ConstOne, &One, 8);
       if (T.InitShared) {
@@ -1934,6 +2527,12 @@ int main(int argc, char** argv) {
       for (auto& GT : Threads) {
         Host.emplace_back(RunGuest, Context, &GT);
       }
+      // Poll instead of blocking in join (see GuestQos), then join the finished threads.
+      for (auto& GT : Threads) {
+        while (GT.Stage.load() < 4) {
+          usleep(500);
+        }
+      }
       for (auto& H : Host) {
         H.join();
       }
@@ -1999,7 +2598,7 @@ int main(int argc, char** argv) {
     // have seen some instruction fault on more than one thread at once.
     const bool NeedConcurrentFaults = T.PatchedPerRun && Opt.Mode == Options::TSO::On && Groups >= 2;
     const auto [MostThreadsAtOneSite, FaultingSites] = FaultSiteSummary();
-    const Expect Required = Opt.Want == Options::Expect::TSO    ? Expect::Hold :
+    const Expect Required = Opt.Want == Options::Expect::TSO    ? T.On :
                             Opt.Want == Options::Expect::Weak   ? T.Off :
                             Opt.Want == Options::Expect::Scalar ? T.Scalar :
                                                                   Expect::Either;
@@ -2049,10 +2648,14 @@ int main(int argc, char** argv) {
       printf("    misaligned-access faults handled: %llu over %u runs, at %zu instructions, up to %d distinct threads at one\n",
              static_cast<unsigned long long>(Faults), RunLimit, FaultingSites, MostThreadsAtOneSite);
     }
-    printf("    %s, %.1fs\n", Verdict.c_str(), Seconds);
+    const uint64_t TestCpus = CpusSeen.load();
+    CpusSeen.fetch_or(CpusBefore);
+    AllCpus |= TestCpus;
+    printf("    %s, %.1fs, guest threads on CPUs %s\n", Verdict.c_str(), Seconds, CpuList(TestCpus).c_str());
   }
 
   const double Total = std::chrono::duration<double>(std::chrono::steady_clock::now() - Start).count();
+  printf("guest threads (QoS %s) ran on CPUs %s\n", QosName, CpuList(AllCpus).c_str());
   printf("%s: emulation %s, %d test(s) failed, %.1fs\n", Failures ? "FAIL" : "PASS", ModeName, Failures, Total);
   fflush(stdout);
   _exit(Failures ? 1 : 0);

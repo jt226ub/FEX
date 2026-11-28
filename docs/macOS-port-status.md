@@ -461,6 +461,28 @@ pass it by the architecture but has not been seen to on the M4. `--expect scalar
 default with `--tso scalar`) requires each of those named tests to break and the rest to
 hold, so a sub-setting that stopped ordering its accesses would be noticed.
 
+**Round 2 additions** (acceptance tests for the ordering-speed experiments; M4, default
+run, numbers in the round 2 report). Tearing: `TEAR-sse` (aligned `movdqa` stores read by
+`movdqa`), `TEAR-sse-st` (the store side: `movdqa` stores read by ordered qword loads) and
+`TEAR-sse-ld` (the load side: ordered qword stores read by `movdqa`) must show no torn
+16-byte access with emulation on, since x86 processors with AVX carry out aligned 16-byte
+`movdqa` accesses atomically (Intel SDM vol. 3A, "Guaranteed Atomic Operations"); they hold
+today in every mode, and fail with a deliberately broken build that splits a vector TSO
+access into two 8-byte acquire loads or release stores. `TEAR-sse-unaligned` and `TEAR-avx`
+only report (x86 does not promise atomicity there; 32-byte accesses tear today, being two
+16-byte halves). `MP-avx`: message passing with 32-byte `vmovdqu` data and flag (breaks
+with scalar only). Strings longer than a page (20K, across 4K guest pages and the 16K host
+page): `MP-stosq-long`, `MP-movsq-long` (break with scalar only), `MP-movsq-long-read` and
+`MP-before-stosq-long` (hold; not seen to break on the M4 with the setting off, so they
+only report there), and `REP-order-within`, which only reports a string's last store seen
+before its first (allowed by x86 for fast strings, Intel SDM vol. 3A, "Memory-Ordering
+Model for String Operations on Write-Back (WB) Memory"). `--qos background` runs every
+guest thread at background QoS, which kept them on the efficiency cores (CPUs 0 to 5 on the
+M4; the tool prints the CPU numbers each test's threads ran on and a calibration
+frequency); the main thread waits for guest threads by polling, because a thread blocked
+in `pthread_join` lends its priority to the thread it waits for, which then ran on the
+performance cores.
+
 The default run (`FEXCoreOrderingTest`, emulation on, 3.2 million tries per litmus test)
 takes about 15 seconds, of which the counting tests are about 10: every locked operation
 on a misaligned operand is a fault. `--tso off` and `--tso scalar` take the same. All three run

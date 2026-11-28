@@ -444,7 +444,11 @@ do the same. FEX is faster than Rosetta 2 at full precision, and much faster wit
 ### Candidates (recorded, not done in this package)
 
 - Use FEAT_LRCPC3 RCpc vector loads and stores for vector ordering where the host has
-  them (the core does not support them yet; no Apple chip so far has them).
+  them (the core does not support them yet). The M4 measured here does not report the
+  feature (`sysctl hw.optional.arm.FEAT_LRCPC3`: unknown oid, macOS 27.0.1); other Apple
+  chips were not checked. The port's macOS feature detection asks for it and records it
+  without using it (`fexmac_hook_test host-features-rcpc` prints the value), so a host
+  that has it would be noticed.
 - Cheaper vector ordering on hosts without them: drop a `dmb ishld` that is followed by
   a `dmb ish` with no memory access between them (`copy_loop`'s block has this pattern),
   and merge barriers between consecutive vector accesses where x86 ordering allows it.

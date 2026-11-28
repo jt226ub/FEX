@@ -74,6 +74,10 @@ FEXMAC_EXPORT void fexmac_testing_log(const char* message);
  * claiming hardware x86 memory ordering; instructions forced to TSO. */
 FEXMAC_EXPORT fexmac_result fexmac_testing_add_thunk_trampoline(fexmac_context* context, uint64_t entry, uint64_t target);
 FEXMAC_EXPORT fexmac_result fexmac_testing_set_hardware_tso(fexmac_context* context, int supported);
+
+/* The RCPC levels the context's host features record (FEAT_LRCPC, FEAT_LRCPC2,
+ * FEAT_LRCPC3), each 0 or 1. LRCPC3 is recorded only; no code uses it. */
+FEXMAC_EXPORT fexmac_result fexmac_testing_rcpc_features(fexmac_context* context, int* rcpc, int* rcpc2, int* rcpc3);
 FEXMAC_EXPORT fexmac_result fexmac_testing_force_tso(fexmac_context* context, uint64_t begin, uint64_t end, uint64_t instruction);
 
 /* Called (NULL to stop) where the core reports guest code it starts executing, which is

@@ -21,6 +21,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/sysctl.h>
 #include <unistd.h>
 
 /* A bug inside the library's handler (the hook writes to an inaccessible page) must
@@ -839,6 +840,30 @@ static void TestMisalignedBlocksSignals(void) {
 }
 
 #define MAP_FAILED_TEXT(MiB) "Couldn't make a " MiB " MiB code buffer: couldn't allocate the executable (MAP_JIT) memory (errno 12)"
+/* The RCPC levels the host features record must be what the kernel reports
+ * (hw.optional.arm.FEAT_LRCPC*; a name the kernel does not know counts as absent). LRCPC3
+ * is detection only (no code uses it); this is where its value is shown. */
+static int SysctlFlag(const char* Name, int* Present) {
+  int32_t Value = 0;
+  size_t Size = sizeof(Value);
+  *Present = sysctlbyname(Name, &Value, &Size, NULL, 0) == 0;
+  return *Present && Value != 0;
+}
+
+static void TestRcpcFeatures(void) {
+  fexmac_context* Context = CreateContext(NULL, NULL);
+  int Got[3] = {-1, -1, -1};
+  Check(fexmac_testing_rcpc_features(Context, &Got[0], &Got[1], &Got[2]) == FEXMAC_OK, "rcpc features query");
+  static const char* Names[3] = {"hw.optional.arm.FEAT_LRCPC", "hw.optional.arm.FEAT_LRCPC2", "hw.optional.arm.FEAT_LRCPC3"};
+  for (int i = 0; i < 3; ++i) {
+    int Present = 0;
+    const int Want = SysctlFlag(Names[i], &Present);
+    printf("    %s: sysctl %s, host features %d\n", Names[i], Present ? (Want ? "1" : "0") : "not present", Got[i]);
+    Check(Got[i] == Want, "%s: host features %d, sysctl %d", Names[i], Got[i], Want);
+  }
+  fexmac_context_destroy(Context);
+}
+
 #define OVERRUN_TEXT "fexmac: SIGBUS: write past the end of a code buffer, at address 0x"
 
 static const struct Subtest Subtests[] = {
@@ -867,6 +892,7 @@ static const struct Subtest Subtests[] = {
   {"code-buffer-fill-random", TestCodeBufferFillRandom, 0, NULL, NULL, 0},
   {"code-buffer-first-fails", TestCodeBufferFirstFails, 0, MAP_FAILED_TEXT("16"), "guard page", 1},
   {"code-buffer-later-fails-dies", TestCodeBufferLaterFailsDies, SIGILL, MAP_FAILED_TEXT("32"), "guard page", 1},
+  {"host-features-rcpc", TestRcpcFeatures, 0, NULL, NULL, 0},
 };
 
 int main(int argc, char** argv) {
