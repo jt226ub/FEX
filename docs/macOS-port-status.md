@@ -517,13 +517,21 @@ by `fexmac`. Neither is the default, and nothing changes without them.
 - `TSOBARRIERMERGE` (`EmitVectorTSOBarrier`, `IsBarrierTransparentOp`). A vector load's
   trailing `dmb ishld` is dropped (turned into a `nop`, or replaced in place when adjacent)
   when the next vector store's leading `dmb ish` follows in the same block with only
-  register-only IR ops between: a fixed list of ALU and vector arithmetic ops, none of
-  which accesses memory, branches, calls or can fault; anything else, and every block
-  start, ends the chance. The single `dmb ish` then sits between the load and the store
+  register-only IR ops between: a fixed list (ops that emit no code, such as
+  `KeepFlagsLive`, and ALU, flag-setting, bitfield, guest-address-constant and vector
+  arithmetic ops), none of which accesses memory, branches, calls or can fault; anything
+  else, and every block start, ends the chance. (Without `KeepFlagsLive`, which the port
+  puts before every instruction that can fault, a diagnostic build showed the merge almost
+  never firing.) The single `dmb ish` then sits between the load and the store
   with no memory access between it and either, so it orders the load (and everything
   earlier) before the store (and everything later), which is both barriers' obligation.
   Two loads still need a barrier each; a store's `dmb ish` is never merged with anything
-  after it (a store is a memory access).
+  after it (a store is a memory access). `MP-sse-merge2` (vector data store, vector load,
+  vector flag store, read by scalar loads) fails when the merged barrier is removed
+  altogether; a deliberately too weak merged barrier (`dmb ishld` instead of `dmb ish`)
+  was not caught in 16 million tries: on the M4 that barrier also kept the two stores in
+  order, which the architecture does not promise (DMB LD orders reads before later
+  accesses only). The choice of `dmb ish` rests on the Arm ARM text, not on a test.
 
 The ordering argument, what was measured and the commands are in the round 2 report (task
 E2) and `docs/macOS-benchmarks.md` ("Candidates"). Tests: `fexmac_c_test vector-tso-forms`
