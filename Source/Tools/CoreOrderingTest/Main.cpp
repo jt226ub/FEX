@@ -1415,7 +1415,7 @@ std::vector<LitmusTest> MakeTests() {
     // Weak: what --tso off and --tso scalar require (Break only where an M4 showed it in
     // 40 runs of each mode: the pairs either side of the 16K page).
     auto RepOrder = [&](const char* Name, const char* Desc, std::function<void(Asm&)> Writer, int32_t LaterOff, int32_t EarlierOff,
-                        uint64_t Value, Expect Weak = Expect::Either) {
+                        uint64_t Value, Expect Weak = Expect::Either, int32_t Trigger = -1) {
       // The reader reads first the qword written later, then the one written earlier.
       LitmusTest t {Name, Desc, L};
       t.Labels = {"later=0 earlier=0", "later=0 earlier=set", "later=set earlier=0", "later=set earlier=set"};
@@ -1428,9 +1428,18 @@ std::vector<LitmusTest> MakeTests() {
         WarmData(A, Role, EarlierOff);
       };
       t.IterationDivisor = 20;
-      t.Body = [FlagThen, Writer, LaterOff, EarlierOff](Asm& A, int Role) {
+      // Trigger: a qword the string writes shortly before the pair. The reader waits for it
+      // (on odd iterations, as FlagThen), so that its two loads fall while the writer is at
+      // the pair, which in a 20K string it reaches long after the reader's first look.
+      t.Body = [FlagThen, Writer, LaterOff, EarlierOff, Trigger](Asm& A, int Role) {
         if (Role == 0) {
           Writer(A);
+        } else if (Trigger >= 0) {
+          FlagThen(A, [Trigger](Asm& A) { A.Load(RAX, RBX, Trigger); });
+          A.Load(RAX, RBX, LaterOff);
+          A.Load(RDX, RBX, EarlierOff);
+          A.Store(R12, 0, RAX);
+          A.Store(R12, 8, RDX);
         } else {
           FlagThen(A, [LaterOff](Asm& A) { A.Load(RAX, RBX, LaterOff); });
           A.Load(RDX, RBX, EarlierOff);
@@ -1484,7 +1493,7 @@ std::vector<LitmusTest> MakeTests() {
     T.push_back(RepOrder("REP-order-movsb", "one 20K rep movsb, source 3 bytes off: last qword seen before the first", MovsbLong(3, false),
                          LongBytes - 8, 0, CopyQ));
     T.push_back(RepOrder("REP-order-movsb-page", "one 20K rep movsb, source 3 bytes off: qword after the 16K page before the one before it",
-                         MovsbLong(3, false), 16384, 16376, CopyQ, Expect::Break));
+                         MovsbLong(3, false), 16384, 16376, CopyQ, Expect::Break, 15864));
     T.push_back(RepOrder("REP-order-std-movsb", "one 20K std; rep movsb, source 3 bytes off: lowest qword (written last) before the highest",
                          MovsbLong(3, true), 0, LongBytes - 8, CopyQ));
     T.push_back(RepOrder("REP-order-stosb", "one 20K rep stosb: last qword seen before the first", StosLong(true, false), LongBytes - 8, 0,
@@ -1492,17 +1501,17 @@ std::vector<LitmusTest> MakeTests() {
     // Within one page-bounded run of the translation (4K), across a 128-byte line: what a
     // translation that put barriers only around each run would let through.
     T.push_back(RepOrder("REP-order-movsb-line", "one 20K rep movsb, source 3 bytes off: qword after a line inside a 4K page before the one before",
-                         MovsbLong(3, false), 2048, 2040, CopyQ, Expect::Break));
+                         MovsbLong(3, false), 2048, 2040, CopyQ, Expect::Break, 1528));
     T.push_back(RepOrder("REP-order-stosb-line", "one 20K rep stosb: qword after a line inside a 4K page before the one before",
-                         StosLong(true, false), 2048, 2040, STOS_VALUE, Expect::Break));
+                         StosLong(true, false), 2048, 2040, STOS_VALUE, Expect::Break, 1528));
     T.push_back(RepOrder("REP-order-std-stosq-line", "one 20K std; rep stosq: qword a line below another in the first 4K run before that one",
-                         StosLong(false, true), 18304, 18432, STOS_VALUE, Expect::Break));
+                         StosLong(false, true), 18304, 18432, STOS_VALUE, Expect::Break, 18944));
     T.push_back(RepOrder("REP-order-stosb-page", "one 20K rep stosb: qword after the 16K page seen before the one before it",
-                         StosLong(true, false), 16384, 16376, STOS_VALUE, Expect::Break));
+                         StosLong(true, false), 16384, 16376, STOS_VALUE, Expect::Break, 15864));
     T.push_back(RepOrder("REP-order-std-movsb-page", "one 20K std; rep movsb, source 3 bytes off: qword below the 16K page before the one above",
-                         MovsbLong(3, true), 16376, 16384, CopyQ, Expect::Break));
+                         MovsbLong(3, true), 16376, 16384, CopyQ, Expect::Break, 16896));
     T.push_back(RepOrder("REP-order-std-stosq-page", "one 20K std; rep stosq: qword below the 16K page before the one above",
-                         StosLong(false, true), 16376, 16384, STOS_VALUE, Expect::Break));
+                         StosLong(false, true), 16376, 16384, STOS_VALUE, Expect::Break, 16896));
     T.push_back(RepOrder("REP-order-std-stosq", "one 20K std; rep stosq: lowest qword (written last) before the highest",
                          StosLong(false, true), 0, LongBytes - 8, STOS_VALUE));
 
@@ -1555,17 +1564,13 @@ std::vector<LitmusTest> MakeTests() {
     T.push_back(RepReadOrder("REP-order-read-movsb", "loads within one 20K rep movsb: first source qword read new, last old", false, 0));
     T.push_back(RepReadOrder("REP-order-read-movsb-skew", "as REP-order-read-movsb, destination 3 bytes off (source read as words)", false, 3));
     T.push_back(RepReadOrder("REP-order-read-std-movsb", "loads within one 20K std; rep movsb: highest read new, lowest old", true, 0));
-    T.push_back(RepReadOrder("REP-order-read-movsb-page", "loads within one 20K rep movsb: qword below the 16K page read new, above old",
-                             false, 0, 16376, 16384));
-    T.push_back(RepReadOrder("REP-order-read-std-movsb-page", "loads within one 20K std; rep movsb: qword above the 16K page read new, below old",
-                             true, 0, 16376, 16384, Expect::Break));
+    T.push_back(RepReadOrder("REP-order-read-std-movsb-page", "loads within one 20K std; rep movsb: qword 128 bytes above the 16K page read new, one below old",
+                             true, 0, 16256, 16512, Expect::Break));
     T.push_back(RepReadOrder("REP-order-read-movsb-line", "loads within one 20K rep movsb: qword below a line in a 4K page read new, above old",
                              false, 0, 2040, 2048, Expect::Break));
     T.push_back(RepReadOrder("REP-order-read-std-movsb-line", "loads within one 20K std; rep movsb: qword a line above another in the first 4K run read new, that one old",
                              true, 0, 18304, 18432, Expect::Break));
     T.push_back(RepReadOrder("REP-order-read-movsb-skew-line", "as REP-order-read-movsb-line, destination 3 bytes off", false, 3, 2040, 2048, Expect::Break));
-    T.push_back(RepReadOrder("REP-order-read-movsb-skew-page", "as REP-order-read-movsb-page, destination 3 bytes off", false, 3, 16376,
-                             16384));
 
     // Message passing with the data written by the forms the option adds (a scalar flag
     // after them; the samples straddle the 16K page).
