@@ -762,6 +762,10 @@ static void TestErrors(void) {
     {"MULTIBLOCK", "2", "boolean that is not 0 or 1"},
     {"MULTIBLOCK", "true", "boolean spelt true"},
     {"VECTORTSOSPLIT", "32", "mask above 31"},
+    {"VECTORTSOSPLIT", "15", "16-byte halves (not atomic): testing build only"},
+    {"VECTORTSOSPLIT", "4", "16-byte loads as halves: testing build only"},
+    {"VECTORTSOSPLIT", "8", "16-byte stores as halves: testing build only"},
+    {"VECTORTSOSPLIT", "19", "aligned-forms bit: testing build only"},
     {"VECTORTSOSPLIT", "03", "mask with a leading zero"},
     {"TSOBARRIERMERGE", "yes", "boolean spelt yes"},
     {"SMCCHECKS", "sometimes", "unknown named value"},
@@ -787,7 +791,7 @@ static void TestErrors(void) {
   /* After all those failures, a good configuration still works. */
   fexmac_option Good[] = {{"SMCCHECKS", "full"}, {"MaxInst", "0x100"}, {"MULTIBLOCK", "0"}, {"HOSTFEATURES", "disablesve,disablefrintts"},
                           {"HostFeatures", "off"},
-                          {"VECTORTSOSPLIT", "31"}, {"TSOBarrierMerge", "0"}};
+                          {"VECTORTSOSPLIT", "3"}, {"TSOBarrierMerge", "0"}};
   fexmac_config_init(&Config);
   Config.options = Good;
   Config.option_count = sizeof(Good) / sizeof(Good[0]);

@@ -866,6 +866,42 @@ static void TestRcpcFeatures(void) {
 
 #define OVERRUN_TEXT "fexmac: SIGBUS: write past the end of a code buffer, at address 0x"
 
+/* VECTORTSOSPLIT bits 4, 8 and 16 (16-byte vector accesses as two 8-byte halves: not
+ * atomic, a measured experiment) are accepted only by this testing build; the production
+ * library refuses them (fexmac_c_test errors). Here they are accepted and give the right
+ * results for a misaligned 16-byte copy (movdqu load and store, every misalignment). */
+static void TestVectorSplit16TestingOnly(void) {
+  fexmac_install_fault_handlers();
+  static const uint8_t Program[] = {
+    0xF3, 0x0F, 0x6F, 0x07, /* movdqu xmm0, [rdi] */
+    0xF3, 0x0F, 0x7F, 0x06, /* movdqu [rsi], xmm0 */
+    0xF4,                   /* hlt */
+  };
+  const fexmac_option Options[] = {{"TSOENABLED", "1"}, {"VECTORTSOENABLED", "1"}, {"VECTORTSOSPLIT", "15"}};
+  uint8_t* Code = MapGuestMemory(0x10000);
+  uint8_t* Data = MapGuestMemory(0x10000);
+  memcpy(Code, Program, sizeof(Program));
+  for (int i = 0; i < 64; ++i) {
+    Data[i] = (uint8_t)(i * 13 + 7);
+  }
+  fexmac_context* Context = CreateContextWithOptions(Options, 3, NULL, NULL);
+  fexmac_thread* Thread = CreateThreadAt(Context, (uint64_t)(uintptr_t)Code, 0);
+  int Right = 0;
+  for (int Mis = 0; Mis < 16; ++Mis) {
+    memset(Data + 0x1000, 0, 64);
+    fexmac_x86_state State = GetState(Thread);
+    State.rip = (uint64_t)(uintptr_t)Code;
+    State.gpr[RDI] = (uint64_t)(uintptr_t)Data + Mis;
+    State.gpr[RSI] = (uint64_t)(uintptr_t)Data + 0x1000 + 15 - Mis;
+    SetState(Thread, &State);
+    const fexmac_stop Stop = Run(Thread);
+    Right += Stop.reason == FEXMAC_STOP_HALT && !memcmp(Data + 0x1000 + 15 - Mis, Data + Mis, 16);
+  }
+  Check(Right == 16, "VECTORTSOSPLIT=15 accepted by the testing build; %d of 16 misaligned copies right", Right);
+  fexmac_thread_destroy(Thread);
+  fexmac_context_destroy(Context);
+}
+
 static const struct Subtest Subtests[] = {
   {"guest-load-callret-low-guard", TestGuestLoadCallRetLowGuard, 0, NULL, "fexmac:", 2},
   {"guest-store-callret-high-guard", TestGuestStoreCallRetHighGuard, 0, NULL, "fexmac:", 2},
@@ -893,6 +929,7 @@ static const struct Subtest Subtests[] = {
   {"code-buffer-first-fails", TestCodeBufferFirstFails, 0, MAP_FAILED_TEXT("16"), "guard page", 1},
   {"code-buffer-later-fails-dies", TestCodeBufferLaterFailsDies, SIGILL, MAP_FAILED_TEXT("32"), "guard page", 1},
   {"host-features-rcpc", TestRcpcFeatures, 0, NULL, NULL, 0},
+  {"vector-split16-testing-only", TestVectorSplit16TestingOnly, 0, NULL, "fexmac:", 0},
 };
 
 int main(int argc, char** argv) {

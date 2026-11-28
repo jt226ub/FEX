@@ -774,9 +774,9 @@ DEF_OP(LoadMemPair) {
 // load is followed by DMB ISHLD, a store preceded by DMB ISH. With VectorTSOSplit the
 // access goes through general registers instead, as acquire loads (LDAPUR) and release
 // stores (STLUR) of at most 8 bytes, which is what the scalar path uses:
-//   load,  1/2/4/8 bytes:  LDAPUR{B,H,,} tmp; [NOP]; FMOV s/d, tmp
+//   load,  4/8 bytes:      LDAPUR w/x tmp; NOP; FMOV s/d, tmp
 //   load,  16 bytes:       LDAPUR x, [a]; NOP; LDAPUR x', [a+8]; NOP; FMOV d, x; INS v.d[1], x'
-//   store, 1/2/4/8 bytes:  UMOV/FMOV tmp, v; [NOP]; STLUR{B,H,,} tmp
+//   store, 4/8 bytes:      FMOV tmp, v; NOP; STLUR w/x tmp
 //   store, 16 bytes:       if [a, a+16) crosses a 4K boundary: DMB ISH; STR q (as without
 //                          the option); otherwise FMOV x, d; UMOV x', v.d[1];
 //                          NOP; STLUR x', [a+8]; NOP; STLUR x, [a]   (upper half first)
@@ -800,6 +800,13 @@ DEF_OP(LoadMemPair) {
 bool Arm64JITCore::UseVectorTSOSplit(IR::OpSize AccessSize, IR::OpSize Align, bool IsStore) const {
   const uint8_t Mode = CTX->Config.VectorTSOSplit();
   if (!Mode || !CTX->IsVectorAtomicTSOEnabled() || !CTX->HostFeatures.SupportsTSOImm9 || AccessSize > IR::OpSize::i128Bit) {
+    return false;
+  }
+  if (AccessSize < IR::OpSize::i32Bit) {
+    // 1- and 2-byte vector-register accesses reach LoadMemTSO/StoreMemTSO from no x86
+    // instruction found (pinsrb/pextrb/pinsrw/pextrw use VLoadVectorElement and
+    // VStoreVectorElement, which keep their barriers), so they keep the barrier form
+    // rather than an untested split path.
     return false;
   }
   if (AccessSize <= IR::OpSize::i64Bit) {
@@ -831,11 +838,16 @@ Arm64JITCore::SplitTSOAddress(ARMEmitter::Register Base, IR::OrderedNodeWrapper 
   }
   uint64_t Const;
   if (IsInlineConstant(Offset, &Const)) {
+    // A constant offset is used unscaled, as GenerateMemOperand (the barrier form) uses it;
+    // ApplyMemOperand would shift it by OffsetScale.
     const int64_t Imm = static_cast<int64_t>(Const);
     const int64_t Last = Imm + (Span > 8 ? Span - 8 : 0);
     if (Imm >= -256 && Last <= 255) {
       return {Base, static_cast<int32_t>(Imm)};
     }
+    LoadConstant(ARMEmitter::Size::i64Bit, Tmp, Const);
+    add(ARMEmitter::Size::i64Bit, Tmp, Base, Tmp);
+    return {Tmp, 0};
   }
   return {ApplyMemOperand(AccessSize, Base, Tmp, Offset, OffsetType, OffsetScale), 0};
 }
@@ -1018,16 +1030,6 @@ DEF_OP(LoadMemTSO) {
     const auto [Base, Imm] =
       SplitTSOAddress(MemReg, Op->Offset, Op->OffsetType, Op->OffsetScale, IR::OpSizeToSize(OpSize), OpSize, TMP1);
     switch (OpSize) {
-    case IR::OpSize::i8Bit:
-      ldapurb(TMP2, Base, Imm);
-      fmov(ARMEmitter::Size::i32Bit, Dst.S(), TMP2.W());
-      break;
-    case IR::OpSize::i16Bit:
-      ldapurh(TMP2, Base, Imm);
-      // Half-barrier once back-patched.
-      nop();
-      fmov(ARMEmitter::Size::i32Bit, Dst.S(), TMP2.W());
-      break;
     case IR::OpSize::i32Bit:
       ldapur(TMP2.W(), Base, Imm);
       nop();
@@ -2066,16 +2068,6 @@ DEF_OP(StoreMemTSO) {
     const auto [Base, Imm] =
       SplitTSOAddress(MemReg, Op->Offset, Op->OffsetType, Op->OffsetScale, IR::OpSizeToSize(OpSize), OpSize, TMP1);
     switch (OpSize) {
-    case IR::OpSize::i8Bit:
-      umov<ARMEmitter::SubRegSize::i8Bit>(TMP2, Src, 0);
-      stlurb(TMP2, Base, Imm);
-      break;
-    case IR::OpSize::i16Bit:
-      umov<ARMEmitter::SubRegSize::i16Bit>(TMP2, Src, 0);
-      // Half-barrier once back-patched.
-      nop();
-      stlurh(TMP2, Base, Imm);
-      break;
     case IR::OpSize::i32Bit:
       fmov(ARMEmitter::Size::i32Bit, TMP2.W(), Src.S());
       nop();

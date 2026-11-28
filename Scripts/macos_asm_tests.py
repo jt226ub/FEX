@@ -42,8 +42,7 @@ MODES = {
 # 2 vector-ordering experiments on (VECTORTSOSPLIT, TSOBARRIERMERGE); run them with --modes.
 DEFAULT_MODES = list(MODES)
 for _name, _extra in (("split", {"FEX_VECTORTSOSPLIT": "3"}), ("merge", {"FEX_TSOBARRIERMERGE": "1"}),
-                      ("split_merge", {"FEX_VECTORTSOSPLIT": "3", "FEX_TSOBARRIERMERGE": "1"}),
-                      ("split16", {"FEX_VECTORTSOSPLIT": "15"})):
+                      ("split_merge", {"FEX_VECTORTSOSPLIT": "3", "FEX_TSOBARRIERMERGE": "1"})):
     MODES["jit_500_tso_" + _name] = {**MODES["jit_500_tso"], **_extra}
 # The self-modifying-code mode is stated: none for every test but the SelfModifyingCode
 # ones (full, or mtrack with --smc), so results do not follow fexmac's default (which

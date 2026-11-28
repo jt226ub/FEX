@@ -332,10 +332,10 @@ private:
 
   // Vector memory-ordering emulation (MemoryOps.cpp).
   //
-  // VectorTSOSplit: a vector TSO access of 1 to 16 bytes as acquire loads or release
+  // VectorTSOSplit: a vector TSO access of 4 to 16 bytes as acquire loads or release
   // stores of at most 8 bytes through general registers (FEAT_LRCPC2's LDAPUR/STLUR),
   // instead of a plain access and a barrier.
-  // VectorTSOSplit bits. 1, 2: loads, stores of 1 to 8 bytes (one access each, atomic).
+  // VectorTSOSplit bits. 1, 2: loads, stores of 4 or 8 bytes (one access each, atomic).
   // 4, 8: 16-byte loads, stores as two 8-byte halves (NOT atomic). 16: with 4 or 8,
   // accesses by instructions that require 16-byte alignment keep the barrier form.
   static constexpr uint8_t VECTOR_TSO_SPLIT_LOADS = 1;

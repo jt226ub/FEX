@@ -127,11 +127,8 @@ CONFIGS["tso_on_merge"] = ({**BASE, **TSO_ALL, "TSOBARRIERMERGE": "1"}, {},
                            "as tso_on, a vector load's barrier merged into the next vector store's (TSOBARRIERMERGE)")
 CONFIGS["tso_on_fp64_merge"] = ({**BASE, **TSO_ALL, "VECTORTSOSPLIT": "3", "TSOBARRIERMERGE": "1"}, {},
                                 "as tso_on, with VECTORTSOSPLIT=3 and TSOBARRIERMERGE")
-# Recorded, not proposed: 16-byte accesses as two 8-byte halves break x86's aligned
-# 16-byte atomicity (the TEAR tests of FEXCoreOrderingTest see torn values).
-CONFIGS["tso_on_split16"] = ({**BASE, **TSO_ALL, "VECTORTSOSPLIT": "15"}, {},
-                             "as tso_on, every vector access split, 16 bytes as two 8-byte halves (VECTORTSOSPLIT=15; "
-                             "not atomic, dropped)")
+# Not here: 16-byte accesses as two 8-byte halves (VECTORTSOSPLIT=15), measured in round
+# 2 and dropped (not atomic); the production library refuses those bits.
 # Round 2, E2: string instructions in 8-byte acquire/release units (MEMCPYSETTSOWIDE).
 CONFIGS["tso_on_wide"] = ({**BASE, **TSO_ALL, "MEMCPYSETTSOWIDE": "1"}, {},
                           "as tso_on, with rep movs/stos in 8-byte acquire loads and release stores")
@@ -140,8 +137,7 @@ CONFIGS["tso_memcpy_wide"] = ({**BASE, "TSOENABLED": "1", "VECTORTSOENABLED": "0
 # The recommended set of round 2 options together.
 CONFIGS["tso_on_r2"] = ({**BASE, **TSO_ALL, "VECTORTSOSPLIT": "3", "TSOBARRIERMERGE": "1", "MEMCPYSETTSOWIDE": "1"}, {},
                         "as tso_on, with VECTORTSOSPLIT=3, TSOBARRIERMERGE and MEMCPYSETTSOWIDE (the round 2 set)")
-E2_CONFIGS = ["tso_on", "tso_on_fp64", "tso_on_merge", "tso_on_fp64_merge", "tso_on_wide", "tso_on_r2", "tso_on_split16",
-              "tso_scalar"]
+E2_CONFIGS = ["tso_on", "tso_on_fp64", "tso_on_merge", "tso_on_fp64_merge", "tso_on_wide", "tso_on_r2", "tso_scalar"]
 CONFIGS["tso_on_cache_cold"] = (CONFIGS["tso_on"][0], {}, "as tso_on, with the code cache on in a fresh, empty directory "
                                  "for every launch: everything is compiled and written to the cache")
 CONFIGS["tso_on_cache_warm"] = (CONFIGS["tso_on"][0], {}, "as tso_on, with the code cache on in a directory one run "

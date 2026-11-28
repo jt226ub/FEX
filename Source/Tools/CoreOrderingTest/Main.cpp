@@ -240,6 +240,29 @@ struct Asm {
   void FldQ(int Base, int32_t Disp) {
     X87Mem(0xDD, 0, Base, Disp);
   }
+  // pextrd m32, xmm, 0 (66 0F 3A 16 /r 0) and pinsrd xmm, m32, 0 (66 0F 3A 22 /r 0):
+  // element stores and loads (VStoreVectorElement / VLoadVectorElement in the core).
+  void PextrdStore(int Base, int32_t Disp, int X) {
+    U8(0x66);
+    Rex(false, X, Base);
+    U8(0x0F);
+    U8(0x3A);
+    U8(0x16);
+    Mem(X, Base, Disp);
+    U8(0);
+  }
+  void PinsrdLoad(int X, int Base, int32_t Disp) {
+    U8(0x66);
+    Rex(false, X, Base);
+    U8(0x0F);
+    U8(0x3A);
+    U8(0x22);
+    Mem(X, Base, Disp);
+    U8(0);
+  }
+  void FstQ(int Base, int32_t Disp) {
+    X87Mem(0xDD, 2, Base, Disp);
+  }
   void FstpQ(int Base, int32_t Disp) {
     X87Mem(0xDD, 3, Base, Disp);
   }
@@ -2216,6 +2239,136 @@ std::vector<LitmusTest> MakeTests() {
     t.Scalar = Expect::Either;
     t.Classify = [](const uint64_t*, const uint64_t* R1) {
       return State(R1[0], 1) * 3 + State(R1[1], 1);
+    };
+    T.push_back(std::move(t));
+  }
+  // From the independent review of the round 2 vector changes (adopted as written,
+  // with this tool's helpers):
+  // MP-merge-rload: the reader's vector flag load is followed by a scalar data load and
+  // then a vector store. If the merge treated the scalar load as transparent, the flag
+  // load's DMB ISHLD would move after the data load (ldr q; ldapur; dmb ish). A build with
+  // OP_LOADMEMTSO in IsBarrierTransparentOp passed every other test; this one failed.
+  {
+    auto t = MP("MP-merge-rload", "message passing, scalar stores; SSE flag load, scalar data load, SSE store");
+    t.Reset = {D.X, D.Y, D.Y + 8};
+    t.Pre = [](Asm& A, int Role) {
+      WarmData(A, Role, D.X);
+    };
+    t.Body = [](Asm& A, int Role) {
+      if (Role == 0) {
+        A.MovImm(RAX, FULL);
+        A.Store(RBX, D.X, RAX);
+        A.Store(RBX, D.Y, RAX);
+      } else {
+        A.MovdquLoad(1, RBX, D.Y);
+        A.Load(RDX, RBX, D.X);
+        A.MovdquStore(R12, 0, 1);
+        A.Store(R12, 16, RDX);
+      }
+    };
+    t.Scalar = Expect::Either;
+    t.Classify = [](const uint64_t*, const uint64_t* R1) {
+      return State(R1[0], FULL) * 3 + State(R1[2], FULL);
+    };
+    T.push_back(std::move(t));
+  }
+  // MP-sd-mis: movsd data and flag each crossing 16 bytes (+12), both sides. With
+  // VECTORTSOSPLIT=3 every access takes the alignment fault once and is rewritten.
+  {
+    auto t = MP("MP-sd-mis", "message passing, movsd data and flag across 16 bytes, both sides");
+    t.Reset = {D.X + 8, D.X + 16, D.Y, D.Y + 8};
+    t.Pre = [](Asm& A, int Role) {
+      WarmData(A, Role, D.X + 8);
+    };
+    t.Body = [](Asm& A, int Role) {
+      if (Role == 0) {
+        A.MovsdLoad(0, R8, ConstFull);
+        A.MovsdStore(RBX, D.X + 12, 0);
+        A.MovsdStore(RBX, D.Y + 4, 0);
+      } else {
+        A.MovsdLoad(1, RBX, D.Y + 4);
+        A.MovsdLoad(2, RBX, D.X + 12);
+        A.MovsdStore(R12, 0, 1);
+        A.MovsdStore(R12, 8, 2);
+      }
+    };
+    t.Scalar = Expect::Either;
+    t.Classify = [](const uint64_t*, const uint64_t* R1) {
+      return State(R1[0], FULL) * 3 + State(R1[1], FULL);
+    };
+    T.push_back(std::move(t));
+  }
+  // MP-x87: data and flag written by x87 stores (fst m64; fstp m64), read by scalar loads.
+  {
+    auto t = MP("MP-x87", "message passing, x87 fst data and fstp flag; scalar loads");
+    t.Reset = {D.X, D.Y};
+    t.Pre = [](Asm& A, int Role) {
+      WarmData(A, Role, D.X);
+    };
+    t.Body = [](Asm& A, int Role) {
+      if (Role == 0) {
+        A.FldQ(R8, ConstFull);
+        A.FstQ(RBX, D.X);
+        A.FstpQ(RBX, D.Y);
+      } else {
+        A.Load(RAX, RBX, D.Y);
+        A.Load(RDX, RBX, D.X);
+        A.Store(R12, 0, RAX);
+        A.Store(R12, 8, RDX);
+      }
+    };
+    t.Scalar = Expect::Either;
+    t.Classify = [](const uint64_t*, const uint64_t* R1) {
+      return State(R1[0], FULL) * 3 + State(R1[1], FULL);
+    };
+    T.push_back(std::move(t));
+  }
+  // Element stores and loads to memory (pextrd, pinsrd): ordered by their barriers.
+  {
+    auto t = MP("MP-pextrd", "message passing, pextrd data and flag, scalar loads");
+    t.Reset = {D.X, D.Y};
+    t.Pre = [](Asm& A, int Role) {
+      WarmData(A, Role, D.X);
+    };
+    t.Body = [](Asm& A, int Role) {
+      if (Role == 0) {
+        A.MovdquLoad(0, R8, ConstFull);
+        A.PextrdStore(RBX, D.X, 0);
+        A.PextrdStore(RBX, D.Y, 0);
+      } else {
+        A.Load(RAX, RBX, D.Y);
+        A.Load(RDX, RBX, D.X);
+        A.Store(R12, 0, RAX);
+        A.Store(R12, 8, RDX);
+      }
+    };
+    t.Scalar = Expect::Either;
+    t.Classify = [](const uint64_t*, const uint64_t* R1) {
+      return State(R1[0], FULL & 0xFFFFFFFFULL) * 3 + State(R1[1], FULL & 0xFFFFFFFFULL);
+    };
+    T.push_back(std::move(t));
+  }
+  {
+    auto t = MP("MP-pinsrd", "message passing, scalar stores, pinsrd flag then pinsrd data");
+    t.Reset = {D.X, D.Y};
+    t.Pre = [](Asm& A, int Role) {
+      WarmData(A, Role, D.X);
+    };
+    t.Body = [](Asm& A, int Role) {
+      if (Role == 0) {
+        A.MovImm(RAX, FULL);
+        A.Store(RBX, D.X, RAX);
+        A.Store(RBX, D.Y, RAX);
+      } else {
+        A.PinsrdLoad(1, RBX, D.Y);
+        A.PinsrdLoad(2, RBX, D.X);
+        A.MovdquStore(R12, 0, 1);
+        A.MovdquStore(R12, 16, 2);
+      }
+    };
+    t.Scalar = Expect::Either;
+    t.Classify = [](const uint64_t*, const uint64_t* R1) {
+      return State(R1[0] & 0xFFFFFFFFULL, FULL & 0xFFFFFFFFULL) * 3 + State(R1[2] & 0xFFFFFFFFULL, FULL & 0xFFFFFFFFULL);
     };
     T.push_back(std::move(t));
   }

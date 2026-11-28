@@ -18,6 +18,7 @@
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <string>
 #include <string_view>
 
 namespace fexmac {
@@ -56,8 +57,9 @@ namespace {
     // with VECTORTSOENABLED): vector accesses as general-register acquire/release
     // accesses (a 16-byte access becomes two 8-byte ones), and merging of a vector load's
     // barrier with the next vector store's. VECTORTSOSPLIT is a mask: 1 loads, 2 stores of
-    // up to 8 bytes; 4 loads, 8 stores of 16 bytes as two halves (not atomic: experiment
-    // only); 16 keeps aligned-form 16-byte accesses whole. See
+    // up to 8 bytes; 4 loads, 8 stores of 16 bytes as two halves and 16 keeping
+    // aligned-form 16-byte accesses whole exist only in the testing build (not atomic:
+    // experiment only, refused below otherwise). See
     // docs/macOS-port-status.md.
     OPTION(VECTORTSOSPLIT, VectorTSOSplit, Mask5),
     OPTION(TSOBARRIERMERGE, TSOBarrierMerge, Bool),
@@ -246,6 +248,16 @@ fexmac_result ParseOptions(const fexmac_config& Config, ParsedOptions* Out) {
       return FEXMAC_ERROR_BAD_CONFIG;
     }
     auto Converted = Convert(*Info, Value);
+#ifndef FEXMAC_TESTING
+    // VECTORTSOSPLIT bits 4, 8 and 16 split 16-byte vector accesses into two 8-byte
+    // halves, which breaks the 16-byte atomicity x86 guarantees for aligned accesses
+    // (docs/macOS-port-status.md). Measured experiments only: accepted by the testing
+    // build (fexmac_testing), never by the library an embedder ships.
+    if (Converted && Info->Option == FEXCore::Config::CONFIG_VECTORTSOSPLIT && std::stoul(std::string(Converted->c_str())) > 3) {
+      ReportBadOption(Name, Value, "bits 4, 8 and 16 (16-byte accesses as two halves, not atomic) exist only in the testing build");
+      return FEXMAC_ERROR_BAD_CONFIG;
+    }
+#endif
     if (!Converted) {
       ReportBadOption(Name, Value, Info->Option == FEXCore::Config::CONFIG_IS64BIT_MODE ? "only 64-bit guests are supported on macOS" :
                                                                                          "value not valid for this option");
