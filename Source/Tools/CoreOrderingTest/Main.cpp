@@ -1727,6 +1727,35 @@ std::vector<LitmusTest> MakeTests() {
     };
     T.push_back(std::move(t));
   }
+  // MP-sse-merge2: as MP-sse-merge with the data written by a vector store, whose plain
+  // `str q` only the merged barrier orders before the flag's `str q`. (The M4 has not
+  // been seen to let a plain store pass an earlier release store, so MP-sse-merge alone
+  // does not show a merged barrier that is too weak; this one does.)
+  {
+    auto t = MP("MP-sse-merge2", "message passing, SSE data store, then SSE load and SSE flag store; scalar loads");
+    t.Reset = {D.X, D.X + 8, D.Y, D.Y + 8};
+    t.Pre = [](Asm& A, int Role) {
+      WarmData(A, Role, D.X);
+    };
+    t.Body = [](Asm& A, int Role) {
+      if (Role == 0) {
+        A.MovdquLoad(0, R8, ConstFull);
+        A.MovdquStore(RBX, D.X, 0);
+        A.MovdquLoad(1, R8, ConstFull);
+        A.MovdquStore(RBX, D.Y, 1);
+      } else {
+        A.Load(RAX, RBX, D.Y + 8);
+        A.Load(RDX, RBX, D.X + 8);
+        A.Store(R12, 0, RAX);
+        A.Store(R12, 8, RDX);
+      }
+    };
+    t.Scalar = Expect::Break;
+    t.Classify = [](const uint64_t*, const uint64_t* R1) {
+      return State(R1[0], FULL) * 3 + State(R1[1], FULL);
+    };
+    T.push_back(std::move(t));
+  }
   // MP-sd: 8-byte vector-register accesses (movsd) for data and flag, both sides: with
   // VECTORTSOSPLIT=3 each is one acquire load or release store through a general register.
   {

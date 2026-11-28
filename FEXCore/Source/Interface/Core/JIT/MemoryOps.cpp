@@ -878,6 +878,11 @@ bool Arm64JITCore::IsBarrierTransparentOp(IR::IROps Op) {
   // Ops whose code is register-only: no memory access (guest or host), no branch, no
   // call, nothing that can fault. Everything else ends a pending merge.
   switch (Op) {
+  // No code at all (JITDispatchOverride NoOp, or metadata). KeepFlagsLive marks the point
+  // before an instruction that can fault; the fault itself is on a memory access, which
+  // is not transparent.
+  case IR::OP_KEEPFLAGSLIVE:
+  case IR::OP_INVALIDATEFLAGS:
   case IR::OP_GUESTOPCODE:
   case IR::OP_CONSTANT:
   case IR::OP_INLINECONSTANT:
@@ -892,6 +897,12 @@ bool Arm64JITCore::IsBarrierTransparentOp(IR::IROps Op) {
   case IR::OP_LSHR:
   case IR::OP_ASHR:
   case IR::OP_ADDSHIFT:
+  case IR::OP_ADDWITHFLAGS:
+  case IR::OP_SUBWITHFLAGS:
+  case IR::OP_BFE:
+  case IR::OP_SBFE:
+  // A constant move of a guest address (with a relocation record for the code cache).
+  case IR::OP_ENTRYPOINTOFFSET:
   case IR::OP_MUL:
   case IR::OP_VMOV:
   case IR::OP_VECTORIMM:
@@ -926,7 +937,13 @@ bool Arm64JITCore::IsBarrierTransparentOp(IR::IROps Op) {
   case IR::OP_VUNZIP2:
   case IR::OP_VEXTR:
   case IR::OP_VDUPELEMENT:
-  case IR::OP_VINSELEMENT: return true;
+  case IR::OP_VINSELEMENT:
+  case IR::OP_VFADDSCALARINSERT:
+  case IR::OP_VFSUBSCALARINSERT:
+  case IR::OP_VFMULSCALARINSERT:
+  case IR::OP_VFDIVSCALARINSERT:
+  case IR::OP_VUMULL:
+  case IR::OP_VSMULL: return true;
   default: return false;
   }
 }
