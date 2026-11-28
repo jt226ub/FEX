@@ -12,6 +12,7 @@
 
 #include <inttypes.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -415,7 +416,12 @@ static void MarkSharedObserved(const fexmac_option* Options, size_t Count, int D
   }
   const uint64_t Before = HostReads(Data, 200000000, 1);
   if (Deferred) {
-    Check(Before > 0, "deferred: the host saw the guest's stores out of order (translation observably unordered)");
+    /* Report only (round 2 review): under load the hardware may not reorder within the
+     * bound, and a positive control that fails at random would fail the suite. The hard
+     * check that deferred code is unordered is FEXCoreOrderingSwitchTest's --mode off and
+     * --break runs. */
+    printf("    deferred: the host %s the guest's stores out of order in at most 200M reads%s\n", Before ? "saw" : "did not see",
+           Before ? " (translation observably unordered)" : " (report only)");
   } else {
     Check(Before == 0, "ordering on from the start: the host never saw the stores out of order");
   }
@@ -434,6 +440,105 @@ static void TestDeferredMarkShared(void) {
   InstallHandlers();
   MarkSharedObserved(DeferredOptions, COUNT(DeferredOptions), 1);
   MarkSharedObserved(OrderedOptions, COUNT(OrderedOptions), 0);
+}
+
+/* ---- fexmac_context_mark_memory_shared from a signal handler on the guest's host
+ * thread (round 2 review): the thread would be counted and wait for itself. BUSY. */
+static fexmac_context* SignalContext;
+static atomic_int SignalResult = -100;
+static void MarkFromSignal(int Signal) {
+  (void)Signal;
+  atomic_store(&SignalResult, (int)fexmac_context_mark_memory_shared(SignalContext));
+}
+static void TestDeferredMarkSharedSignal(void) {
+  InstallHandlers();
+  uint8_t* Mem = MapGuestMemory(0x8000);
+  memcpy(Mem, CountLoop, sizeof(CountLoop));
+  uint8_t* Data = Mem + 0x4000;
+  const uint64_t Base = (uint64_t)(uintptr_t)Mem;
+  SignalContext = CreateContextWithOptions(DeferredOptions, COUNT(DeferredOptions), NULL, NULL);
+  struct sigaction Action;
+  memset(&Action, 0, sizeof(Action));
+  Action.sa_handler = MarkFromSignal;
+  sigaction(SIGUSR1, &Action, NULL);
+  struct RunArgs A = {.Thread = ThreadAt(SignalContext, Base, Base + 0x4000)};
+  pthread_t Host;
+  pthread_create(&Host, NULL, RunWorker, &A);
+  while (Load64(Data, 0) < 100000) {
+  }
+  pthread_kill(Host, SIGUSR1);
+  while (atomic_load(&SignalResult) == -100) {
+  }
+  Check(atomic_load(&SignalResult) == FEXMAC_ERROR_BUSY, "from a signal handler on the running guest thread: BUSY (got %d), no hang",
+        atomic_load(&SignalResult));
+  Check(fexmac_context_ordering_deferred(SignalContext) == 1, "still deferred after the refused call");
+  CheckResult(fexmac_context_mark_memory_shared(SignalContext), FEXMAC_OK, "from the main thread: switched");
+  Store64(Data, 16, 1);
+  pthread_join(Host, NULL);
+  Check(A.Stop.reason == FEXMAC_STOP_HALT && GetState(A.Thread).gpr[RAX] == Load64(Data, 0), "the guest halts with the right count");
+  fexmac_thread_destroy(A.Thread);
+  fexmac_context_destroy(SignalContext);
+  munmap(Mem, 0x8000);
+}
+
+/* ---- a host write window from another thread ends the deferral (round 2 review) ----
+ * fexmac_memory_write_begin from a host thread that is not running a guest thread is the
+ * embedder writing guest memory concurrently. Opened while the guest runs: the switch is
+ * complete when it returns, and a host reader then never sees the guest's message-passing
+ * stores out of order. Opened while no guest thread runs and kept open: the run that
+ * starts meanwhile switches. Opened and closed with no guest thread running: nothing. */
+static void TestDeferredHostWriteWindow(void) {
+  InstallHandlers();
+  uint8_t* Mem = MapGuestMemory(0x8000);
+  memcpy(Mem, MPWriter, sizeof(MPWriter));
+  uint8_t* Data = Mem + 0x4000;
+  const uint64_t Base = (uint64_t)(uintptr_t)Mem;
+
+  /* 1. Begin and end with nothing running: still deferred. */
+  fexmac_context* Context = CreateContextWithOptions(DeferredOptions, COUNT(DeferredOptions), NULL, NULL);
+  CheckResult(fexmac_memory_map(Context, Base, 0x8000, FEXMAC_PROT_READ | FEXMAC_PROT_WRITE | FEXMAC_PROT_EXEC), FEXMAC_OK, "register");
+  CheckResult(fexmac_memory_write_begin(Context, Base + 0x4000, 0x4000), FEXMAC_OK, "write_begin, nothing running");
+  CheckResult(fexmac_memory_write_end(Context, Base + 0x4000, 0x4000), FEXMAC_OK, "write_end");
+  Check(fexmac_context_ordering_deferred(Context) == 1, "a window with no guest thread running keeps the deferral");
+
+  /* 2. Begin while the guest runs. */
+  struct RunArgs A = {.Thread = ThreadAt(Context, Base, Base + 0x4000)};
+  pthread_t Host;
+  pthread_create(&Host, NULL, RunWorker, &A);
+  while (Load64(Data, 0) < 10000) {
+  }
+  CheckResult(fexmac_memory_write_begin(Context, Base + 0x4000, 0x4000), FEXMAC_OK, "write_begin from the main thread while the guest runs");
+  Check(fexmac_context_ordering_deferred(Context) == 0, "the window ended the deferral before write_begin returned");
+  const uint64_t Bad = HostReads(Data, 50000000, ~0ull);
+  Check(Bad == 0, "inside the window: 0 of 50M host reads saw the guest's stores out of order (%" PRIu64 ")", Bad);
+  CheckResult(fexmac_memory_write_end(Context, Base + 0x4000, 0x4000), FEXMAC_OK, "write_end");
+  Store64(Data, 0x100, 1);
+  pthread_join(Host, NULL);
+  Check(A.Stop.reason == FEXMAC_STOP_HALT, "the guest halts");
+  fexmac_thread_destroy(A.Thread);
+  fexmac_context_destroy(Context);
+
+  /* 3. Begin with nothing running, then a run starts inside the window. */
+  Store64(Data, 0x100, 0);
+  Store64(Data, 0, 0);
+  Context = CreateContextWithOptions(DeferredOptions, COUNT(DeferredOptions), NULL, NULL);
+  CheckResult(fexmac_memory_map(Context, Base, 0x8000, FEXMAC_PROT_READ | FEXMAC_PROT_WRITE | FEXMAC_PROT_EXEC), FEXMAC_OK, "register");
+  CheckResult(fexmac_memory_write_begin(Context, Base + 0x4000, 0x4000), FEXMAC_OK, "write_begin, nothing running yet");
+  Check(fexmac_context_ordering_deferred(Context) == 1, "deferred while no guest thread runs");
+  struct RunArgs B = {.Thread = ThreadAt(Context, Base, Base + 0x4000)};
+  pthread_create(&Host, NULL, RunWorker, &B);
+  while (Load64(Data, 0) < 10000) {
+  }
+  Check(fexmac_context_ordering_deferred(Context) == 0, "a run started inside the window switched");
+  const uint64_t Bad2 = HostReads(Data, 50000000, ~0ull);
+  Check(Bad2 == 0, "0 of 50M host reads saw the stores out of order (%" PRIu64 ")", Bad2);
+  CheckResult(fexmac_memory_write_end(Context, Base + 0x4000, 0x4000), FEXMAC_OK, "write_end");
+  Store64(Data, 0x100, 1);
+  pthread_join(Host, NULL);
+  Check(B.Stop.reason == FEXMAC_STOP_HALT, "the guest halts");
+  fexmac_thread_destroy(B.Thread);
+  fexmac_context_destroy(Context);
+  munmap(Mem, 0x8000);
 }
 
 /* ---- the code cache: unordered and ordered translations never mix ---- */
@@ -630,6 +735,8 @@ const struct Subtest OrderingSubtests[] = {
   {"deferred-mark-shared", TestDeferredMarkShared, 0, NULL, NULL, 0},
   {"deferred-cache", TestDeferredCache, 0, NULL, NULL, 0},
   {"deferred-switch-races", TestDeferredSwitchRaces, 0, NULL, NULL, 0},
+  {"deferred-mark-shared-signal", TestDeferredMarkSharedSignal, 0, NULL, NULL, 0},
+  {"deferred-host-write-window", TestDeferredHostWriteWindow, 0, NULL, NULL, 0},
 #ifdef ORDERING_SWITCH_HOOKS
   {"deferred-broken-no-discard-mid-loop", TestBrokenNoDiscardMidLoop, 0, NULL, NULL, 0},
 #endif

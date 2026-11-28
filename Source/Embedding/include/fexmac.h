@@ -312,8 +312,14 @@ FEXMAC_EXPORT fexmac_result fexmac_after_fork(fexmac_context* context, int child
  * writing guest buffers natively), a device, or another process sharing the memory
  * (MAP_SHARED, shared memory objects). Call fexmac_context_mark_memory_shared before such
  * an agent can touch the memory. It returns once ordering is on and no guest thread can
- * run code made without it; it may be called from a system call callback, but not from
- * a signal handler or the log callback (FEXMAC_ERROR_BUSY). A no-op (FEXMAC_OK) if
+ * run code made without it; it may be called from a system call callback. From the log
+ * callback, and from a signal handler on a host thread that is running a guest thread
+ * (outside its callback), it returns FEXMAC_ERROR_BUSY; a signal handler on any other
+ * host thread must not call it (it takes locks; not detected). fexmac_memory_write_begin
+ * and _begin_ex called by a host thread that is not running a guest thread of the
+ * context count as declaring memory shared when a guest thread runs while the window is
+ * open: the switch is made (with the wait) before the begin returns if one is running,
+ * or when a run starts inside the window. A no-op (FEXMAC_OK) if
  * ordering is already on or was never deferred. While a running guest thread is waited
  * for it must reach its next check: within one translated block, one loop iteration or
  * 64 elements of a `rep` instruction (as for fexmac_thread_request_stop). A thread whose

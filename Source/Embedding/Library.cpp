@@ -502,6 +502,67 @@ namespace {
     }
   }
 
+  // A write window (fexmac_memory_write_begin to _end) opened by a host thread that is
+  // not running a guest thread of this context is the embedder touching guest memory from
+  // another thread. While ordering is deferred it ends the deferral if a guest thread runs
+  // during the window: at the begin if one is running then (the full switch and the
+  // wait, before the begin returns), or when a run starts while a window is open
+  // (fexmac_thread_run). The decision and the count are under the registry lock, which
+  // runs also take to mark themselves running, so neither order of the two is missed.
+  template<typename F>
+  fexmac_result HostWrite(fexmac_context* Context, bool Begin, F&& Write) {
+    auto* Current = GetCurrentThread();
+    const bool FromGuest = Current && Current->Context == Context;
+    if (FromGuest || !Context->OrderingDeferred.load(std::memory_order_acquire)) {
+      if (!FromGuest) {
+        // Keep the count right across a switch made meanwhile by something else.
+        const fexmac_result Result = Write();
+        if (Result == FEXMAC_OK) {
+          std::lock_guard Registry {RegistryMutex};
+          if (Begin) {
+            ++Context->OpenHostWriteWindows;
+          } else if (Context->OpenHostWriteWindows) {
+            --Context->OpenHostWriteWindows;
+          }
+        }
+        return Result;
+      }
+      return Write();
+    }
+    if (Begin) {
+      bool AnyRunning = false;
+      {
+        std::lock_guard Registry {RegistryMutex};
+        ++Context->OpenHostWriteWindows;
+        std::lock_guard ThreadsLock {Context->ThreadsMutex};
+        for (auto* Thread : Context->Threads) {
+          AnyRunning |= Thread->Running;
+        }
+      }
+      if (AnyRunning) {
+        {
+          std::lock_guard Switch {Context->OrderingSwitchMutex};
+          EnableOrderingLocked(Context);
+        }
+        WaitForOrdering(Context, nullptr);
+      }
+      const fexmac_result Result = Write();
+      if (Result != FEXMAC_OK) {
+        std::lock_guard Registry {RegistryMutex};
+        --Context->OpenHostWriteWindows;
+      }
+      return Result;
+    }
+    const fexmac_result Result = Write();
+    if (Result == FEXMAC_OK) {
+      std::lock_guard Registry {RegistryMutex};
+      if (Context->OpenHostWriteWindows) {
+        --Context->OpenHostWriteWindows;
+      }
+    }
+    return Result;
+  }
+
   void SetInCallback(fexmac_thread* Thread, bool Value) {
     std::lock_guard Lock {RegistryMutex};
     Thread->InCallback = Value;
@@ -915,6 +976,13 @@ fexmac_result fexmac_context_mark_memory_shared(fexmac_context* context) {
   if (InLogCallback) {
     return FEXMAC_ERROR_BUSY;
   }
+  // On a host thread that is running a guest thread outside its system call callback,
+  // the only way here is a signal handler that interrupted the guest code: that thread
+  // would be counted by the switch and then wait for itself (round 2 review). Refused
+  // before any lock. Running and InCallback are written by this host thread itself.
+  if (auto* Current = GetCurrentThread(); Current && Current->Running && !Current->InCallback) {
+    return FEXMAC_ERROR_BUSY;
+  }
   ContextUse Use {context};
   if (!Use) {
     return FEXMAC_ERROR_INVALID_HANDLE;
@@ -1207,6 +1275,19 @@ fexmac_result fexmac_thread_run(fexmac_thread* thread, fexmac_stop* stop) {
   // Marked by an ordering switch that came between this run being entered and now: it has
   // run nothing yet. Then no guest code until every thread that may still be running
   // code made without ordering has left it (Ordering deferred while single-threaded).
+  // A host write window open while ordering is deferred: this run makes the guest
+  // concurrent with it (HostWrite).
+  if (thread->Context->OrderingDeferred.load(std::memory_order_acquire)) {
+    bool WindowOpen;
+    {
+      std::lock_guard Lock {RegistryMutex};
+      WindowOpen = thread->Context->OpenHostWriteWindows != 0;
+    }
+    if (WindowOpen) {
+      std::lock_guard Switch {thread->Context->OrderingSwitchMutex};
+      EnableOrderingLocked(thread->Context);
+    }
+  }
   WaitForOrdering(thread->Context, thread);
 
   if (thread->StopRequested.exchange(0)) {
@@ -1335,7 +1416,7 @@ fexmac_result fexmac_memory_write_begin(fexmac_context* context, uint64_t addres
   if (!Use) {
     return FEXMAC_ERROR_INVALID_HANDLE;
   }
-  return WriteBegin(context, address, size, true);
+  return HostWrite(context, true, [&] { return WriteBegin(context, address, size, true); });
 }
 
 fexmac_result fexmac_memory_write_begin_ex(fexmac_context* context, uint64_t address, uint64_t size, uint32_t flags, uint64_t* first_unwritable) {
@@ -1346,7 +1427,7 @@ fexmac_result fexmac_memory_write_begin_ex(fexmac_context* context, uint64_t add
   if (!Use) {
     return FEXMAC_ERROR_INVALID_HANDLE;
   }
-  return WriteBegin(context, address, size, true, flags, first_unwritable);
+  return HostWrite(context, true, [&] { return WriteBegin(context, address, size, true, flags, first_unwritable); });
 }
 
 fexmac_result fexmac_memory_write_end(fexmac_context* context, uint64_t address, uint64_t size) {
@@ -1357,7 +1438,7 @@ fexmac_result fexmac_memory_write_end(fexmac_context* context, uint64_t address,
   if (!Use) {
     return FEXMAC_ERROR_INVALID_HANDLE;
   }
-  return WriteBegin(context, address, size, false);
+  return HostWrite(context, false, [&] { return WriteBegin(context, address, size, false); });
 }
 
 uint64_t fexmac_memory_unenforced_count(fexmac_context* context) {

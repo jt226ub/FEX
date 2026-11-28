@@ -217,6 +217,9 @@ struct fexmac_context {
   // point where they look up code anew. No guest thread starts running guest code while
   // it is non-zero (fexmac_thread_run waits).
   std::atomic<uint32_t> OrderingAcksPending {};
+  // Write windows (fexmac_memory_write_begin to _end) open from host threads that are not
+  // running a guest thread of this context. Guarded by the registry lock.
+  uint32_t OpenHostWriteWindows {};
   // Statistics for the tests (relaxed): switches made, acknowledgements at a resync, at
   // a system call or the end of a run, and at the start of one, and waits for them.
   std::atomic<uint64_t> OrderingSwitches {};
