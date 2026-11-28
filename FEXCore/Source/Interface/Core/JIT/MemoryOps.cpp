@@ -1933,6 +1933,15 @@ bool Arm64JITCore::EmitRepStringInPlace(bool Copy, bool IsAtomic, size_t Size, A
   };
   auto StoreElement = [&](ARMEmitter::Register Data) {
     if (IsAtomic) {
+      if (!Copy && Size != 1) {
+        // The slot the misaligned-access handler overwrites with a barrier when it patches
+        // this store (it writes the instruction before a faulting stlr). In a copy the
+        // load's two placeholders come just before. Without it, rep stos{w,d,q} with string
+        // ordering on and an element across 16 bytes had the instruction before the store
+        // replaced: the count-zero test, after which a later rep stos with rcx = 0 ran
+        // until it faulted (found by rep-string-diff-on).
+        nop();
+      }
       switch (Size) {
       case 1: stlrb(Data.W(), D); break;
       case 2: stlrh(Data.W(), D); break;
