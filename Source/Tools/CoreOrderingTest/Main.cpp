@@ -230,6 +230,28 @@ struct Asm {
     U8(0x6F);
     Mem(X, Base, Disp);
   }
+  // x87 memory forms: fld/fstp m64 (DD /0, DD /3), fld/fstp m80 (DB /5, DB /7), fild/fistp
+  // m64 (DF /5, DF /7).
+  void X87Mem(uint8_t Opcode, int Ext, int Base, int32_t Disp) {
+    Rex(false, 0, Base);
+    U8(Opcode);
+    Mem(Ext, Base, Disp);
+  }
+  void FldQ(int Base, int32_t Disp) {
+    X87Mem(0xDD, 0, Base, Disp);
+  }
+  void FstpQ(int Base, int32_t Disp) {
+    X87Mem(0xDD, 3, Base, Disp);
+  }
+  void FstpT(int Base, int32_t Disp) {
+    X87Mem(0xDB, 7, Base, Disp);
+  }
+  void FildQ(int Base, int32_t Disp) {
+    X87Mem(0xDF, 5, Base, Disp);
+  }
+  void FistpQ(int Base, int32_t Disp) {
+    X87Mem(0xDF, 7, Base, Disp);
+  }
   // movsd (F2 0F 10 load, F2 0F 11 store): 8-byte vector-register accesses.
   void MovsdLoad(int X, int Base, int32_t Disp) {
     U8(0xF2);
@@ -2081,6 +2103,119 @@ std::vector<LitmusTest> MakeTests() {
     t.Scalar = Expect::Break;
     t.Classify = [](const uint64_t*, const uint64_t* R1) {
       return State(R1[0], FULL) * 3 + State(R1[1], FULL);
+    };
+    T.push_back(std::move(t));
+  }
+  // x87 memory accesses (fst/fstp/fistp, fld/fild), which the core emits through its x87
+  // stack pass. FULL as a double is a normal number, so fld/fstp m64 and fild/fistp m64 of
+  // it give back the same bits; fstp m80 of it writes the 64-bit mantissa below.
+  {
+    auto t = MP("MP-x87-st", "message passing, x87 fstp qword for data and flag, scalar loads");
+    t.Reset = {D.X, D.Y};
+    t.Pre = [](Asm& A, int Role) {
+      WarmData(A, Role, D.X);
+    };
+    t.Body = [](Asm& A, int Role) {
+      if (Role == 0) {
+        // Both values loaded first, so that the two stores are adjacent (an x87 load
+        // between them, with its barrier, hid the reordering on the M4).
+        A.FldQ(R8, ConstFull);
+        A.FldQ(R8, ConstFull);
+        A.FstpQ(RBX, D.X);
+        A.FstpQ(RBX, D.Y);
+      } else {
+        A.Load(RAX, RBX, D.Y);
+        A.Load(RDX, RBX, D.X);
+        A.Store(R12, 0, RAX);
+        A.Store(R12, 8, RDX);
+      }
+    };
+    // Measured on the M4 to break with emulation off and with scalar ordering only.
+    t.Scalar = Expect::Break;
+    t.Classify = [](const uint64_t*, const uint64_t* R1) {
+      return State(R1[0], FULL) * 3 + State(R1[1], FULL);
+    };
+    T.push_back(std::move(t));
+  }
+  {
+    auto t = MP("MP-x87-ld", "message passing, scalar stores, x87 fld qword for flag and data");
+    t.Reset = {D.X, D.Y};
+    t.Pre = [](Asm& A, int Role) {
+      WarmData(A, Role, D.X);
+    };
+    t.Body = [](Asm& A, int Role) {
+      if (Role == 0) {
+        A.MovImm(RAX, FULL);
+        A.Store(RBX, D.X, RAX);
+        A.Store(RBX, D.Y, RAX);
+      } else {
+        A.FldQ(RBX, D.Y);
+        A.FldQ(RBX, D.X);
+        A.FstpQ(R12, 8);
+        A.FstpQ(R12, 0);
+      }
+    };
+    // Measured on the M4 to break with emulation off and with scalar ordering only.
+    t.Scalar = Expect::Break;
+    t.Classify = [](const uint64_t*, const uint64_t* R1) {
+      return State(R1[0], FULL) * 3 + State(R1[1], FULL);
+    };
+    T.push_back(std::move(t));
+  }
+  {
+    // The 80-bit store is one x86 store of 10 bytes (x86 promises no atomicity for it,
+    // so only its ordering is tested): its low 8 bytes, the mantissa, are read.
+    constexpr uint64_t Frac = FULL & ((1ULL << 52) - 1);
+    constexpr uint64_t Mantissa = (1ULL << 63) | (Frac << 11);
+    auto t = MP("MP-x87-st80", "message passing, x87 fstp tword data, fstp qword flag, scalar loads");
+    t.Reset = {D.X, D.X + 8, D.Y};
+    t.Pre = [](Asm& A, int Role) {
+      WarmData(A, Role, D.X);
+    };
+    t.Body = [](Asm& A, int Role) {
+      if (Role == 0) {
+        A.FldQ(R8, ConstFull);
+        A.FldQ(R8, ConstFull);
+        A.FstpT(RBX, D.X);
+        A.FstpQ(RBX, D.Y);
+      } else {
+        A.Load(RAX, RBX, D.Y);
+        A.Load(RDX, RBX, D.X);
+        A.Store(R12, 0, RAX);
+        A.Store(R12, 8, RDX);
+      }
+    };
+    // Measured on the M4 to break with emulation off and with scalar ordering only.
+    t.Scalar = Expect::Break;
+    t.Classify = [](const uint64_t*, const uint64_t* R1) {
+      return State(R1[0], FULL) * 3 + State(R1[1], Mantissa);
+    };
+    T.push_back(std::move(t));
+  }
+  {
+    // The integer 1 (exact also with X87REDUCEDPRECISION, where FULL would be rounded).
+    auto t = MP("MP-x87-fistp", "message passing, x87 fistp qword for data and flag, scalar loads");
+    t.Reset = {D.X, D.Y};
+    t.Pre = [](Asm& A, int Role) {
+      WarmData(A, Role, D.X);
+    };
+    t.Body = [](Asm& A, int Role) {
+      if (Role == 0) {
+        A.FildQ(R8, ConstOne);
+        A.FildQ(R8, ConstOne);
+        A.FistpQ(RBX, D.X);
+        A.FistpQ(RBX, D.Y);
+      } else {
+        A.Load(RAX, RBX, D.Y);
+        A.Load(RDX, RBX, D.X);
+        A.Store(R12, 0, RAX);
+        A.Store(R12, 8, RDX);
+      }
+    };
+    t.Off = Expect::Either;
+    t.Scalar = Expect::Either;
+    t.Classify = [](const uint64_t*, const uint64_t* R1) {
+      return State(R1[0], 1) * 3 + State(R1[1], 1);
     };
     T.push_back(std::move(t));
   }
