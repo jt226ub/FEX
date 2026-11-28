@@ -398,7 +398,15 @@ def main():
     parser.add_argument("--smc", choices=["full", "mtrack"], default="full",
                         help="how the SelfModifyingCode tests detect changed code: checks in every block (full) "
                              "or write protection of translated pages (mtrack)")
+    parser.add_argument("--tso-option", action="append", default=[], metavar="FEX_NAME=VALUE",
+                        help="a further setting for the jit_500_tso mode only (repeatable), e.g. FEX_MEMCPYSETTSOWIDE=1")
     args = parser.parse_args()
+    for setting in args.tso_option:
+        name, sep, value = setting.partition("=")
+        if not sep or not name.startswith("FEX_"):
+            parser.error("--tso-option takes FEX_NAME=VALUE: " + setting)
+        MODES["jit_500_tso"][name] = value
+        print("jit_500_tso: %s=%s" % (name, value))
 
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     asm_dir = os.path.join(root, "unittests", "ASM")

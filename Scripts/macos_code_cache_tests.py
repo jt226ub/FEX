@@ -579,6 +579,21 @@ def main():
         check("cache not used with %s" % name, info["rc"] == 0 and same and info.get("compiled", 0) > 0,
               "%s; with an empty cache: %s" % (summary(info), summary(empty)))
 
+    # MEMCPYSETTSOWIDE (round 2, E2) changes how rep movs/stos are translated: a cache made
+    # with string ordering on but without it is used again in the same configuration and
+    # not used with it (only that option differs).
+    wide_base = {"FEX_TSOENABLED": "1", "FEX_MEMCPYSETTSOENABLED": "1"}
+    target = os.path.join(work, "memcpy-wide")
+    run(test_cmd, target, wide_base)
+    again = run(test_cmd, target, wide_base)
+    wide = run(test_cmd, target, dict(wide_base, FEX_MEMCPYSETTSOWIDE="1"))
+    empty = run(test_cmd, os.path.join(work, "empty-memcpy-wide"), dict(wide_base, FEX_MEMCPYSETTSOWIDE="1"))
+    same = all(wide.get(k) == empty.get(k) for k in ("compiled", "loaded", "queued"))
+    check("cache made without MEMCPYSETTSOWIDE is used again without it", again["rc"] == 0 and again.get("loaded", 0) > 0 and
+          again.get("compiled") == 0, summary(again))
+    check("cache not used with MEMCPYSETTSOWIDE=1", wide["rc"] == 0 and same and wide.get("compiled", 0) > 0,
+          "%s; with an empty cache: %s" % (summary(wide), summary(empty)))
+
     # The same database copied under the name another configuration uses.
     target = os.path.join(work, "transplant")
     run(test_cmd, target, {"FEX_TSOENABLED": "1"})

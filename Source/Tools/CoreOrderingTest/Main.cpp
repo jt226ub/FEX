@@ -1422,7 +1422,11 @@ std::vector<LitmusTest> MakeTests() {
       t.Forbidden = {2};
       t.Interleaved = {1};
       t.Reset = {L.Y};
-      t.Pre = ClearAhead;
+      t.Pre = [ClearAhead, LaterOff, EarlierOff](Asm& A, int Role) {
+        ClearAhead(A, Role);
+        WarmData(A, Role, LaterOff);
+        WarmData(A, Role, EarlierOff);
+      };
       t.IterationDivisor = 20;
       t.Body = [FlagThen, Writer, LaterOff, EarlierOff](Asm& A, int Role) {
         if (Role == 0) {
@@ -1485,6 +1489,14 @@ std::vector<LitmusTest> MakeTests() {
                          MovsbLong(3, true), 0, LongBytes - 8, CopyQ));
     T.push_back(RepOrder("REP-order-stosb", "one 20K rep stosb: last qword seen before the first", StosLong(true, false), LongBytes - 8, 0,
                          STOS_VALUE));
+    // Within one page-bounded run of the translation (4K), across a 128-byte line: what a
+    // translation that put barriers only around each run would let through.
+    T.push_back(RepOrder("REP-order-movsb-line", "one 20K rep movsb, source 3 bytes off: qword after a line inside a 4K page before the one before",
+                         MovsbLong(3, false), 2048, 2040, CopyQ, Expect::Break));
+    T.push_back(RepOrder("REP-order-stosb-line", "one 20K rep stosb: qword after a line inside a 4K page before the one before",
+                         StosLong(true, false), 2048, 2040, STOS_VALUE, Expect::Break));
+    T.push_back(RepOrder("REP-order-std-stosq-line", "one 20K std; rep stosq: qword below a line inside a 4K page before the one above",
+                         StosLong(false, true), 2040, 2048, STOS_VALUE, Expect::Break));
     T.push_back(RepOrder("REP-order-stosb-page", "one 20K rep stosb: qword after the 16K page seen before the one before it",
                          StosLong(true, false), 16384, 16376, STOS_VALUE, Expect::Break));
     T.push_back(RepOrder("REP-order-std-movsb-page", "one 20K std; rep movsb, source 3 bytes off: qword below the 16K page before the one above",
@@ -1547,6 +1559,11 @@ std::vector<LitmusTest> MakeTests() {
                              false, 0, 16376, 16384));
     T.push_back(RepReadOrder("REP-order-read-std-movsb-page", "loads within one 20K std; rep movsb: qword above the 16K page read new, below old",
                              true, 0, 16376, 16384, Expect::Break));
+    T.push_back(RepReadOrder("REP-order-read-movsb-line", "loads within one 20K rep movsb: qword below a line in a 4K page read new, above old",
+                             false, 0, 2040, 2048, Expect::Break));
+    T.push_back(RepReadOrder("REP-order-read-std-movsb-line", "loads within one 20K std; rep movsb: qword above a line in a 4K page read new, below old",
+                             true, 0, 2040, 2048));
+    T.push_back(RepReadOrder("REP-order-read-movsb-skew-line", "as REP-order-read-movsb-line, destination 3 bytes off", false, 3, 2040, 2048, Expect::Break));
     T.push_back(RepReadOrder("REP-order-read-movsb-skew-page", "as REP-order-read-movsb-page, destination 3 bytes off", false, 3, 16376,
                              16384));
 
