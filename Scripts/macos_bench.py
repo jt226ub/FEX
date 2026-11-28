@@ -133,7 +133,7 @@ CONFIGS["tso_on_cache_warm"] = (CONFIGS["tso_on"][0], {}, "as tso_on, with the c
 CACHE_MODE = {"tso_on_cache_cold": "cold", "tso_on_cache_warm": "warm"}
 DEFAULT_CONFIGS = ["tso_on", "tso_scalar", "tso_vector", "tso_memcpy", "tso_on_nomb", "tso_on_x87rp", "tso_off", "tso_on_deferred",
                    "tso_on_cache_cold", "tso_on_cache_warm"]
-QUICK_CONFIGS = ["tso_on", "tso_off", "tso_on_nomb", "tso_on_x87rp", "tso_on_cache_cold", "tso_on_cache_warm"]
+QUICK_CONFIGS = ["tso_on", "tso_off", "tso_on_deferred", "tso_on_nomb", "tso_on_x87rp", "tso_on_cache_cold", "tso_on_cache_warm"]
 STARTUP_CONFIG = "tso_on"
 
 
