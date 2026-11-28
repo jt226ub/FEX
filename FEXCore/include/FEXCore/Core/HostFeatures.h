@@ -132,6 +132,10 @@ struct HostFeatures {
 
   // The Linux PID of this process. Useful for punching through perf-top information.
   uint32_t ProcessPID {};
-  uint32_t pad2 {};
+  // FEAT_LRCPC3 (vector and pair acquire/release forms). Detected and recorded only: no
+  // code path reads it (see Addressing.cpp), and it lies outside the hashed first eight
+  // bytes, so neither code generation nor the code-cache bucket depends on it.
+  uint32_t SupportsLRCPC3 : 1 {};
+  uint32_t pad2 : 31 {};
 };
 } // namespace FEXCore
