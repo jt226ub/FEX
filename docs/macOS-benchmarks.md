@@ -467,12 +467,15 @@ do the same. FEX is faster than Rosetta 2 at full precision, and much faster wit
     load, `pxor`, `movdqa` load, `pxor`, `movdqa` store, `movdqa` store) only the second
     load's `dmb ishld` is followed by a store's `dmb ish`, so three of the four barriers
     remain, and the 16-byte accesses keep theirs.
-  - For the record, 16-byte accesses as two 8-byte halves (`VECTORTSOSPLIT=15`,
-    `tso_on_split16`) gave the largest gain (`copy_loop` most of all) but made
-    `matmul_f32x4` slower, and is dropped: it breaks the 16-byte atomicity x86
-    guarantees for aligned accesses on processors with AVX (Intel SDM vol. 3A 11.1.1,
-    AMD APM vol. 2 7.3.2), and `TEAR-sse`, `TEAR-sse-st` and `TEAR-sse-ld` see torn values
-    under it.
+  - For the record, 16-byte accesses as two 8-byte halves (`VECTORTSOSPLIT=15`) gave the
+    largest gain (`copy_loop` most of all) but made `matmul_f32x4` slower, and is dropped:
+    it breaks the 16-byte atomicity x86 guarantees for aligned accesses on processors with
+    AVX (Intel SDM vol. 3A 11.1.1, AMD APM vol. 2 7.3.2), and `TEAR-sse`, `TEAR-sse-st` and
+    `TEAR-sse-ld` see torn values under it. The production library now refuses those bits
+    (testing build only), so the configuration is no longer in `--configs e2`; its figures
+    are in the round 2 report.
+  - `tso_on_r2`: the round 2 set together (`VECTORTSOSPLIT=3`, `TSOBARRIERMERGE=1`,
+    `MEMCPYSETTSOWIDE=1`).
   - Not done: merging barriers between consecutive loads or consecutive stores (each load
     needs its own barrier after it, each store one before it; nothing there is
     redundant).
