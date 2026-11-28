@@ -4,7 +4,8 @@
 // translates without memory-ordering emulation while it has one guest thread must switch
 // ordering on, completely, before a second guest thread runs.
 //
-//   FEXCoreOrderingSwitchTest litmus [--trials N] [--reads R] [--mode deferred|on|off] [--pattern loop|call]
+//   FEXCoreOrderingSwitchTest litmus [--trials N] [--reads R] [--mode deferred|on|off]
+//                                    [--pattern loop|call|callret|misaligned|smc|cbcreate|cbmark]
 //                                    [--stores scalar|movsd|movdqu|x87|stos] [--option NAME=VALUE]...
 //                                    [--break no-wait|no-discard|keep-callret]
 //                                    [--expect pass|fail|report] [--qos interactive|utility|background]
@@ -29,8 +30,16 @@
 // fexmac_testing) accepts --break, which makes the library's switch deliberately wrong:
 // no-wait lets the reader run while the writer keeps its unordered translation,
 // no-discard keeps the old translations, keep-callret leaves the call/return stacks (seen
-// with --pattern call). Those must show forbidden outcomes
+// reliably with --pattern callret, the round 2 review's design; rarely with call). Those
+// must show forbidden outcomes
 // (--expect fail). --mode on (ordering on from the start, no deferral) is the reference.
+//
+// More patterns (round 2 review): callret (an inner store loop of 5,000 iterations, then a
+// call to a one-instruction leaf whose return lands on a jump target: the stale-return
+// hazard), misaligned and smc (the writer takes an alignment fault, or a write fault on
+// its own write-protected code page, every iteration, so the switch meets it inside that
+// handling), cbcreate and cbmark (thread 2 created from the writer's own system call
+// callback, after fexmac_context_mark_memory_shared there for cbmark).
 //
 // cost: what the switch costs for a program with N translated blocks. One guest thread
 // runs a chain of N blocks (`add rax, 1; jmp next`, MULTIBLOCK=0), then spins on a flag.
@@ -74,12 +83,14 @@ void Quiet(fexmac_log_level Level, const char* Message, void*) {
   }
 }
 
-fexmac_context* MakeContext(const std::vector<fexmac_option>& Options) {
+fexmac_context* MakeContext(const std::vector<fexmac_option>& Options, fexmac_syscall_fn Syscall = nullptr, void* SyscallData = nullptr) {
   fexmac_config Config;
   fexmac_config_init(&Config);
   Config.options = Options.data();
   Config.option_count = Options.size();
   Config.log = Quiet;
+  Config.syscall = Syscall;
+  Config.syscall_user_data = SyscallData;
   fexmac_context* Context {};
   if (fexmac_context_create(&Config, &Context) != FEXMAC_OK) {
     Fail("fexmac_context_create");
@@ -205,6 +216,155 @@ std::vector<uint8_t> WriterStores(const std::string& Stores) {
   P.push_back(0xF4);
   return P;
 }
+// A small assembler for the writers with labels (round 2 review's design).
+struct Asm {
+  std::vector<uint8_t> P;
+  struct Fix {
+    size_t At;
+    int Label;
+  };
+  std::vector<Fix> Fixes;
+  std::vector<int64_t> Labels;
+  void B(std::initializer_list<uint8_t> L) {
+    P.insert(P.end(), L);
+  }
+  void I32(uint32_t V) {
+    for (int i = 0; i < 4; ++i) {
+      P.push_back(uint8_t(V >> (8 * i)));
+    }
+  }
+  int NewLabel() {
+    Labels.push_back(-1);
+    return int(Labels.size() - 1);
+  }
+  void Bind(int L) {
+    Labels[L] = int64_t(P.size());
+  }
+  void Rel32(int L) {
+    Fixes.push_back({P.size(), L});
+    I32(0);
+  }
+  void Jcc(uint8_t CC, int L) {
+    B({0x0F, uint8_t(0x80 | CC)});
+    Rel32(L);
+  }
+  void Call(int L) {
+    B({0xE8});
+    Rel32(L);
+  }
+  std::vector<uint8_t> Finish() {
+    for (auto& F : Fixes) {
+      if (Labels[F.Label] < 0) {
+        Fail("unbound label");
+      }
+      const int32_t Rel = int32_t(Labels[F.Label] - int64_t(F.At + 4));
+      memcpy(P.data() + F.At, &Rel, 4);
+    }
+    return P;
+  }
+};
+constexpr uint8_t CC_Z = 4, CC_NZ = 5;
+
+// --pattern callret (the round 2 review's design for the stale-return hazard): an outer
+// loop whose body is an inner loop of 5,000 store pairs, then a call to a leaf of one
+// instruction. The return lands on an entry point of the caller's translation (a jump
+// target), so at the switch the writer is almost always inside the inner loop of the old
+// caller, and its next return goes through the call/return stack: if the stack is not
+// cleared it returns into the old (unordered) caller, which then loops in itself.
+std::vector<uint8_t> WriterCallRet() {
+  Asm C;
+  int Outer = C.NewLabel(), Inner = C.NewLabel(), Out = C.NewLabel(), After = C.NewLabel(), Leaf = C.NewLabel();
+  C.B({0x90}); // the loop head is not the unit's entry
+  C.Bind(Outer);
+  C.B({0x41, 0xBC});
+  C.I32(5000); // mov r12d, 5000
+  C.Bind(Inner);
+  C.B({0x48, 0xFF, 0xC0});                         // inc rax
+  C.B({0x48, 0x89, 0x03});                         // mov [rbx], rax          (X)
+  C.B({0x48, 0x89, 0x83, 0x80, 0x00, 0x00, 0x00}); // mov [rbx+0x80], rax     (Y)
+  C.B({0x41, 0xFF, 0xCC});                         // dec r12d
+  C.Jcc(CC_NZ, Inner);
+  C.B({0x48, 0x8B, 0x8B, 0x00, 0x01, 0x00, 0x00}); // mov rcx, [rbx+0x100]    (DONE)
+  C.B({0x48, 0x85, 0xC9});                         // test rcx, rcx
+  C.Jcc(CC_NZ, Out);
+  C.B({0x48, 0x85, 0xC0}); // test rax, rax (non-zero)
+  C.Jcc(CC_Z, After);      // never taken: makes the return address a jump target
+  C.Call(Leaf);
+  C.Bind(After);
+  C.B({0x48, 0x85, 0xC0});
+  C.Jcc(CC_NZ, Outer);
+  C.Bind(Out);
+  C.B({0xF4});
+  C.Bind(Leaf);
+  C.B({0xC3}); // ret: a leaf of one instruction
+  return C.Finish();
+}
+
+// The loop writer with one more instruction in the loop, so the switch meets the writer
+// in the middle of other fault handling: misaligned, a locked add across 16 bytes
+// (an alignment fault and the split-lock emulation every iteration); smc, a byte store
+// into the writer's own (write-protected) code page (a self-modifying-code write fault,
+// which discards the page's translations, every iteration).
+std::vector<uint8_t> WriterExtra(const std::string& Kind) {
+  Asm W;
+  int Loop = W.NewLabel();
+  W.Bind(Loop);
+  W.B({0x48, 0xFF, 0xC0});                         // inc rax
+  W.B({0x48, 0x89, 0x03});                         // mov [rbx], rax
+  W.B({0x48, 0x89, 0x83, 0x80, 0x00, 0x00, 0x00}); // mov [rbx+0x80], rax
+  if (Kind == "misaligned") {
+    W.B({0xF0, 0x48, 0x0F, 0xC1, 0x93, 0x0C, 0x03, 0x00, 0x00}); // lock xadd [rbx+0x30C], rdx
+  } else {
+    W.B({0x41, 0x88, 0x03}); // mov [r11], al (r11: a byte in the code page)
+  }
+  W.B({0x48, 0x8B, 0x8B, 0x00, 0x01, 0x00, 0x00, 0x48, 0x85, 0xC9}); // mov rcx, [DONE]; test rcx, rcx
+  W.Jcc(CC_Z, Loop);
+  W.B({0xF4});
+  return W.Finish();
+}
+
+// --pattern cbcreate / cbmark (round 2 review): the writer makes a system call once its
+// count reaches a value that varies per trial; the callback creates thread 2 (cbmark:
+// after fexmac_context_mark_memory_shared, from the callback), which the host then runs.
+std::vector<uint8_t> WriterSyscall(uint32_t At) {
+  Asm W;
+  int Loop = W.NewLabel(), NoSys = W.NewLabel(), Out = W.NewLabel();
+  W.Bind(Loop);
+  W.B({0x48, 0xFF, 0xC0});
+  W.B({0x48, 0x89, 0x03});
+  W.B({0x48, 0x89, 0x83, 0x80, 0x00, 0x00, 0x00});
+  W.B({0x48, 0x3D});
+  W.I32(At); // cmp rax, imm32
+  W.Jcc(CC_NZ, NoSys);
+  W.B({0x0F, 0x05}); // syscall
+  W.Bind(NoSys);
+  W.B({0x48, 0x8B, 0x8B, 0x00, 0x01, 0x00, 0x00});
+  W.B({0x48, 0x85, 0xC9});
+  W.Jcc(CC_NZ, Out);
+  W.B({0xE9});
+  W.Rel32(Loop);
+  W.Bind(Out);
+  W.B({0xF4});
+  return W.Finish();
+}
+struct CallbackState {
+  fexmac_context* Context;
+  uint64_t Base;
+  uint64_t Reads;
+  bool Mark;
+  std::atomic<fexmac_thread*> Second {nullptr};
+};
+fexmac_syscall_action CreateFromCallback(fexmac_thread*, void* UserData) {
+  auto* S = static_cast<CallbackState*>(UserData);
+  if (!S->Second.load()) {
+    if (S->Mark && fexmac_context_mark_memory_shared(S->Context) != FEXMAC_OK) {
+      Fail("mark_memory_shared from the callback");
+    }
+    S->Second = MakeThread(S->Context, S->Base + 0x400, S->Base + 0x8000, S->Reads);
+  }
+  return FEXMAC_SYSCALL_RESUME;
+}
+
 std::string StoresKind = "scalar";
 std::vector<std::string> ExtraOptions;
 
@@ -215,7 +375,12 @@ struct LitmusResult {
   uint64_t Stats[5];
 };
 
-LitmusResult LitmusTrial(const std::vector<fexmac_option>& Options, uint64_t Reads, bool Call) {
+LitmusResult LitmusTrial(const std::vector<fexmac_option>& Options, uint64_t Reads, const std::string& Pattern, uint64_t Trial) {
+  const bool Call = Pattern == "call" || Pattern == "callret";
+  const bool Callback = Pattern == "cbcreate" || Pattern == "cbmark";
+  // The writer's own count: X, except for x87, where X holds a double and the integer
+  // is at 0x200 (the reviewer saw the double's bit pattern printed as iterations).
+  const size_t Count = StoresKind == "x87" ? 0x200 : X;
   constexpr size_t Size = 0x10000;
   auto* Mem = static_cast<uint8_t*>(mmap(nullptr, Size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
   if (Mem == MAP_FAILED) {
@@ -223,8 +388,17 @@ LitmusResult LitmusTrial(const std::vector<fexmac_option>& Options, uint64_t Rea
   }
   uint8_t* Code = Mem;
   uint8_t* Data = Mem + 0x8000;
-  if (Call) {
+  if (Pattern == "call") {
     const auto P = WriterCall();
+    memcpy(Code, P.data(), P.size());
+  } else if (Pattern == "callret") {
+    const auto P = WriterCallRet();
+    memcpy(Code, P.data(), P.size());
+  } else if (Pattern == "misaligned" || Pattern == "smc") {
+    const auto P = WriterExtra(Pattern);
+    memcpy(Code, P.data(), P.size());
+  } else if (Callback) {
+    const auto P = WriterSyscall(uint32_t(20000 + (Trial % 5000) * 3));
     memcpy(Code, P.data(), P.size());
   } else if (StoresKind != "scalar") {
     const auto P = WriterStores(StoresKind);
@@ -235,16 +409,28 @@ LitmusResult LitmusTrial(const std::vector<fexmac_option>& Options, uint64_t Rea
   memcpy(Code + 0x400, Reader, sizeof(Reader));
   const auto Base = reinterpret_cast<uint64_t>(Mem);
 
-  fexmac_context* Context = MakeContext(Options);
+  CallbackState CB;
+  CB.Base = reinterpret_cast<uint64_t>(Mem);
+  CB.Reads = Reads;
+  CB.Mark = Pattern == "cbmark";
+  fexmac_context* Context = MakeContext(Options, Callback ? CreateFromCallback : nullptr, &CB);
+  CB.Context = Context;
+  if (Pattern == "smc") {
+    // Registered memory, so translated code pages are write-protected (SMCCHECKS mtrack).
+    if (fexmac_memory_map(Context, reinterpret_cast<uint64_t>(Mem), Size, FEXMAC_PROT_READ | FEXMAC_PROT_WRITE | FEXMAC_PROT_EXEC) != FEXMAC_OK) {
+      Fail("fexmac_memory_map");
+    }
+  }
   LitmusResult R {};
   R.DeferredBefore = fexmac_context_ordering_deferred(Context);
   // The call pattern needs a stack (rsp).
   fexmac_thread* T1 = MakeThread(Context, Base, Base + 0x8000, 0);
-  if (Call) {
+  {
     fexmac_x86_state S;
     fexmac_x86_state_init(&S);
     fexmac_thread_get_state(T1, &S);
     S.gpr[RSP] = Base + 0x7000;
+    S.gpr[11] = Base + 0x3F00; // smc: a byte of the code page that is not code
     fexmac_thread_set_state(T1, &S);
   }
   fexmac_stop Stop1 {};
@@ -253,13 +439,24 @@ LitmusResult LitmusTrial(const std::vector<fexmac_option>& Options, uint64_t Rea
     Stop1 = RunToStop(T1);
     Ended1 = true;
   });
-  // The writer is in its loop once X has moved well past its first translation.
-  while (Load(Data, X) < 10000) {
-    if (Ended1) {
-      Fail("the writer stopped before the second thread was created");
+  fexmac_thread* T2 = nullptr;
+  if (Callback) {
+    while (!(T2 = CB.Second.load())) {
+      if (Ended1) {
+        Fail("the writer stopped before its callback created the second thread");
+      }
     }
+  } else {
+    // The writer is in its loop once its count has moved well past its first translation
+    // (callret: a random number of outer iterations, so the switch lands anywhere).
+    const uint64_t Want = Pattern == "callret" ? 5000 * (2 + Trial % 7) : Pattern == "smc" || Pattern == "misaligned" ? 200 : 10000;
+    while (Load(Data, Count) < Want) {
+      if (Ended1) {
+        Fail("the writer stopped before the second thread was created");
+      }
+    }
+    T2 = MakeThread(Context, Base + 0x400, Base + 0x8000, Reads);
   }
-  fexmac_thread* T2 = MakeThread(Context, Base + 0x400, Base + 0x8000, Reads);
   R.DeferredAfter = fexmac_context_ordering_deferred(Context);
   fexmac_stop Stop2 = RunToStop(T2);
   Host1.join();
@@ -273,7 +470,7 @@ LitmusResult LitmusTrial(const std::vector<fexmac_option>& Options, uint64_t Rea
   if (S.gpr[R8] != 0) {
     Fail("reader did not finish its reads");
   }
-  R.WriterIterations = Load(Data, X);
+  R.WriterIterations = Load(Data, Count);
 #ifdef SWITCH_TEST_HOOKS
   uint32_t Effective = 0;
   fexmac_testing_ordering_state(Context, &Effective, R.Stats);
@@ -308,8 +505,9 @@ int Litmus(int argc, char** argv) {
       Expect = Next();
     } else if (A == "--pattern") {
       Pattern = Next();
-      if (Pattern != "loop" && Pattern != "call") {
-        Fail("--pattern loop|call");
+      if (Pattern != "loop" && Pattern != "call" && Pattern != "callret" && Pattern != "misaligned" && Pattern != "smc" &&
+          Pattern != "cbcreate" && Pattern != "cbmark") {
+        Fail("--pattern loop|call|callret|misaligned|smc|cbcreate|cbmark");
       }
     } else if (A == "--break") {
       Break = Next();
@@ -346,7 +544,7 @@ int Litmus(int argc, char** argv) {
   for (const auto& [Name, Value] : Extra) {
     Options.push_back({Name.c_str(), Value.c_str()});
   }
-  if (StoresKind != "scalar" && Pattern == "call") {
+  if (StoresKind != "scalar" && Pattern != "loop") {
     Fail("--stores applies to --pattern loop");
   }
   if (!Break.empty()) {
@@ -383,7 +581,7 @@ int Litmus(int argc, char** argv) {
   uint64_t Stats[5] {};
   const auto Start = std::chrono::steady_clock::now();
   for (uint64_t t = 0; t < Trials; ++t) {
-    const auto R = LitmusTrial(Options, Reads, Pattern == "call");
+    const auto R = LitmusTrial(Options, Reads, Pattern, t);
     Total += R.Forbidden;
     TrialsWith += R.Forbidden != 0;
     Max = std::max(Max, R.Forbidden);

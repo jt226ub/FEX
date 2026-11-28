@@ -193,9 +193,13 @@ jobs:
           codesign --force --sign - --options runtime --entitlements Data/macOS/jit.entitlements FEXCoreOrderingSwitchTest-hardened
           ./FEXCoreOrderingSwitchTest-hardened litmus --trials 2000 2>&1 | tee ordering-switch.log
           ./FEXCoreOrderingSwitchTest-hardened litmus --trials 500 --pattern call 2>&1 | tee -a ordering-switch.log
-          for broken in no-wait no-discard; do
-            "$(find build -name FEXCoreOrderingSwitchTest_hooks -type f | head -1)" litmus --trials 200 --break "$broken" 2>&1 | tee -a ordering-switch.log \
-              || echo "::warning::the broken switch ($broken) showed no forbidden outcome on this machine"
+          for pattern in callret misaligned smc cbcreate cbmark; do
+            ./FEXCoreOrderingSwitchTest-hardened litmus --trials 300 --pattern "$pattern" 2>&1 | tee -a ordering-switch.log
+          done
+          for broken in "no-wait loop" "no-discard loop" "keep-callret callret"; do
+            set -- $broken
+            "$(find build -name FEXCoreOrderingSwitchTest_hooks -type f | head -1)" litmus --trials 200 --break "$1" --pattern "$2" 2>&1 | tee -a ordering-switch.log \
+              || echo "::warning::the broken switch ($1) showed no forbidden outcome on this machine"
           done
           for mode in off scalar; do
             set +e
