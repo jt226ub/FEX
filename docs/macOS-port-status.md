@@ -24,9 +24,12 @@ criteria, criterion by criterion with evidence and limits: "Result" in
 items" below.
 
 Last full check, all on `macos/v1` at `3b12faa03` (the commits after it change documents
-only): the physical-Mac job at full level, both toolchains, every step PASS (umbrella
-repository run 46083556911); the hosted-Mac job (run 46083525991) and the Linux arm64 job
-(run 46083526078) green. Per-test results are in "Tests" below.
+only): the physical-Mac job at full level, every step that ran passed (umbrella
+repository run 46083556911; the Xcode 26.5 leg runs a reduced set, see "Test jobs";
+corrected in round 2: this said "both toolchains, every step PASS"). Soak level: never run in the job (round 2 check, 28 November 2026). The
+hosted-Mac job (run 46083525991) and the Linux arm64 job (run 46083526078) green.
+Per-test results are in "Tests" below. Defects found after 1.0, not fixed on `macos/v1`:
+"Known defects found after 1.0 (round 2)" below.
 
 - **Builds and links on Apple silicon.** The core libraries and the test tools build with
   no errors with the macOS 27 SDK (command line tools, Apple clang 2100.4.1.1) and with
@@ -45,7 +48,8 @@ repository run 46083556911); the hosted-Mac job (run 46083525991) and the Linux 
 - **Keeps x86 memory ordering between threads** with the emulation on: multi-thread litmus
   tests see no forbidden outcome in 100 million tries each, and see them by the million
   with it off; vector and string-instruction ordering are each shown to depend on their
-  own setting (physical Mac).
+  own setting (physical Mac). Not x87 stores: in 1.0 they bypass the emulation (found in
+  round 2, 28 November 2026; "Known defects found after 1.0 (round 2)").
 - **Runs a real guest program to the right answer** (criterion 7): a freestanding x86-64
   benchmark run through `fexmac` by `FEXCoreBench`. Its literal mode (16 kernels, no
   system call but exit) reports every checksum right; its timed mode (18 kernels, with a
@@ -386,6 +390,9 @@ flag is stored after the data, and a store becomes visible only after every earl
 (The first version of the tool counted only a whole flag; a partly visible flag with
 missing data was counted as overlap. With emulation off that hid most of MP-splitline's
 and nearly all of MP-split16K's forbidden outcomes.)
+
+(Round 2, 28 November 2026: x87 stores were not covered by these tests and were not
+ordered in 1.0; see "Known defects found after 1.0 (round 2)".)
 
 Results on the Mac mini (M4), hardened runtime, `--soak`: 100 million tries per litmus
 test, 2 million locked operations per counting test, in each of the three modes. "On" is
@@ -747,7 +754,9 @@ on a public repository can be made to run a stranger's code. The physical-Mac wo
 lives in the private repository for that reason and checks this repository out read-only.
 
 **Latest physical-Mac run: full level, `macos/v1` at `3b12faa03`, both toolchains**
-(umbrella run 46083556911): every step PASS on both legs. Default toolchain: machine
+(umbrella run 46083556911): every step that ran passed on both legs (corrected in round 2:
+this said "every step PASS on both legs"; the Xcode leg's set is below). Soak level: never run in the job (round 2 check, 28 November 2026).
+Default toolchain: machine
 record, probe enforced, low-memory probe, build, linkage (including the non-Apple compile
 check), coverage, smoke, thread, `fexmac_c_test` 80 subtests, `fexmac_hook_test` 24, mutex
 wake, ordering on/off/scalar, 1,000 starts, instruction tests 2,265 pass / 15 expected
@@ -755,12 +764,16 @@ failures / 6 skips in all four modes both ways, the write-protection SMC run (3 
 mode, both ways), the fault differential (1,472 cases x 4 modes x 4 ways, 2 known
 differences, 0 failures), code cache tests (107), the two-pass cache run in all four
 modes, benchmark `--check-docs` and quick run both ways, 58 benchmark mutations caught,
-sync script tests, MetalFX 6 of 6 in all three runs, home check. The Xcode 26.5 leg passes
-its steps (build, linkage, smoke, thread, the two library tests, mutex, ordering,
-instruction tests) with the same counts. Every run and its details:
+sync script tests, MetalFX 6 of 6 in all three runs, home check; the memory-ordering
+soaks were skipped (soak level only). The Xcode 26.5 leg passes the steps it runs (machine
+record, build, linkage, smoke, thread, the two library tests, mutex, ordering
+on/off/scalar, instruction tests in four modes, home check) with the same counts; it skips
+the probe, the low-memory rule, the coverage check, the 1,000 starts, the SMC run, the
+fault differential, the code cache tests, the two-pass cache run, the benchmark and its
+mutations, the sync script tests, MetalFX and the soaks. Every run and its details:
 the umbrella's `docs/testing/physical-mac-job-report.md`.
 
-**The first full-level run** (on `e513ada49`; the Xcode leg passed every step) found two
+**The first full-level run** (on `e513ada49`; the Xcode leg passed every step it ran) found two
 code cache faults in the default leg, both reproduced by hand outside the job, fixed in
 package F:
 
@@ -869,8 +882,8 @@ Where each test runs and its result on the last full check (all on `macos/v1` at
 `3b12faa03`): **hosted Mac** is this repository's `macos_core.yml` on GitHub's virtual Mac
 (run 46083525991, on every push to `main` or `macos/**`); **physical Mac** is the
 umbrella repository's `physical_mac.yml` on the M4 at full level (run 46083556911, started
-by push or by hand, not on every push), "both" meaning as built and as signed for the
-hardened runtime, on the default toolchain and, where marked, the Xcode 26.5 leg;
+by push or by hand, not on every push; every step that ran passed; Soak level: never run in the job (round 2 check, 28 November 2026).), "both" meaning as built and as signed for the
+hardened runtime, on the default toolchain and, only where marked "also Xcode leg", the Xcode 26.5 leg;
 **Linux** is this repository's `linux_core_arm64.yml` (run 46083526078, on every push to
 `main` or `macos/**`). The port's own tools and `fexmac` are Apple-only by design and are
 not built on Linux.
@@ -885,7 +898,7 @@ not built on Linux.
 | `FEXCoreASMTestRunner` with `Scripts/macos_asm_tests.py`, checked by `Scripts/macos_asm_check.py` against `Scripts/macos_asm_floor.txt` | Upstream's 2,292 assembly instruction tests plus the port's four in `unittests/macOS/ASM`, in four modes | 2,257 pass, 15 expected failures, 14 skips in each mode (the VM lacks CPU features), 0 unexpected | 2,265 pass, 15 expected failures, 6 skips in each mode, 0 unexpected, both; also Xcode leg |
 | `Scripts/macos_asm_tests.py --smc mtrack` on `SelfModifyingCode/` | The self-modifying-code tests with detection by write protection (package D) | pass, 3 of 3 per mode | pass, 3 of 3 per mode, both |
 | `Scripts/macos_fault_diff.py` with `fexmac_fault_diff` | Differential test of guest-fault delivery: 368 programs, each also with three flag preludes (1,472 cases), in 4 modes and 4 ways including a get/set-state round trip; the 2 known differences are in `fault_diff_known.txt` | pass | pass, both, 0 failures |
-| `FEXCoreOrderingTest` | Multi-thread x86 memory-ordering litmus tests and misaligned locked-operation counts, in three emulation modes; see "x86 memory ordering between threads" | pass; with emulation off or scalar, a forbidden outcome that does not appear only warns | pass, both, in each mode, the forbidden outcomes required with emulation off and scalar; 1,000 starts; also Xcode leg. The `--soak` figures in that section were measured by hand; the job's soak level has not been run |
+| `FEXCoreOrderingTest` | Multi-thread x86 memory-ordering litmus tests and misaligned locked-operation counts, in three emulation modes; see "x86 memory ordering between threads" | pass; with emulation off or scalar, a forbidden outcome that does not appear only warns | pass, both, in each mode, the forbidden outcomes required with emulation off and scalar; 1,000 starts; also Xcode leg. The `--soak` figures in that section were measured by hand. Soak level: never run in the job (round 2 check, 28 November 2026). |
 | `FEXCoreMutexWakeTest` | The core's reader-writer lock never loses a wake-up, in six queueing orders | pass | pass, both; also Xcode leg; with the bug restored, two orders hang (by hand) |
 | `fexmac_c_test` | A C program using only `fexmac.h`, linked as an outside project would be: 80 subtests (listed in `docs/macOS-embedding-interface.md`) covering large blocks (every size across the first scratch-buffer overflow, 8 threads translating large blocks at once), system calls (prefixed, restarted), stops (also inside long `rep` loops), state, guest memory registration, guest faults, self-modifying-code detection, invalidation (also from 8 threads at once), misaligned atomics with each signal-handler arrangement, call/return stack overflow and underflow, guest accesses to protected pages, chained handlers (one that leaves with siglongjmp, over 306 stack layouts; one that faults itself, which must end the process quickly; one that returns without fixing the fault) and sent signals, garbage struct sizes, lifetime races, cached translations and code ranges, split locked operations from 8 threads in every emulated form, also with plain stores to neighbouring bytes and under a signal storm (exact results), and error paths | 80 of 80, both | 80 of 80, both; also Xcode leg |
 | `fexmac_hook_test` | The same library built with test hooks (the separate `fexmac_testing` build, never in production artefacts), 24 subtests: asynchronous signals held off while the core handles a misaligned access, translations overflowing the scratch buffer 0 to 5 times run correctly, translations moving through three code buffers (also from the code cache), a block ending exactly on a code buffer's last byte, 5,014 random-size blocks across six buffers, a first code buffer that cannot be made fails thread creation cleanly and a later one ends the process with an accurate message, a guest store into a code buffer's guard page is a guest fault, a block that never fits stops cleanly at its start and the thread stays usable, each code buffer ends in an inaccessible page, a write past the end of a code buffer dies with a message (also with a host handler chained), guest and callback accesses to guard pages are not claimed, the scratch-buffer guard is disarmed after each translation, a log callback cannot re-enter the library, a fault inside the handler crashes with a message instead of hanging, the log callback is never called from a signal handler, a failed create leaves no log hook, invalidation leaves fault signals unblocked | 24 of 24, both | 24 of 24, both; also Xcode leg |
@@ -1087,6 +1100,31 @@ Older branches, kept as history and not worked on: `macos/core-port-smoke` is
 which showed the fixes are needed). `macos/runtime-fixes` (`2f7579f`) is where `macos/v1`
 started.
 
+## Known defects found after 1.0 (round 2)
+
+Added 28 November 2026. Found by round 2's tests on the M4; fixed (or given an opt-in) on
+the round 2 integration branch `macos/wp-r2-ordering-speed`, **not on `macos/v1` or
+`main`**. Details: that branch's copy of this document and the umbrella repository's round
+2 report (task E).
+
+- **x87 stores to memory bypassed the ordering emulation.** `fst`/`fstp` (32, 64 and 80
+  bits) and `fbstp` were emitted as plain stores whatever the ordering settings said. The 1.0 litmus tests had no x87 store test; round 2's x87
+  message-passing tests show thousands of forbidden outcomes with `--tso on` on the 1.0
+  code (for example 4,342 in 3.2 million for two `fstp qword`) and none after the fix
+  (`e57afd2a0`). Criterion 5's "0 forbidden outcomes with everything on" did not cover
+  these stores.
+- **`rep stos{w,d,q}` with string ordering on could lose its count-zero test.** The loop
+  had no placeholder before its release store, so the misaligned-access handler, patching
+  an element across 16 bytes, could overwrite the loop's count-zero test; a later `rep
+  stos` with rcx = 0 at that place then stored until it faulted. Found by round 2's `rep`
+  string differential; fixed in `f2412cd93`.
+- **`rep movs` between two mappings of the same memory.** The 1.0 copy path (string
+  ordering off: 32-byte chunks) judges overlap from the addresses, so a destination that
+  reaches the source's memory through a second mapping 1 to 31 bytes ahead of it in the
+  copy's direction gives a result x86 does not. It cannot be detected from the addresses;
+  round 2 adds an opt-in (`GUESTMEMORYALIASED=1`, every `rep movs` then copies element by
+  element), not a fix of the chunk path.
+
 ## Known limits
 
 Every limit of the port at 1.0, in one place, with where it is explained. None of them is
@@ -1148,8 +1186,7 @@ gate saw a short background spike ("Guest program and benchmark" states the load
 
 Of the test jobs (criterion 10): the physical-Mac job runs on one machine (an M4 Mac mini,
 macOS 27.0.1); its runner runs job code as the owner's account and is started by hand for
-supervised runs only (the umbrella's `docs/testing/physical-mac-runner.md`); its soak
-level has not been run in the job.
+supervised runs only (the umbrella's `docs/testing/physical-mac-runner.md`). Soak level: never run in the job (round 2 check, 28 November 2026).
 
 Upstream behaviour kept, not changed by the port: far jumps and calls through memory read
 a 32-bit offset also with REX.W (AMD's behaviour under an Intel CPUID), and `o32 iret`
@@ -1166,7 +1203,7 @@ From the umbrella repository's progress log (`docs/testing/v1-progress.md`), the
   machine (`python3 Scripts/macos_bench.py --loader build/Bin/FEXCoreBench --out
   bench-out --final --write-docs`, from a clean tree).
 - **Physical-Mac runner:** a dedicated non-admin macOS user for the runner (the owner's
-  to set up); until then no nightly schedule. The soak level has never run in the job.
+  to set up); until then no nightly schedule. Soak level: never run in the job (round 2 check, 28 November 2026).
 - **Package C:** one sentence for `docs/macOS-embedding-interface.md`: a SIGSEGV or SIGBUS
   sent from outside can re-enter a chained handler (per the progress log; not yet in the
   document).
