@@ -562,6 +562,35 @@ what the port promises. Numbers, the scratch-build logs and the measurement comm
 are in the round 2 report; the effect on the benchmark is in `docs/macOS-benchmarks.md`
 ("Candidates").
 
+After review (round 2): `fexmac_c_test rep-string-diff-{off,on,wide}` and the same with
+`GUESTMEMORYALIASED` compare about 250,000 `rep movs`/`stos` per translation with an
+element-by-element reference on position-dependent data (overlap -80 to +80 bytes both
+ways, every element size and skew, counts 0 to 300 and some across pages, `fs:`/`gs:`
+bases at every offset), memory and rcx/rsi/rdi. It found a 1.0 defect, now fixed: with
+string ordering on, `rep stos{w,d,q}` had no placeholder before its release store, so the
+misaligned-access handler, patching an element across 16 bytes, overwrote the loop's
+count-zero test, and a later `rep stos` with rcx = 0 there stored until it faulted.
+`RV-mono-*` are continuous order tests: one thread writes two words again and again in a
+fixed order with rising values, the other looks again and again (or copies them with one
+`rep movs`), so two accesses emitted in the wrong order are seen without any reordering
+by the hardware (about 150,000 overlapping looks per default run); `RV-order-*-chunk`
+(the review's) look at units 0 and 1 of one chunk. `stop-rep-movs*` count only stops that
+end a copy part-way. Deliberately wrong translations (`e2-logs/mutants.txt`, scratch
+builds, the review's mutation driver), and what catches each: plain loads and stores
+(15 ordering tests); word 1 loaded before word 0 (`RV-mono-read-*`); unit 1 stored
+before unit 0 (`RV-order-movsb0-chunk`, `RV-mono-movsq-chunk`); `stos` units 1, 0, 2, 3
+(`RV-order-stosb-chunk`, `RV-mono-stosq-chunk`, `RV-mono-std-stosq-chunk`); `stos` units 1
+to 3 plain stores (`RV-mono-stosq-line`, units either side of a line); plain loads in the
+`extr` loop (`RV-mono-read-movsb-skew-line`); no interrupt check after a run
+(`stop-rep-movs-string-tso-wide`); the element loop only up to 4 bytes of overlap, the
+source alignment ignoring the `fs:` base, no source alignment test (`rep-string-diff-wide`);
+runs one chunk past the page backward, runs not bounded by the source page (fault
+differential). Not caught, and equivalent on this machine: runs bounded by 8K instead of
+4K (faults are 16K-grained here), the element loop only up to 16 bytes of overlap (the
+loads run at most 16 bytes ahead), the word holding a chunk's first byte re-read at every
+chunk (each byte is still read once, in order). The instruction tests (`unittests/ASM`)
+never reach the wide path: their strings are at most 8 elements, below one chunk.
+
 The default run (`FEXCoreOrderingTest`, emulation on, 3.2 million tries per litmus test)
 takes about 15 seconds, of which the counting tests are about 10: every locked operation
 on a misaligned operand is a fault. `--tso off` and `--tso scalar` take the same. All three run
