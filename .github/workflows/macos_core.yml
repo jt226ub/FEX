@@ -6,6 +6,7 @@ name: macOS core build
 on:
   push:
     branches:
+      - main
       - 'macos/**'
   workflow_dispatch:
 

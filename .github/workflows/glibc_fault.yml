@@ -25,6 +25,7 @@ env:
 jobs:
   glibc_fault_test:
     runs-on: ${{ matrix.arch }}
+    if: github.repository == 'FEX-Emu/FEX'
     strategy:
       matrix:
         arch: [[self-hosted, ARM64]]

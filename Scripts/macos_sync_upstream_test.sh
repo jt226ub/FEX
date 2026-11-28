@@ -151,6 +151,14 @@ echo dirty >>port.txt
 expect "uncommitted changes" 1 "uncommitted changes" -- /bin/bash "$SCRIPT" --here
 git checkout -q -- port.txt
 
+# This repository's own main carries the port and is not upstream: make the test port's
+# main diverge from upstream (the port plus one more commit). The script must still take
+# upstream only from the upstream address, whatever the local main holds.
+git branch -f main macos/v1
+git switch -q main
+commit main-only.txt "main" "a commit only on the port's main"
+git switch -q macos/v1
+
 # --- 3. Dry run, merge, conflict (local test upstream) ----------------------------------
 
 export MACOS_SYNC_TEST_UPSTREAM_URL="$UPSTREAM_TEST_URL"
@@ -167,6 +175,8 @@ if [ "$BEFORE" = "$AFTER" ]; then pass "dry run left refs, remote settings and H
 fi
 expect "commit counts name merge and non-merge commits" 0 "4 (3 without merge commits)" \
   -- /bin/bash "$SCRIPT" --dry-run --here
+expect "a local main that carries the port is not taken for upstream" 0 "Upstream main:    $UP_SHA" \
+  -- /bin/bash "$SCRIPT" --dry-run main
 
 echo mine >"added by upstream.txt"
 expect "refuses an untracked file where upstream adds one" 1 "untracked files are where upstream adds files" \

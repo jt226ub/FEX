@@ -7,8 +7,12 @@
 #
 #   Scripts/macos_sync_upstream.sh [options] [port-branch] [upstream-ref]
 #
-#   port-branch   the port's integration branch (default macos/v1)
-#   upstream-ref  the upstream branch or tag to merge (default main)
+#   port-branch   the port's integration branch (default macos/v1). The fork's main also
+#                 carries the port, but syncs land on macos/v1 first and reach main only
+#                 by the owner's merge.
+#   upstream-ref  the upstream branch or tag to merge (default main: upstream's main,
+#                 fetched from FEX-Emu/FEX; this repository's own main is never used as
+#                 upstream)
 #
 #   --here         merge into the branch checked out in this worktree instead of creating
 #                  a new branch. The checked-out branch must already contain the port

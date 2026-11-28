@@ -16,6 +16,7 @@ name: Linux arm64 build and instruction tests
 on:
   push:
     branches:
+      - main
       - 'macos/**'
   workflow_dispatch:
 

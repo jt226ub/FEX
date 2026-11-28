@@ -11,6 +11,7 @@ env:
 jobs:
   wine_dll_artifacts:
     runs-on: ${{ matrix.arch }}
+    if: github.repository == 'FEX-Emu/FEX'
     strategy:
       matrix:
         arch: [[self-hosted, ARM64, mingw]]

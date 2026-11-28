@@ -18,6 +18,7 @@ env:
 jobs:
   vixl_simulator:
     runs-on: ${{ matrix.arch }}
+    if: github.repository == 'FEX-Emu/FEX'
     strategy:
       matrix:
         # Only the x86-64 runner is fast enough to run this

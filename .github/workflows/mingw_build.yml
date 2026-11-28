@@ -14,6 +14,7 @@ env:
 jobs:
   mingw_build:
     runs-on: ${{ matrix.arch }}
+    if: github.repository == 'FEX-Emu/FEX'
     strategy:
       matrix:
         arch: [[self-hosted, ARM64, mingw], [self-hosted, ARM64EC, mingw, ARM64]]

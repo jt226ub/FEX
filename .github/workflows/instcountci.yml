@@ -17,6 +17,7 @@ env:
 jobs:
   instcountci_tests:
     runs-on: ${{ matrix.arch }}
+    if: github.repository == 'FEX-Emu/FEX'
     strategy:
       matrix:
         arch: [[self-hosted, x64], [self-hosted, ARM64]]

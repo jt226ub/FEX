@@ -4,6 +4,21 @@ The port follows upstream FEX-Emu/FEX by merging it, never by rebasing or squash
 each merge commit has upstream as a parent and the next sync starts from the right merge
 base. Nothing is ever sent upstream: no push, pull request, issue or comment.
 
+## Branches
+
+- **`main`** in this fork carries the port. It is no longer a mirror of upstream; it
+  moves only when the owner merges `macos/v1` into it.
+- **`macos/v1`** is the integration branch for further work, and the port branch the
+  sync script uses by default. A sync is merged on a branch made from `macos/v1`, checked
+  there, merged into `macos/v1`, and reaches `main` with the owner's next merge.
+- **Upstream** is tracked only through the fetch-only remotes `upstream` and
+  `upstream-readonly` (their push addresses are `DISABLED-never-push-upstream`). The
+  script fetches upstream's `main` from the fixed address
+  `https://github.com/FEX-Emu/FEX.git` into `refs/remotes/upstream-readonly/main`; it
+  never reads this fork's `main` or `origin/main` as upstream.
+  `Scripts/macos_sync_upstream_test.sh` checks this with a local `main` that carries the
+  port and differs from upstream.
+
 ## Upstream merged so far
 
 | Date | Upstream `main` | Merge base before | New upstream commits | Branch |
@@ -56,7 +71,8 @@ listed and the merge left in progress to resolve; 3 a remote could still push up
 or `upstream-readonly` or the fetch address points elsewhere.
 
 It works from any worktree and never checks out the port branch itself, so it runs while
-another worktree has `macos/v1` checked out. It never pushes.
+another worktree has `macos/v1` checked out. It never pushes. Passing `main` as the port
+branch works too, but is not the procedure: syncs go through `macos/v1`.
 
 `Scripts/macos_sync_upstream_test.sh` tests it offline, in the Mac job too. It builds
 throwaway repositories under a temporary path with spaces and runs every case under
@@ -66,6 +82,28 @@ variable `MACOS_SYNC_TEST_UPSTREAM_URL` stands in a local repository for upstrea
 a test hook only and the script says so when it is set.
 
 ## Resolving conflicts
+
+Expected port changes in upstream's own files, besides the source changes:
+
+- **Upstream's workflows** (`ccpp.yml`, `glibc_fault.yml`, `hostrunner.yml`,
+  `instcountci.yml`, `mingw_build.yml`, `steamrt4.yml`, `vixl_simulator.yml`,
+  `wine_dll_artifacts.yml` under `.github/workflows/`) each have one added line per job,
+  `if: github.repository == 'FEX-Emu/FEX'`, after the job's `runs-on:`, in the style of
+  upstream's own `pr-code-format.yml`. With the port on this fork's `main` they would
+  otherwise start on every push to `main`, wait 24 hours for upstream's self-hosted
+  runners and fail, and a self-hosted label must never be matchable from this public
+  fork. When upstream changes one of these files, expect a conflict or a merged file
+  without the guard: keep upstream's change and keep (or put back) the guard on every
+  job, including any job upstream adds. After the sync, check that every job of every
+  workflow that is not the port's (`macos_core.yml`, `linux_core_arm64.yml`) has the
+  guard, for example with
+  `python3 -c "import yaml,glob; [print(f, j) for f in glob.glob('.github/workflows/*.yml') if not f.endswith(('macos_core.yml', 'linux_core_arm64.yml')) for j, v in yaml.safe_load(open(f))['jobs'].items() if v.get('if') != \"github.repository == 'FEX-Emu/FEX'\"]"`,
+  which prints nothing when all are guarded.
+- **`README.md`** has a notice at the top saying what this fork is; keep it above
+  upstream's text.
+
+When the merge itself conflicts:
+
 
 - Keep the macOS changes. Where upstream rewrote code the port also changed, take
   upstream's new code and apply the port's intent to it again. Do not keep the port's old

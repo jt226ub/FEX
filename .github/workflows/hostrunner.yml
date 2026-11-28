@@ -18,6 +18,7 @@ env:
 jobs:
   hostrunner_tests:
     runs-on: ${{ matrix.arch }}
+    if: github.repository == 'FEX-Emu/FEX'
     strategy:
       matrix:
         arch: [[self-hosted, x64]]
