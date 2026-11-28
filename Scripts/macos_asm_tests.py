@@ -184,11 +184,26 @@ def relocate_expected_addresses(original, relocated, assemble_map):
 
 
 def symbol_map(nasm_args, text, scratch):
-    """Assembles text and returns {label: offset} from nasm's map file."""
+    """Assembles text and returns {label: offset} from nasm's map file.
+
+    nasm's `[map symbols FILE]` directive ends the file name at the first space and does
+    not accept quotes, so with an output directory whose path has a space the map was
+    never written and every label lookup silently fell back to "add the relocation",
+    which is off by the moved code's longer encodings (Test_FEX_bugs/cmpxchg8b and
+    cmpxchg16b failed from such a directory). nasm runs in the map's directory with the
+    bare file name, and a missing map is an error, not a fallback."""
     source, mapfile = scratch + "_MAP.asm", scratch + ".map"
+    directory, mapname = os.path.split(os.path.abspath(mapfile))
+    if any(c.isspace() for c in mapname):
+        raise RuntimeError("map file name with a space: %r" % mapname)
     with open(source, "w") as handle:
-        handle.write("[map symbols %s]\nBITS 64\n%s\nret\n" % (mapfile, text))
-    subprocess.run(nasm_args + [source, "-o", scratch + "_MAP.bin"], capture_output=True, text=True)
+        handle.write("[map symbols %s]\nBITS 64\n%s\nret\n" % (mapname, text))
+    if os.path.exists(mapfile):
+        os.remove(mapfile)
+    result = subprocess.run(nasm_args + [os.path.abspath(source), "-o", os.path.abspath(scratch + "_MAP.bin")], capture_output=True,
+                            text=True, cwd=directory)
+    if result.returncode != 0 or not os.path.exists(mapfile):
+        raise RuntimeError("nasm wrote no symbol map for %s: %s" % (source, result.stderr.strip()[-300:]))
     symbols = {}
     if os.path.exists(mapfile):
         with open(mapfile) as handle:
@@ -293,11 +308,14 @@ def prepare(root, asm_dir, source, out_dir):
     with open(source) as handle:
         text = handle.read()
     includes = os.path.join(root, "unittests", "ASM", "Includes")
-    nasm_args = ["nasm", "-w+error=number-overflow", "-i", includes + "/", "-i", os.path.dirname(source) + "/"]
+    nasm_args = ["nasm", "-w+error=number-overflow", "-i", os.path.abspath(includes) + "/", "-i", os.path.abspath(os.path.dirname(source)) + "/"]
     relocated = relocate_low_memory(text, "Test_" + rel)
     if LOW_MEMORY_RELOCATION:
         # The code moves even when no constant does, so this applies to every test.
-        relocated = relocate_expected_addresses(text, relocated, lambda t: symbol_map(nasm_args, t, base))
+        try:
+            relocated = relocate_expected_addresses(text, relocated, lambda t: symbol_map(nasm_args, t, base))
+        except RuntimeError as error:
+            return "symbol map: " + str(error)[:200]
     with open(tmp, "w") as handle:
         handle.write("BITS 64\n" + relocated + "\nret\n")
     config_source = source
