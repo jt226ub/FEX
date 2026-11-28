@@ -1753,6 +1753,43 @@ std::vector<LitmusTest> MakeTests() {
                      MonoScalarWriter(2056, 2048, 255), MonoCopyReader(false, 1, 0, 8, 100)));
     T.push_back(Mono("RV-mono-read-movsq-chunk", "as RV-mono-read-movsb-chunk, with rep movsq", MonoScalarWriter(2056, 2048, 3000),
                      MonoCopyReader(false, 8, 0, 8, 300)));
+    // The extr loop (source 3 bytes off): words 1 and 2 of a run are its 'next' loads; the
+    // two either side of a 128-byte line. The writer stores the low byte of each (values
+    // below 256): 2176 then 2168; the copy from 2163 reads 2168 first (copy byte 5) and
+    // 2176 second (copy byte 13).
+    {
+      auto Reader = [](Asm& A) {
+        A.MovImm(RDX, 100);
+        A.Store(R12, 16, RDX);
+        const size_t Loop = A.Here();
+        A.Mov(RSI, RBX);
+        A.AluImm(ADD, RSI, 2163);
+        A.Mov(RDI, RBX);
+        A.AluImm(ADD, RDI, Scratch);
+        A.MovImm(RCX, 64);
+        A.RepMovsb();
+        A.MovzxByte(RAX, RBX, Scratch + 5);
+        A.MovzxByte(RDX, RBX, Scratch + 13);
+        A.Cmp(RDX, RAX);
+        const size_t Same = A.JccFwd(CC_Z);
+        A.Load(RCX, R12, 8);
+        A.Inc(RCX);
+        A.Store(R12, 8, RCX);
+        A.Cmp(RDX, RAX);
+        const size_t InOrder = A.JccFwd(CC_AE);
+        A.Load(RCX, R12, 0);
+        A.Inc(RCX);
+        A.Store(R12, 0, RCX);
+        A.Bind(InOrder);
+        A.Bind(Same);
+        A.Load(RCX, R12, 16);
+        A.Dec32(RCX);
+        A.Store(R12, 16, RCX);
+        A.JccBack(CC_NZ, Loop);
+      };
+      T.push_back(Mono("RV-mono-read-movsb-skew-line", "source 3 bytes off: word at 2176 then 2168 written; the copy never has 2168's ahead",
+                       MonoScalarWriter(2176, 2168, 255), Reader));
+    }
     T.push_back(Mono("RV-mono-read-std-movsq-chunk", "word 2 then word 3 written; std; rep movsq's copy never has word 3 ahead",
                      MonoScalarWriter(2064, 2072, 3000), MonoCopyReader(true, 8, 24, 16, 300)));
 
@@ -1760,7 +1797,7 @@ std::vector<LitmusTest> MakeTests() {
     // on the M4; the others are only reported there).
     for (auto& t : T) {
       const std::string N = t.Name;
-      if (N == "RV-mono-stosq-line" || N == "RV-mono-movsq-line") {
+      if (N == "RV-mono-stosq-line" || N == "RV-mono-movsq-line" || N == "RV-mono-read-movsb-skew-line") {
         t.Off = t.Scalar = Expect::Break;
       } else if (N == "RV-mono-stosq-chunk" || N == "RV-mono-std-stosq-chunk" || N == "RV-mono-movsq-chunk" ||
                  N == "RV-order-std-stosq-chunk") {
