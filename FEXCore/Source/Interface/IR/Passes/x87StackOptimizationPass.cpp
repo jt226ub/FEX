@@ -9,6 +9,7 @@
 #include "FEXCore/Utils/Profiler.h"
 #include "FEXCore/Core/HostFeatures.h"
 #include "Interface/Core/Addressing.h"
+#include "Interface/Context/Context.h"
 
 #include <array>
 #include <cstddef>
@@ -151,9 +152,10 @@ private:
 
 class X87StackOptimization final : public Pass {
 public:
-  X87StackOptimization(const FEXCore::HostFeatures& Features, OpSize GPROpSize)
+  X87StackOptimization(const FEXCore::HostFeatures& Features, OpSize GPROpSize, const Context::ContextImpl* CTX)
     : Features(Features)
-    , GPROpSize(GPROpSize) {
+    , GPROpSize(GPROpSize)
+    , CTX(CTX) {
     FEX_CONFIG_OPT(ReducedPrecision, X87REDUCEDPRECISION);
     ReducedPrecisionMode = ReducedPrecision;
   }
@@ -162,7 +164,24 @@ public:
 private:
   const FEXCore::HostFeatures& Features;
   const OpSize GPROpSize;
+  // For the memory-ordering settings: x87 values live in vector registers, so x87 stores
+  // follow the vector setting (VectorTSOEnabled), as x87 loads do (they go through
+  // LoadSource, _LoadMemAutoTSO with the FPR class).
+  const Context::ContextImpl* CTX;
   bool ReducedPrecisionMode;
+
+  bool X87StoresOrdered() const {
+    return CTX && CTX->IsVectorAtomicTSOEnabled();
+  }
+  // An x87 store of 4 or 8 bytes: ordered (StoreMemTSO, FPR) under vector ordering, as an
+  // SSE store would be; plain otherwise.
+  void StoreX87(OpSize Size, Ref Value, Ref Addr, Ref Offset, OpSize Align, MemOffsetType OffsetType, uint8_t OffsetScale) {
+    if (X87StoresOrdered()) {
+      IREmit->_StoreMemTSO(RegClass::FPR, Size, Value, Addr, Offset, Align, OffsetType, OffsetScale);
+    } else {
+      IREmit->_StoreMemFPR(Size, Value, Addr, Offset, Align, OffsetType, OffsetScale);
+    }
+  }
   FEX_CONFIG_OPT(DisableVixlIndirectCalls, DISABLE_VIXL_INDIRECT_RUNTIME_CALLS);
 
   // Helpers
@@ -170,7 +189,11 @@ private:
 
   void F80SplitStore_Helper(const IROp_StoreStackMem* Op, Ref StackNode, Ref AddrNode, Ref Offset, OpSize Align, MemOffsetType OffsetType,
                             uint8_t OffsetScale) {
-    IREmit->_StoreMemFPR(OpSize::i64Bit, StackNode, AddrNode, Offset, Align, OffsetType, OffsetScale);
+    // One x86 store of 10 bytes as an 8-byte and a 2-byte store, lower part first. With
+    // ordering on, the first is ordered after every earlier access (a vector TSO store)
+    // and the second is a release store, ordered after the first: every later store is
+    // ordered after both. (x86 promises no atomicity beyond 8 bytes here.)
+    StoreX87(OpSize::i64Bit, StackNode, AddrNode, Offset, Align, OffsetType, OffsetScale);
     auto Upper = IREmit->_VExtractToGPR(OpSize::i128Bit, OpSize::i64Bit, StackNode, 1);
 
     // Store the Upper part of the register (the remaining 2 bytes) into memory.
@@ -180,8 +203,13 @@ private:
                    .IndexType = MemOffsetType::SXTX,
                    .IndexScale = OffsetScale,
                    .AddrSize = OpSize::i64Bit};
-    A = SelectAddressMode(IREmit, A, GPROpSize, Features.SupportsTSOImm9, false, false, OpSize::i16Bit);
-    IREmit->_StoreMemGPR(OpSize::i16Bit, Upper, A.Base, A.Index, OpSize::i64Bit, MemOffsetType::SXTX, A.IndexScale);
+    const bool Ordered = X87StoresOrdered();
+    A = SelectAddressMode(IREmit, A, GPROpSize, Features.SupportsTSOImm9, Ordered, false, OpSize::i16Bit);
+    if (Ordered) {
+      IREmit->_StoreMemTSO(RegClass::GPR, OpSize::i16Bit, Upper, A.Base, A.Index, OpSize::i64Bit, A.IndexType, A.IndexScale);
+    } else {
+      IREmit->_StoreMemGPR(OpSize::i16Bit, Upper, A.Base, A.Index, OpSize::i64Bit, MemOffsetType::SXTX, A.IndexScale);
+    }
   }
 
   void Store80BitToMem(const IROp_StoreStackMem* Op, Ref StackNode, Ref AddrNode, Ref Offset, OpSize Align, MemOffsetType OffsetType,
@@ -213,7 +241,7 @@ private:
     case OpSize::i32Bit:
     case OpSize::i64Bit: {
       StackNode = IREmit->_F80CVT(Op->StoreSize, StackNode);
-      IREmit->_StoreMemFPR(Op->StoreSize, StackNode, AddrNode, Offset, Align, OffsetType, OffsetScale);
+      StoreX87(Op->StoreSize, StackNode, AddrNode, Offset, Align, OffsetType, OffsetScale);
       break;
     }
 
@@ -242,7 +270,7 @@ private:
       [[fallthrough]];
     }
     case OpSize::i64Bit: {
-      IREmit->_StoreMemFPR(Op->StoreSize, StackNode, AddrNode, Offset, Align, OffsetType, OffsetScale);
+      StoreX87(Op->StoreSize, StackNode, AddrNode, Offset, Align, OffsetType, OffsetScale);
       break;
     }
 
@@ -1023,7 +1051,7 @@ void X87StackOptimization::Run(IREmitter* Emit) {
           if (Op->StoreSize == OpSize::f80Bit) {
             Store80BitToMem(Op, SourceValue, AddrNode, Offset, Align, OffsetType, OffsetScale);
           } else {
-            IREmit->_StoreMemFPR(StoreSize, SourceValue, AddrNode, Offset, Align, OffsetType, OffsetScale);
+            StoreX87(StoreSize, SourceValue, AddrNode, Offset, Align, OffsetType, OffsetScale);
           }
           break;
         }
@@ -1234,7 +1262,7 @@ void X87StackOptimization::Run(IREmitter* Emit) {
   }
 }
 
-fextl::unique_ptr<Pass> CreateX87StackOptimizationPass(const HostFeatures& Features, OpSize GPROpSize) {
-  return fextl::make_unique<X87StackOptimization>(Features, GPROpSize);
+fextl::unique_ptr<Pass> CreateX87StackOptimizationPass(const HostFeatures& Features, OpSize GPROpSize, const Context::ContextImpl* CTX) {
+  return fextl::make_unique<X87StackOptimization>(Features, GPROpSize, CTX);
 }
 } // namespace FEXCore::IR

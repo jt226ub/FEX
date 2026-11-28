@@ -33,7 +33,8 @@ namespace {
   //    undo records for restartable faults.
   // 4: package D's store-first read-modify-writes and rep loop tuning; package F's
   //    batched writer (merged from macos/v1) without its own bump.
-  constexpr uint32_t PortCacheRevision = 4;
+  // 5: x87 stores (fst/fstp m32/m64/m80, fbstp) ordered under vector ordering (round 2).
+  constexpr uint32_t PortCacheRevision = 5;
 
   constexpr size_t FOZRecordHeaderSize = sizeof(MesaFOZ::foz_payload_key) + sizeof(MesaFOZ::foz_payload_header);
   constexpr size_t IndexRecordMinPayload = sizeof(MesaFOZ::mesa_index_db_file_entry) + sizeof(IndexExtraBlobHeader);

@@ -4829,10 +4829,19 @@ void OpDispatchBuilder::StoreResult_WithOpSize(RegClass Class, FEXCore::X86Table
     if (CTX->HostFeatures.SupportsSVE()) {
       _StoreMemX87SVEOptPredicate(OpSize::i128Bit, OpSize::i16Bit, Src, MemStoreDst);
     } else {
-      // For X87 extended doubles, split before storing
-      _StoreMemFPR(OpSize::i64Bit, MemStoreDst, Src, Align);
-      auto Upper = _VExtractToGPR(OpSize::i128Bit, OpSize::i64Bit, Src, 1);
-      _StoreMemGPR(OpSize::i16Bit, Upper, MemStoreDst, Constant(8), std::min(Align, OpSize::i64Bit), MemOffsetType::SXTX, 1);
+      // For X87 extended doubles, split before storing. With vector ordering on (x87 values
+      // are vector registers) both parts are ordered stores, lower part first, as in the
+      // x87 stack pass (F80SplitStore_Helper).
+      if (IsTSOEnabled(RegClass::FPR)) {
+        _StoreMemTSO(RegClass::FPR, OpSize::i64Bit, Src, MemStoreDst, Invalid(), Align, MemOffsetType::SXTX, 1);
+        auto Upper = _VExtractToGPR(OpSize::i128Bit, OpSize::i64Bit, Src, 1);
+        _StoreMemTSO(RegClass::GPR, OpSize::i16Bit, Upper, Add(OpSize::i64Bit, MemStoreDst, 8), Invalid(), std::min(Align, OpSize::i64Bit),
+                     MemOffsetType::SXTX, 1);
+      } else {
+        _StoreMemFPR(OpSize::i64Bit, MemStoreDst, Src, Align);
+        auto Upper = _VExtractToGPR(OpSize::i128Bit, OpSize::i64Bit, Src, 1);
+        _StoreMemGPR(OpSize::i16Bit, Upper, MemStoreDst, Constant(8), std::min(Align, OpSize::i64Bit), MemOffsetType::SXTX, 1);
+      }
     }
   } else {
     _StoreMemAutoTSO(Class, OpSize, A, Src, Align == OpSize::iInvalid ? OpSize : Align);
