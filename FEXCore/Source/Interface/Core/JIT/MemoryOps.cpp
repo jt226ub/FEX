@@ -1949,7 +1949,7 @@ bool Arm64JITCore::EmitRepStringInPlace(bool Copy, bool IsAtomic, size_t Size, A
     }
   };
 
-  // MemcpySetTSOWide: forward rep movs / rep stos with ordering on, in 8-byte acquire
+  // MemcpySetTSOWide: rep movs / rep stos (either direction) with ordering on, in 8-byte acquire
   // loads (ldapur) and release stores (stlur) instead of one pair per element. Why this
   // and not plain stores between two barriers: Intel lets the stores within one fast
   // string operation become visible out of order (SDM vol. 3A 253668-093US, 11.2.4.1,
@@ -1966,18 +1966,20 @@ bool Arm64JITCore::EmitRepStringInPlace(bool Copy, bool IsAtomic, size_t Size, A
   //    destination and source are aligned to the element size; the destination is then
   //    brought to 8-byte alignment element by element;
   //  - a source not 8-aligned relative to the destination is read as aligned words, each
-  //    exactly once and in ascending order, and each destination word is assembled with
+  //    exactly once and in the copy's order, and each destination word is assembled with
   //    extr from two of them (one loop per source offset, an immediate in extr);
-  //  - loads run at most one word ahead of the stores, i.e. a load is performed before an
-  //    earlier store to a different address, which TSO allows (and ldapr allows after
-  //    stlr); the destination 1 to 64 bytes above the source (where a later element reads
+  //  - loads run at most two words (16 bytes) ahead of the stores, i.e. a load is
+  //    performed before an earlier store to a different address, which TSO allows (and
+  //    ldapr allows after stlr); the destination 1 to 64 bytes ahead of the source in the
+  //    copy's direction (where a later element reads
   //    what an earlier one wrote) goes element by element, as before;
   //  - runs of 32-byte chunks within one 4K page of the destination and of the source (as
   //    the plain chunk path): any fault is on the run's first access to that page, before
   //    any store of the run, and rcx/rsi/rdi count whole chunks, so progress at a fault is
   //    exact; the interrupt check follows every run;
-  //  - backward copies (DF=1), tails shorter than a chunk and anything not eligible use
-  //    the element loop unchanged. No barrier is added anywhere.
+  //  - backward copies (DF=1) are the mirror image (units and words taken from the top);
+  //    tails shorter than a chunk and anything not eligible use the element loop
+  //    unchanged. No barrier is added anywhere.
   const bool Wide = IsAtomic && CTX->IsMemcpyWideTSOEnabled() && CTX->HostFeatures.SupportsTSOImm9;
   auto EmitWide = [&](bool Back, ARMEmitter::ForwardLabel& ElementTail, ARMEmitter::ForwardLabel& Done, auto&& EmitElement) {
     const uint32_t ChunkElements = 32 / Size;

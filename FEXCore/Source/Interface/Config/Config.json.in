@@ -633,7 +633,7 @@
         "Default": "false",
         "AffectsCodeGen": "true",
         "Desc": [
-          "macOS only, with TSOEnabled and MemcpySetTSOEnabled: REP MOVS and REP STOS copy forward",
+          "macOS only, with TSOEnabled and MemcpySetTSOEnabled: REP MOVS and REP STOS copy (either direction)",
           "in 8-byte acquire loads and release stores (whole elements, page-bounded runs) instead of",
           "one acquire/release pair per element. Every access stays ordered exactly as before; see",
           "docs/macOS-port-status.md. Off by default."
