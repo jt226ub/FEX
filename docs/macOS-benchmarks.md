@@ -454,10 +454,17 @@ do the same. FEX is faster than Rosetta 2 at full precision, and much faster wit
   and merge barriers between consecutive vector accesses where x86 ordering allows it.
 - Treat provably thread-private memory (beyond the stack, which is already exempt) as
   needing no ordering.
-- `rep movs`/`rep stos` with string ordering: x86 makes no promise about the order of
-  the individual stores of one fast string instruction; copying in larger ordered units,
-  or with plain wide stores bracketed by barriers, would keep the guarantee that matters
-  (ordering against other instructions) at a fraction of the cost.
+- `rep movs`/`rep stos` with string ordering (round 2, E2). Intel lets the stores of one
+  fast string operation be seen out of order, AMD documents no such exception and Intel
+  none for its loads (citations in `docs/macOS-port-status.md`, "String instructions in
+  wider ordered units"), so plain stores between two barriers were not implemented.
+  Implemented instead, behind `MEMCPYSETTSOWIDE` (off by default): the same acquire loads
+  and release stores, eight bytes at a time. The configurations `tso_on_wide` and
+  `tso_memcpy_wide` of `Scripts/macos_bench.py` (not in the default set) measure it, and
+  `Scripts/macos_string_bench.py` times `rep movsb`, `movsq`, `stosb` and `stosq` at four
+  sizes and in the kernel's shapes (skewed source, misaligned elements, overlapping
+  copies); results are in the round 2 report, not in the generated block, which still
+  holds the measurement taken for the first release.
 
 ## How the code was examined
 
@@ -506,6 +513,14 @@ python3 Scripts/macos_bench.py --check-docs
 # The correctness check (what the Mac workflow runs, as built and with --hardened):
 python3 Scripts/macos_bench.py --loader build/Bin/FEXCoreBench --out bench-quick --quick [--hardened]
 python3 Scripts/macos_bench_mutations.py
+```
+
+The string-instruction microbenchmark (round 2), at the default QoS and on the
+efficiency cores:
+
+```
+python3 Scripts/macos_string_bench.py --loader build/Bin/FEXCoreBench --out string-bench --launches 5
+python3 Scripts/macos_string_bench.py --loader build/Bin/FEXCoreBench --out string-bench-e --launches 5 --background
 ```
 
 `--configs`, `--only`, `--launches`, `--reps` narrow or widen a run. `FEXCoreBench`
