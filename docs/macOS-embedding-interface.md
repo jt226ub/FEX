@@ -178,8 +178,10 @@ hexadecimal; a leading 0 is refused rather than read as octal.
 | `MULTIBLOCK` | 0, 1 | |
 | `MAXINST` | 1 to 2^31-1 | instructions per block |
 | `TSOENABLED`, `VECTORTSOENABLED`, `MEMCPYSETTSOENABLED`, `HALFBARRIERTSOENABLED` | 0, 1 | x86 memory-ordering emulation (software; macOS has no hardware mode for ordinary processes) |
-| `VECTORTSOSPLIT` | 0 to 31 (bit mask) | experimental, off by default: vector-register accesses under `VECTORTSOENABLED` as general-register acquire/release accesses. 1 loads, 2 stores of 8 bytes or less (one access each); 4, 8: 16-byte loads, stores as two 8-byte halves, which breaks x86's aligned 16-byte atomicity (experiment only); 16 keeps aligned-form 16-byte accesses whole. See `docs/macOS-port-status.md` |
-| `TSOBARRIERMERGE` | 0, 1 | experimental, off by default: one `dmb ish` instead of a vector load's `dmb ishld` and the next vector store's `dmb ish` when only register-only operations lie between |
+| `VECTORTSOSPLIT` | 0 to 3 (bit mask) | default 0. With `VECTORTSOENABLED`: vector-register loads (1) and stores (2) of 4 or 8 bytes as one acquire load or release store through a general register, no barrier; every access stays one access. Bits 4, 8 and 16 (16-byte accesses as two halves, not atomic) are accepted only by the testing build (`docs/macOS-port-status.md`, "Cheaper vector ordering") |
+| `TSOBARRIERMERGE` | 0, 1 | default 0: one `dmb ish` instead of a vector load's `dmb ishld` and the next vector store's `dmb ish` when only register-only operations lie between |
+| `MEMCPYSETTSOWIDE` | 0, 1 | default 0. With `TSOENABLED` and `MEMCPYSETTSOENABLED`: `rep movs`/`stos` in 8-byte acquire loads and release stores instead of one pair per element; every access ordered as before (`docs/macOS-port-status.md`, "String instructions in wider ordered units") |
+| `GUESTMEMORYALIASED` | 0, 1 | default 0. Declares that guest memory is reachable through more than one virtual address; every `rep movs` then copies element by element (see "Aliases" under "Self-modifying code") |
 | `SMCCHECKS` | `none`, `mtrack`, `full` (or 0, 1, 2) | default `mtrack`: with no guest memory registered nothing is detected (the embedder calls `fexmac_invalidate`, as before package D); with memory registered, translated pages are write-protected (see "Self-modifying code"). `full`: a check of the guest bytes before every instruction, everywhere. `none`: nothing |
 | `X87REDUCEDPRECISION`, `HIDEHYPERVISORBIT` | 0, 1 | |
 | `HOSTFEATURES` | `off`, or comma-separated `disable*` names the core knows | `enable*` names are refused: they force a feature on whether the host has it or not (`enablesve` dies with SIGILL on an M4) |
@@ -799,6 +801,23 @@ JIT's dual mapping, shared memory) is not detected: the embedder, which created 
 must call `fexmac_invalidate` for the executable alias's range after such writes (or keep
 `SMCCHECKS full`). `smc-alias-needs-invalidate` shows the stale result without the call
 and the new code with it.
+
+**Aliases and `rep movs`.** `rep movs` decides from rsi and rdi whether the copy reads
+bytes it has itself just written (destination 1 to 64 bytes ahead of the source in the
+copy's direction: x86 copies element after element, so the copy repeats data) and copies
+in larger pieces otherwise. Through a second mapping of the same memory the addresses can
+be far apart while the memory overlaps, and those pieces then read bytes before the copy
+has written them. Measured on the M4 (`fexmac_c_test rep-movs-alias`, destination 1 to 80
+bytes from the source through a `mach_vm_remap` alias, 3,840 cases per translation): with
+string ordering off (the 32-byte chunks and the one-byte fill of the 1.0 port) 744 cases
+are not x86's result; with string ordering on, element by element, none; with
+`MEMCPYSETTSOWIDE` 90 (destination 1 to 8 bytes ahead); with string ordering off every
+distance from 1 to 31 bytes. Nothing in the addresses tells,
+so the embedder, which made the alias, declares it: `GUESTMEMORYALIASED=1` makes every
+`rep movs` of the context copy element by element, in x86's order, in every translation
+(the same test: 0 wrong in each). It costs the speed of the element loop for every copy;
+`rep stos` is unaffected, and so is every other instruction (each accesses its memory
+once).
 
 Host pages are 16K and guest pages 4K, so data that shares a host page with code costs a
 fault per write (counted by `fexmac_memory_code_write_count`). Measured on the M4

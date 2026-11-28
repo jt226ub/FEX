@@ -2246,13 +2246,17 @@ extern const size_t FaultSubtestCount;
 /* VectorOrderingTest.c */
 extern const struct Subtest VectorOrderingSubtests[];
 extern const size_t VectorOrderingSubtestCount;
+/* RepStringTest.c */
+extern const struct Subtest RepSubtests[];
+extern const size_t RepSubtestCount;
 
 int main(int argc, char** argv) {
   enum { Own = sizeof(Subtests) / sizeof(Subtests[0]) };
-  const size_t Total = Own + FaultSubtestCount + VectorOrderingSubtestCount;
+  const size_t Total = Own + FaultSubtestCount + VectorOrderingSubtestCount + RepSubtestCount;
   struct Subtest* All = malloc(sizeof(struct Subtest) * Total);
   memcpy(All, Subtests, sizeof(Subtests));
   memcpy(All + Own, FaultSubtests, sizeof(struct Subtest) * FaultSubtestCount);
   memcpy(All + Own + FaultSubtestCount, VectorOrderingSubtests, sizeof(struct Subtest) * VectorOrderingSubtestCount);
+  memcpy(All + Own + FaultSubtestCount + VectorOrderingSubtestCount, RepSubtests, sizeof(struct Subtest) * RepSubtestCount);
   return RunSubtests(argc, argv, All, Total, 120);
 }

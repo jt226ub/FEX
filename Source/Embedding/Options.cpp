@@ -52,6 +52,8 @@ namespace {
     OPTION(MEMCPYSETTSOENABLED, MemcpySetTSOEnabled, Bool),
     // rep movs/stos with string ordering on: 8-byte acquire/release units (round 2, E2).
     OPTION(MEMCPYSETTSOWIDE, MemcpySetTSOWide, Bool),
+    // Guest memory reachable through two virtual addresses: rep movs element by element.
+    OPTION(GUESTMEMORYALIASED, GuestMemoryAliased, Bool),
     OPTION(HALFBARRIERTSOENABLED, HalfBarrierTSOEnabled, Bool),
     // Experimental cheaper forms of the vector ordering (off by default; effective only
     // with VECTORTSOENABLED): vector accesses as general-register acquire/release

@@ -1788,7 +1788,9 @@ static void TestStopRepMovsMode(int StringTSO) {
           (Run_->Copy && State.gpr[RSI] != Addr(Src) + Moved)) {
         ++Bad;
       }
-      ++Stops;
+      /* Part-way only: a stop before the first element or at the hlt says nothing about
+       * the checks inside the loop (a translation without them is stopped only there). */
+      Stops += Done > 0 && State.gpr[RCX] != 0;
     }
     atomic_store(&StormDone, 1);
     pthread_join(Requester, NULL);

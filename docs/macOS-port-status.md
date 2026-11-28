@@ -620,16 +620,20 @@ load-store and store-store order; a release store followed by an RCpc load is no
   never split between two units) and the copy does not read what it wrote (destination
   1 to 64 bytes ahead of the source in the copy's direction: element by element, as
   before). The destination is brought to 8-byte alignment element by element. A source
-  at another offset within 8 bytes is read as aligned 8-byte acquire loads, each word
-  once and in the copy's order, and each destination word is assembled with `extr`
-  (one loop per offset); loads run at most one word ahead of the stores, a load passing
-  an earlier store to another address, which TSO allows.
+  at another offset within 8 bytes is read as aligned 8-byte acquire loads in the copy's
+  order, each destination word assembled with `extr` from two of them (one loop per
+  offset). Within a run each word is read once; at the start of the next run the word
+  holding its first byte is read again (the previous read supplied the bytes before it,
+  this one the bytes after: each byte is still read once, in order). Loads run at most two
+  words (16 bytes) ahead of the stores, a load passing an earlier store to another
+  address, which TSO allows.
 - Runs of 32-byte chunks within one 4K page of the destination and of the source, as the
   plain chunk path: a fault can only be the run's first access to a page, before any of
   its stores, and rcx/rsi/rdi count whole chunks, so progress at faults and stops is
-  exact; the interrupt check follows every run. Fewer than 32 bytes, misaligned elements,
-  overlapping copies and `fs:`/`gs:` sources with a base not keeping the alignment use the
-  element loop unchanged. No barrier is added; nothing changes with string ordering off.
+  exact; the interrupt check follows every run. Fewer than 32 bytes, misaligned elements
+  and overlapping copies use the element loop unchanged. With `fs:`/`gs:` the source
+  address that counts is base + rsi: its alignment decides between the aligned loop and
+  the `extr` loops, and an element misaligned there goes element by element. No barrier is added; nothing changes with string ordering off.
   The option acts only on macOS (the in-place loops exist only there; elsewhere it is
   accepted and does nothing), only with `TSOENABLED` and `MEMCPYSETTSOENABLED`, and only
   on hosts with FEAT_LRCPC2 (`ldapur`/`stlur`); it is in the code-cache key (the
@@ -654,6 +658,35 @@ Intel-only relaxation) the six `-line` tests break: the tests tell that relaxati
 what the port promises. Numbers, the scratch-build logs and the measurement commands
 are in the round 2 report; the effect on the benchmark is in `docs/macOS-benchmarks.md`
 ("Candidates").
+
+After review (round 2): `fexmac_c_test rep-string-diff-{off,on,wide}` and the same with
+`GUESTMEMORYALIASED` compare about 250,000 `rep movs`/`stos` per translation with an
+element-by-element reference on position-dependent data (overlap -80 to +80 bytes both
+ways, every element size and skew, counts 0 to 300 and some across pages, `fs:`/`gs:`
+bases at every offset), memory and rcx/rsi/rdi. It found a 1.0 defect, now fixed: with
+string ordering on, `rep stos{w,d,q}` had no placeholder before its release store, so the
+misaligned-access handler, patching an element across 16 bytes, overwrote the loop's
+count-zero test, and a later `rep stos` with rcx = 0 there stored until it faulted.
+`RV-mono-*` are continuous order tests: one thread writes two words again and again in a
+fixed order with rising values, the other looks again and again (or copies them with one
+`rep movs`), so two accesses emitted in the wrong order are seen without any reordering
+by the hardware (about 150,000 overlapping looks per default run); `RV-order-*-chunk`
+(the review's) look at units 0 and 1 of one chunk. `stop-rep-movs*` count only stops that
+end a copy part-way. Deliberately wrong translations (`e2-logs/mutants.txt`, scratch
+builds, the review's mutation driver), and what catches each: plain loads and stores
+(15 ordering tests); word 1 loaded before word 0 (`RV-mono-read-*`); unit 1 stored
+before unit 0 (`RV-order-movsb0-chunk`, `RV-mono-movsq-chunk`); `stos` units 1, 0, 2, 3
+(`RV-order-stosb-chunk`, `RV-mono-stosq-chunk`, `RV-mono-std-stosq-chunk`); `stos` units 1
+to 3 plain stores (`RV-mono-stosq-line`, units either side of a line); plain loads in the
+`extr` loop (`RV-mono-read-movsb-skew-line`); no interrupt check after a run
+(`stop-rep-movs-string-tso-wide`); the element loop only up to 4 bytes of overlap, the
+source alignment ignoring the `fs:` base, no source alignment test (`rep-string-diff-wide`);
+runs one chunk past the page backward, runs not bounded by the source page (fault
+differential). Not caught, and equivalent on this machine: runs bounded by 8K instead of
+4K (faults are 16K-grained here), the element loop only up to 16 bytes of overlap (the
+loads run at most 16 bytes ahead), the word holding a chunk's first byte re-read at every
+chunk (each byte is still read once, in order). The instruction tests (`unittests/ASM`)
+never reach the wide path: their strings are at most 8 elements, below one chunk.
 
 The default run (`FEXCoreOrderingTest`, emulation on, 3.2 million tries per litmus test)
 takes about 15 seconds, of which the counting tests are about 10: every locked operation
@@ -1323,6 +1356,14 @@ Of memory ordering (criterion 5):
   cross-modifying code that the architecture does not guarantee; at most one access per
   thread per patched instruction, once, can miss its barrier. Never observed. Kept as
   upstream's design ("x86 memory ordering between threads", "Known gap").
+- **`rep movs` through aliased mappings.** The copy paths judge overlap from the addresses;
+  a destination that reaches the source's memory through a second mapping 1 to 64 bytes
+  ahead of it in the copy's direction gives a result x86 does not: with string ordering
+  off (the 1.0 default: 32-byte chunks, the one-byte fill) at distances of 1 to 31 bytes,
+  with `MEMCPYSETTSOWIDE` at 1 to 8 bytes (measured: `fexmac_c_test rep-movs-alias`). Undetectable from
+  the addresses; the embedder declares aliased guest memory with `GUESTMEMORYALIASED=1`,
+  and every `rep movs` then copies element by element, exact (`fexmac_c_test
+  rep-movs-alias`; "Aliases and `rep movs`" in `docs/macOS-embedding-interface.md`).
 - `rep movs`/`rep stos` with string ordering on stay ordered element by element (also with
   `MEMCPYSETTSOWIDE`, which only widens the ordered accesses): the Intel-only relaxation
   of a fast string's stores is not used, since AMD documents none ("String instructions in

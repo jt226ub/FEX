@@ -2214,6 +2214,15 @@ bool Arm64JITCore::EmitRepStringInPlace(bool Copy, bool IsAtomic, size_t Size, A
   };
   auto StoreElement = [&](ARMEmitter::Register Data) {
     if (IsAtomic) {
+      if (!Copy && Size != 1) {
+        // The slot the misaligned-access handler overwrites with a barrier when it patches
+        // this store (it writes the instruction before a faulting stlr). In a copy the
+        // load's two placeholders come just before. Without it, rep stos{w,d,q} with string
+        // ordering on and an element across 16 bytes had the instruction before the store
+        // replaced: the count-zero test, after which a later rep stos with rcx = 0 ran
+        // until it faulted (found by rep-string-diff-on).
+        nop();
+      }
       switch (Size) {
       case 1: stlrb(Data.W(), D); break;
       case 2: stlrh(Data.W(), D); break;
@@ -2262,6 +2271,15 @@ bool Arm64JITCore::EmitRepStringInPlace(bool Copy, bool IsAtomic, size_t Size, A
   //    tails shorter than a chunk and anything not eligible use the element loop
   //    unchanged. No barrier is added anywhere.
   const bool Wide = IsAtomic && CTX->IsMemcpyWideTSOEnabled() && CTX->HostFeatures.SupportsTSOImm9;
+  // GuestMemoryAliased: the embedder declared that guest memory is reachable through more
+  // than one virtual address. Every faster copy path (the wide one above, the plain 32-byte
+  // chunks and the one-byte fill below) judges from rsi and rdi whether the copy reads what
+  // it writes; through an alias a destination 1 to 64 bytes ahead of the source in memory
+  // can be far away in addresses, and those paths then read bytes before the copy has
+  // written them (x86 propagates them). There is no way to tell from the addresses, so a
+  // declared context copies element by element in x86's order, which is exact however the
+  // memory is mapped. rep stos is unaffected (it only stores).
+  const bool Chunked = !(Copy && CTX->IsGuestMemoryAliased());
   auto EmitWide = [&](bool Back, ARMEmitter::ForwardLabel& ElementTail, ARMEmitter::ForwardLabel& Done, auto&& EmitElement) {
     const uint32_t ChunkElements = 32 / Size;
     ARMEmitter::BackwardLabel Head;
@@ -2497,10 +2515,10 @@ bool Arm64JITCore::EmitRepStringInPlace(bool Copy, bool IsAtomic, size_t Size, A
     };
     ARMEmitter::ForwardLabel PureEntry;
     ARMEmitter::ForwardLabel OverlapEntry;
-    if (Wide) {
+    if (Wide && Chunked) {
       EmitWide(Back, PureEntry, Finished, EmitElement);
     }
-    if (!IsAtomic && Copy) {
+    if (!IsAtomic && Copy && Chunked) {
       // The destination 1 to 32 bytes ahead of the source in the direction of the copy
       // (the copy reads what it wrote, x86 propagates it): element by element, in x86's
       // order. A source ahead of the destination is never read after being written by
@@ -2516,7 +2534,7 @@ bool Arm64JITCore::EmitRepStringInPlace(bool Copy, bool IsAtomic, size_t Size, A
       (void)cbz(ARMEmitter::Size::i64Bit, TMP1, &OverlapEntry);
     }
     (void)Bind(&ElementLoop);
-    if (!IsAtomic) {
+    if (!IsAtomic && Chunked) {
       // A run of 32-byte chunks (ldp/stp of two q registers) when at least one chunk is
       // left and (copies) source and destination are 32 bytes apart or more, so that a
       // chunk never reads bytes it writes. The run is as long as neither the source nor
@@ -2592,7 +2610,7 @@ bool Arm64JITCore::EmitRepStringInPlace(bool Copy, bool IsAtomic, size_t Size, A
     }
     // Overlapping copies (source and destination less than 32 bytes apart) come here.
     (void)Bind(&OverlapEntry);
-    if (!IsAtomic && Copy && !Back && Size == 1) {
+    if (!IsAtomic && Copy && !Back && Size == 1 && Chunked) {
       // rep movsb with rdi == rsi + 1 (run-length fill, LZ decoders): every byte copied is
       // the first one. x86 reads each source byte after writing it, so after loading the
       // first byte the copy is a fill with it; the source is the destination one byte
@@ -3122,7 +3140,8 @@ DEF_OP(MemCpy) {
     // Early exit if zero count.
     (void)cbz(ARMEmitter::Size::i64Bit, TMP1, &DoneInternal);
 
-    if (!IsAtomic) {
+    // GuestMemoryAliased: element by element (see EmitRepStringInPlace).
+    if (!IsAtomic && !CTX->IsGuestMemoryAliased()) {
       if (CTX->HostFeatures.SupportsMOPS) {
         // In the event we have an overlap (gross), we need to fall back
         // to the non-mops copy handler. Since the overlap check needs to

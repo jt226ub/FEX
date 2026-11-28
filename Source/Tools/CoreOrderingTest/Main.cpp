@@ -106,7 +106,7 @@ namespace {
 // always [base + disp32].
 enum Reg : int { RAX = 0, RCX, RDX, RBX, RSP, RBP, RSI, RDI, R8, R9, R10, R11, R12, R13, R14, R15 };
 enum Alu : int { ADD = 0, AND = 4, SUB = 5, CMP = 7 };
-enum Cond : uint8_t { CC_B = 0x2, CC_Z = 0x4, CC_NZ = 0x5 };
+enum Cond : uint8_t { CC_B = 0x2, CC_AE = 0x3, CC_Z = 0x4, CC_NZ = 0x5 };
 
 struct Asm {
   std::vector<uint8_t> B;
@@ -1639,6 +1639,239 @@ std::vector<LitmusTest> MakeTests() {
     T.push_back(RepReadOrder("REP-order-read-std-movsb-line", "loads within one 20K std; rep movsb: qword a line above another in the first 4K run read new, that one old",
                              true, 0, 18304, 18432, Expect::Break));
     T.push_back(RepReadOrder("REP-order-read-movsb-skew-line", "as REP-order-read-movsb-line, destination 3 bytes off", false, 3, 2040, 2048, Expect::Break));
+
+    // Pairs inside one 32-byte chunk (the reviewer's tests): units 0 and 1 of one chunk.
+    T.push_back(RepOrder("RV-order-movsb0-chunk", "rep movsb, source aligned like dest: unit 1 of a chunk seen before unit 0",
+                         MovsbLong(0, false), 2056, 2048, CopyQ, Expect::Either, 1528));
+    T.push_back(RepOrder("RV-order-movsb3-chunk", "rep movsb, source 3 off: unit 1 of a chunk seen before unit 0",
+                         MovsbLong(3, false), 2056, 2048, CopyQ, Expect::Either, 1528));
+    T.push_back(RepOrder("RV-order-stosb-chunk", "rep stosb: unit 1 of a chunk seen before unit 0",
+                         StosLong(true, false), 2056, 2048, STOS_VALUE, Expect::Either, 1528));
+    T.push_back(RepOrder("RV-order-std-stosq-chunk", "std; rep stosq: unit 1 (lower) of a chunk seen before unit 0",
+                         StosLong(false, true), 18432, 18440, STOS_VALUE, Expect::Either, 18944));
+    T.push_back(RepReadOrder("RV-order-read-movsb-chunk", "loads within rep movsb: unit 0 of a chunk read new, unit 1 old", false, 0, 2048,
+                             2056));
+    T.push_back(RepReadOrder("RV-order-read-movsb3-chunk", "as above, destination 3 off", false, 3, 2048, 2056));
+
+    // Continuous order tests: one thread writes two words again and again with increasing
+    // values, always in the same order, so that at any moment the word written first holds
+    // at least the other's value; the other thread looks at them again and again, the
+    // word written second first. Seeing that one ahead of the other is forbidden by x86
+    // whatever the timing, and the writer is between its two stores at many of the looks,
+    // so a translation that puts the two accesses in the wrong order shows it without any
+    // reordering by the hardware. Outcome per iteration: no look between the stores, some
+    // looks between them (the threads overlapped), or the order broken.
+    auto MonoLabels = std::vector<std::string> {"no look between the two writes", "looks between them, in order",
+                                                "the word written second seen ahead (forbidden)"};
+    auto MonoClassify = [](const uint64_t*, const uint64_t* R1) {
+      return R1[0] ? 2 : (R1[1] ? 1 : 0);
+    };
+    // Reader that looks with scalar loads: Later (written second) first, then Earlier.
+    auto MonoScalarReader = [](Asm& A, int32_t Later, int32_t Earlier, int32_t Looks) {
+      A.MovImm(RSI, 0);
+      A.MovImm(RDI, 0);
+      A.MovImm(RDX, Looks);
+      const size_t Loop = A.Here();
+      A.Load(RCX, RBX, Later);
+      A.Load(RAX, RBX, Earlier);
+      A.Cmp(RAX, RCX);
+      const size_t Same = A.JccFwd(CC_Z);
+      A.Inc(RDI);
+      A.Cmp(RAX, RCX);
+      const size_t InOrder = A.JccFwd(CC_AE);
+      A.Inc(RSI);
+      A.Bind(InOrder);
+      A.Bind(Same);
+      A.Dec32(RDX);
+      A.JccBack(CC_NZ, Loop);
+      A.Store(R12, 0, RSI);
+      A.Store(R12, 8, RDI);
+    };
+    auto Mono = [&](const char* Name, const char* Desc, std::function<void(Asm&)> Writer, std::function<void(Asm&)> Reader) {
+      LitmusTest t {Name, Desc, L};
+      t.Labels = MonoLabels;
+      t.Forbidden = {2};
+      t.Interleaved = {1};
+      t.Reset = {L.Y};
+      t.Pre = ClearAhead;
+      t.IterationDivisor = 20;
+      t.Body = [Writer, Reader](Asm& A, int Role) {
+        if (Role == 0) {
+          Writer(A);
+        } else {
+          Reader(A);
+        }
+      };
+      t.Classify = MonoClassify;
+      t.Off = t.Scalar = Expect::Either;
+      return t;
+    };
+    // Writer: `Writes` times, rep stos / rep movs of four qwords at Off (forward) or of the
+    // four qwords ending at Off + 32 (backward), with the value 1, 2, 3, ...
+    auto MonoStringWriter = [](bool Movs, bool Back, int32_t Off, int32_t Writes) {
+      return [Movs, Back, Off, Writes](Asm& A) {
+        constexpr int32_t Src = 8192;
+        A.MovImm(RDX, 1);
+        const size_t Loop = A.Here();
+        if (Movs) {
+          for (int i = 0; i < 4; ++i) {
+            A.Store(RBX, Src + 8 * i, RDX);
+          }
+          A.Mov(RSI, RBX);
+          A.AluImm(ADD, RSI, Src + (Back ? 24 : 0));
+        }
+        A.Mov(RAX, RDX);
+        A.Mov(RDI, RBX);
+        A.AluImm(ADD, RDI, Off + (Back ? 24 : 0));
+        A.MovImm(RCX, 4);
+        if (Back) {
+          A.Std();
+        }
+        if (Movs) {
+          A.RepMovsq();
+        } else {
+          A.RepStosq();
+        }
+        if (Back) {
+          A.Cld();
+        }
+        A.Inc(RDX);
+        A.AluImm(CMP, RDX, Writes + 1);
+        A.JccBack(CC_B, Loop);
+      };
+    };
+    // Store order inside one chunk (units 0 and 1), across a 128-byte line inside one
+    // chunk (units 1 and 2: the chunk at 2160 has two units in each line), and backward.
+    T.push_back(Mono("RV-mono-stosq-chunk", "rep stosq of 4 qwords again and again: unit 1 never ahead of unit 0",
+                     MonoStringWriter(false, false, 2048, 200), [MonoScalarReader](Asm& A) { MonoScalarReader(A, 2056, 2048, 1000); }));
+    T.push_back(Mono("RV-mono-stosq-line", "as RV-mono-stosq-chunk, units 1 and 2 either side of a 128-byte line",
+                     MonoStringWriter(false, false, 2160, 200), [MonoScalarReader](Asm& A) { MonoScalarReader(A, 2176, 2168, 1000); }));
+    T.push_back(Mono("RV-mono-std-stosq-chunk", "std; rep stosq of 4 qwords again and again: the lower unit never ahead of the upper",
+                     MonoStringWriter(false, true, 2048, 200), [MonoScalarReader](Asm& A) { MonoScalarReader(A, 2064, 2072, 1000); }));
+    T.push_back(Mono("RV-mono-movsq-chunk", "rep movsq of 4 qwords again and again: unit 1 never ahead of unit 0",
+                     MonoStringWriter(true, false, 2048, 200), [MonoScalarReader](Asm& A) { MonoScalarReader(A, 2056, 2048, 1000); }));
+    T.push_back(Mono("RV-mono-movsq-line", "as RV-mono-movsq-chunk, units 1 and 2 either side of a 128-byte line",
+                     MonoStringWriter(true, false, 2160, 200), [MonoScalarReader](Asm& A) { MonoScalarReader(A, 2176, 2168, 1000); }));
+
+    // Load order inside one chunk: the writer stores word 1, then word 0 of the source
+    // (scalar), again and again; the reader copies the chunk with one rep movs (which
+    // reads word 0 first) and then looks at its copy: word 0 ahead of word 1 is forbidden.
+    // Backward: words 3 and 2, the copy reading word 3 first.
+    // rep movsb reads the bytes of a word one at a time (x86 too), so a word of its copy can
+    // mix two of the writer's values: with Size 1 the values stay below 256 and only the
+    // low byte of each word is compared.
+    auto MonoCopyReader = [](bool Back, int Size, int32_t First, int32_t Second, int32_t Copies) {
+      return [Back, Size, First, Second, Copies](Asm& A) {
+        A.MovImm(RDX, Copies);
+        A.Store(R12, 16, RDX);
+        const size_t Loop = A.Here();
+        A.Mov(RSI, RBX);
+        A.AluImm(ADD, RSI, 2048 + (Back ? 32 - Size : 0));
+        A.Mov(RDI, RBX);
+        A.AluImm(ADD, RDI, Scratch + (Back ? 32 - Size : 0));
+        A.MovImm(RCX, 32 / Size);
+        if (Back) {
+          A.Std();
+        }
+        if (Size == 1) {
+          A.RepMovsb();
+        } else {
+          A.RepMovsq();
+        }
+        if (Back) {
+          A.Cld();
+        }
+        if (Size == 1) {
+          A.MovzxByte(RAX, RBX, Scratch + First);
+          A.MovzxByte(RDX, RBX, Scratch + Second);
+        } else {
+          A.Load(RAX, RBX, Scratch + First);
+          A.Load(RDX, RBX, Scratch + Second);
+        }
+        A.Cmp(RDX, RAX);
+        const size_t Same = A.JccFwd(CC_Z);
+        A.Load(RCX, R12, 8);
+        A.Inc(RCX);
+        A.Store(R12, 8, RCX);
+        A.Cmp(RDX, RAX);
+        const size_t InOrder = A.JccFwd(CC_AE);
+        A.Load(RCX, R12, 0);
+        A.Inc(RCX);
+        A.Store(R12, 0, RCX);
+        A.Bind(InOrder);
+        A.Bind(Same);
+        A.Load(RCX, R12, 16);
+        A.Dec32(RCX);
+        A.Store(R12, 16, RCX);
+        A.JccBack(CC_NZ, Loop);
+      };
+    };
+    auto MonoScalarWriter = [](int32_t WrittenFirst, int32_t WrittenSecond, int32_t Writes) {
+      return [WrittenFirst, WrittenSecond, Writes](Asm& A) {
+        A.MovImm(RDX, 1);
+        const size_t Loop = A.Here();
+        A.Store(RBX, WrittenFirst, RDX);
+        A.Store(RBX, WrittenSecond, RDX);
+        A.Inc(RDX);
+        A.AluImm(CMP, RDX, Writes + 1);
+        A.JccBack(CC_B, Loop);
+      };
+    };
+    T.push_back(Mono("RV-mono-read-movsb-chunk", "the source's word 1 then word 0 written again and again; rep movsb's copy never has word 0 ahead",
+                     MonoScalarWriter(2056, 2048, 255), MonoCopyReader(false, 1, 0, 8, 100)));
+    T.push_back(Mono("RV-mono-read-movsq-chunk", "as RV-mono-read-movsb-chunk, with rep movsq", MonoScalarWriter(2056, 2048, 3000),
+                     MonoCopyReader(false, 8, 0, 8, 300)));
+    // The extr loop (source 3 bytes off): words 1 and 2 of a run are its 'next' loads; the
+    // two either side of a 128-byte line. The writer stores the low byte of each (values
+    // below 256): 2176 then 2168; the copy from 2163 reads 2168 first (copy byte 5) and
+    // 2176 second (copy byte 13).
+    {
+      auto Reader = [](Asm& A) {
+        A.MovImm(RDX, 100);
+        A.Store(R12, 16, RDX);
+        const size_t Loop = A.Here();
+        A.Mov(RSI, RBX);
+        A.AluImm(ADD, RSI, 2163);
+        A.Mov(RDI, RBX);
+        A.AluImm(ADD, RDI, Scratch);
+        A.MovImm(RCX, 64);
+        A.RepMovsb();
+        A.MovzxByte(RAX, RBX, Scratch + 5);
+        A.MovzxByte(RDX, RBX, Scratch + 13);
+        A.Cmp(RDX, RAX);
+        const size_t Same = A.JccFwd(CC_Z);
+        A.Load(RCX, R12, 8);
+        A.Inc(RCX);
+        A.Store(R12, 8, RCX);
+        A.Cmp(RDX, RAX);
+        const size_t InOrder = A.JccFwd(CC_AE);
+        A.Load(RCX, R12, 0);
+        A.Inc(RCX);
+        A.Store(R12, 0, RCX);
+        A.Bind(InOrder);
+        A.Bind(Same);
+        A.Load(RCX, R12, 16);
+        A.Dec32(RCX);
+        A.Store(R12, 16, RCX);
+        A.JccBack(CC_NZ, Loop);
+      };
+      T.push_back(Mono("RV-mono-read-movsb-skew-line", "source 3 bytes off: word at 2176 then 2168 written; the copy never has 2168's ahead",
+                       MonoScalarWriter(2176, 2168, 255), Reader));
+    }
+    T.push_back(Mono("RV-mono-read-std-movsq-chunk", "word 2 then word 3 written; std; rep movsq's copy never has word 3 ahead",
+                     MonoScalarWriter(2064, 2072, 3000), MonoCopyReader(true, 8, 24, 16, 300)));
+
+    // What --tso off and --tso scalar must show of these (seen in two default runs of each
+    // on the M4; the others are only reported there).
+    for (auto& t : T) {
+      const std::string N = t.Name;
+      if (N == "RV-mono-stosq-line" || N == "RV-mono-movsq-line" || N == "RV-mono-read-movsb-skew-line") {
+        t.Off = t.Scalar = Expect::Break;
+      } else if (N == "RV-mono-stosq-chunk" || N == "RV-mono-std-stosq-chunk" || N == "RV-mono-movsq-chunk" ||
+                 N == "RV-order-std-stosq-chunk") {
+        t.Off = Expect::Break;
+      }
+    }
 
     // Message passing with the data written by the forms the option adds (a scalar flag
     // after them; the samples straddle the 16K page).

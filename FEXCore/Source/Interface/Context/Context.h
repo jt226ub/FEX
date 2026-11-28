@@ -377,6 +377,7 @@ public:
     FEX_CONFIG_OPT(VectorTSOSplit, VECTORTSOSPLIT);
     FEX_CONFIG_OPT(TSOBarrierMerge, TSOBARRIERMERGE);
     FEX_CONFIG_OPT(MemcpySetTSOWide, MEMCPYSETTSOWIDE);
+    FEX_CONFIG_OPT(GuestMemoryAliased, GUESTMEMORYALIASED);
     FEX_CONFIG_OPT(SMCChecks, SMCCHECKS);
     FEX_CONFIG_OPT(MaxInstPerBlock, MAXINST);
     FEX_CONFIG_OPT(RootFSPath, ROOTFS);
@@ -481,6 +482,12 @@ public:
   // (MemcpySetTSOWide). Only meaningful while IsMemcpyAtomicTSOEnabled().
   bool IsMemcpyWideTSOEnabled() const {
     return MemcpyAtomicTSOEmulationEnabled && Config.MemcpySetTSOWide;
+  }
+
+  // The embedder declared that guest memory has aliases (GuestMemoryAliased): rep movs
+  // copies element by element, since overlap cannot be judged from the addresses.
+  bool IsGuestMemoryAliased() const {
+    return Config.GuestMemoryAliased;
   }
 
   void SetHardwareTSOSupport(bool HardwareTSOSupported) override {
