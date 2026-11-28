@@ -761,6 +761,8 @@ static void TestErrors(void) {
     {"MAXINST", "4294967296", "number out of range"},
     {"MULTIBLOCK", "2", "boolean that is not 0 or 1"},
     {"MULTIBLOCK", "true", "boolean spelt true"},
+    {"VECTORTSOSPLIT", "2", "boolean that is not 0 or 1"},
+    {"TSOBARRIERMERGE", "yes", "boolean spelt yes"},
     {"SMCCHECKS", "sometimes", "unknown named value"},
     {"HOSTFEATURES", "disablesve,nonsense", "unknown host feature name"},
     {"HOSTFEATURES", "enablesve", "forcing a feature on (the M4 has no SVE: SIGILL)"},
@@ -776,11 +778,15 @@ static void TestErrors(void) {
   Check(Context == NULL, "failed creates leave the output NULL");
 
   Check(fexmac_option_known("MULTIBLOCK") && fexmac_option_known("Multiblock"), "option names known in both spellings");
+  Check(fexmac_option_known("VECTORTSOSPLIT") && fexmac_option_known("VectorTSOSplit") && fexmac_option_known("TSOBARRIERMERGE") &&
+          fexmac_option_known("TSOBarrierMerge"),
+        "the vector ordering options are known");
   Check(!fexmac_option_known("FEX_MULTIBLOCK") && !fexmac_option_known("DISKCACHE") && !fexmac_option_known(NULL), "other names unknown");
 
   /* After all those failures, a good configuration still works. */
   fexmac_option Good[] = {{"SMCCHECKS", "full"}, {"MaxInst", "0x100"}, {"MULTIBLOCK", "0"}, {"HOSTFEATURES", "disablesve,disablefrintts"},
-                          {"HostFeatures", "off"}};
+                          {"HostFeatures", "off"},
+                          {"VECTORTSOSPLIT", "1"}, {"TSOBarrierMerge", "0"}};
   fexmac_config_init(&Config);
   Config.options = Good;
   Config.option_count = sizeof(Good) / sizeof(Good[0]);
@@ -2232,11 +2238,16 @@ static const struct Subtest Subtests[] = {
 /* FaultHandlingTest.c */
 extern const struct Subtest FaultSubtests[];
 extern const size_t FaultSubtestCount;
+/* VectorOrderingTest.c */
+extern const struct Subtest VectorOrderingSubtests[];
+extern const size_t VectorOrderingSubtestCount;
 
 int main(int argc, char** argv) {
   enum { Own = sizeof(Subtests) / sizeof(Subtests[0]) };
-  struct Subtest* All = malloc(sizeof(struct Subtest) * (Own + FaultSubtestCount));
+  const size_t Total = Own + FaultSubtestCount + VectorOrderingSubtestCount;
+  struct Subtest* All = malloc(sizeof(struct Subtest) * Total);
   memcpy(All, Subtests, sizeof(Subtests));
   memcpy(All + Own, FaultSubtests, sizeof(struct Subtest) * FaultSubtestCount);
-  return RunSubtests(argc, argv, All, Own + FaultSubtestCount, 120);
+  memcpy(All + Own + FaultSubtestCount, VectorOrderingSubtests, sizeof(struct Subtest) * VectorOrderingSubtestCount);
+  return RunSubtests(argc, argv, All, Total, 120);
 }

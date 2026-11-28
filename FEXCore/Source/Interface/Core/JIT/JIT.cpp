@@ -1077,6 +1077,8 @@ CPUBackend::CompiledCode Arm64JITCore::EmitJITCode(uint64_t Entry, uint64_t Size
       PendingTargetLabel = nullptr;
 
       BindOrRestart(Target);
+      // A block start is a branch target: never merge a barrier across it.
+      LastVectorTSOBarrierEnd = ~size_t(0);
     }
 
     for (auto [CodeNode, IROp] : IR->GetCode(BlockNode)) {

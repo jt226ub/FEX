@@ -764,6 +764,79 @@ DEF_OP(LoadMemPair) {
   }
 }
 
+// Vector memory-ordering emulation without barriers (VectorTSOSplit, off by default).
+//
+// FEAT_LRCPC3 (acquire and release forms for SIMD&FP registers) is absent on Apple's
+// chips so far, so a vector TSO access is normally a plain access plus a barrier: a
+// load is followed by DMB ISHLD, a store preceded by DMB ISH. With VectorTSOSplit the
+// access goes through general registers instead, as acquire loads (LDAPUR) and release
+// stores (STLUR) of at most 8 bytes, which is what the scalar path uses:
+//   load,  1/2/4/8 bytes:  LDAPUR{B,H,,} tmp; [NOP]; FMOV s/d, tmp
+//   load,  16 bytes:       LDAPUR x, [a]; NOP; LDAPUR x', [a+8]; NOP; FMOV d, x; INS v.d[1], x'
+//   store, 1/2/4/8 bytes:  UMOV/FMOV tmp, v; [NOP]; STLUR{B,H,,} tmp
+//   store, 16 bytes:       if [a, a+16) crosses a 4K boundary: DMB ISH; STR q (as without
+//                          the option); otherwise FMOV x, d; UMOV x', v.d[1];
+//                          NOP; STLUR x', [a+8]; NOP; STLUR x, [a]   (upper half first)
+// Each access of 2 bytes or more has its NOP in the place the misaligned-access handler
+// (ArchHelpers/Arm64.cpp, HandleUnalignedAccess) expects for the scalar forms: after an
+// LDAPUR, before an STLUR. An acquire/release access that crosses 16 bytes raises an
+// alignment fault on the M4 (measured, docs/macOS-port-status.md), and the handler turns
+// that one instruction into LDUR + DMB ISHLD or DMB ISH + STUR, exactly as for a scalar
+// access. The instruction forms are the scalar path's (64-bit, 32-bit, 16-bit LDAPUR and
+// STLUR with a 9-bit offset), so the handler needs nothing new.
+//
+// Faults: a load writes the vector register only after its last access, so a fault
+// leaves the guest state untouched. A 16-byte store is two stores; a split store whose
+// halves lie in different pages could write one half and then fault on the other, which
+// a single STR q on the M4 does not do (it writes nothing). Such a store therefore takes
+// the barrier path; only stores within one page are split, and their two halves fault
+// (or not) together on the first one, so nothing is written before a fault.
+//
+// Only with LRCPC2 (unscaled offsets); otherwise, and for 32-byte SVE accesses, the
+// barrier forms stay.
+bool Arm64JITCore::UseVectorTSOSplit(IR::OpSize AccessSize) const {
+  return CTX->Config.VectorTSOSplit() && CTX->IsVectorAtomicTSOEnabled() && CTX->HostFeatures.SupportsTSOImm9 &&
+         AccessSize <= IR::OpSize::i128Bit;
+}
+
+std::pair<ARMEmitter::Register, int32_t>
+Arm64JITCore::SplitTSOAddress(ARMEmitter::Register Base, IR::OrderedNodeWrapper Offset, IR::MemOffsetType OffsetType,
+                              uint8_t OffsetScale, uint32_t Span, IR::OpSize AccessSize, ARMEmitter::Register Tmp) {
+  if (Offset.IsInvalid()) {
+    return {Base, 0};
+  }
+  uint64_t Const;
+  if (IsInlineConstant(Offset, &Const)) {
+    const int64_t Imm = static_cast<int64_t>(Const);
+    const int64_t Last = Imm + (Span > 8 ? Span - 8 : 0);
+    if (Imm >= -256 && Last <= 255) {
+      return {Base, static_cast<int32_t>(Imm)};
+    }
+  }
+  return {ApplyMemOperand(AccessSize, Base, Tmp, Offset, OffsetType, OffsetScale), 0};
+}
+
+void Arm64JITCore::EmitVectorTSOBarrier(ARMEmitter::BarrierScope Scope) {
+  const size_t Here = GetCursorOffset();
+  if (CTX->Config.TSOBarrierMerge() && LastVectorTSOBarrierEnd == Here) {
+    // The instruction just before is this function's previous barrier, with nothing in
+    // between (no access, no label: block starts reset LastVectorTSOBarrierEnd, and no
+    // caller binds a label before its barrier). DMB ISH orders everything DMB ISHLD
+    // orders, so the pair is the stronger one alone.
+    const auto Merged = (Scope == ARMEmitter::BarrierScope::ISH || LastVectorTSOBarrierScope == ARMEmitter::BarrierScope::ISH) ?
+                          ARMEmitter::BarrierScope::ISH :
+                          ARMEmitter::BarrierScope::ISHLD;
+    SetCursorOffset(Here - 4);
+    dmb(Merged);
+    LastVectorTSOBarrierScope = Merged;
+    LastVectorTSOBarrierEnd = GetCursorOffset();
+    return;
+  }
+  dmb(Scope);
+  LastVectorTSOBarrierScope = Scope;
+  LastVectorTSOBarrierEnd = GetCursorOffset();
+}
+
 DEF_OP(LoadMemTSO) {
   const auto Op = IROp->C<IR::IROp_LoadMemTSO>();
   const auto OpSize = IROp->Size;
@@ -828,6 +901,45 @@ DEF_OP(LoadMemTSO) {
       // Half-barrier once back-patched.
       nop();
     }
+  } else if (UseVectorTSOSplit(OpSize)) {
+    // See UseVectorTSOSplit. The vector register is written only after the last load.
+    const auto Dst = GetVReg(Node);
+    const auto [Base, Imm] =
+      SplitTSOAddress(MemReg, Op->Offset, Op->OffsetType, Op->OffsetScale, IR::OpSizeToSize(OpSize), OpSize, TMP1);
+    switch (OpSize) {
+    case IR::OpSize::i8Bit:
+      ldapurb(TMP2, Base, Imm);
+      fmov(ARMEmitter::Size::i32Bit, Dst.S(), TMP2.W());
+      break;
+    case IR::OpSize::i16Bit:
+      ldapurh(TMP2, Base, Imm);
+      // Half-barrier once back-patched.
+      nop();
+      fmov(ARMEmitter::Size::i32Bit, Dst.S(), TMP2.W());
+      break;
+    case IR::OpSize::i32Bit:
+      ldapur(TMP2.W(), Base, Imm);
+      nop();
+      fmov(ARMEmitter::Size::i32Bit, Dst.S(), TMP2.W());
+      break;
+    case IR::OpSize::i64Bit:
+      ldapur(TMP2, Base, Imm);
+      nop();
+      fmov(ARMEmitter::Size::i64Bit, Dst.D(), TMP2);
+      break;
+    case IR::OpSize::i128Bit:
+      // Lower half, then upper half; each is an acquire, so the upper half and every
+      // later access are ordered after the lower half, and every later access after the
+      // upper half.
+      ldapur(TMP2, Base, Imm);
+      nop();
+      ldapur(TMP3, Base, Imm + 8);
+      nop();
+      fmov(ARMEmitter::Size::i64Bit, Dst.D(), TMP2);
+      ins(ARMEmitter::SubRegSize::i64Bit, Dst, 1, TMP3);
+      break;
+    default: LOGMAN_MSG_A_FMT("Unhandled LoadMemTSO size: {}", OpSize); break;
+    }
   } else {
     const auto Dst = GetVReg(Node);
     const auto MemSrc = GenerateMemOperand(OpSize, MemReg, Op->Offset, Op->OffsetType, Op->OffsetScale);
@@ -847,7 +959,7 @@ DEF_OP(LoadMemTSO) {
     }
     if (CTX->IsVectorAtomicTSOEnabled()) {
       // Half-barrier.
-      dmb(ARMEmitter::BarrierScope::ISHLD);
+      EmitVectorTSOBarrier(ARMEmitter::BarrierScope::ISHLD);
     }
   }
 }
@@ -1393,7 +1505,7 @@ DEF_OP(VLoadVectorElement) {
 
   // Emit a half-barrier if TSO is enabled.
   if (CTX->IsVectorAtomicTSOEnabled()) {
-    dmb(ARMEmitter::BarrierScope::ISHLD);
+    EmitVectorTSOBarrier(ARMEmitter::BarrierScope::ISHLD);
   }
 }
 
@@ -1414,7 +1526,7 @@ DEF_OP(VStoreVectorElement) {
 
   // Emit a half-barrier if TSO is enabled.
   if (CTX->IsVectorAtomicTSOEnabled()) {
-    dmb(ARMEmitter::BarrierScope::ISH);
+    EmitVectorTSOBarrier(ARMEmitter::BarrierScope::ISH);
   }
 
   if (Is256Bit) {
@@ -1474,7 +1586,7 @@ DEF_OP(VBroadcastFromMem) {
 
   // Emit a half-barrier if TSO is enabled.
   if (CTX->IsVectorAtomicTSOEnabled()) {
-    dmb(ARMEmitter::BarrierScope::ISHLD);
+    EmitVectorTSOBarrier(ARMEmitter::BarrierScope::ISHLD);
   }
 }
 
@@ -1837,10 +1949,76 @@ DEF_OP(StoreMemTSO) {
       default: LOGMAN_MSG_A_FMT("Unhandled StoreMemTSO size: {}", OpSize); break;
       }
     }
+  } else if (UseVectorTSOSplit(OpSize)) {
+    // See UseVectorTSOSplit.
+    const auto Src = GetVReg(Op->Value);
+    const auto [Base, Imm] =
+      SplitTSOAddress(MemReg, Op->Offset, Op->OffsetType, Op->OffsetScale, IR::OpSizeToSize(OpSize), OpSize, TMP1);
+    switch (OpSize) {
+    case IR::OpSize::i8Bit:
+      umov<ARMEmitter::SubRegSize::i8Bit>(TMP2, Src, 0);
+      stlurb(TMP2, Base, Imm);
+      break;
+    case IR::OpSize::i16Bit:
+      umov<ARMEmitter::SubRegSize::i16Bit>(TMP2, Src, 0);
+      // Half-barrier once back-patched.
+      nop();
+      stlurh(TMP2, Base, Imm);
+      break;
+    case IR::OpSize::i32Bit:
+      fmov(ARMEmitter::Size::i32Bit, TMP2.W(), Src.S());
+      nop();
+      stlur(TMP2.W(), Base, Imm);
+      break;
+    case IR::OpSize::i64Bit:
+      fmov(ARMEmitter::Size::i64Bit, TMP2, Src.D());
+      nop();
+      stlur(TMP2, Base, Imm);
+      break;
+    case IR::OpSize::i128Bit: {
+      // The whole address, for the page check and the plain store.
+      ARMEmitter::Register Addr = Base;
+      if (Imm > 0) {
+        add(ARMEmitter::Size::i64Bit, TMP1, Base, Imm);
+        Addr = TMP1;
+      } else if (Imm < 0) {
+        sub(ARMEmitter::Size::i64Bit, TMP1, Base, -Imm);
+        Addr = TMP1;
+      }
+      // Bit 12 of the address differs from bit 12 of its last byte exactly when the 16
+      // bytes cross a 4K boundary (which every larger page boundary also is).
+      ARMEmitter::ForwardLabel Split {};
+      ARMEmitter::ForwardLabel Done {};
+      add(ARMEmitter::Size::i64Bit, TMP4, Addr, 15);
+      eor(ARMEmitter::Size::i64Bit, TMP4, TMP4, Addr);
+      // The split path is the branch target, the rare one falls through: an efficiency
+      // core of the M4 runs the split path measurably slower when it has to branch over
+      // the plain store instead.
+      (void)tbz(TMP4, 12, &Split);
+      dmb(ARMEmitter::BarrierScope::ISH);
+      str(Src.Q(), Addr, 0);
+      (void)b(&Done);
+      (void)Bind(&Split);
+      // Upper half first, then lower half, each a release: the lower half and every later
+      // store are ordered after the upper half, and the upper half after every earlier
+      // access. A reader that loads lower then upper (as LoadMemTSO does) and sees the new
+      // lower half therefore also sees the new upper half. The same order as the two
+      // halves of a 32-byte store (AVX128_StoreResult_WithOpSize).
+      fmov(ARMEmitter::Size::i64Bit, TMP2, Src.D());
+      umov<ARMEmitter::SubRegSize::i64Bit>(TMP3, Src, 1);
+      nop();
+      stlur(TMP3, Addr, 8);
+      nop();
+      stlur(TMP2, Addr, 0);
+      (void)Bind(&Done);
+      break;
+    }
+    default: LOGMAN_MSG_A_FMT("Unhandled StoreMemTSO size: {}", OpSize); break;
+    }
   } else {
     if (CTX->IsVectorAtomicTSOEnabled()) {
       // Half-Barrier.
-      dmb(ARMEmitter::BarrierScope::ISH);
+      EmitVectorTSOBarrier(ARMEmitter::BarrierScope::ISH);
     }
     const auto Src = GetVReg(Op->Value);
     const auto MemSrc = GenerateMemOperand(OpSize, MemReg, Op->Offset, Op->OffsetType, Op->OffsetScale);

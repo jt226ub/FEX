@@ -619,6 +619,25 @@
           "When TSO emulation is enabled, controls if vector loadstores should also be atomic."
         ]
       },
+      "VectorTSOSplit": {
+        "Type": "bool",
+        "Default": "false",
+        "AffectsCodeGen": "true",
+        "Desc": [
+          "When vector TSO emulation is enabled, emit vector loads and stores of up to 16 bytes as 64-bit (or smaller)",
+          "acquire loads and release stores through general registers (FEAT_LRCPC2) instead of a plain access and a barrier.",
+          "A 16-byte access then becomes two 8-byte accesses: another thread can see half of it."
+        ]
+      },
+      "TSOBarrierMerge": {
+        "Type": "bool",
+        "Default": "false",
+        "AffectsCodeGen": "true",
+        "Desc": [
+          "When vector TSO emulation is enabled, merge a vector store's leading barrier into the barrier of a vector load",
+          "emitted immediately before it (no instruction between), so that one full barrier replaces the pair."
+        ]
+      },
       "MemcpySetTSOEnabled": {
         "Type": "bool",
         "Default": "false",
