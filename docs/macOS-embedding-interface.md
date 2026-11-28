@@ -178,7 +178,7 @@ hexadecimal; a leading 0 is refused rather than read as octal.
 | `MULTIBLOCK` | 0, 1 | |
 | `MAXINST` | 1 to 2^31-1 | instructions per block |
 | `TSOENABLED`, `VECTORTSOENABLED`, `MEMCPYSETTSOENABLED`, `HALFBARRIERTSOENABLED` | 0, 1 | x86 memory-ordering emulation (software; macOS has no hardware mode for ordinary processes) |
-| `SMCCHECKS` | `none`, `mtrack`, `full` (or 0, 1, 2) | default `mtrack`: with no guest memory registered nothing is detected (the embedder calls `fexmac_invalidate`, as on `macos/v1`); with memory registered, translated pages are write-protected (see "Self-modifying code"). `full`: a check of the guest bytes before every instruction, everywhere. `none`: nothing |
+| `SMCCHECKS` | `none`, `mtrack`, `full` (or 0, 1, 2) | default `mtrack`: with no guest memory registered nothing is detected (the embedder calls `fexmac_invalidate`, as before package D); with memory registered, translated pages are write-protected (see "Self-modifying code"). `full`: a check of the guest bytes before every instruction, everywhere. `none`: nothing |
 | `X87REDUCEDPRECISION`, `HIDEHYPERVISORBIT` | 0, 1 | |
 | `HOSTFEATURES` | `off`, or comma-separated `disable*` names the core knows | `enable*` names are refused: they force a feature on whether the host has it or not (`enablesve` dies with SIGILL on an M4) |
 | `SOFTWARERNG` | 0, 1 | RDRAND and RDSEED from `arc4random_buf`; no Apple chip so far has FEAT_RNG, so without it the guest CPUID offers neither |
@@ -623,7 +623,7 @@ copies ahead and behind by 1, 3, 8 and 31 bytes, a faulting source).
   rbp before setting rsp and rbp. `pop` to an address that uses rsp (which x86 computes
   from the incremented rsp) keeps the core's form and saves rsp in the undo record below.
   The reorder is also faster: `push; pop [m]` loops as before, a `leave` loop 25% faster
-  than `macos/v1` (no read-modify-write handle).
+  than `macos/v1` before package D (no read-modify-write handle).
 - **Read-modify-write instructions on memory** change the flags before their store in
   the core's handlers. Two designs, chosen per handler:
   - *Store first, flags after* (`OpcodeDispatcher.cpp`, `__APPLE__`): `add`, `or`, `and`,
@@ -647,7 +647,7 @@ copies ahead and behind by 1, 3, 8 and 31 bytes, a faulting source).
     SpillGuestState) uses the saved values when the mask is set. The mask lives in the
     thread frame rather than in the RIP-entry metadata, so the fault path needs no
     lookup.
-  - Cost against `macos/v1`: loops of `add/sub/inc/or`, `adc/sbb/add`, `lock add; lock
+  - Cost against `macos/v1` before package D: loops of `add/sub/inc/or`, `adc/sbb/add`, `lock add; lock
     xadd` and `shl/ror/bts` on memory run at +0 to 4%; a loop of only record-carrying
     forms (`rol [m],cl; rcl [m],1; sar [m],3`) +15%, of rotates only +13%. With a record on every
     read-modify-write (the first version of this rework) such loops took +65 to 130%.
@@ -748,7 +748,7 @@ leaves the dispatcher; `fexmac_thread_run` returns `FEXMAC_STOP_REQUESTED`.
 **Defaults (no `SMCCHECKS` option):** the core's default, `mtrack`.
 
 - **No guest memory registered:** nothing is detected, exactly as on `macos/v1` before
-  this package: `mtrack` without memory tracking has nothing to protect, and the embedder
+  package D: `mtrack` without memory tracking has nothing to protect, and the embedder
   calls `fexmac_invalidate` after changing code.
 - **Memory registered (`fexmac_memory_map`):** write protection of translated pages
   (below). A code write is re-run through the guest-fault path, which is exact for every

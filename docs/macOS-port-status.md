@@ -17,6 +17,17 @@ Related documents:
 
 ## Where it stands
 
+Branches: the port is on this fork's `main` and on `macos/v1`, the integration branch for
+further work (`main` is no longer a mirror of upstream; see `CLAUDE.md`). The 1.0 exit
+criteria, criterion by criterion with evidence and limits: "Result" in
+`docs/macOS-v1.0-plan.md`. Known limits: "Known limits" below; what is still open: "Open
+items" below.
+
+Last full check, all on `macos/v1` at `3b12faa03` (the commits after it change documents
+only): the physical-Mac job at full level, both toolchains, every step PASS (umbrella
+repository run 46083556911); the hosted-Mac job (run 46083525991) and the Linux arm64 job
+(run 46083526078) green. Per-test results are in "Tests" below.
+
 - **Builds and links on Apple silicon.** The core libraries and the test tools build with
   no errors with the macOS 27 SDK (command line tools, Apple clang 2100.4.1.1) and with
   Xcode 26.5 (macOS 26.5 SDK). The dylib and the test tools depend only on `libSystem`
@@ -48,11 +59,12 @@ Related documents:
   pages, stopping a thread from another thread at a safe point, and guest page faults
   delivered as stops with the guest state reconstructed, each tested through the C
   interface as built and hardened. See "Fault handling for an embedder" below.
-- **Linux is unaffected, and this is now checked on every push.** A hosted arm64 Ubuntu
-  job builds the core-only configuration and the whole ordinary Linux build, and runs
-  upstream's 64-bit instruction tests and unit tests there, on the port and on the
-  upstream commit it is based on: identical results (see "Test jobs" below). It found
-  one Linux regression, now fixed (the scratch-buffer guard page).
+- **Linux is unaffected, and this is checked on every push** to `main` and `macos/**`.
+  A hosted arm64 Ubuntu job builds the core-only configuration and the whole ordinary
+  Linux build, and runs upstream's 64-bit instruction tests and unit tests there, on the
+  port and on the upstream commit it is based on: identical results, 0 tests differ (run
+  46083526078; see "Test jobs" below). It found two Linux breaks, both fixed (the
+  scratch-buffer guard page, and a macOS-only function called from a shared handler).
 
 Only the translator core is built on macOS. FEX's Linux process loader, syscall emulation,
 FEXServer and thunks are not part of this port.
@@ -70,9 +82,12 @@ FEXServer and thunks are not part of this port.
 | Linker options | `-dead_strip`, `-x`, `-dead_strip_dylibs` |
 | CPU tuning | `-mcpu=apple-m1` baseline |
 
-## Runtime fixes and what is still unproven
+## Runtime fixes
 
-Fixed in code on `macos/runtime-fixes`:
+Fixed in code (first on `macos/runtime-fixes`, now on `main` and `macos/v1`), and shown on
+the physical M4 to be needed (round 1: the branch without them dies at its first write to
+code memory; package A: with its change to item 1 reverted, the 24 ordering-mode hangs
+return, per the umbrella's progress log):
 
 1. **Writing translated code.** `FEXCore::Allocator::ScopedJITWrite` wraps
    `pthread_jit_write_protect_np`. It surrounds the dispatcher emit, the copy of compiled
@@ -256,24 +271,23 @@ with `JITWriteProbe`:
 - GitHub's hosted Mac reports `pthread_jit_write_protect_supported_np` as 0 and lets a
   thread write and run `MAP_JIT` memory in any state, so it cannot test any of this.
 
-Still unproven or open:
-
-1. **Speed.** Nothing has been measured.
-
-(The interrupt fault page and self-modifying code by write protection, open here before,
-are exercised now: see "Fault handling for an embedder".)
+(Speed, the interrupt fault page and self-modifying code by write protection, listed as
+unproven here before, are measured or tested now: see "Guest program and benchmark" and
+"Fault handling for an embedder". What is still not shown is under "Known limits" and
+"Open items".)
 
 ## Fault handling for an embedder (criterion 4)
 
 `docs/macOS-embedding-interface.md` has the contracts; this is the state after the package
-D review and its second rework, on the M4. Criterion 4 is met except for the at-fault
-limits listed in the last row, where running again still gives x86's result.
+D review and its second rework, on the M4. Criterion 4 is met with documented limits (the
+independent reviewer's verdict): the at-fault limits listed in the table, where running
+again still gives x86's result, and the 4K-within-16K rule in its last row.
 
 | Fault path | Tests | State |
 |---|---|---|
 | Misaligned atomics | `faults-*`, `split-locks-concurrent`, `split-lock-faults`, `split-lock-unmap-race`, `guest-misaligned-atomic-prot-none`, `split-emulation-fault-*-dies` | pass; with the second half on an inaccessible page each thread stops with a page fault before anything is written, totals exact after the fix |
 | Scratch-buffer restart | `scratch-guard-disarmed-after-translation`, `scratch-overflow-*`; `CodeBufferOverflow` | pass |
-| Self-modifying code by page protection | `smc-*`, `split-lock-on-code-page`, `SelfModifyingCode/*` with `--smc mtrack`, the harness's write-protection path | pass; **the default once memory is registered** (no memory registered: nothing detected, as on `macos/v1`); writes through aliases and to non-writable guest pages sharing a host page with writable ones are not seen |
+| Self-modifying code by page protection | `smc-*`, `split-lock-on-code-page`, `SelfModifyingCode/*` with `--smc mtrack`, the harness's write-protection path | pass; **the default once memory is registered** (no memory registered: nothing detected, as before package D); writes through aliases and to non-writable guest pages sharing a host page with writable ones are not seen |
 | Stopping a thread from another thread | `stop-*`, `stop-rep-movs` | pass; median 4 to 6 us request to return; also inside a long `rep movs`/`stos` (32 MB, thousands of stops, registers exact at each, final memory x86's) |
 | Guest fault with correct guest state | `fault-*`, `guest-*`, `Scripts/macos_fault_diff.py` (368 programs, each also with three flag preludes, x 4 modes x 4 ways including the get/set-state round trip) | **exact, and running again gives x86's result, for loads, stores, push/pop/call/ret, `pop [m]`, `leave`, `enter`, every read-modify-write form on memory (also locked and misaligned), `xadd`/`cmpxchg`, vector and x87 accesses, 16- and 32-byte stores across a page, and every `rep` string form part-way (also with fs:/gs:), with x86's fault address**; RFLAGS at the fault is the pre-instruction value, every flag; 2 memory-at-the-fault differences remain in `fault_diff_known.txt`: a 32-byte store whose lower page faults, `fxsave` across a page |
 | 4K protections within a 16K host page | `memory-arguments` | refused unless `FEXMAC_PROT_ALLOW_UNENFORCED`; accepted ones are counted and NOT enforced (guard pages, read-only next to writable, SMC protection of the non-writable page): the 1.0 limit, stated in `fexmac.h` and the embedding document with the sound scheme as future work |
@@ -287,11 +301,11 @@ checks on block entries, back-edges, conditional back-edges and inside `rep` loo
 code check for undecodable instructions. The code cache's port revision is 3.
 
 Performance, the review's microbenchmarks (best of 5, `SMCCHECKS none`, M4, machine
-shared with other builds, so differences under about 5% are noise). Base: `macos/v1`;
-"before": this package before the second rework (no undo record, the core's rep loops);
+shared with other builds, so differences under about 5% are noise). Base: `macos/v1`
+before package D; "before": package D before its second rework (no undo record, the core's rep loops);
 after: the tip.
 
-| Loop | Multiblock | Base (`macos/v1`) | Previous tip `995572564` | Tip |
+| Loop | Multiblock | Base (`macos/v1` before D) | Previous tip `995572564` | Tip |
 |---|---|---|---|---|
 | counted `jnz` | off / on | 0.153 / 0.150 s | +3% / -1% | +3% / -1% |
 | memory mixed (ld/st/adc) | off / on | 0.099 / 0.099 s | +2% / +2% | +2% / +2% |
@@ -318,7 +332,7 @@ after every 32-byte chunk and every element, the page-bounded run setup, and an 
 loop that counts elements for the interrupt check. A forward byte copy overlapping by
 one (`rdi == rsi + 1`, run-length fills in LZ decoders) is a fill with the first byte,
 and an overlap with the source ahead in the direction of the copy uses whole chunks:
-both about 16 times faster than `macos/v1`. A destination 2 to 32 bytes ahead of the
+both about 16 times faster than `macos/v1` before package D. A destination 2 to 32 bytes ahead of the
 source still goes element by element, bound by store-to-load forwarding (about 4 cycles
 a byte); chunks narrower than the distance would keep x86's result and progress but are
 not done. A
@@ -675,7 +689,8 @@ The runner registers the memory it maps as guest code (`fexmac_memory_map`, read
 without the cache. Three expected failures (`PrimaryGroup/5_FF_05`, `_03_o64`,
 `_03_o64_imm`, which jump to an address cut to 32 bits) therefore now stop with a guest
 page fault at that address instead of dying of a host fault while the translator read
-unmapped memory; `Known_Failures_macOS` says so.
+unmapped memory; `Known_Failures_macOS` says so. (Since package D's guest fault delivery
+the other eight are page-fault stops too; see "Tests".)
 
 Speed: little gained on these tiny tests. Pass times (as built): cold 59 s, warm 19 s;
 hardened 53 s and 17 s. Per process, start-up dominates. In jit_1, whose database has
@@ -723,27 +738,31 @@ Three jobs run the tests automatically. Each shows something the others cannot.
 
 | Job | Where | Trigger | What it can show | What it cannot |
 |---|---|---|---|---|
-| `macos_core.yml` (this repository) | GitHub's hosted Mac (a virtual machine, Apple silicon) | push to `macos/**` | the build with the default toolchain, linkage, every test tool, the instruction tests in four modes, the code cache, the benchmark checksums, the sync script | write protection (the VM does not enforce it), the forbidden memory-ordering outcomes with emulation off (warn only), the Metal tiers; tests needing CPU features the VM lacks are skipped (14 instead of 6) |
-| `physical_mac.yml` (the private umbrella repository, `jt226ub/Apple-Silicon-Translation-Runtime`) | the physical Mac mini (M4), self-hosted runner `m4-mini` registered to that private repository only | push to `physical-mac/**`, manual (FEX ref, quick/full/soak), nightly | everything above as built **and** hardened, with write protection enforced (`JITWriteProbe --expect-enforced`), the ordering test's off/scalar modes as hard requirements, the 1,000-start stress, all four modes of the two-pass cache run, the Xcode 26.5 toolchain, and the umbrella's MetalFX tests (all six, under Metal validation) | Linux; another Mac model |
-| `linux_core_arm64.yml` (this repository) | GitHub's hosted `ubuntu-24.04-arm` (Azure Cobalt 100, 4K pages) | push to `macos/**` | that the port's changes do not break Linux: the `BUILD_FEXCORE_ONLY` build, the whole Linux build, upstream's 64-bit instruction tests through `TestHarnessRunner` and CTest (modes jit_1, jit_500, jit_500_m), upstream's FEXCore, API and emitter unit tests; all also on the upstream base commit, compared test by test | the port's own tools and `fexmac` (Apple-only by design), the TSO mode the Mac runs, anything Mac-specific |
+| `macos_core.yml` (this repository) | GitHub's hosted Mac (a virtual machine, Apple silicon) | push to `main` or `macos/**`, manual | the build with the default toolchain, linkage, every test tool, the instruction tests in four modes, the code cache, the benchmark checksums, the sync script | write protection (the VM does not enforce it), the forbidden memory-ordering outcomes with emulation off (warn only), the Metal tiers; tests needing CPU features the VM lacks are skipped (14 instead of 6) |
+| `physical_mac.yml` (the private umbrella repository, `jt226ub/Apple-Silicon-Translation-Runtime`) | the physical Mac mini (M4), self-hosted runner `m4-mini` registered to that private repository only, started by hand for supervised runs | push to `physical-mac/**`, manual (FEX ref `main`, `macos/<branch>` or a commit on one of them; quick/full/soak); no schedule until a dedicated runner user exists | everything above as built **and** hardened, with write protection enforced (`JITWriteProbe --expect-enforced`), the ordering test's off/scalar modes as hard requirements, the 1,000-start stress, all four modes of the two-pass cache run, the Xcode 26.5 toolchain, and the umbrella's MetalFX tests (all six, under Metal validation) | Linux; another Mac model |
+| `linux_core_arm64.yml` (this repository) | GitHub's hosted `ubuntu-24.04-arm` (Azure Cobalt 100, 4K pages) | push to `main` or `macos/**`, manual | that the port's changes do not break Linux: the `BUILD_FEXCORE_ONLY` build, the whole Linux build, upstream's 64-bit instruction tests through `TestHarnessRunner` and CTest (modes jit_1, jit_500, jit_500_m), upstream's FEXCore, API and emitter unit tests; all also on the upstream base commit, compared test by test | the port's own tools and `fexmac` (Apple-only by design), the TSO mode the Mac runs, anything Mac-specific |
 
 No runner is registered on this public repository, and none may be: a self-hosted runner
 on a public repository can be made to run a stranger's code. The physical-Mac workflow
 lives in the private repository for that reason and checks this repository out read-only.
 
-**Physical Mac, quick level, `macos/v1` at `e513ada49`**: every step PASS (machine
-record, probe enforced, build, linkage, smoke, thread, `fexmac_c_test` 46 subtests,
-`fexmac_hook_test` 9, mutex wake, ordering on/off/scalar, 1,000 starts, instruction tests
-2,265 pass / 15 expected failures / 6 skips in all four modes both ways, code cache tests,
-two-pass cache run, benchmark quick both ways, 58 benchmark mutations caught, sync script
-tests, MetalFX 6 of 6 in all three runs); the write-protection SMC run is ABSENT on that
-ref (package D adds it; the step runs it once `macos_asm_tests.py` has `--smc`). 13
-minutes with the machine at load 20. Run URLs and the full level are in the umbrella's
-`docs/testing/physical-mac-job-report.md`.
+**Latest physical-Mac run: full level, `macos/v1` at `3b12faa03`, both toolchains**
+(umbrella run 46083556911): every step PASS on both legs. Default toolchain: machine
+record, probe enforced, low-memory probe, build, linkage (including the non-Apple compile
+check), coverage, smoke, thread, `fexmac_c_test` 80 subtests, `fexmac_hook_test` 24, mutex
+wake, ordering on/off/scalar, 1,000 starts, instruction tests 2,265 pass / 15 expected
+failures / 6 skips in all four modes both ways, the write-protection SMC run (3 of 3 per
+mode, both ways), the fault differential (1,472 cases x 4 modes x 4 ways, 2 known
+differences, 0 failures), code cache tests (107), the two-pass cache run in all four
+modes, benchmark `--check-docs` and quick run both ways, 58 benchmark mutations caught,
+sync script tests, MetalFX 6 of 6 in all three runs, home check. The Xcode 26.5 leg passes
+its steps (build, linkage, smoke, thread, the two library tests, mutex, ordering,
+instruction tests) with the same counts. Every run and its details:
+the umbrella's `docs/testing/physical-mac-job-report.md`.
 
-**Physical Mac, full level** (adds the Xcode 26.5 leg and the two-pass cache run in all
-four modes): the Xcode leg passes every step with the same counts. The default leg found
-two code cache faults, both reproduced by hand outside the job, fixed in package F:
+**The first full-level run** (on `e513ada49`; the Xcode leg passed every step) found two
+code cache faults in the default leg, both reproduced by hand outside the job, fixed in
+package F:
 
 1. `macos_code_cache_tests.py`, "six processes rotating one database, 72 runs": every
    answer right, but four generations left on disk where at most three may be (for
@@ -771,7 +790,7 @@ two code cache faults, both reproduced by hand outside the job, fixed in package
    requires at most twice the time without the cache plus 2 s: 2.2 to 6.3 s against 1.6
    to 5.1 s (per-entry stores: 71 s against 2.4 s).
 
-**Hosted Mac job changes (this package).** The instruction-test steps now also fail on
+**Hosted Mac job changes (package I).** The instruction-test steps now also fail on
 an expected failure that now passes (the script itself exits 0 for that); the old
 diagnosis step, which ran `lldb` and `sample` on three tests that pass since the
 scratch-buffer restart, is replaced by printing the unexpected rows of `results.tsv` when
@@ -814,10 +833,15 @@ handler body is now a stop with a message. Linux green again with the fix.
 
 Upstream's own workflows (`ccpp.yml`, `glibc_fault.yml`, `hostrunner.yml`,
 `instcountci.yml`, `mingw_build.yml`, `steamrt4.yml`, `vixl_simulator.yml`,
-`wine_dll_artifacts.yml`, `pr-code-format.yml`) trigger only on pushes to `main` or pull
-requests to `main` and target upstream's self-hosted runners. They never run on `macos/**`
-pushes, and none has run on this fork (only `macOS core build` is registered), so they are
-left unchanged to keep upstream syncs clean.
+`wine_dll_artifacts.yml`, `pr-code-format.yml`) trigger on pushes and pull requests to
+`main` and target upstream's self-hosted runners. With the port on this fork's `main`
+they would start on every push, wait for runners that do not exist here and fail, and a
+self-hosted label must never be matchable from this public fork. Every job in them
+therefore carries `if: github.repository == 'FEX-Emu/FEX'` (upstream's
+`pr-code-format.yml` already did), so on this fork they are skipped. This is a port
+change in upstream's files; expect it in merge conflicts on a sync
+(`docs/macOS-upstream-sync.md` says how to check it). None of them has run on this fork
+so far (only the two port workflows are registered).
 
 **Instruction-test floor.** `Scripts/macos_asm_floor.txt` holds the minimum counts (2,296
 tests found; 2,265 passes per mode on a physical Mac, 2,257 on the hosted VM) and
@@ -835,33 +859,52 @@ fixed. All actions in this repository's workflows are pinned to full commits.
   the workflows use nothing else.
 - Never register a self-hosted runner on this public repository; the physical-Mac job
   lives in the private umbrella repository and only reads this one.
-- Consider disabling upstream's own workflows on this fork (Actions, select the workflow,
-  Disable workflow): they cannot run usefully here, and disabling them in the settings
-  keeps the files identical to upstream's.
+- Optionally also disable upstream's own workflows on this fork (Actions, select the
+  workflow, Disable workflow). Their jobs are already skipped by the repository guard
+  above; disabling them as well keeps them out of the Actions list.
 
 ## Tests
 
-All of these run in the Mac job on every push to a `macos/**` branch.
+Where each test runs and its result on the last full check (all on `macos/v1` at
+`3b12faa03`): **hosted Mac** is this repository's `macos_core.yml` on GitHub's virtual Mac
+(run 46083525991, on every push to `main` or `macos/**`); **physical Mac** is the
+umbrella repository's `physical_mac.yml` on the M4 at full level (run 46083556911, started
+by push or by hand, not on every push), "both" meaning as built and as signed for the
+hardened runtime, on the default toolchain and, where marked, the Xcode 26.5 leg;
+**Linux** is this repository's `linux_core_arm64.yml` (run 46083526078, on every push to
+`main` or `macos/**`). The port's own tools and `fexmac` are Apple-only by design and are
+not built on Linux.
 
-| Test | What it does | Hosted Mac result | Physical Mac (M4) result |
+| Test | What it does | Hosted Mac | Physical Mac (M4) |
 |---|---|---|---|
-| `FEXCoreSmokeTest` | Translates and runs a 23-byte loop, as built and under the hardened runtime | pass, both | pass, both |
-| `FEXCoreThreadTest` | Eight host threads share a context, each summing a different count in a long guest loop | pass | pass, both |
-| `FEXCoreCacheTest` | Eight threads run a chain of 200 blocks at once, with the code cache on; checks results that depend on every constant and on the code's address, and the cache counters | added in package F, not yet run there | pass, both; 150 of 150 runs after the mutex fix (hung about one run in 30 before it) |
-| `Scripts/macos_code_cache_tests.py` | Damaged, mismatched and moved caches, fuzzing, threads, fork (with and without the fexmac calls), stalled lock holders, superseded entries, generations and size limits, six processes rotating at once (then exactly N - 1 and N after one open), stale generations with gaps and a locked one, six processes each storing 60,000 blocks into one database on a busy machine within twice the time without the cache, a planted generation name, cache states, directory rules (see above) | added in package F, not yet run there | 107 of 107, both, 8 runs each |
-| `fexmac_c_test` cache subtests | `cache-off`, `cache-cold-warm`, `cache-cross-process`, `cache-untrusted`, `cache-untrusted-file`, `cache-unavailable`, `cache-options`, `cache-fork`, `code-ranges` | added in package F, not yet run there | pass, both |
-| `Scripts/macos_asm_tests.py --cache-dir DIR --cache-passes 2` | The instruction tests cold then warm; fails if a warm result differs, a finished warm run compiled anything, or an entry was rejected | added in package F, not yet run there (two modes in the job) | pass, all four modes, both |
-| `FEXCoreASMTestRunner` with `Scripts/macos_asm_tests.py` | Upstream's 2,292 assembly instruction tests plus the port's four in `unittests/macOS/ASM`, in four modes | 2,253 pass in each mode (before the upstream sync added one test) | 2,265 of 2,296 pass in each mode, both |
-| `FEXCoreOrderingTest` | Multi-thread x86 memory-ordering litmus tests and misaligned locked-operation counts, in three emulation modes; see above | not yet run | pass, both, in each mode |
-| `FEXCoreMutexWakeTest` | The core's reader-writer lock never loses a wake-up, in six queueing orders | not yet run | pass, both; with the bug restored, two orders hang |
-| `fexmac_c_test` | A C program using only `fexmac.h`, linked as an outside project would be: 48 subtests covering large blocks (every size across the first scratch-buffer overflow, 8 threads translating large blocks at once), system calls (prefixed, restarted), stops, state, guest faults, invalidation (also from 8 threads at once), misaligned atomics with each signal-handler arrangement, call/return stack overflow and underflow, guest accesses to protected pages, chained handlers (one that leaves with siglongjmp, over 306 stack layouts; one that faults itself, which must end the process quickly; one that returns without fixing the fault) and sent signals, garbage struct sizes, lifetime races, cached translations and code ranges, split locked operations from 8 threads in every emulated form, also with plain stores to neighbouring bytes and under a signal storm (exact results), and error paths | not yet run | pass, both |
-| `fexmac_hook_test` | The same library built with test hooks, 22 subtests: asynchronous signals held off while the core handles a misaligned access, translations overflowing the scratch buffer 0 to 5 times run correctly, translations moving through three code buffers (also from the code cache), a block ending exactly on a code buffer's last byte, 5,014 random-size blocks across six buffers, a first code buffer that cannot be made fails thread creation cleanly and a later one ends the process with an accurate message, a guest store into a code buffer's guard page is a guest fault, a block that never fits stops cleanly at its start and the thread stays usable, each code buffer ends in an inaccessible page, a write past the end of a code buffer dies with a message (also with a host handler chained), guest and callback accesses to guard pages are not claimed, the scratch-buffer guard is disarmed after each translation, a log callback cannot re-enter the library, a fault inside the handler crashes with a message instead of hanging, the log callback is never called from a signal handler, a failed create leaves no log hook, invalidation leaves fault signals unblocked | not yet run | pass, both |
-| `FEXCoreBench` with `Scripts/macos_bench.py --quick` | The freestanding x86-64 benchmark, as built and hardened: the literal mode (no system call but exit) natively and under FEX; the loader's contract (9 cases of a guest breaking it); the timed mode (18 kernels, 4 guest threads) in four translator configurations, every checksum matching the recorded value and the native arm64 build (and Rosetta 2's where present), with the stated exceptions for ordering off and reduced x87 precision | not yet run (added after the last hosted run) | pass, both |
-| `Scripts/macos_bench_mutations.py` | 58 mutations of the benchmark kernels, each of which must change its kernel's checksum (native arm64; x86-64-only ones under Rosetta 2) | not yet run | pass |
+| `FEXCoreSmokeTest` | Translates and runs a 23-byte loop, as built and under the hardened runtime | pass, both | pass, both; also Xcode leg |
+| `FEXCoreThreadTest` | Eight host threads share a context, each summing a different count in a long guest loop | pass | pass, both; also Xcode leg |
+| `FEXCoreCacheTest` | Eight threads run a chain of 200 blocks at once, with the code cache on; checks results that depend on every constant and on the code's address, and the cache counters | pass, cold then warm | pass, both, cold then warm; 150 of 150 hand runs after the mutex fix (hung about one run in 30 before it) |
+| `Scripts/macos_code_cache_tests.py` | Damaged, mismatched and moved caches, fuzzing, threads, fork (with and without the fexmac calls), stalled lock holders, superseded entries, generations and size limits, six processes rotating at once (then exactly N - 1 and N after one open), stale generations with gaps and a locked one, six processes each storing 60,000 blocks into one database on a busy machine within twice the time without the cache, a planted generation name, cache states, directory rules (see above) | 107 of 107 | 107 of 107, both |
+| `Scripts/macos_asm_tests.py --cache-dir DIR --cache-passes 2` | The instruction tests cold then warm; fails if a warm result differs, a finished warm run compiled anything, or an entry was rejected | pass (two modes and the jit_1 subset) | pass, all four modes and the jit_1 subset, both |
+| `FEXCoreASMTestRunner` with `Scripts/macos_asm_tests.py`, checked by `Scripts/macos_asm_check.py` against `Scripts/macos_asm_floor.txt` | Upstream's 2,292 assembly instruction tests plus the port's four in `unittests/macOS/ASM`, in four modes | 2,257 pass, 15 expected failures, 14 skips in each mode (the VM lacks CPU features), 0 unexpected | 2,265 pass, 15 expected failures, 6 skips in each mode, 0 unexpected, both; also Xcode leg |
+| `Scripts/macos_asm_tests.py --smc mtrack` on `SelfModifyingCode/` | The self-modifying-code tests with detection by write protection (package D) | pass, 3 of 3 per mode | pass, 3 of 3 per mode, both |
+| `Scripts/macos_fault_diff.py` with `fexmac_fault_diff` | Differential test of guest-fault delivery: 368 programs, each also with three flag preludes (1,472 cases), in 4 modes and 4 ways including a get/set-state round trip; the 2 known differences are in `fault_diff_known.txt` | pass | pass, both, 0 failures |
+| `FEXCoreOrderingTest` | Multi-thread x86 memory-ordering litmus tests and misaligned locked-operation counts, in three emulation modes; see "x86 memory ordering between threads" | pass; with emulation off or scalar, a forbidden outcome that does not appear only warns | pass, both, in each mode, the forbidden outcomes required with emulation off and scalar; 1,000 starts; also Xcode leg. The `--soak` figures in that section were measured by hand; the job's soak level has not been run |
+| `FEXCoreMutexWakeTest` | The core's reader-writer lock never loses a wake-up, in six queueing orders | pass | pass, both; also Xcode leg; with the bug restored, two orders hang (by hand) |
+| `fexmac_c_test` | A C program using only `fexmac.h`, linked as an outside project would be: 80 subtests (listed in `docs/macOS-embedding-interface.md`) covering large blocks (every size across the first scratch-buffer overflow, 8 threads translating large blocks at once), system calls (prefixed, restarted), stops (also inside long `rep` loops), state, guest memory registration, guest faults, self-modifying-code detection, invalidation (also from 8 threads at once), misaligned atomics with each signal-handler arrangement, call/return stack overflow and underflow, guest accesses to protected pages, chained handlers (one that leaves with siglongjmp, over 306 stack layouts; one that faults itself, which must end the process quickly; one that returns without fixing the fault) and sent signals, garbage struct sizes, lifetime races, cached translations and code ranges, split locked operations from 8 threads in every emulated form, also with plain stores to neighbouring bytes and under a signal storm (exact results), and error paths | 80 of 80, both | 80 of 80, both; also Xcode leg |
+| `fexmac_hook_test` | The same library built with test hooks (the separate `fexmac_testing` build, never in production artefacts), 24 subtests: asynchronous signals held off while the core handles a misaligned access, translations overflowing the scratch buffer 0 to 5 times run correctly, translations moving through three code buffers (also from the code cache), a block ending exactly on a code buffer's last byte, 5,014 random-size blocks across six buffers, a first code buffer that cannot be made fails thread creation cleanly and a later one ends the process with an accurate message, a guest store into a code buffer's guard page is a guest fault, a block that never fits stops cleanly at its start and the thread stays usable, each code buffer ends in an inaccessible page, a write past the end of a code buffer dies with a message (also with a host handler chained), guest and callback accesses to guard pages are not claimed, the scratch-buffer guard is disarmed after each translation, a log callback cannot re-enter the library, a fault inside the handler crashes with a message instead of hanging, the log callback is never called from a signal handler, a failed create leaves no log hook, invalidation leaves fault signals unblocked | 24 of 24, both | 24 of 24, both; also Xcode leg |
+| `FEXCoreBench` with `Scripts/macos_bench.py --quick` | The freestanding x86-64 benchmark, as built and hardened: the literal mode (no system call but exit) natively and under FEX; the loader's contract (9 cases of a guest breaking it); the timed mode (18 kernels, 4 guest threads) in four translator configurations, every checksum matching the recorded value and the native arm64 build (and Rosetta 2's where present), with the stated exceptions for ordering off and reduced x87 precision. Asserts no timing | pass, both | pass, both, after `--check-docs` |
+| `Scripts/macos_bench_mutations.py` | 58 mutations of the benchmark kernels, each of which must change its kernel's checksum (native arm64; x86-64-only ones under Rosetta 2) | 58 of 58 caught | 58 of 58 caught |
 | `JITWriteProbe` | Reports how the machine treats executable memory, including writes and switches from a fault handler, instruction-cache flushing and the ways of placing a guard page after `MAP_JIT` memory | report only | see the facts above |
-| `JITWriteProbe --expect-enforced` | The same, but exits 1 unless every asserted case gives the result the port relies on with write protection enforced, or if a fault-handler case's handler never ran | not run: the hosted Mac does not enforce, so it would fail | pass, as built and hardened |
-| `Scripts/macos_check_linkage.sh` | Fails if the core or a test tool links anything but `libSystem` and `libc++`, if one of them is missing, or if the bundled `fmt` was not compiled. Homebrew's `fmt` is installed first. `otool` shows only that no fmt dylib is linked; the `build.ninja` check covers a static one | not yet run (added after the last hosted run) | pass, both toolchains |
-| Low-memory probe | Shows that a program with a small page-zero reservation is killed | report only | same as hosted |
+| `JITWriteProbe --expect-enforced` | The same, but exits 1 unless every asserted case gives the result the port relies on with write protection enforced, or if a fault-handler case's handler never ran | not run: the hosted Mac does not enforce, so it would fail | pass, both |
+| `Scripts/macos_check_linkage.sh` | Fails if the core or a test tool links anything but `libSystem` and `libc++`, if one of them is missing, or if the bundled `fmt` was not compiled. Homebrew's `fmt` is installed first. `otool` shows only that no fmt dylib is linked; the `build.ninja` check covers a static one | pass | pass; also Xcode leg |
+| `Scripts/macos_check_nonapple.sh` | Compiles the non-Apple side of the core files the port changes (their `__APPLE__` blocks removed) with `-fsyntax-only`, on the Mac; a quick check, not a Linux build | pass | pass (in the linkage step) |
+| `Scripts/macos_sync_upstream_test.sh` | 32 offline tests of the upstream sync script (never-push hardening, refusals, dry run, merge, conflict, a local `main` that differs from upstream) | pass (31 tests at `3b12faa03`; the 32nd was added for the merge into `main` and passes locally) | pass (31 tests at `3b12faa03`) |
+| Low-memory probe | Shows that a program with a small page-zero reservation is killed | report only | same as hosted (page zero shrunk: exit 137) |
+
+On Linux (`linux_core_arm64.yml`): the `BUILD_FEXCORE_ONLY` build and the whole ordinary
+Linux build, with no warnings; upstream's 64-bit instruction tests through CTest (6,876
+of 6,876 as upstream's lists expect, modes jit_1, jit_500, jit_500_m); upstream's unit
+tests (355 of 355, the four timed `FutexSpin` tests left out); all of it also on the
+upstream base commit, and port against base: 0 tests differ. Details under "Test jobs"
+above. `Scripts/macos_linux_asm_compare.py` makes the port-against-base comparison in the
+job; the Linux-against-Mac comparison under "Test jobs" was made with it by hand.
 
 The instruction tests, per mode, on the most recent physical-Mac run (as built and
 hardened, the same in all four modes). There are 2,296: upstream's 2,292 and the port's
@@ -877,10 +920,11 @@ reason; the script also prints each skip with its reason.
 | Skipped by the runner | 6 |
 | Skipped by upstream's own lists | 6 |
 | Skipped because the test reaches low memory through a 32-bit operand | 4 |
-| Expected failures: 3 crashes, 8 guest page-fault stops and 1 stop (`32bit_syscall`) | 12 |
+| Expected failures: 11 guest page-fault stops and 1 unsupported-instruction stop (`32bit_syscall`) | 12 |
 | Port tests whose correct result is a stop (`ud2`, `mov_fs`, `tf_int80`) | 3 |
 
-The script counts the last two rows together as 15 expected failures (3 crash, 12 fail).
+The script counts the last two rows together as 15 expected failures, all of kind "fail"
+(each a checked stop; since package D none is a crash).
 
 Before package B, on the merged base (the fexmac runner), the counts were pass 2,255,
 runner skips 8, low-memory skips 5 and 18 expected failures (12 crash, 6 fail). Nine
@@ -926,17 +970,19 @@ by two `nop`s it fails.
 **Every test that does not pass, and why** (each run on the M4 in all four modes, with
 the addresses from the runner's lines above):
 
-- *Expected failures, 12, in every mode.* Eleven crash on an address cut to 32 bits,
-  which lands below 4GB where macOS maps nothing:
+- *Expected failures, 12, in every mode.* Eleven stop with a guest page fault
+  (`FEXMAC_STOP_GUEST_FAULT`, trap 14, si_code 1) at an address cut to 32 bits, which
+  lands below 4GB where macOS maps nothing (before package D they were host crashes at
+  the same addresses):
   `FEX_bugs/a32_lods` and `a32_rep_lods` (fault at 0x80000), `Primary/Primary_A6_addrmod`,
   `Primary_A6_REP_addrmod` (0x10000200) and `Primary_AE_addrmod` (0x10000100) use the
   0x67 address-size prefix; `VEX/vmovq_vmovd_reg` reads `[edx]` (0xe0000000; the earlier
-  description, a 32-bit vector move cutting the address, was wrong); all are data aborts
-  in translated code (ESR class 0x24). `PrimaryGroup/5_FF_05` and the four `5_FF_05_03_*`
+  description, a 32-bit vector move cutting the address, was wrong); all are data page
+  faults in translated code. `PrimaryGroup/5_FF_05` and the four `5_FF_05_03_*`
   far-call tests jump through an m16:32 pointer built with `lea edi, [rel .success]`: the
-  jump and o64 forms fault at 0x10028, the code's original address, in host code (the
-  translator reading the guest instructions there), the o32 forms first at 0xe0000ff0
-  through `[esp]`. The twelfth is `FEX_bugs/32bit_syscall`, also on upstream's
+  jump and o64 forms stop with a fetch page fault at 0x10028, the code's original
+  address, where the runner has registered nothing, the o32 forms first with a data page
+  fault at 0xe0000ff0 through `[esp]`. The twelfth is `FEX_bugs/32bit_syscall`, also on upstream's
   `Known_Failures_jit`: FEX refuses `int 0x80` in a 64-bit process, so no block can be
   compiled there. Upstream (and this port before) then jumped to host address 0; on macOS
   the run now stops with `FEXMAC_STOP_UNSUPPORTED_INSTRUCTION` at the instruction
@@ -1035,5 +1081,119 @@ x86 memory-ordering emulation off; this mode turns it on.
 
 32-bit guest tests (`unittests/32Bit_ASM`) are not run: they need memory below 4GB.
 
-`macos/core-port-smoke` is `macos/core-port` plus the smoke test, kept only so the two can
-be compared on a physical Mac.
+Older branches, kept as history and not worked on: `macos/core-port-smoke` is
+`macos/core-port` plus the smoke test, without the runtime fixes; it was compared with
+`macos/runtime-fixes` on the M4 in round 1 (it dies at its first write to code memory,
+which showed the fixes are needed). `macos/runtime-fixes` (`2f7579f`) is where `macos/v1`
+started.
+
+## Known limits
+
+Every limit of the port at 1.0, in one place, with where it is explained. None of them is
+an unexplained test failure.
+
+Of the platform (macOS on Apple silicon):
+
+- **No guest memory below 4GB** ("Found out about macOS on Apple silicon"), so 32-bit
+  guest code is out of scope (`unittests/32Bit_ASM` is not run), 4 instruction tests
+  cannot be assembled and 11 are expected failures ("Every test that does not pass").
+  64GB to 448GB and about 12GB near 32GB are reserved too.
+- **16K host pages.** 4K guest protections that differ within one 16K host page are
+  refused unless the embedder passes `FEXMAC_PROT_ALLOW_UNENFORCED`, and are then not
+  enforced ("Fault handling for an embedder", last row; `fexmac.h`).
+- **No hardware x86 memory ordering for ordinary processes.** The ordering is emulated in
+  software, which is most of the gap to Rosetta 2 ("Guest program and benchmark").
+- **`mprotect` inside a `MAP_JIT` mapping is refused**, so self-modifying code inside
+  the code buffer cannot be detected by page protection there, and the guard page is a
+  separate mapping (runtime fix 4).
+- **The hosted (virtual) GitHub Mac does not enforce write protection** and cannot show
+  the faults that matter most; only the physical-Mac job can.
+- **Tools that hang on this Mac:** `lldb` and `sample` (Developer mode is off), and any
+  unsigned x86-64 program under Rosetta 2 (it hangs unkillably; the scripts sign theirs).
+
+Of fault handling (criterion 4, met with documented limits):
+
+- At a guest fault, memory differs from x86 in two cases: a 32-byte store whose lower
+  page faults has already written its upper half, and `fxsave` across a page
+  (`fault_diff_known.txt`). Running again gives x86's result.
+- Self-modifying code is not detected for writes through aliased mappings, for writes to
+  a non-writable guest page that shares a host page with a writable one, or at all when
+  no guest memory is registered (the embedder then calls `fexmac_invalidate`).
+- The exactness costs speed on some loops: the block-entry stop check, `rep` string loops
+  and the undo record for rotates and similar forms (the performance table in "Fault
+  handling for an embedder").
+
+Of memory ordering (criterion 5):
+
+- **Known gap, for the owner to judge against criterion 5:** the misaligned back-patch is
+  cross-modifying code that the architecture does not guarantee; at most one access per
+  thread per patched instruction, once, can miss its barrier. Never observed. Kept as
+  upstream's design ("x86 memory ordering between threads", "Known gap").
+- Split locked operations (operands across 16 bytes) have five stated limits, none seen
+  in the tests ("Remaining limits of split locked operations"), among them that the
+  split-lock lock is per process.
+
+Of the code cache: a cache directory is trusted only if it is private to the user (same
+user only, by design); upstream's whole-section cache (`FXCC`) is not implemented on
+macOS ("Not implemented, by decision or for lack of a macOS method").
+
+Of the embedding library: a separately signed `libfexmac.dylib` under the hardened
+runtime needs the embedder and the dylib signed with one real Team ID (library validation
+refuses an ad hoc signature); the static library and the prelinked archive have no such
+need (`docs/macOS-embedding-interface.md`).
+
+Of the speed figures (criterion 8): they are measured on the M4 with the machine nearly
+idle, but the generated blocks label them PROVISIONAL because the script's strict load
+gate saw a short background spike ("Guest program and benchmark" states the load).
+
+Of the test jobs (criterion 10): the physical-Mac job runs on one machine (an M4 Mac mini,
+macOS 27.0.1); its runner runs job code as the owner's account and is started by hand for
+supervised runs only (the umbrella's `docs/testing/physical-mac-runner.md`); its soak
+level has not been run in the job.
+
+Upstream behaviour kept, not changed by the port: far jumps and calls through memory read
+a 32-bit offset also with REX.W (AMD's behaviour under an Intel CPUID), and `o32 iret`
+pops 64-bit values ("Known upstream behaviour, not macOS failures").
+
+## Open items
+
+From the umbrella repository's progress log (`docs/testing/v1-progress.md`), the
+"Open" column, after the 1.0 work:
+
+- **Criterion 5 known gap** (above): the owner decides whether it is accepted for 1.0 or
+  needs one of the two remedies described.
+- **Benchmark figures:** accept the PROVISIONAL figures or re-measure on a quieter
+  machine (`python3 Scripts/macos_bench.py --loader build/Bin/FEXCoreBench --out
+  bench-out --final --write-docs`, from a clean tree).
+- **Physical-Mac runner:** a dedicated non-admin macOS user for the runner (the owner's
+  to set up); until then no nightly schedule. The soak level has never run in the job.
+- **Package C:** one sentence for `docs/macOS-embedding-interface.md`: a SIGSEGV or SIGBUS
+  sent from outside can re-enter a chained handler (per the progress log; not yet in the
+  document).
+- **Package D:** one intermittent `cache-fork` failure, seen once in 70 runs, not
+  reproduced.
+- **Package F:** the cache's Linux build and its out-of-space paths are unverified.
+- **Package J:** a real failure to place a code buffer's guard mapping is untested (the
+  hook test simulates it); an unlocked read of the shared current-code-buffer pointer at
+  thread creation is a pre-existing race, not fixed.
+- **Instruction tests:** five tests the Mac runner skips for CPU features the guest
+  CPUID does not report pass on Linux and could be run on the Mac too ("Test jobs").
+- **Repository settings** for the owner ("Repository settings the owner should apply").
+
+## Document review (exit criterion 11)
+
+Reviewed end to end for the 1.0 merge into `main` (27 November 2026), against the code on
+`macos/v1` at `0d7359b7e`, the job runs named under "Where it stands" and the umbrella's
+progress log. Checked: every test count in "Tests" and "Test jobs" against the logs of
+those runs (hosted Mac 46083525991, physical Mac 46083556911, Linux 46083526078); every
+entry in `unittests/ASM/Known_Failures_macOS` states the exact outcome it must have
+(15 entries, none "believed"; a listed test failing any other way fails the run) and each
+is explained under "Every test that does not pass"; the descriptions of the expected
+failures match the list (all are checked stops since package D, none a crash); branch
+names (`main`, `macos/v1`; older branches marked as history); the workflow triggers; and
+the generated benchmark blocks (`python3 Scripts/macos_bench.py --check-docs` passes).
+Corrected in this review: stale branch names, an "unproven: speed" item, the expected
+failures described as crashes, test counts from earlier packages (`fexmac_c_test` 48,
+`fexmac_hook_test` 22), the physical-Mac trigger (no nightly schedule), the hosted-Mac
+column ("not yet run" for tests that now run there), and the note that upstream's
+workflows are unchanged (they now carry a repository guard).

@@ -1,3 +1,16 @@
+> **About this fork (`jt226ub/FEX`).** This repository's `main` branch is an independent
+> port of the FEX translator core to macOS on Apple silicon. It is not the upstream FEX
+> project, is not affiliated with or endorsed by FEX-Emu, and nothing from it is submitted
+> upstream. Only the translator core is built on macOS (no Linux process loader, FEXServer
+> or thunks). What works, on which machine it was shown, and the known limits:
+> [docs/macOS-port-status.md](docs/macOS-port-status.md). The C interface a host program
+> uses: [docs/macOS-embedding-interface.md](docs/macOS-embedding-interface.md). Upstream
+> FEX is at [FEX-Emu/FEX](https://github.com/FEX-Emu/FEX); its licence (`LICENSE`, MIT) and
+> copyright notices are kept unchanged. Everything below this notice is
+> upstream's README.
+
+---
+
 [中文](https://github.com/FEX-Emu/FEX/blob/main/docs/Readme_CN.md)
 # FEX: Emulate x86 Programs on ARM64
 FEX allows you to run x86 applications on ARM64 Linux devices, similar to qemu-user and box64.
