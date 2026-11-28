@@ -14,3 +14,5 @@
 # fault differs from x86's):
 ystore-cross-low-ro    at-fault   # 32-byte store whose LOWER page faults: the upper half is stored first
 fxsave-cross-ro        at-fault   # fxsave across a page: written in parts (x86 too may leave it partly written)
+rvw-fstp-tbyte-cross8-ro at-fault  # 80-bit x87 store across a page whose upper page faults: the lower 8 bytes are written first
+rvw-fstp-tbyte-cross9-ro at-fault  # the same, 9 bytes below the page

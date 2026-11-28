@@ -179,7 +179,11 @@ public:
   uintptr_t FindBlock(FEXCore::Core::InternalThreadState* Thread, uint64_t Address) {
     // Try L1, no lock needed
     auto& L1Entry = reinterpret_cast<LookupCacheEntry*>(L1Pointer)[Address & L1PointerMask];
-    if (L1Entry.GuestCode == Address) {
+    if (L1Entry.GuestCode == Address
+#ifdef __APPLE__
+        && L1Entry.HostCode
+#endif
+    ) {
       return L1Entry.HostCode;
     }
 
@@ -250,6 +254,7 @@ public:
 
           CurrentL1Entries <<= 1;
           L1PointerMask = CurrentL1Entries - 1;
+          ResetL1EmptySlot();
 
           // Update the thread's L1 pointer mask to increase how much cache it uses.
           // Since we're in C-code, this is safe to update here.
@@ -312,7 +317,15 @@ public:
     // Do L1
     auto& L1Entry = reinterpret_cast<LookupCacheEntry*>(L1Pointer)[Address & L1PointerMask];
     if (L1Entry.GuestCode == Address) {
+#ifdef __APPLE__
+      // Not 0: the inline lookups compare only the guest address, so 0 here matched a
+      // guest jump to rip 0 and ran this stale host code (round 2 review). Address ^ 1
+      // differs from Address in the lowest index bit, so no rip that indexes this slot
+      // can ever equal it.
+      L1Entry.GuestCode = Address ^ 1;
+#else
       L1Entry.GuestCode = 0;
+#endif
       // Leave L1Entry.HostCode as is, so that concurrent lookups won't read a null pointer
       // This is a soft guarantee for cross thread invalidation, as atomics are not used
       // and it hasn't been thoroughly tested
@@ -386,6 +399,20 @@ public:
   // Also note that L1 lookups might be inlined in the JIT Dispatcher and/or block ends.
   auto AcquireWriteLock() {
     return Shared->AcquireWriteLock();
+  }
+
+  // An L1 entry that is all zeros is "guest 0 at host 0", which a guest transfer to rip 0
+  // matched (the inline lookups compare only the guest address): translated code then
+  // branched to host address 0 and the process died (round 2 review). Slot 0 is the only
+  // slot rip 0 indexes, so after every clear (fresh mapping, ClearThreadLocalCaches, a
+  // resize) it gets a guest address that cannot index it. Other zero entries cannot match:
+  // rip 0 does not index them. macOS only; elsewhere the tables are as upstream has them.
+  void ResetL1EmptySlot() {
+#ifdef __APPLE__
+    auto& L1Entry = reinterpret_cast<LookupCacheEntry*>(L1Pointer)[0];
+    L1Entry.HostCode = 0;
+    L1Entry.GuestCode = 1;
+#endif
   }
 
 private:

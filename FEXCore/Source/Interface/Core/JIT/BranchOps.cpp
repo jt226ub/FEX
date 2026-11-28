@@ -200,7 +200,16 @@ DEF_OP(ExitFunction) {
       // First try to pop from the call-ret stack, otherwise follow the normal path (but ending in a ret)
       ldp<ARMEmitter::IndexType::POST>(TMP1, TMP2, REG_CALLRET_SP, 0x10);
       sub(TMP1, TMP1, RipReg.X());
+#ifdef __APPLE__
+      // An empty or cleared entry is (0, 0), and a return to rip 0 matched it and
+      // returned to host address 0 (round 2 review): a hit needs host code too.
+      ARMEmitter::ForwardLabel l_NotCallRet;
+      (void)cbnz(ARMEmitter::Size::i64Bit, TMP1, &l_NotCallRet);
+      (void)cbnz(ARMEmitter::Size::i64Bit, TMP2, &SkipFullLookup);
+      (void)Bind(&l_NotCallRet);
+#else
       (void)cbz(ARMEmitter::Size::i64Bit, TMP1, &SkipFullLookup);
+#endif
     }
 
     // L1 Cache

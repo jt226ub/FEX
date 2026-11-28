@@ -205,7 +205,35 @@ RMW_CASES += [
     ("push-cross-ro", "lea rsp, [r15+4]\nFAULT: push rax\nhlt", 1),
     ("call-cross-ro", "lea rsp, [r15+4]\nFAULT: call 1f\n1: hlt", 1),
     ("fstp-tbyte-cross-ro", "fld1\nFAULT: fstp tbyte ptr [r15-4]\nhlt", 1),
+    # x87 stores across the page (round 2 review). An 80-bit store whose upper page faults
+    # leaves its lower 8 bytes written (cross8, cross9: listed as known); the others hold.
+    ("rvw-fstp-tbyte-cross8-ro", "fldpi\nFAULT: fstp tbyte ptr [r15-8]\nhlt", 1),
+    ("rvw-fstp-tbyte-cross9-ro", "fldpi\nFAULT: fstp tbyte ptr [r15-9]\nhlt", 1),
+    ("rvw-fstp-tbyte-cross2-ro", "fldpi\nFAULT: fstp tbyte ptr [r15-2]\nhlt", 1),
+    ("rvw-fstp-qword-cross-ro", "fldpi\nFAULT: fstp qword ptr [r15-4]\nhlt", 1),
+    ("rvw-fst-dword-cross-ro", "fldpi\nFAULT: fst dword ptr [r15-2]\nhlt", 1),
+    ("rvw-fistp-qword-cross-ro", "fldpi\nFAULT: fistp qword ptr [r15-4]\nhlt", 1),
+    ("rvw-fbstp-cross-ro", "fldpi\nFAULT: fbstp tbyte ptr [r15-4]\nhlt", 1),
+    ("rvw-fstp-tbyte-mis16-ok", "fldpi\nlea rax, [r15-0x1000+7]\nfstp tbyte ptr [rax]\nFAULT: mov rbx, [r15]\nhlt", 0),
 ]
+# Control transfers to an address with no code (round 2 review, item 1): the fetch fault
+# at the target, with the state the transfer leaves (x86: rip the target, a call's return
+# address pushed). The reference ends where the transfer would land. No resume: the
+# target cannot be made into code. Address 0, the test page while inaccessible (prot 0)
+# and while only readable (prot 1, not executable).
+XFER_CASES = []
+for target, setup, prot in (("zero", "xor eax, eax", 0), ("none", "lea rax, [r15]", 0), ("noexec", "lea rax, [r15]", 1)):
+    XFER_CASES += [
+        ("xfer-jmp-" + target, setup + "\nFAULT: jmp rax\nhlt", prot, False, setup + "\nFAULT:\nhlt"),
+        # call rax (2 bytes) after 3 one-byte nops ends where call rel32 (5 bytes) does, so
+        # both push the same return address.
+        ("xfer-call-" + target, setup + "\nnop\nnop\nnop\nFAULT: call rax\nhlt", prot, False, setup + "\nFAULT:\ncall 1f\n1: hlt"),
+        ("xfer-ret-" + target, setup + "\npush rax\nFAULT: ret\nhlt", prot, False, setup + "\npush rax\nFAULT:\nlea rsp, [rsp+8]\nhlt"),
+        ("xfer-jmpmem-" + target, setup + "\nmov [rdi], rax\nFAULT: jmp qword ptr [rdi]\nhlt", prot, False,
+         setup + "\nmov [rdi], rax\nFAULT:\nhlt"),
+        ("xfer-callpopret-" + target, setup + "\ncall 1f\n1: pop rcx\npush rax\nFAULT: ret\nhlt", prot, False,
+         setup + "\ncall 1f\n1: pop rcx\npush rax\nFAULT:\nlea rsp, [rsp+8]\nhlt"),
+    ]
 
 MODES = [(0, 0), (1, 0), (0, 1), (1, 1)]
 # The guest-fault comparisons run with each way of translating: SMCCHECKS full (the
@@ -283,7 +311,9 @@ def with_prelude(case, tag):
     lines[marked:marked] = prelude.splitlines()
     if ref:
         rlines = ref.splitlines()
-        at = next(i for i, l in enumerate(rlines) if l.strip() == instruction)
+        # A line "FAULT:" alone marks where the case's own reference stands for the marked
+        # instruction (a transfer whose target faults has no instruction to keep there).
+        at = next(i for i, l in enumerate(rlines) if l.strip() in (instruction, "FAULT:"))
         rlines[at:at] = prelude.splitlines()
         ref = "\n".join(rlines)
     return (name + "~" + tag, "\n".join(lines), prot, clean, ref)
@@ -298,6 +328,8 @@ def check_case_in(tool, name, src, prot, clean, ref_src, d):
     fault = assemble(src.replace("FAULT:", ""), d, "fault")
     # The reference replaces the marked instruction (and nothing else on its line, such
     # as a label) by hlt, unless the case gives its own.
+    if ref_src:
+        ref_src = "\n".join(l for l in ref_src.splitlines() if l.strip() != "FAULT:")
     ref = assemble(ref_src, d, "ref") if ref_src else assemble("\n".join((l.split("FAULT:")[0] + "hlt" if "FAULT:" in l else l)
                                                                        for l in src.splitlines()), d, "ref")
     found = {}
@@ -375,7 +407,7 @@ def main():
             words = line.split("#", 1)[0].split()
             if len(words) >= 2:
                 known.add((words[0], words[1]))
-    base = CASES + REP_CASES + RMW_CASES
+    base = CASES + REP_CASES + RMW_CASES + XFER_CASES
     cases = [c for c in base + [with_prelude(c, t) for c in base for t in PRELUDES] if args.filter in c[0]]
     failures = 0
     seen = set()

@@ -2252,10 +2252,13 @@ extern const size_t RepSubtestCount;
 /* OrderingSwitchTest.c */
 extern const struct Subtest OrderingSubtests[];
 extern const size_t OrderingSubtestCount;
+/* NullTransferTest.c */
+extern const struct Subtest NullTransferSubtests[];
+extern const size_t NullTransferSubtestCount;
 
 int main(int argc, char** argv) {
   enum { Own = sizeof(Subtests) / sizeof(Subtests[0]) };
-  const size_t Total = Own + FaultSubtestCount + VectorOrderingSubtestCount + RepSubtestCount + OrderingSubtestCount;
+  const size_t Total = Own + FaultSubtestCount + VectorOrderingSubtestCount + RepSubtestCount + OrderingSubtestCount + NullTransferSubtestCount;
   struct Subtest* All = malloc(sizeof(struct Subtest) * Total);
   size_t At = 0;
   memcpy(All + At, Subtests, sizeof(Subtests));
@@ -2267,5 +2270,7 @@ int main(int argc, char** argv) {
   memcpy(All + At, RepSubtests, sizeof(struct Subtest) * RepSubtestCount);
   At += RepSubtestCount;
   memcpy(All + At, OrderingSubtests, sizeof(struct Subtest) * OrderingSubtestCount);
+  At += OrderingSubtestCount;
+  memcpy(All + At, NullTransferSubtests, sizeof(struct Subtest) * NullTransferSubtestCount);
   return RunSubtests(argc, argv, All, Total, 120);
 }

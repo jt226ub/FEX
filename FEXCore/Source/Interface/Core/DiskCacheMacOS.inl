@@ -39,7 +39,9 @@ namespace {
   //    test without it). New options (MEMCPYSETTSOWIDE, GUESTMEMORYALIASED, VECTORTSOSPLIT,
   //    TSOBARRIERMERGE) are in the configuration hash; TSODEFERRED is not, the effective
   //    ordering state it changes is (CodeGenStateFlags).
-  constexpr uint32_t PortCacheRevision = 6;
+  // 7: round 2 review: a return through the call/return stack needs non-zero host code
+  //    (a return to rip 0 matched an empty entry and branched to host address 0).
+  constexpr uint32_t PortCacheRevision = 7;
 
   constexpr size_t FOZRecordHeaderSize = sizeof(MesaFOZ::foz_payload_key) + sizeof(MesaFOZ::foz_payload_header);
   constexpr size_t IndexRecordMinPayload = sizeof(MesaFOZ::mesa_index_db_file_entry) + sizeof(IndexExtraBlobHeader);

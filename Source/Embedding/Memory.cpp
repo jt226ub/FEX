@@ -34,6 +34,8 @@
 #include <pthread.h>
 #include <sched.h>
 #include <sys/mman.h>
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
 
 namespace fexmac {
 
@@ -423,7 +425,23 @@ fexmac_result WriteBegin(fexmac_context* Context, uint64_t Address, uint64_t Siz
 FEXCore::HLE::ExecutableRangeInfo SyscallHandler::QueryGuestExecutableRange(FEXCore::Core::InternalThreadState*, uint64_t Address) {
   const auto& Memory = Context->Memory;
   if (!Memory.Tracking()) {
-    return {0, UINT64_MAX, true};
+    // Nothing registered: any host memory the process can read is executable guest code,
+    // as before. But memory it cannot read is not: the translator would read it and the
+    // process would die of the host fault (a guest jump to 0 or to any unmapped address
+    // did, round 2 review). The host's own map says which: the region holding Address,
+    // or none. The frontend caches the answer until it leaves the range or code is
+    // invalidated. Writable stays true, as before, because the code cache key uses it.
+    mach_vm_address_t RegionStart = Address;
+    mach_vm_size_t RegionSize = 0;
+    vm_region_basic_info_data_64_t Info {};
+    mach_msg_type_number_t Count = VM_REGION_BASIC_INFO_COUNT_64;
+    mach_port_t Object = MACH_PORT_NULL;
+    const kern_return_t Result = mach_vm_region(mach_task_self(), &RegionStart, &RegionSize, VM_REGION_BASIC_INFO_64,
+                                                reinterpret_cast<vm_region_info_t>(&Info), &Count, &Object);
+    if (Result != KERN_SUCCESS || RegionStart > Address || !(Info.protection & VM_PROT_READ)) {
+      return {0, 0, false};
+    }
+    return {RegionStart, RegionSize, true};
   }
   const auto Executable = [&](uint64_t Page) {
     const uint8_t Info = Memory.Page(Page);
