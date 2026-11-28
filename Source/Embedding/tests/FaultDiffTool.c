@@ -98,11 +98,29 @@ int main(int argc, char** argv) {
   const int Resume = argc > 5 && !strcmp(argv[5], "resume");
   const char* SMC = getenv("SMC") ? getenv("SMC") : "full";
   const int Warm = getenv("WARM") && !strcmp(getenv("WARM"), "1");
-  fexmac_option Options[] = {{"MULTIBLOCK", argv[2]}, {"TSOENABLED", argv[3]}, {"SMCCHECKS", SMC}};
+  /* FAULTDIFF_OPTIONS="NAME=VALUE,NAME=VALUE": further options from the harness's
+   * --option (for example the string-ordering settings). */
+  fexmac_option Options[3 + 8] = {{"MULTIBLOCK", argv[2]}, {"TSOENABLED", argv[3]}, {"SMCCHECKS", SMC}};
+  size_t OptionCount = 3;
+  static char Extra[512];
+  if (getenv("FAULTDIFF_OPTIONS")) {
+    snprintf(Extra, sizeof(Extra), "%s", getenv("FAULTDIFF_OPTIONS"));
+    for (char *Save = NULL, *Item = strtok_r(Extra, ",", &Save); Item; Item = strtok_r(NULL, ",", &Save)) {
+      char* Eq = strchr(Item, '=');
+      if (!Eq || OptionCount == sizeof(Options) / sizeof(Options[0])) {
+        fprintf(stderr, "bad FAULTDIFF_OPTIONS item: %s\n", Item);
+        return 2;
+      }
+      *Eq = 0;
+      Options[OptionCount].name = Item;
+      Options[OptionCount].value = Eq + 1;
+      ++OptionCount;
+    }
+  }
   fexmac_config Config;
   fexmac_config_init(&Config);
   Config.options = Options;
-  Config.option_count = 3;
+  Config.option_count = OptionCount;
   fexmac_context* Context;
   if (fexmac_context_create(&Config, &Context) != FEXMAC_OK) {
     printf("context failed\n");

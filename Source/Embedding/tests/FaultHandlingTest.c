@@ -1678,7 +1678,12 @@ static void* RequestEvery100us(void* Argument) {
   return NULL;
 }
 
-static void TestStopRepMovs(void) {
+/* String ordering for TestStopRepMovs: 0 off (the 1.0 subtest), 1 MEMCPYSETTSOENABLED,
+ * 2 also MEMCPYSETTSOWIDE (8-byte acquire/release units). */
+static int StopRepStringTSO = 0;
+
+static void TestStopRepMovsMode(int StringTSO) {
+  StopRepStringTSO = StringTSO;
   fexmac_install_fault_handlers();
   static const struct RepRun Runs[] = {
     {"rep movsb, 32MB apart", {0xF3, 0xA4, 0xF4}, 3, 1, 0, 1, 32 << 20},
@@ -1687,14 +1692,53 @@ static void TestStopRepMovs(void) {
     {"rep movsb overlapping forward by 1 (replicates)", {0xF3, 0xA4, 0xF4}, 3, 1, 0, 1, 1},
     {"rep movsb overlapping forward by 24", {0xF3, 0xA4, 0xF4}, 3, 1, 0, 1, 24},
     {"std; rep movsb overlapping backward by 3", {0xF3, 0xA4, 0xF4}, 3, 1, 1, 1, -3},
+    /* Source 3 and 6 bytes past the destination's alignment (the wide path's extr loops),
+     * rep movsw/movsd, rep stosb/stosw/stosd, a source 32MB-40 apart (no overlap but
+     * closer than the window), and a destination 64 and 65 bytes above the source (the
+     * last element-by-element distance and the first wide one). */
+    {"rep movsb, source 3 bytes off", {0xF3, 0xA4, 0xF4}, 3, 1, 0, 1, (32 << 20) - 3},
+    {"rep movsw, source 6 bytes off", {0xF3, 0x66, 0xA5, 0xF4}, 4, 2, 0, 1, (32 << 20) - 6},
+    {"rep movsd, source 4 bytes off", {0xF3, 0xA5, 0xF4}, 3, 4, 0, 1, (32 << 20) - 4},
+    {"rep stosb", {0xF3, 0xAA, 0xF4}, 3, 1, 0, 0, 0},
+    {"rep stosw", {0xF3, 0x66, 0xAB, 0xF4}, 4, 2, 0, 0, 0},
+    {"rep stosd", {0xF3, 0xAB, 0xF4}, 3, 4, 0, 0, 0},
+    {"rep movsb overlapping forward by 64", {0xF3, 0xA4, 0xF4}, 3, 1, 0, 1, 64},
+    {"rep movsb overlapping forward by 65", {0xF3, 0xA4, 0xF4}, 3, 1, 0, 1, 65},
+    {"rep movsb, source 5 bytes above (overlapping)", {0xF3, 0xA4, 0xF4}, 3, 1, 0, 1, -5},
+    {"std; rep movsb, 32MB apart", {0xF3, 0xA4, 0xF4}, 3, 1, 1, 1, 32 << 20},
+    {"std; rep movsb, source 3 bytes off", {0xF3, 0xA4, 0xF4}, 3, 1, 1, 1, (32 << 20) - 3},
+    {"std; rep movsd, source 4 bytes off", {0xF3, 0xA5, 0xF4}, 3, 4, 1, 1, (32 << 20) - 4},
+    {"std; rep movsq, 32MB apart", {0xF3, 0x48, 0xA5, 0xF4}, 4, 8, 1, 1, 32 << 20},
+    {"std; rep movsb, destination 5 above (memmove)", {0xF3, 0xA4, 0xF4}, 3, 1, 1, 1, 5},
+    {"std; rep movsb, destination 65 above (memmove)", {0xF3, 0xA4, 0xF4}, 3, 1, 1, 1, 65},
+    {"std; rep movsb overlapping backward by 64", {0xF3, 0xA4, 0xF4}, 3, 1, 1, 1, -64},
+    {"std; rep movsb overlapping backward by 65", {0xF3, 0xA4, 0xF4}, 3, 1, 1, 1, -65},
+    {"std; rep stosb", {0xF3, 0xAA, 0xF4}, 3, 1, 1, 0, 0},
+    {"std; rep stosq", {0xF3, 0x48, 0xAB, 0xF4}, 4, 8, 1, 0, 0},
   };
   const size_t Bytes = 32 << 20;
   uint8_t* Area = MapGuestMemory(Bytes * 3);
   uint8_t* Expect = malloc(Bytes * 3);
   for (size_t r = 0; r < sizeof(Runs) / sizeof(Runs[0]); ++r) {
     const struct RepRun* Run_ = &Runs[r];
-    fexmac_context* Context = MakeContext(1, (int)(r & 1), "none", NULL, NULL);
+    fexmac_context* Context = NULL;
+    if (StopRepStringTSO == 0) {
+      Context = MakeContext(1, (int)(r & 1), "none", NULL, NULL);
+    } else {
+      const fexmac_option Options[] = {
+        {"MULTIBLOCK", (r & 1) ? "1" : "0"},
+        {"TSOENABLED", "1"},
+        {"SMCCHECKS", "none"},
+        {"MEMCPYSETTSOENABLED", "1"},
+        {"MEMCPYSETTSOWIDE", StopRepStringTSO == 2 ? "1" : "0"},
+      };
+      Context = CreateContextWithOptions(Options, 5, NULL, NULL);
+    }
     uint8_t* Code = MapCode(Context, Run_->Program, Run_->ProgramSize, 0);
+    /* A fast run may finish before the requester's first stop lands: run again (up to
+     * 20 times) until one is stopped part-way. Every attempt is checked in full. */
+    int Stops = 0, Bad = 0, Attempts = 0, WrongResult = 0;
+    for (; Attempts < 20 && Stops == 0; ++Attempts) {
     for (size_t i = 0; i < Bytes * 3; ++i) {
       Area[i] = (uint8_t)(i * 131 + 7);
     }
@@ -1728,7 +1772,6 @@ static void TestStopRepMovs(void) {
     atomic_store(&StormDone, 0);
     pthread_t Requester;
     pthread_create(&Requester, NULL, RequestEvery100us, Thread);
-    int Stops = 0, Bad = 0;
     for (;;) {
       const fexmac_stop Stop = Run(Thread);
       State = GetState(Thread);
@@ -1749,16 +1792,29 @@ static void TestStopRepMovs(void) {
     }
     atomic_store(&StormDone, 1);
     pthread_join(Requester, NULL);
-    printf("  %s: %d stops part-way\n", Run_->Name, Stops);
+    WrongResult += !(State.gpr[RCX] == 0 && memcmp(Area, Expect, Bytes * 3) == 0);
+    fexmac_thread_destroy(Thread);
+    }
+    printf("  %s: %d stops part-way (attempt %d)\n", Run_->Name, Stops, Attempts);
     Check(Bad == 0, "%s: every stop at the rep instruction with rcx, rsi, rdi exact (%d bad)", Run_->Name, Bad);
     /* At least once: under load the requester may get little time during the fast
      * chunked runs (3 stops in one of 20 loaded runs); exactness is checked above. */
     Check(Stops >= 1, "%s: stopped part-way (%d times)", Run_->Name, Stops);
-    Check(State.gpr[RCX] == 0 && memcmp(Area, Expect, Bytes * 3) == 0, "%s: after all the resumes, memory is x86's result", Run_->Name);
-    fexmac_thread_destroy(Thread);
+    Check(WrongResult == 0, "%s: after all the resumes, memory is x86's result (%d of %d attempts wrong)", Run_->Name, WrongResult,
+          Attempts);
     fexmac_context_destroy(Context);
   }
   free(Expect);
+}
+
+static void TestStopRepMovs(void) {
+  TestStopRepMovsMode(0);
+}
+static void TestStopRepMovsStringTSO(void) {
+  TestStopRepMovsMode(1);
+}
+static void TestStopRepMovsStringTSOWide(void) {
+  TestStopRepMovsMode(2);
 }
 
 /* fexmac_thread_get_state reports only the RFLAGS bits x86 defines: after rcl r64,1 that
@@ -1911,6 +1967,8 @@ const struct Subtest FaultSubtests[] = {
   {"memory-host-page-rules", TestMemoryHostPageRules, 0, NULL, NULL, 0},
   {"memory-write-begin-contract", TestWriteBeginContract, 0, NULL, NULL, 0},
   {"stop-rep-movs", TestStopRepMovs, 0, NULL, "fexmac:", 0},
+  {"stop-rep-movs-string-tso", TestStopRepMovsStringTSO, 0, NULL, "fexmac:", 0},
+  {"stop-rep-movs-string-tso-wide", TestStopRepMovsStringTSOWide, 0, NULL, "fexmac:", 0},
   {"stop-rep", TestStopRep, 0, NULL, "fexmac:", 0},
   {"stop-not-running", TestStopNotRunning, 0, NULL, "fexmac:", 0},
   {"stop-during-callback", TestStopDuringCallback, 0, NULL, "fexmac:", 0},

@@ -48,6 +48,8 @@ namespace {
     OPTION(TSOENABLED, TSOEnabled, Bool),
     OPTION(VECTORTSOENABLED, VectorTSOEnabled, Bool),
     OPTION(MEMCPYSETTSOENABLED, MemcpySetTSOEnabled, Bool),
+    // rep movs/stos with string ordering on: 8-byte acquire/release units (round 2, E2).
+    OPTION(MEMCPYSETTSOWIDE, MemcpySetTSOWide, Bool),
     OPTION(HALFBARRIERTSOENABLED, HalfBarrierTSOEnabled, Bool),
     // Self-modifying code. "full" validates every block; "mtrack" needs page-protection
     // tracking, which package D adds; until then it detects nothing and the embedder

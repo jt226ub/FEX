@@ -18,7 +18,10 @@ Every difference fails the run unless KNOWN lists it (case, check); a listed dif
 that no longer occurs also fails, so the list cannot go stale. Written from the package D
 review's harness.
 
-    python3 Scripts/macos_fault_diff.py --tool build/Bin/fexmac_fault_diff [--filter text]
+    python3 Scripts/macos_fault_diff.py --tool build/Bin/fexmac_fault_diff [--filter text] [--option NAME=VALUE]...
+
+--option passes further fexmac options to every run (they take effect where they apply:
+the string-ordering options only in the modes with TSOENABLED=1).
 """
 
 import argparse
@@ -342,7 +345,15 @@ def main():
     parser.add_argument("--filter", default="")
     parser.add_argument("--jobs", type=int, default=4)
     parser.add_argument("--verbose", action="store_true")
+    parser.add_argument("--option", action="append", default=[], metavar="NAME=VALUE",
+                        help="a further fexmac option for every run (repeatable), e.g. MEMCPYSETTSOENABLED=1")
     args = parser.parse_args()
+    for o in args.option:
+        if "=" not in o or "," in o:
+            parser.error("--option takes NAME=VALUE (no commas): " + o)
+    if args.option:
+        os.environ["FAULTDIFF_OPTIONS"] = ",".join(args.option)
+        print("options for every run: " + ",".join(args.option))
     known = set()
     if os.path.exists(KNOWN_FILE):
         for line in open(KNOWN_FILE):

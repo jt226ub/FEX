@@ -374,6 +374,7 @@ public:
     FEX_CONFIG_OPT(TSOEnabled, TSOENABLED);
     FEX_CONFIG_OPT(VectorTSOEnabled, VECTORTSOENABLED);
     FEX_CONFIG_OPT(MemcpySetTSOEnabled, MEMCPYSETTSOENABLED);
+    FEX_CONFIG_OPT(MemcpySetTSOWide, MEMCPYSETTSOWIDE);
     FEX_CONFIG_OPT(SMCChecks, SMCCHECKS);
     FEX_CONFIG_OPT(MaxInstPerBlock, MAXINST);
     FEX_CONFIG_OPT(RootFSPath, ROOTFS);
@@ -472,6 +473,12 @@ public:
   // If atomic-based TSO emulation is enabled for memcpy operations.
   bool IsMemcpyAtomicTSOEnabled() const {
     return MemcpyAtomicTSOEmulationEnabled;
+  }
+
+  // macOS: rep movs/stos with memcpy TSO emulation in 8-byte acquire/release units
+  // (MemcpySetTSOWide). Only meaningful while IsMemcpyAtomicTSOEnabled().
+  bool IsMemcpyWideTSOEnabled() const {
+    return MemcpyAtomicTSOEmulationEnabled && Config.MemcpySetTSOWide;
   }
 
   void SetHardwareTSOSupport(bool HardwareTSOSupported) override {
