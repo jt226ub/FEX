@@ -371,6 +371,7 @@ Ref OpDispatchBuilder::GetX87FTW_Helper() {
 }
 
 void OpDispatchBuilder::X87FNSTENV(OpcodeArgs) {
+  SaveAreaFence(true);
 
 
   // 14 bytes for 16bit
@@ -472,9 +473,11 @@ void OpDispatchBuilder::X87LDENV(OpcodeArgs) {
     Ref MemLocation = Add(OpSize::i64Bit, Mem, IR::OpSizeToSize(Size) * 2);
     SetX87FTW(_LoadMemGPR(Size, MemLocation, Size));
   }
+  SaveAreaFence(false);
 }
 
 void OpDispatchBuilder::X87FNSAVE(OpcodeArgs) {
+  SaveAreaFence(true);
   _SyncStackToSlow();
 
   // 14 bytes for 16bit
@@ -620,6 +623,7 @@ void OpDispatchBuilder::X87FRSTOR(OpcodeArgs) {
     Reg = _F80CVT(OpSize::i64Bit, Reg); // Convert to double precision
   }
   _StoreContextFPRIndexed(Reg, Top, StoreSize, MMBaseOffset(), IR::OpSizeToSize(OpSize::i128Bit));
+  SaveAreaFence(false);
 }
 
 // Load / Store Control Word

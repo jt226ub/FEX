@@ -753,6 +753,18 @@ public:
   void X87FFREE(OpcodeArgs);
   void X87FLDCW(OpcodeArgs);
   void X87FNSAVE(OpcodeArgs);
+  // macOS: fxsave/xsave/fnsave/fnstenv and fxrstor/xrstor/frstor/fldenv access their area
+  // with plain loads and stores. With vector ordering (effective state) a barrier before
+  // the saves keeps earlier stores before the area's (store-store), and one after the
+  // restores keeps the area's loads before later accesses (load-load, load-store). Round 2
+  // review; FEXCoreOrderingSwitchTest --stores fxrstor showed the second break without it.
+  void SaveAreaFence(bool Save) {
+#ifdef __APPLE__
+    if (CTX->IsVectorAtomicTSOEnabled()) {
+      _Fence(Save ? FenceType::LoadStore : FenceType::Load);
+    }
+#endif
+  }
   void X87FNSTENV(OpcodeArgs);
   void X87FNSTSW(OpcodeArgs, bool DestRAX);
   void X87FRSTOR(OpcodeArgs);

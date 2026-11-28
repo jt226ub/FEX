@@ -2986,6 +2986,7 @@ void OpDispatchBuilder::AVXVFCMPOp(OpcodeArgs, IR::OpSize ElementSize) {
 }
 
 void OpDispatchBuilder::FXSaveOp(OpcodeArgs) {
+  SaveAreaFence(true);
   Ref Mem = MakeSegmentAddress(Op, Op->Dest);
 
   SaveX87State(Op, Mem);
@@ -3002,6 +3003,7 @@ Ref OpDispatchBuilder::XSaveBase(X86Tables::DecodedOp Op) {
 }
 
 void OpDispatchBuilder::XSaveOpImpl(OpcodeArgs) {
+  SaveAreaFence(true);
   // NOTE: Mask should be EAX and EDX concatenated, but we only need to test
   //       for features that are in the lower 32 bits, so EAX only is sufficient.
   const auto OpSize = GetGPROpSize();
@@ -3192,6 +3194,7 @@ void OpDispatchBuilder::FXRStoreOp(OpcodeArgs) {
 
   Ref MXCSR = _LoadMemGPR(OpSize::i32Bit, Mem, Constant(24), OpSize::i32Bit, MemOffsetType::SXTX, 1);
   RestoreMXCSRState(MXCSR);
+  SaveAreaFence(false);
 }
 
 void OpDispatchBuilder::XRstorOpImpl(OpcodeArgs) {
@@ -3256,6 +3259,7 @@ void OpDispatchBuilder::XRstorOpImpl(OpcodeArgs) {
       },
       [] { /* Intentionally do nothing*/ }, 2);
   }
+  SaveAreaFence(false);
 }
 
 void OpDispatchBuilder::RestoreX87State(OpcodeArgs, Ref MemBase) {

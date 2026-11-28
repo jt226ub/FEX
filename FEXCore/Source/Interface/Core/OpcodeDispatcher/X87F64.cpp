@@ -43,6 +43,7 @@ void OpDispatchBuilder::X87LDENVF64(OpcodeArgs) {
     // FTW
     SetX87FTW(_LoadMemGPR(Size, Mem, Constant(IR::OpSizeToSize(Size) * 2), Size, MemOffsetType::SXTX, 1));
   }
+  SaveAreaFence(false);
 }
 
 void OpDispatchBuilder::X87FLDCWF64(OpcodeArgs) {

@@ -204,11 +204,21 @@ std::vector<uint8_t> WriterStores(const std::string& Stores) {
     P.insert(P.end(), {0xDF, 0xAB, 0x00, 0x02, 0x00, 0x00});       // fild qword [rbx+0x200]
     P.insert(P.end(), {0xDD, 0x13});                               // fst qword [rbx]
     P.insert(P.end(), {0xDD, 0x9B, 0x80, 0x00, 0x00, 0x00});       // fstp qword [rbx+0x80]
+  } else if (Stores == "fxsave") {
+    // X by a scalar store, Y by fxsave: xmm0 = rax lands in the save area at 0x400 + 160.
+    P.insert(P.end(), {0x48, 0x89, 0x03});                         // mov [rbx], rax
+    P.insert(P.end(), {0x66, 0x48, 0x0F, 0x6E, 0xC0});             // movq xmm0, rax
+    P.insert(P.end(), {0x0F, 0xAE, 0x83, 0x00, 0x04, 0x00, 0x00}); // fxsave [rbx+0x400]
+  } else if (Stores == "fxrstor") {
+    // Plain stores of X then Y (Y at 0x4A0, xmm0's slot of the save area at 0x400); the
+    // reader loads Y with fxrstor (ReaderFor).
+    P.insert(P.end(), {0x48, 0x89, 0x03});                         // mov [rbx], rax
+    P.insert(P.end(), {0x48, 0x89, 0x83, 0xA0, 0x04, 0x00, 0x00}); // mov [rbx+0x4A0], rax
   } else if (Stores == "stos") {
     P.insert(P.end(), {0x48, 0x8D, 0x3B, 0xB9, 0x01, 0x00, 0x00, 0x00, 0xF3, 0x48, 0xAB});         // rdi = X; rep stosq
     P.insert(P.end(), {0x48, 0x8D, 0xBB, 0x80, 0x00, 0x00, 0x00, 0xB9, 0x01, 0x00, 0x00, 0x00, 0xF3, 0x48, 0xAB}); // Y
   } else {
-    Fail("--stores scalar|movsd|movdqu|x87|stos");
+    Fail("--stores scalar|movsd|movdqu|x87|stos|fxsave|fxrstor");
   }
   P.insert(P.end(), {0x48, 0x8B, 0x8B, 0x00, 0x01, 0x00, 0x00, 0x48, 0x85, 0xC9}); // mov rcx, [DONE]; test rcx, rcx
   const int Back = -static_cast<int>(P.size() + 2);
@@ -368,6 +378,31 @@ fexmac_syscall_action CreateFromCallback(fexmac_thread*, void* UserData) {
 std::string StoresKind = "scalar";
 std::vector<std::string> ExtraOptions;
 
+// The reader for --stores fxsave (Y in the save area's xmm0 slot) and fxrstor (Y loaded
+// by fxrstor of the area, then X by a scalar load): as Reader otherwise.
+std::vector<uint8_t> ReaderFor(const std::string& Stores) {
+  Asm R;
+  int Loop = R.NewLabel(), Ok = R.NewLabel();
+  R.Bind(Loop);
+  if (Stores == "fxrstor") {
+    R.B({0x0F, 0xAE, 0x8B, 0x00, 0x04, 0x00, 0x00}); // fxrstor [rbx+0x400]
+    R.B({0x66, 0x48, 0x0F, 0x7E, 0xC2});             // movq rdx, xmm0     (Y)
+  } else {
+    R.B({0x48, 0x8B, 0x93, 0xA0, 0x04, 0x00, 0x00}); // mov rdx, [rbx+0x4A0] (Y)
+  }
+  R.B({0x48, 0x8B, 0x33}); // mov rsi, [rbx] (X)
+  R.B({0x48, 0x39, 0xD6}); // cmp rsi, rdx
+  R.B({0x0F, 0x83});       // jae ok
+  R.Rel32(Ok);
+  R.B({0x49, 0xFF, 0xC1}); // inc r9 (X < Y: forbidden)
+  R.Bind(Ok);
+  R.B({0x49, 0xFF, 0xC8}); // dec r8
+  R.Jcc(CC_NZ, Loop);
+  R.B({0x48, 0xC7, 0x83, 0x00, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00}); // mov qword [rbx+0x100], 1
+  R.B({0xF4});
+  return R.Finish();
+}
+
 struct LitmusResult {
   uint64_t Forbidden;
   uint64_t WriterIterations;
@@ -406,7 +441,17 @@ LitmusResult LitmusTrial(const std::vector<fexmac_option>& Options, uint64_t Rea
   } else {
     memcpy(Code, Writer, sizeof(Writer));
   }
-  memcpy(Code + 0x400, Reader, sizeof(Reader));
+  if (StoresKind == "fxsave" || StoresKind == "fxrstor") {
+    const auto P = ReaderFor(StoresKind);
+    memcpy(Code + 0x400, P.data(), P.size());
+    // A valid save area for fxrstor: FCW 0x37F, MXCSR 0x1F80.
+    const uint16_t FCW = 0x37F;
+    const uint32_t MXCSR = 0x1F80;
+    memcpy(Data + 0x400, &FCW, sizeof(FCW));
+    memcpy(Data + 0x400 + 24, &MXCSR, sizeof(MXCSR));
+  } else {
+    memcpy(Code + 0x400, Reader, sizeof(Reader));
+  }
   const auto Base = reinterpret_cast<uint64_t>(Mem);
 
   CallbackState CB;

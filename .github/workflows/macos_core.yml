@@ -193,6 +193,9 @@ jobs:
           codesign --force --sign - --options runtime --entitlements Data/macOS/jit.entitlements FEXCoreOrderingSwitchTest-hardened
           ./FEXCoreOrderingSwitchTest-hardened litmus --trials 2000 2>&1 | tee ordering-switch.log
           ./FEXCoreOrderingSwitchTest-hardened litmus --trials 500 --pattern call 2>&1 | tee -a ordering-switch.log
+          for stores in fxsave fxrstor; do
+            ./FEXCoreOrderingSwitchTest-hardened litmus --trials 300 --mode on --stores "$stores" 2>&1 | tee -a ordering-switch.log
+          done
           for pattern in callret misaligned smc cbcreate cbmark; do
             ./FEXCoreOrderingSwitchTest-hardened litmus --trials 300 --pattern "$pattern" 2>&1 | tee -a ordering-switch.log
           done

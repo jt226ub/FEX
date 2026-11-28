@@ -41,6 +41,8 @@ namespace {
   //    ordering state it changes is (CodeGenStateFlags).
   // 7: round 2 review: a return through the call/return stack needs non-zero host code
   //    (a return to rip 0 matched an empty entry and branched to host address 0).
+  //    With vector ordering, a barrier before fxsave/xsave/fnsave/fnstenv's stores and
+  //    after fxrstor/xrstor/frstor/fldenv's loads.
   constexpr uint32_t PortCacheRevision = 7;
 
   constexpr size_t FOZRecordHeaderSize = sizeof(MesaFOZ::foz_payload_key) + sizeof(MesaFOZ::foz_payload_header);
