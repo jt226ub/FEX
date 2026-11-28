@@ -477,13 +477,22 @@ namespace {
     Context->OrderingDeferred.store(false, std::memory_order_release);
   }
 
-  // Until no thread may still be running code made without ordering. Holds no lock.
-  void WaitForOrdering(fexmac_context* Context) {
+  // Until no thread may still be running code made without ordering. Holds no lock. Self
+  // is the thread about to run (or null): a switch made while it waits here can mark it
+  // (it is Running), and it has run nothing in this run, so it acknowledges at once,
+  // in every round, instead of waiting for itself.
+  void WaitForOrdering(fexmac_context* Context, fexmac_thread* Self) {
+    auto AckSelf = [&] {
+      if (Self && AcknowledgeOrdering(Self)) {
+        Context->OrderingAcksAtStart.fetch_add(1, std::memory_order_relaxed);
+      }
+    };
+    AckSelf();
     if (Context->OrderingAcksPending.load(std::memory_order_acquire) == 0) {
       return;
     }
     Context->OrderingWaits.fetch_add(1, std::memory_order_relaxed);
-    for (unsigned Round = 0; Context->OrderingAcksPending.load(std::memory_order_acquire) != 0; ++Round) {
+    for (unsigned Round = 0; AckSelf(), Context->OrderingAcksPending.load(std::memory_order_acquire) != 0; ++Round) {
       if (Round < 64) {
         sched_yield();
       } else {
@@ -555,13 +564,22 @@ void SyscallHandler::HandleSyscall(FEXCore::Core::CpuStateFrame* Frame) {
   // dispatcher looks the next block up after this handler: a safe point for the ordering
   // switch, taken before the callback so that a callback that waits for another guest
   // thread (or calls fexmac_context_mark_memory_shared) cannot wait for this one.
-  if (AcknowledgeOrdering(Thread)) {
-    Context->OrderingAcksAtExit.fetch_add(1, std::memory_order_relaxed);
+  // Under the registry lock, in the same step that marks the thread as in its callback:
+  // a switch then either marked it before (and this acknowledges) or sees it in the
+  // callback (and does not count it). Done separately, a switch in between would count
+  // a thread that then sits in its callback.
+  {
+    std::lock_guard Lock {RegistryMutex};
+    if (AcknowledgeOrdering(Thread)) {
+      Context->OrderingAcksAtExit.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (Context->SyscallFn) {
+      Thread->InCallback = true;
+    }
   }
 
   fexmac_syscall_action Action = FEXMAC_SYSCALL_STOP;
   if (Context->SyscallFn) {
-    SetInCallback(Thread, true);
     Action = Context->SyscallFn(Thread, Context->SyscallUserData);
     SetInCallback(Thread, false);
   }
@@ -907,7 +925,7 @@ fexmac_result fexmac_context_mark_memory_shared(fexmac_context* context) {
   }
   // A guest thread calling from its system call callback is not waited for: it has
   // acknowledged at the system call, or was in it when the switch was made.
-  WaitForOrdering(context);
+  WaitForOrdering(context, nullptr);
   return FEXMAC_OK;
 }
 
@@ -947,6 +965,13 @@ fexmac_result fexmac_before_fork(fexmac_context* context) {
       return FEXMAC_ERROR_BUSY;
     }
   }
+  // An ordering switch in progress on another host thread (which the contract excludes:
+  // no other call may run) would leave the child with this lock held. try_lock: the
+  // switch takes it before the registry lock.
+  if (!context->OrderingSwitchMutex.try_lock()) {
+    RegistryMutex.unlock();
+    return FEXMAC_ERROR_BUSY;
+  }
   // Every lock the library and the core might hold on another host thread, so the child
   // does not inherit one held by a thread it does not have. The registry lock stays held
   // until fexmac_after_fork.
@@ -964,6 +989,7 @@ fexmac_result fexmac_after_fork(fexmac_context* context, int child) {
   context->CTX->UnlockAfterFork(nullptr, child != 0);
   context->Memory.Mutex.unlock();
   context->ThreadsMutex.unlock();
+  context->OrderingSwitchMutex.unlock();
   ForkingContext = nullptr;
   RegistryMutex.unlock();
   return FEXMAC_OK;
@@ -1181,10 +1207,7 @@ fexmac_result fexmac_thread_run(fexmac_thread* thread, fexmac_stop* stop) {
   // Marked by an ordering switch that came between this run being entered and now: it has
   // run nothing yet. Then no guest code until every thread that may still be running
   // code made without ordering has left it (Ordering deferred while single-threaded).
-  if (AcknowledgeOrdering(thread)) {
-    thread->Context->OrderingAcksAtStart.fetch_add(1, std::memory_order_relaxed);
-  }
-  WaitForOrdering(thread->Context);
+  WaitForOrdering(thread->Context, thread);
 
   if (thread->StopRequested.exchange(0)) {
     // A stop requested while the thread was not running (or one that arrived as the last

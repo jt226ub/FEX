@@ -533,6 +533,84 @@ static void TestDeferredCache(void) {
   fexmac_context_destroy(Context);
 }
 
+/* ---- races of the switch with a run starting and with a system call ----
+ * (Found by review, round 2.) A switch made between a run marking its thread Running
+ * and its wait for acknowledgements must not make it wait for itself; a switch made
+ * while a thread enters its system call callback must not count it while the callback
+ * waits for another guest thread. Each case races 4,000 times in fresh contexts; a hang
+ * is caught by the harness's alarm. */
+/* clang-format off */
+static const uint8_t SyscallLoop[] = {
+  0xB8, 0x01, 0x00, 0x00, 0x00, /* loop: mov eax, 1 */
+  0x0F, 0x05,                   /*   syscall (the callback waits until thread 2 has run) */
+  0x48, 0x8B, 0x4B, 0x10,       /*   mov rcx, [rbx+16] */
+  0x48, 0x85, 0xC9,             /*   test rcx, rcx */
+  0x74, 0xF0,                   /*   jz loop */
+  0xF4,
+};
+/* clang-format on */
+struct RaceRecord {
+  uint8_t* Data;
+  atomic_int Calls;
+};
+static fexmac_syscall_action WaitingSyscall(fexmac_thread* Thread, void* UserData) {
+  struct RaceRecord* R = (struct RaceRecord*)UserData;
+  (void)Thread;
+  /* After the first call, wait for thread 2's store, as a callback blocked on another
+   * guest thread would. */
+  if (atomic_fetch_add(&R->Calls, 1) > 0) {
+    while (Load64(R->Data, 16) == 0) {
+    }
+  }
+  return FEXMAC_SYSCALL_RESUME;
+}
+static void TestDeferredSwitchRaces(void) {
+  InstallHandlers();
+  uint8_t* Mem = MapGuestMemory(0x8000);
+  memcpy(Mem, SetStop, sizeof(SetStop));
+  memcpy(Mem + 0x100, SyscallLoop, sizeof(SyscallLoop));
+  uint8_t* Data = Mem + 0x4000;
+  const uint64_t Base = (uint64_t)(uintptr_t)Mem;
+  int Bad = 0;
+  for (int i = 0; i < 4000; ++i) {
+    /* A run of thread 1 starting while thread 2 is created. */
+    Store64(Data, 16, 0);
+    fexmac_context* Context = CreateContextWithOptions(DeferredOptions, COUNT(DeferredOptions), NULL, NULL);
+    struct RunArgs A = {.Thread = ThreadAt(Context, Base, Base + 0x4000)};
+    pthread_t Host;
+    pthread_create(&Host, NULL, RunWorker, &A);
+    for (volatile int Spin = 0; Spin < (i % 64) * 20; ++Spin) {
+    }
+    fexmac_thread* Second = ThreadAt(Context, Base, Base + 0x4000);
+    Bad += Run(Second).reason != FEXMAC_STOP_HALT;
+    pthread_join(Host, NULL);
+    Bad += A.Stop.reason != FEXMAC_STOP_HALT;
+    fexmac_thread_destroy(Second);
+    fexmac_thread_destroy(A.Thread);
+    fexmac_context_destroy(Context);
+
+    /* Thread 1 in a loop of system calls whose callback waits for thread 2. */
+    Store64(Data, 16, 0);
+    struct RaceRecord R = {.Data = Data};
+    Context = CreateContextWithOptions(DeferredOptions, COUNT(DeferredOptions), WaitingSyscall, &R);
+    struct RunArgs B = {.Thread = ThreadAt(Context, Base + 0x100, Base + 0x4000)};
+    pthread_create(&Host, NULL, RunWorker, &B);
+    while (atomic_load(&R.Calls) == 0) {
+    }
+    for (volatile int Spin = 0; Spin < (i % 64) * 20; ++Spin) {
+    }
+    Second = ThreadAt(Context, Base, Base + 0x4000);
+    Bad += Run(Second).reason != FEXMAC_STOP_HALT;
+    pthread_join(Host, NULL);
+    Bad += B.Stop.reason != FEXMAC_STOP_HALT;
+    fexmac_thread_destroy(Second);
+    fexmac_thread_destroy(B.Thread);
+    fexmac_context_destroy(Context);
+  }
+  Check(Bad == 0, "4,000 switches racing a run's start and 4,000 racing a system call whose callback waits for thread 2: no hang, all halt");
+  munmap(Mem, 0x8000);
+}
+
 #ifdef ORDERING_SWITCH_HOOKS
 /* The broken switches, to show the subtests above can fail. */
 static void TestBrokenNoDiscardMidLoop(void) {
@@ -551,6 +629,7 @@ const struct Subtest OrderingSubtests[] = {
   {"deferred-switch-from-callback", TestDeferredSwitchFromCallback, 0, NULL, NULL, 0},
   {"deferred-mark-shared", TestDeferredMarkShared, 0, NULL, NULL, 0},
   {"deferred-cache", TestDeferredCache, 0, NULL, NULL, 0},
+  {"deferred-switch-races", TestDeferredSwitchRaces, 0, NULL, NULL, 0},
 #ifdef ORDERING_SWITCH_HOOKS
   {"deferred-broken-no-discard-mid-loop", TestBrokenNoDiscardMidLoop, 0, NULL, NULL, 0},
 #endif

@@ -776,7 +776,9 @@ sharing is a property of who touches the memory, not of a range, and once anythi
 shared the whole context must switch (the guest's own accesses to other memory are
 ordered against accesses to the shared range). `fexmac_context_mark_memory_shared` may be
 called from a system call callback, not from a signal handler or the log callback
-(`BUSY`).
+(`BUSY`). `fexmac_before_fork` returns `BUSY` while a switch is in progress on another
+host thread (the fork contract already excludes concurrent calls; the child would
+otherwise inherit the switch's lock held).
 
 **The switch** (`EnableOrderingLocked` in `Library.cpp`), serialised by a context mutex
 that thread creation also holds while ordering is deferred:
@@ -796,8 +798,11 @@ that thread creation also holds while ordering is deferred:
 
 A marked thread **acknowledges on its own host thread** at its next resync (a block
 entry or loop back-edge, inside a `rep` loop every 64 elements, `Faults.cpp`), its next
-system call (before the callback) or the end of its run, or at the start of a run it was
-entering at the switch. Each is a point after which the thread looks its code up anew.
+system call (under the registry lock, in the same step that marks it as in its callback,
+so a switch either counted it before and sees the acknowledgement, or sees it in the
+callback and does not count it), the end of its run, or, for a run it was entering at
+the switch, in every round of that run's own wait (it has run nothing yet). Each is a
+point after which the thread looks its code up anew.
 It first clears its own call/return stack, then lowers the count with a sequentially
 consistent (release) decrement. `fexmac_thread_run` does not start guest code while the
 count is non-zero, and `fexmac_context_mark_memory_shared` does not return until it is.
@@ -873,6 +878,7 @@ and breaks the switch on purpose; `FEXCoreOrderingSwitchTest`):
 | `deferred-switch-from-callback` | thread 1's system call callback creates thread 2, runs it on another host thread and joins it before returning: no deadlock, thread 1 then reads its value |
 | `deferred-mark-shared` | a host thread reads the guest's message-passing stores with acquire loads: deferred, it sees them out of order (the translation is observably unordered); after `fexmac_context_mark_memory_shared`, 0 of 50M reads; with the option off, 0 before and after |
 | `deferred-cache` | cold deferred run stores unordered entries; a single-threaded warm start loads them; after the switch the same code is compiled, nothing loaded; ordering on loads the entries stored after the switch, and loads nothing where only unordered entries exist |
+| `deferred-switch-races` | 4,000 switches racing a run's start (thread 1 started on a host thread while thread 2 is created) and 4,000 racing a system call whose callback waits for thread 2's store; a hang is caught by the alarm. Both races hung the first version of the switch (found by review: a run marked between setting `Running` and its wait waited for itself; a thread marked between acknowledging at the system call and entering its callback was counted while its callback waited): 4 of 16 runs hung before the fix, 0 of 20 after |
 | `deferred-broken-no-discard-mid-loop` (hooks) | with the discard skipped, only thread 2's block is compiled after the switch: the counter check above can fail |
 | `FEXCoreOrderingSwitchTest litmus` | message passing across the switch: thread 1 writes X then Y in a loop that stays in one translation; thread 2 is created mid-loop and reads Y then X; X < Y is forbidden. `--pattern call` reads the loop's exit flag in a called function. Must be 0; `--mode off` and the `_hooks` build with `--break no-wait`, `no-discard` (and, rarely, `keep-callret`) show forbidden outcomes |
 | `FEXCoreOrderingSwitchTest cost` | the switch cost and the recompilation burst for N = 100, 10,000, 100,000 blocks |
