@@ -1641,17 +1641,8 @@ std::vector<LitmusTest> MakeTests() {
     T.push_back(RepReadOrder("REP-order-read-movsb-skew-line", "as REP-order-read-movsb-line, destination 3 bytes off", false, 3, 2040, 2048, Expect::Break));
 
     // Pairs inside one 32-byte chunk (the reviewer's tests): units 0 and 1 of one chunk.
-    T.push_back(RepOrder("RV-order-movsb0-chunk", "rep movsb, source aligned like dest: unit 1 of a chunk seen before unit 0",
-                         MovsbLong(0, false), 2056, 2048, CopyQ, Expect::Either, 1528));
-    T.push_back(RepOrder("RV-order-movsb3-chunk", "rep movsb, source 3 off: unit 1 of a chunk seen before unit 0",
-                         MovsbLong(3, false), 2056, 2048, CopyQ, Expect::Either, 1528));
-    T.push_back(RepOrder("RV-order-stosb-chunk", "rep stosb: unit 1 of a chunk seen before unit 0",
-                         StosLong(true, false), 2056, 2048, STOS_VALUE, Expect::Either, 1528));
     T.push_back(RepOrder("RV-order-std-stosq-chunk", "std; rep stosq: unit 1 (lower) of a chunk seen before unit 0",
                          StosLong(false, true), 18432, 18440, STOS_VALUE, Expect::Either, 18944));
-    T.push_back(RepReadOrder("RV-order-read-movsb-chunk", "loads within rep movsb: unit 0 of a chunk read new, unit 1 old", false, 0, 2048,
-                             2056));
-    T.push_back(RepReadOrder("RV-order-read-movsb3-chunk", "as above, destination 3 off", false, 3, 2048, 2056));
 
     // Continuous order tests: one thread writes two words again and again with increasing
     // values, always in the same order, so that at any moment the word written first holds
@@ -1760,16 +1751,17 @@ std::vector<LitmusTest> MakeTests() {
     // rep movsb reads the bytes of a word one at a time (x86 too), so a word of its copy can
     // mix two of the writer's values: with Size 1 the values stay below 256 and only the
     // low byte of each word is compared.
-    auto MonoCopyReader = [](bool Back, int Size, int32_t First, int32_t Second, int32_t Copies) {
-      return [Back, Size, First, Second, Copies](Asm& A) {
+    auto MonoCopyReader = [](bool Back, int Size, int32_t First, int32_t Second, int32_t Copies, int32_t DstSkew = 0,
+                             int32_t Bytes = 32) {
+      return [Back, Size, First, Second, Copies, DstSkew, Bytes](Asm& A) {
         A.MovImm(RDX, Copies);
         A.Store(R12, 16, RDX);
         const size_t Loop = A.Here();
         A.Mov(RSI, RBX);
         A.AluImm(ADD, RSI, 2048 + (Back ? 32 - Size : 0));
         A.Mov(RDI, RBX);
-        A.AluImm(ADD, RDI, Scratch + (Back ? 32 - Size : 0));
-        A.MovImm(RCX, 32 / Size);
+        A.AluImm(ADD, RDI, Scratch + DstSkew + (Back ? 32 - Size : 0));
+        A.MovImm(RCX, Bytes / Size);
         if (Back) {
           A.Std();
         }
@@ -1782,8 +1774,8 @@ std::vector<LitmusTest> MakeTests() {
           A.Cld();
         }
         if (Size == 1) {
-          A.MovzxByte(RAX, RBX, Scratch + First);
-          A.MovzxByte(RDX, RBX, Scratch + Second);
+          A.MovzxByte(RAX, RBX, Scratch + DstSkew + First);
+          A.MovzxByte(RDX, RBX, Scratch + DstSkew + Second);
         } else {
           A.Load(RAX, RBX, Scratch + First);
           A.Load(RDX, RBX, Scratch + Second);
@@ -1819,6 +1811,67 @@ std::vector<LitmusTest> MakeTests() {
     };
     T.push_back(Mono("RV-mono-read-movsb-chunk", "the source's word 1 then word 0 written again and again; rep movsb's copy never has word 0 ahead",
                      MonoScalarWriter(2056, 2048, 255), MonoCopyReader(false, 1, 0, 8, 100)));
+    // The shapes of the review's snapshot tests, continuously (the snapshots overlapped too
+    // rarely on a loaded machine): the destination 3 bytes off (head elements, then the
+    // extr loop over the rest of the 64 bytes), and a skewed source for the store order.
+    T.push_back(Mono("RV-mono-read-movsb3-chunk", "as RV-mono-read-movsb-chunk, destination 3 bytes off",
+                     MonoScalarWriter(2056, 2048, 255), MonoCopyReader(false, 1, 0, 8, 100, 3, 64)));
+    {
+      // Writer: the source (40 bytes at 8192) filled with the byte v by rep stosb, then rep
+      // movsb of 32 bytes from 8195 to 2048 (the extr loop), v = 1 to 255; the reader
+      // looks at unit 1, then unit 0 (every byte of a unit is v: the qwords compare as v).
+      auto Writer = [](Asm& A) {
+        A.MovImm(RDX, 1);
+        const size_t Loop = A.Here();
+        A.Mov(RAX, RDX);
+        A.Mov(RDI, RBX);
+        A.AluImm(ADD, RDI, 8192);
+        A.MovImm(RCX, 40);
+        A.RepStosb();
+        A.Mov(RSI, RBX);
+        A.AluImm(ADD, RSI, 8195);
+        A.Mov(RDI, RBX);
+        A.AluImm(ADD, RDI, 2048);
+        A.MovImm(RCX, 32);
+        A.RepMovsb();
+        A.Inc(RDX);
+        A.AluImm(CMP, RDX, 256);
+        A.JccBack(CC_B, Loop);
+      };
+      T.push_back(Mono("RV-mono-movsb3-chunk", "rep movsb, source 3 bytes off, again and again: unit 1 never ahead of unit 0", Writer,
+                       [MonoScalarReader](Asm& A) { MonoScalarReader(A, 2056, 2048, 1000); }));
+    }
+    {
+      // The same with the source aligned like the destination (the aligned loop), and
+      // rep stosb of 32 bytes with v (the review's RV-order-movsb0-chunk and
+      // RV-order-stosb-chunk, continuously).
+      auto Writer = [](bool Movs) {
+        return [Movs](Asm& A) {
+          A.MovImm(RDX, 1);
+          const size_t Loop = A.Here();
+          A.Mov(RAX, RDX);
+          A.Mov(RDI, RBX);
+          A.AluImm(ADD, RDI, Movs ? 8192 : 2048);
+          A.MovImm(RCX, Movs ? 40 : 32);
+          A.RepStosb();
+          if (Movs) {
+            A.Mov(RSI, RBX);
+            A.AluImm(ADD, RSI, 8192);
+            A.Mov(RDI, RBX);
+            A.AluImm(ADD, RDI, 2048);
+            A.MovImm(RCX, 32);
+            A.RepMovsb();
+          }
+          A.Inc(RDX);
+          A.AluImm(CMP, RDX, 256);
+          A.JccBack(CC_B, Loop);
+        };
+      };
+      T.push_back(Mono("RV-mono-movsb0-chunk", "rep movsb, source aligned like the destination, again and again: unit 1 never ahead of unit 0",
+                       Writer(true), [MonoScalarReader](Asm& A) { MonoScalarReader(A, 2056, 2048, 1000); }));
+      T.push_back(Mono("RV-mono-stosb-chunk", "rep stosb of 32 bytes again and again: unit 1 never ahead of unit 0", Writer(false),
+                       [MonoScalarReader](Asm& A) { MonoScalarReader(A, 2056, 2048, 1000); }));
+    }
     T.push_back(Mono("RV-mono-read-movsq-chunk", "as RV-mono-read-movsb-chunk, with rep movsq", MonoScalarWriter(2056, 2048, 3000),
                      MonoCopyReader(false, 8, 0, 8, 300)));
     // The extr loop (source 3 bytes off): words 1 and 2 of a run are its 'next' loads; the
@@ -3325,6 +3378,7 @@ int main(int argc, char** argv) {
     // must overlap, as every test must).
     const bool RelaxedRequired = T.Relaxed >= 0 && (Opt.Mode == Options::TSO::Off || Groups >= 2);
     unsigned ExtraSets = 0;
+    const double RacingBudget = Opt.Soak ? 1200.0 : 300.0; // seconds per test
     auto Racing = [&] {
       uint64_t Overlap = 0;
       for (int I : T.Interleaved) {
@@ -3522,7 +3576,12 @@ int main(int argc, char** argv) {
         ::munmap(M.Base, M.Size);
       }
       ::munmap(Shared, SHARED_SIZE);
-      if (Run + 1 == RunLimit && !Broken && ExtraSets < 2 && !Racing()) {
+      // Not yet seen to overlap: more sets of runs (every outcome of every set counts), for
+      // up to two sets or, beyond that, while the test has run for less than RacingBudget:
+      // on a loaded machine the threads of a group may share a core for whole runs, and
+      // NOT RACING should mean the harness never got them to overlap, not that it was busy.
+      const double Elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - TestStart).count();
+      if (Run + 1 == RunLimit && !Broken && !Racing() && (ExtraSets < 2 || Elapsed < RacingBudget)) {
         ++ExtraSets;
         RunLimit += Runs;
       }
