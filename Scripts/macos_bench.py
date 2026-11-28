@@ -137,7 +137,19 @@ CONFIGS["tso_memcpy_wide"] = ({**BASE, "TSOENABLED": "1", "VECTORTSOENABLED": "0
 # The recommended set of round 2 options together.
 CONFIGS["tso_on_r2"] = ({**BASE, **TSO_ALL, "VECTORTSOSPLIT": "3", "TSOBARRIERMERGE": "1", "MEMCPYSETTSOWIDE": "1"}, {},
                         "as tso_on, with VECTORTSOSPLIT=3, TSOBARRIERMERGE and MEMCPYSETTSOWIDE (the round 2 set)")
-E2_CONFIGS = ["tso_on", "tso_on_fp64", "tso_on_merge", "tso_on_fp64_merge", "tso_on_wide", "tso_on_r2", "tso_scalar"]
+# fexmac's TSODEFERRED: all ordering configured, none emulated while the guest has one
+# thread. The kernels run in g_kernels' order and the two thread kernels come last, so
+# every single-threaded kernel runs before the second guest thread exists (the switch);
+# the thread kernels then run with ordering on and must be right.
+CONFIGS["tso_on_deferred"] = ({**BASE, **TSO_ALL, "TSODEFERRED": "1"}, {}, "all three ordering switches on, deferred "
+                              "(TSODEFERRED) until the guest creates its second thread: the single-threaded kernels "
+                              "run without ordering, the thread kernels with it")
+# The round 2 set and the deferred ordering together.
+CONFIGS["tso_on_r2_deferred"] = ({**CONFIGS["tso_on_r2"][0], "TSODEFERRED": "1"}, {},
+                                 "as tso_on_r2, with TSODEFERRED (no ordering until the second guest thread)")
+# One command for the whole round 2 table.
+E2_CONFIGS = ["tso_on", "tso_on_fp64", "tso_on_merge", "tso_on_fp64_merge", "tso_on_wide", "tso_on_r2", "tso_on_deferred",
+              "tso_on_r2_deferred", "tso_scalar", "tso_off"]
 CONFIGS["tso_on_cache_cold"] = (CONFIGS["tso_on"][0], {}, "as tso_on, with the code cache on in a fresh, empty directory "
                                  "for every launch: everything is compiled and written to the cache")
 CONFIGS["tso_on_cache_warm"] = (CONFIGS["tso_on"][0], {}, "as tso_on, with the code cache on in a directory one run "
@@ -145,9 +157,10 @@ CONFIGS["tso_on_cache_warm"] = (CONFIGS["tso_on"][0], {}, "as tso_on, with the c
 # The code cache, through FEXCoreBench --code-cache (fexmac's code_cache_* fields), in a
 # private directory under --out; never the user's ~/Library/Caches.
 CACHE_MODE = {"tso_on_cache_cold": "cold", "tso_on_cache_warm": "warm"}
-DEFAULT_CONFIGS = ["tso_on", "tso_scalar", "tso_vector", "tso_memcpy", "tso_on_nomb", "tso_on_x87rp", "tso_off",
+DEFAULT_CONFIGS = ["tso_on", "tso_scalar", "tso_vector", "tso_memcpy", "tso_on_nomb", "tso_on_x87rp", "tso_off", "tso_on_deferred",
                    "tso_on_cache_cold", "tso_on_cache_warm"]
-QUICK_CONFIGS = ["tso_on", "tso_off", "tso_on_nomb", "tso_on_x87rp", "tso_on_cache_cold", "tso_on_cache_warm", "tso_on_wide"]
+QUICK_CONFIGS = ["tso_on", "tso_off", "tso_on_deferred", "tso_on_nomb", "tso_on_x87rp", "tso_on_cache_cold", "tso_on_cache_warm",
+                 "tso_on_wide"]
 STARTUP_CONFIG = "tso_on"
 
 
@@ -407,6 +420,9 @@ def check_run(label, r, want, allowed, size, problems, literal=False):
     ok = {}
     for line in r["stderr"]:
         f = line.split()
+        if line.startswith("FEXCoreBench: guest threads seen on CPUs"):
+            after = f[f.index("CPUs") + 1] if "CPUs" in f and f.index("CPUs") + 1 < len(f) else ""
+            r["cpus"] = sorted(int(c) for c in after.split(",") if c.isdigit())
         if line.startswith("FEXCoreBench: translation:") and len(f) >= 12:
             r["counters"] = {"compiled": int(f[3]), "loaded": int(f[5]), "rejected": int(f[7]), "queued": int(f[9]),
                              "cache": f[11]}
@@ -646,6 +662,11 @@ def main():
     status = "FINAL" if final else "PROVISIONAL"
 
     summary = None if args.quick else summarise(results, labels, startup, want)
+    # The CPUs FEX's guest threads were seen on (FEXCoreBench samples them at system
+    # calls), per configuration: with --qos background they must all be efficiency cores.
+    cpus = {l: sorted(set(c for r in results[l] for c in r.get("cpus", []))) for l in labels if l.startswith("fex:")}
+    for l, c in cpus.items():
+        print(f"{l}: guest threads seen on CPUs {','.join(map(str, c)) or '(none reported)'}")
     meta = {
         "status": status,
         "started": started_at.isoformat(timespec="seconds"),
@@ -659,6 +680,7 @@ def main():
         "reps": reps,
         "hardened": args.hardened,
         "qos": args.qos,
+        "guest_cpus": cpus,
         "cflags": CFLAGS,
         "configs": {c: {"options": CONFIGS[c][0], "what": CONFIGS[c][2]} for c in configs},
         "load": load,
@@ -666,7 +688,7 @@ def main():
         "load_samples": sampler.samples,
     }
     slim = {l: [{k: r.get(k) for k in ("launch", "exit", "times", "sums", "verdicts", "ok", "counters", "first_result_s",
-                                        "clock_ns", "stderr", "timed_out", "seconds")}
+                                        "clock_ns", "stderr", "timed_out", "seconds", "cpus")}
                 for r in results[l]] for l in labels}
     name = "results-quick" if args.quick else "results"
     with open(os.path.join(out, name + ".json"), "w") as f:
@@ -956,7 +978,9 @@ def summary_markdown(meta, s, labels):
              ("tso_vector", "scalar and vector ordering (`tso_vector`)"),
              ("tso_memcpy", "scalar and string-instruction ordering (`tso_memcpy`)"),
              ("tso_on_nomb", "all on, multiblock off"), ("tso_on_x87rp", "all on, reduced x87 precision"),
-             ("tso_on_cache_cold", "all on, code cache cold"), ("tso_on_cache_warm", "all on, code cache warm")]
+             ("tso_on_cache_cold", "all on, code cache cold"), ("tso_on_cache_warm", "all on, code cache warm"),
+             ("tso_on_deferred", "all on, deferred while single-threaded (`tso_on_deferred`, exact only because these "
+              "kernels run before the program's second thread)")]
     parts = [f"{what} **{fmt_ratio(means.get('fex:' + c, {}).get('headline'))}**" for c, what in names if have(c)]
     if "native-arm64" in means:
         parts.append(f"native arm64 {fmt_ratio(means['native-arm64'].get('headline'))}")

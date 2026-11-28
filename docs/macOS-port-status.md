@@ -688,6 +688,44 @@ loads run at most 16 bytes ahead), the word holding a chunk's first byte re-read
 chunk (each byte is still read once, in order). The instruction tests (`unittests/ASM`)
 never reach the wide path: their strings are at most 8 elements, below one chunk.
 
+**Round 2, experiment 5: ordering deferred while single-threaded** (`fexmac` option
+`TSODEFERRED`, default off; interface 2.1 adds `fexmac_context_mark_memory_shared` and
+`fexmac_context_ordering_deferred`). A context translates without ordering emulation
+while it has one live guest thread and switches it on for good at the second thread or
+when the embedder declares memory shared: every translation is discarded, and no guest
+thread runs until each thread that was in code made without ordering has re-entered the
+dispatcher (resync, system call or end of run) and cleared its own call/return stack. The
+handshake and the argument that no unordered access can follow the second thread's first
+instruction are in `macOS-embedding-interface.md` ("Ordering deferred while
+single-threaded"). Upstream had a "TSO auto migration" for its Linux layer (2022, removed
+upstream in September 2025, `fee9e91c4`); it cleared only the calling thread's lookup
+cache and let already compiled unordered code keep running, which this port does not do.
+Measured on the M4 under load (other workers' builds, load average 11 to 18), as built
+and hardened: `FEXCoreOrderingSwitchTest litmus` (message passing across the switch,
+writer in a loop that stays inside one translation) 0 forbidden outcomes in 500 million
+reads (5,000 trials) per pattern (`loop`, `call`) at user-interactive and at background
+QoS; the same with ordering off 13.8 million of 50 million (`loop`) and 2.0 million
+(`call`); deliberately broken switches (`FEXCoreOrderingSwitchTest_hooks`, 1,000 trials):
+`no-wait` 2.6 million forbidden (`loop`), `no-discard` 3.2 million (`loop`) and 0.86
+million (`call`); `keep-callret` (call/return stacks not cleared) 25 in 1 trial of 6,000
+(`call`), so the stale-return hazard is real but this test rarely reaches it. A review by
+a second worker found two hangs in the first version (a run marked while entering waited
+for itself; a thread marked between its system-call acknowledgement and its callback was
+counted while the callback waited) and a lock a fork could inherit; all three fixed,
+`deferred-switch-races` hung in 4 of 16 runs before the fix and 0 of 20 after. The
+benchmark's `tso_on_deferred` configuration, provisional under load (7.7 of 10 cores busy
+with other work, 3 launches): headline 0.89 of Rosetta 2's time against `tso_on` 2.11
+and `tso_off` 0.94; `copy_loop` 2.38 (`tso_on` 31.4), `rep_movs` 0.19 (4.95),
+`matmul_f32x4` 1.24 (6.38), `fft` 1.01 (4.01), `nbody` 1.37 (3.44); thread kernels right.
+The switch costs 0.04 to 0.08 ms with 100 translated blocks, 1.7 to 2.3 ms with 10,000,
+37 to 51 ms with 100,000, then each block is translated again on first use. It helps
+single-threaded programs and phases (tools, tests, loaders, start-up); a game, which is
+multi-threaded from the start, gains nothing. Known limit: an embedder whose own host
+threads (or another process) touch guest memory while a guest thread runs must call
+`fexmac_context_mark_memory_shared` first; the library cannot detect it. Experiment 6
+(memory declared private to one thread) is recorded, not implemented, in the same
+section of the embedding document.
+
 The default run (`FEXCoreOrderingTest`, emulation on, 3.2 million tries per litmus test)
 takes about 15 seconds, of which the counting tests are about 10: every locked operation
 on a misaligned operand is a fault. `--tso off` and `--tso scalar` take the same. All three run
@@ -1114,8 +1152,8 @@ not built on Linux.
 | `Scripts/macos_fault_diff.py` with `fexmac_fault_diff` | Differential test of guest-fault delivery: 368 programs, each also with three flag preludes (1,472 cases), in 4 modes and 4 ways including a get/set-state round trip; the 2 known differences are in `fault_diff_known.txt` | pass | pass, both, 0 failures |
 | `FEXCoreOrderingTest` | Multi-thread x86 memory-ordering litmus tests and misaligned locked-operation counts, in three emulation modes; see "x86 memory ordering between threads" | pass; with emulation off or scalar, a forbidden outcome that does not appear only warns | pass, both, in each mode, the forbidden outcomes required with emulation off and scalar; 1,000 starts; also Xcode leg. The `--soak` figures in that section were measured by hand; the job's soak level has not been run |
 | `FEXCoreMutexWakeTest` | The core's reader-writer lock never loses a wake-up, in six queueing orders | pass | pass, both; also Xcode leg; with the bug restored, two orders hang (by hand) |
-| `fexmac_c_test` | A C program using only `fexmac.h`, linked as an outside project would be: 80 subtests (listed in `docs/macOS-embedding-interface.md`) covering large blocks (every size across the first scratch-buffer overflow, 8 threads translating large blocks at once), system calls (prefixed, restarted), stops (also inside long `rep` loops), state, guest memory registration, guest faults, self-modifying-code detection, invalidation (also from 8 threads at once), misaligned atomics with each signal-handler arrangement, call/return stack overflow and underflow, guest accesses to protected pages, chained handlers (one that leaves with siglongjmp, over 306 stack layouts; one that faults itself, which must end the process quickly; one that returns without fixing the fault) and sent signals, garbage struct sizes, lifetime races, cached translations and code ranges, split locked operations from 8 threads in every emulated form, also with plain stores to neighbouring bytes and under a signal storm (exact results), and error paths | 80 of 80, both | 80 of 80, both; also Xcode leg |
-| `fexmac_hook_test` | The same library built with test hooks (the separate `fexmac_testing` build, never in production artefacts), 24 subtests: asynchronous signals held off while the core handles a misaligned access, translations overflowing the scratch buffer 0 to 5 times run correctly, translations moving through three code buffers (also from the code cache), a block ending exactly on a code buffer's last byte, 5,014 random-size blocks across six buffers, a first code buffer that cannot be made fails thread creation cleanly and a later one ends the process with an accurate message, a guest store into a code buffer's guard page is a guest fault, a block that never fits stops cleanly at its start and the thread stays usable, each code buffer ends in an inaccessible page, a write past the end of a code buffer dies with a message (also with a host handler chained), guest and callback accesses to guard pages are not claimed, the scratch-buffer guard is disarmed after each translation, a log callback cannot re-enter the library, a fault inside the handler crashes with a message instead of hanging, the log callback is never called from a signal handler, a failed create leaves no log hook, invalidation leaves fault signals unblocked | 24 of 24, both | 24 of 24, both; also Xcode leg |
+| `fexmac_c_test` | A C program using only `fexmac.h`, linked as an outside project would be: 80 subtests (listed in `docs/macOS-embedding-interface.md`) covering large blocks (every size across the first scratch-buffer overflow, 8 threads translating large blocks at once), system calls (prefixed, restarted), stops (also inside long `rep` loops), state, guest memory registration, guest faults, self-modifying-code detection, invalidation (also from 8 threads at once), misaligned atomics with each signal-handler arrangement, call/return stack overflow and underflow, guest accesses to protected pages, chained handlers (one that leaves with siglongjmp, over 306 stack layouts; one that faults itself, which must end the process quickly; one that returns without fixing the fault) and sent signals, garbage struct sizes, lifetime races, cached translations and code ranges, split locked operations from 8 threads in every emulated form, also with plain stores to neighbouring bytes and under a signal storm (exact results), and error paths. Round 2 adds 9 `deferred-*` subtests (`TSODEFERRED`, 89 in all: 89 of 89 on the M4 as built and hardened; the columns are the 1.0 runs) | 80 of 80, both | 80 of 80, both; also Xcode leg |
+| `fexmac_hook_test` | The same library built with test hooks (the separate `fexmac_testing` build, never in production artefacts), 24 subtests: asynchronous signals held off while the core handles a misaligned access, translations overflowing the scratch buffer 0 to 5 times run correctly, translations moving through three code buffers (also from the code cache), a block ending exactly on a code buffer's last byte, 5,014 random-size blocks across six buffers, a first code buffer that cannot be made fails thread creation cleanly and a later one ends the process with an accurate message, a guest store into a code buffer's guard page is a guest fault, a block that never fits stops cleanly at its start and the thread stays usable, each code buffer ends in an inaccessible page, a write past the end of a code buffer dies with a message (also with a host handler chained), guest and callback accesses to guard pages are not claimed, the scratch-buffer guard is disarmed after each translation, a log callback cannot re-enter the library, a fault inside the handler crashes with a message instead of hanging, the log callback is never called from a signal handler, a failed create leaves no log hook, invalidation leaves fault signals unblocked. Round 2 adds `host-features-rcpc` and 10 `deferred-*` subtests (the core's effective ordering flags, acknowledgement counts, a deliberately broken switch; 35 in all: 35 of 35 on the M4 as built and hardened) | 24 of 24, both | 24 of 24, both; also Xcode leg |
 | `FEXCoreBench` with `Scripts/macos_bench.py --quick` | The freestanding x86-64 benchmark, as built and hardened: the literal mode (no system call but exit) natively and under FEX; the loader's contract (9 cases of a guest breaking it); the timed mode (18 kernels, 4 guest threads) in four translator configurations, every checksum matching the recorded value and the native arm64 build (and Rosetta 2's where present), with the stated exceptions for ordering off and reduced x87 precision. Asserts no timing | pass, both | pass, both, after `--check-docs` |
 | `Scripts/macos_bench_mutations.py` | 58 mutations of the benchmark kernels, each of which must change its kernel's checksum (native arm64; x86-64-only ones under Rosetta 2) | 58 of 58 caught | 58 of 58 caught |
 | `JITWriteProbe` | Reports how the machine treats executable memory, including writes and switches from a fault handler, instruction-cache flushing and the ways of placing a guard page after `MAP_JIT` memory | report only | see the facts above |

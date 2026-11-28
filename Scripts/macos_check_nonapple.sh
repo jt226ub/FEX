@@ -25,7 +25,7 @@ strip_apple "$ROOT/FEXCore/Source/Interface/Core/X86Tables/X86Tables.h" "$OV/Int
 R="$ROOT/FEXCore/Source/Interface/Core"
 bad=0
 cd "$BUILD"
-for f in JIT/MemoryOps.cpp JIT/BranchOps.cpp JIT/MiscOps.cpp JIT/JIT.cpp OpcodeDispatcher.cpp OpcodeDispatcher/AVX_128.cpp Core.cpp; do
+for f in JIT/MemoryOps.cpp JIT/BranchOps.cpp JIT/MiscOps.cpp JIT/JIT.cpp OpcodeDispatcher.cpp OpcodeDispatcher/AVX_128.cpp Core.cpp CPUID.cpp; do
   src="$R/$f"; tmp="${src%.cpp}.nonapple_check.cpp"; TMPS+=("$tmp")
   strip_apple "$src" "$tmp"
   # Quoted includes resolve next to the source first: make the overlaid ones angle includes.

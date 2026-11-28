@@ -34,7 +34,9 @@
  * Versions: a program must refuse to run if fexmac_version() >> 16 differs from
  * FEXMAC_VERSION_MAJOR, and should check that the minor part is at least the one it was
  * built with. 2.0 is the first version with struct_size fields; nothing built against the
- * 1.x headers of the development branch is compatible with it.
+ * 1.x headers of the development branch is compatible with it. 2.1 adds
+ * fexmac_context_mark_memory_shared and fexmac_context_ordering_deferred (option
+ * TSODEFERRED); no structure changed.
  */
 #ifndef FEXMAC_H
 #define FEXMAC_H
@@ -56,7 +58,7 @@ extern "C" {
 /* Version of this header. fexmac_version() returns the version the library was built
  * with; see "Versions" above. */
 #define FEXMAC_VERSION_MAJOR 2
-#define FEXMAC_VERSION_MINOR 0
+#define FEXMAC_VERSION_MINOR 1
 #define FEXMAC_VERSION ((FEXMAC_VERSION_MAJOR << 16) | FEXMAC_VERSION_MINOR)
 
 typedef struct fexmac_context fexmac_context;
@@ -289,6 +291,46 @@ FEXMAC_EXPORT fexmac_result fexmac_context_flush_cache(fexmac_context* context);
  * library's own locks are only safe with them. */
 FEXMAC_EXPORT fexmac_result fexmac_before_fork(fexmac_context* context);
 FEXMAC_EXPORT fexmac_result fexmac_after_fork(fexmac_context* context, int child);
+
+/* Memory-ordering emulation deferred while single-threaded (option TSODEFERRED=1;
+ * default 0, ordering always as configured). x86 ordering can only be observed by a
+ * second agent touching the same memory at the same time. With the option, a context
+ * translates WITHOUT ordering emulation while it has at most one live guest thread, and
+ * switches ordering on for good, discarding every translation, when a second
+ * fexmac_thread is created in it or fexmac_context_mark_memory_shared is called. A guest
+ * thread still running code made without ordering at the switch is brought to a point
+ * where it looks its code up anew (its next block entry, loop back-edge, system call or
+ * the end of its run) before any guest thread starts running guest code
+ * (fexmac_thread_run waits for that), so no access made without ordering can follow the
+ * first instruction of another guest thread. It never switches back, even when threads
+ * are destroyed. One fexmac_thread run on several host threads in turn is one guest
+ * thread.
+ *
+ * THE EMBEDDER'S DUTY: the library sees only fexmac threads. Any other agent that reads
+ * or writes guest memory while a guest thread runs breaks the single-thread assumption
+ * silently: the embedder's own host threads (an audio, GPU or I/O thread reading or
+ * writing guest buffers natively), a device, or another process sharing the memory
+ * (MAP_SHARED, shared memory objects). Call fexmac_context_mark_memory_shared before such
+ * an agent can touch the memory. It returns once ordering is on and no guest thread can
+ * run code made without it; it may be called from a system call callback, but not from
+ * a signal handler or the log callback (FEXMAC_ERROR_BUSY). A no-op (FEXMAC_OK) if
+ * ordering is already on or was never deferred. While a running guest thread is waited
+ * for it must reach its next check: within one translated block, one loop iteration or
+ * 64 elements of a `rep` instruction (as for fexmac_thread_request_stop). A thread whose
+ * host thread the embedder has suspended is waited for until it is resumed.
+ *
+ * What it helps: single-threaded programs, tools, tests, loaders and the single-threaded
+ * start of a program, at ordering-off speed until the second thread. What it does not:
+ * a program that is multi-threaded from the start (most games) gains nothing. The switch
+ * discards every translation (about 2 ms for 10,000 translated blocks, 40 to 50 ms for
+ * 100,000, measured under load) and each block is translated again on first use.
+ * Details and the argument: docs/macOS-embedding-interface.md, "Ordering deferred while
+ * single-threaded". */
+FEXMAC_EXPORT fexmac_result fexmac_context_mark_memory_shared(fexmac_context* context);
+
+/* 1 while the context translates without ordering emulation because of TSODEFERRED,
+ * 0 otherwise (also for a handle that is not a live context). */
+FEXMAC_EXPORT int fexmac_context_ordering_deferred(fexmac_context* context);
 
 /* ---------------------------------------------------------------------------------
  * Threads

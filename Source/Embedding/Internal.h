@@ -204,6 +204,26 @@ struct fexmac_context {
 
   // Whether the embedder asked for the code cache.
   bool CacheRequested {};
+
+  // TSODEFERRED (Library.cpp, "Ordering deferred while single-threaded"). True while code
+  // is translated without memory-ordering emulation; cleared once, never set again, at
+  // the end of the switch (EnableOrdering), so a reader that sees it false knows every
+  // thread that may still run unordered code is counted in OrderingAcksPending.
+  std::atomic<bool> OrderingDeferred {};
+  // Held for the whole switch, and by thread creation while OrderingDeferred is set.
+  // Taken before the registry lock and ThreadsMutex.
+  std::mutex OrderingSwitchMutex;
+  // Threads that were running translated code at the switch and have not yet passed a
+  // point where they look up code anew. No guest thread starts running guest code while
+  // it is non-zero (fexmac_thread_run waits).
+  std::atomic<uint32_t> OrderingAcksPending {};
+  // Statistics for the tests (relaxed): switches made, acknowledgements at a resync, at
+  // a system call or the end of a run, and at the start of one, and waits for them.
+  std::atomic<uint64_t> OrderingSwitches {};
+  std::atomic<uint64_t> OrderingAcksAtResync {};
+  std::atomic<uint64_t> OrderingAcksAtExit {};
+  std::atomic<uint64_t> OrderingAcksAtStart {};
+  std::atomic<uint64_t> OrderingWaits {};
 };
 
 struct fexmac_thread {
@@ -246,6 +266,12 @@ struct fexmac_thread {
   // next block's). Only this thread touches these.
   uint64_t PendingCodeWritePage {};
   uint32_t PendingCodeWriteChecks {};
+
+  // Set by the ordering switch when this thread was running translated code made without
+  // ordering; cleared (with Context->OrderingAcksPending lowered) by this thread itself
+  // when it next re-enters the dispatcher through a resync, or ends or starts a run
+  // (AcknowledgeOrdering).
+  std::atomic<uint32_t> OrderingAckPending {};
 };
 
 namespace fexmac {
@@ -273,6 +299,14 @@ void FinishCodeWrite(fexmac_thread* Thread);
 // fexmac_testing_set_mark_executable_hook's hook, called from MarkGuestExecutableRange.
 void CallTestMarkHook(uint64_t Start, uint64_t Length);
 #endif
+
+// The ordering switch's acknowledgement, on the thread's own host thread, at a point where
+// it is about to look code up anew: clears its call/return stack (which may hold return
+// addresses into discarded code, pushed after the switcher cleared it), then lowers the
+// context's count. Async-signal-safe (mmap and atomics). Returns whether it was pending.
+bool AcknowledgeOrdering(fexmac_thread* Thread);
+// fexmac_testing_break_ordering_switch's flags (same values as in fexmac_testing.h).
+enum : uint32_t { BreakOrderingNoWait = 1, BreakOrderingNoDiscard = 2, BreakOrderingKeepCallRet = 4 };
 
 // The process's one context, for the fault handler's message about host writes to
 // write-protected code from any host thread. Set while the context exists.

@@ -65,6 +65,10 @@ namespace {
     // docs/macOS-port-status.md.
     OPTION(VECTORTSOSPLIT, VectorTSOSplit, Mask5),
     OPTION(TSOBARRIERMERGE, TSOBarrierMerge, Bool),
+    // No ordering emulation while the context has one guest thread and no memory is
+    // declared shared (fexmac_context_mark_memory_shared); switched on for good, with
+    // every translation discarded, at the second thread. Library.cpp.
+    OPTION(TSODEFERRED, TSODeferred, Bool),
     // Self-modifying code. "full" validates every block; "mtrack" needs page-protection
     // tracking, which package D adds; until then it detects nothing and the embedder
     // calls fexmac_invalidate. "none" detects nothing.

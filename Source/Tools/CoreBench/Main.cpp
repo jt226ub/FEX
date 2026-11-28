@@ -293,7 +293,18 @@ bool RunUntilExit(fexmac_thread* Thread, const std::string& Who, bool IsMain) {
   return false;
 }
 
+// The CPU numbers guest threads were on at their system calls (pthread_cpu_number_np),
+// bit per CPU: printed at the end, so that a run meant for one core type can be checked
+// (on the M4 Mac mini CPUs 0 to 5 are efficiency cores, 6 to 9 performance cores).
+std::atomic<uint64_t> GuestCpus {};
+
 fexmac_syscall_action OnSyscall(fexmac_thread* Thread, void*) {
+  {
+    size_t Cpu = 0;
+    if (pthread_cpu_number_np(&Cpu) == 0 && Cpu < 64) {
+      GuestCpus.fetch_or(1ULL << Cpu, std::memory_order_relaxed);
+    }
+  }
   const bool IsMain = Thread == MainThread;
   auto* Self = static_cast<GuestThread*>(fexmac_thread_get_user_data(Thread));
   const std::string Who = IsMain ? "main guest thread" : "guest thread " + std::to_string(Self ? Self->Handle : ~0ull);
@@ -593,5 +604,15 @@ int main(int argc, char** argv) {
   }
   fexmac_thread_destroy(MainThread);
   fexmac_context_destroy(Context);
+  {
+    std::string List;
+    const uint64_t Cpus = GuestCpus.load();
+    for (int i = 0; i < 64; ++i) {
+      if (Cpus & (1ULL << i)) {
+        List += (List.empty() ? "" : ",") + std::to_string(i);
+      }
+    }
+    fprintf(stderr, "FEXCoreBench: guest threads seen on CPUs %s (at system calls)\n", List.c_str());
+  }
   return GuestFailures == 0 ? 0 : ExitWrongChecksums;
 }

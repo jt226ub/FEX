@@ -577,6 +577,11 @@ namespace {
       // instruction (the fill-state entry, not single-stepping), which looks it up anew.
       Current->ResyncRequested.store(0);
       UnprotectInterruptPageUnlessRequested(Current);
+      // Checked after the request is consumed: the ordering switch marks before it asks.
+      // The thread looks its code up anew from here (Library.cpp, ordering deferred).
+      if (AcknowledgeOrdering(Current)) {
+        Current->Context->OrderingAcksAtResync.fetch_add(1, std::memory_order_relaxed);
+      }
       SpillGuestState(Current, Context);
       State.__sp = Current->Thread->CurrentFrame->ReturningStackLocation;
       State.__x[1] = 0;

@@ -495,6 +495,23 @@ public:
     UpdateAtomicTSOEmulationConfig();
   }
 
+  // CPUID's Enhanced REP MOVS bit follows the configured string ordering, not the
+  // effective one: with TSODEFERRED (macOS) the effective one changes during the run, and
+  // a guest reads CPUID once.
+  bool IsMemcpyAtomicTSOEnabledForCPUID() const {
+    return MemcpyAtomicTSOConfigured;
+  }
+
+#ifdef __APPLE__
+  void SetTSOEmulationDeferred(bool Deferred) override {
+    TSOEmulationDeferred = Deferred;
+    UpdateAtomicTSOEmulationConfig();
+  }
+  uint32_t GetEffectiveTSOEmulation() const override {
+    return (AtomicTSOEmulationEnabled ? 1U : 0U) | (VectorAtomicTSOEmulationEnabled ? 2U : 0U) | (MemcpyAtomicTSOEmulationEnabled ? 4U : 0U);
+  }
+#endif
+
   bool AreMonoHacksActive() const {
     return Config.MonoHacks && MonoDetected;
   }
@@ -529,6 +546,15 @@ protected:
       VectorAtomicTSOEmulationEnabled = Config.TSOEnabled && Config.VectorTSOEnabled;
       MemcpyAtomicTSOEmulationEnabled = Config.TSOEnabled && Config.MemcpySetTSOEnabled;
     }
+    MemcpyAtomicTSOConfigured = MemcpyAtomicTSOEmulationEnabled;
+#ifdef __APPLE__
+    if (TSOEmulationDeferred) {
+      // fexmac's TSODEFERRED: a single guest thread, no memory shared yet.
+      AtomicTSOEmulationEnabled = false;
+      VectorAtomicTSOEmulationEnabled = false;
+      MemcpyAtomicTSOEmulationEnabled = false;
+    }
+#endif
   }
 
 private:
@@ -545,6 +571,10 @@ private:
   bool AtomicTSOEmulationEnabled = true;
   bool VectorAtomicTSOEmulationEnabled = false;
   bool MemcpyAtomicTSOEmulationEnabled = false;
+  bool MemcpyAtomicTSOConfigured = false;
+  // Written only with the code invalidation lock held exclusively (or before any thread
+  // exists); read while translating, under that lock shared.
+  bool TSOEmulationDeferred = false;
 
   FEX_CONFIG_OPT(AppFilename, APP_FILENAME);
 

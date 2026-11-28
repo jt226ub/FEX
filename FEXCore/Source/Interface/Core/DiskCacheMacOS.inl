@@ -34,7 +34,12 @@ namespace {
   // 4: package D's store-first read-modify-writes and rep loop tuning; package F's
   //    batched writer (merged from macos/v1) without its own bump.
   // 5: x87 stores (fst/fstp m32/m64/m80, fbstp) ordered under vector ordering (round 2).
-  constexpr uint32_t PortCacheRevision = 5;
+  // 6: round 2 integration: rep stos{w,d,q} with string ordering gets the placeholder
+  //    before its release store (the misaligned back-patch overwrote the loop's count
+  //    test without it). New options (MEMCPYSETTSOWIDE, GUESTMEMORYALIASED, VECTORTSOSPLIT,
+  //    TSOBARRIERMERGE) are in the configuration hash; TSODEFERRED is not, the effective
+  //    ordering state it changes is (CodeGenStateFlags).
+  constexpr uint32_t PortCacheRevision = 6;
 
   constexpr size_t FOZRecordHeaderSize = sizeof(MesaFOZ::foz_payload_key) + sizeof(MesaFOZ::foz_payload_header);
   constexpr size_t IndexRecordMinPayload = sizeof(MesaFOZ::mesa_index_db_file_entry) + sizeof(IndexExtraBlobHeader);

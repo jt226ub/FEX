@@ -326,7 +326,7 @@ static void TestABI(void) {
   CheckResult(fexmac_context_get_counters(Context, &Counters), FEXMAC_ERROR_INVALID_ARGUMENT, "counters of an unknown (larger) size");
   fexmac_translation_counters_init(&Counters);
   CheckResult(fexmac_context_get_counters(Context, &Counters), FEXMAC_OK, "counters of the known size");
-  Check(fexmac_version() == ((2u << 16) | 0u) && FEXMAC_VERSION_MAJOR == 2, "version 2.0, the first with struct_size");
+  Check(fexmac_version() == ((2u << 16) | 1u) && FEXMAC_VERSION_MAJOR == 2, "version 2.1 (2.0 was the first with struct_size)");
 
   fexmac_thread_destroy(Thread);
   fexmac_context_destroy(Context);
@@ -2249,14 +2249,23 @@ extern const size_t VectorOrderingSubtestCount;
 /* RepStringTest.c */
 extern const struct Subtest RepSubtests[];
 extern const size_t RepSubtestCount;
+/* OrderingSwitchTest.c */
+extern const struct Subtest OrderingSubtests[];
+extern const size_t OrderingSubtestCount;
 
 int main(int argc, char** argv) {
   enum { Own = sizeof(Subtests) / sizeof(Subtests[0]) };
-  const size_t Total = Own + FaultSubtestCount + VectorOrderingSubtestCount + RepSubtestCount;
+  const size_t Total = Own + FaultSubtestCount + VectorOrderingSubtestCount + RepSubtestCount + OrderingSubtestCount;
   struct Subtest* All = malloc(sizeof(struct Subtest) * Total);
-  memcpy(All, Subtests, sizeof(Subtests));
-  memcpy(All + Own, FaultSubtests, sizeof(struct Subtest) * FaultSubtestCount);
-  memcpy(All + Own + FaultSubtestCount, VectorOrderingSubtests, sizeof(struct Subtest) * VectorOrderingSubtestCount);
-  memcpy(All + Own + FaultSubtestCount + VectorOrderingSubtestCount, RepSubtests, sizeof(struct Subtest) * RepSubtestCount);
+  size_t At = 0;
+  memcpy(All + At, Subtests, sizeof(Subtests));
+  At += Own;
+  memcpy(All + At, FaultSubtests, sizeof(struct Subtest) * FaultSubtestCount);
+  At += FaultSubtestCount;
+  memcpy(All + At, VectorOrderingSubtests, sizeof(struct Subtest) * VectorOrderingSubtestCount);
+  At += VectorOrderingSubtestCount;
+  memcpy(All + At, RepSubtests, sizeof(struct Subtest) * RepSubtestCount);
+  At += RepSubtestCount;
+  memcpy(All + At, OrderingSubtests, sizeof(struct Subtest) * OrderingSubtestCount);
   return RunSubtests(argc, argv, All, Total, 120);
 }

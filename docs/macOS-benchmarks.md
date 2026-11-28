@@ -233,6 +233,9 @@ ordering switches on: that is the configuration that is correct for any guest.
 message-passing kernel fails in it) and is given only as an upper bound for a guest
 known not to need ordering. `tso_scalar` (FEX's defaults), `tso_vector` and `tso_memcpy`
 add the vector and string-instruction switches one at a time, to show what each costs.
+`tso_on_deferred` is `tso_on` with `fexmac`'s `TSODEFERRED` option (round 2): no ordering
+until the program creates its second thread, which it does only for its last two (thread)
+kernels; see "Candidates".
 
 Two configurations show the code cache (exit criterion 6) on this program, both
 `tso_on` with `FEXCoreBench --code-cache DIR`, which sets `fexmac`'s
@@ -480,7 +483,40 @@ do the same. FEX is faster than Rosetta 2 at full precision, and much faster wit
     needs its own barrier after it, each store one before it; nothing there is
     redundant).
 - Treat provably thread-private memory (beyond the stack, which is already exempt) as
-  needing no ordering.
+  needing no ordering. Round 2 (experiment 6) looked at an embedder-declared variant, a
+  `fexmac_memory_map` flag for regions only one guest thread touches, and did not
+  implement it: ordering is chosen per instruction at translation time but the address
+  is known only at run time, so the flag needs a check per access or a guarded per-block
+  speculation. By the round 2 E1 probe a range check (compare and branch, or a dependent
+  table load) costs about what it saves on scalar accesses; only vector accesses (load
+  plus `dmb ishld`, `dmb ish` plus store) and string copies could gain. A wrong
+  declaration silently removes the ordering guarantee, and no caller in this project
+  knows of such regions (a game's thread-local memory is
+  allocated inside the guest). Written up in `macOS-embedding-interface.md` ("Not done:
+  memory the embedder declares private to one thread").
+- **No ordering while the guest has one thread (round 2, experiment 5; done as an
+  option, `TSODEFERRED`, default off).** `fexmac` translates without ordering emulation
+  until the embedder creates a second guest thread or calls
+  `fexmac_context_mark_memory_shared`, then switches it on for good: every translation is
+  discarded and no thread runs guest code until each thread that was in code made
+  without ordering has left it (`macOS-embedding-interface.md`, "Ordering deferred while
+  single-threaded", has the handshake and the argument). Configuration `tso_on_deferred`
+  (all three switches on, plus `TSODEFERRED=1`): this program's single-threaded kernels
+  all run before its first thread kernel creates the second thread, so they run at
+  ordering-off speed, and the thread kernels then run with ordering on and are right.
+  A provisional measurement under heavy load (the round 2 report and
+  `macOS-port-status.md`, "x86 memory ordering between threads", give the figures; this
+  document carries only generated ones) puts `tso_on_deferred` at `tso_off`'s speed, within that
+  load's noise, on every single-threaded kernel, `copy_loop`, `rep_movs`, `matmul_f32x4`
+  and `fft` included, with every checksum right. The switch costs a discard of every translation
+  (`FEXCoreOrderingSwitchTest cost`: milliseconds for ten thousand translated blocks,
+  tens of milliseconds for a hundred thousand) and a translation of each block again on
+  first use. Exact, but **little help for a game**, which is multi-threaded from the
+  start: it helps single-threaded programs and phases (tools, tests, loaders,
+  start-up), not the like-for-like figure. The measurement for an idle machine:
+  `python3 Scripts/macos_bench.py --loader build/Bin/FEXCoreBench --out bench-deferred
+  --configs tso_on,tso_off,tso_on_deferred` (writes `bench-deferred/results.md`; do not
+  pass `--write-docs` unless the owner accepts the figures).
 - `rep movs`/`rep stos` with string ordering (round 2, E2). Intel lets the stores of one
   fast string operation be seen out of order, AMD documents no such exception and Intel
   none for its loads (citations in `docs/macOS-port-status.md`, "String instructions in

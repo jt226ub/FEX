@@ -62,7 +62,7 @@ jobs:
       - name: Build
         run: |
           set -o pipefail
-          ninja -C build -k 0 FEXCore FEXCore_shared Common CommonTools FEXCoreSmokeTest FEXCoreASMTestRunner FEXCoreThreadTest FEXCoreOrderingTest FEXCoreMutexWakeTest FEXCoreBench FEXCoreCacheTest fexmac fexmac_shared fexmac_testing fexmac_bundle fexmac_c_test fexmac_hook_test fexmac_fault_diff 2>&1 | tee build.log
+          ninja -C build -k 0 FEXCore FEXCore_shared Common CommonTools FEXCoreSmokeTest FEXCoreASMTestRunner FEXCoreThreadTest FEXCoreOrderingTest FEXCoreOrderingSwitchTest FEXCoreOrderingSwitchTest_hooks FEXCoreMutexWakeTest FEXCoreBench FEXCoreCacheTest fexmac fexmac_shared fexmac_testing fexmac_bundle fexmac_c_test fexmac_hook_test fexmac_fault_diff 2>&1 | tee build.log
 
       - name: Inspect what was built
         run: |
@@ -184,6 +184,19 @@ jobs:
           # not break (exit 1) only warns. A stall (exit 3), a crash, a guest thread that
           # did not finish (BROKEN), threads that never overlapped (NOT RACING) or a test
           # that must hold but broke still fail the job.
+          # TSODEFERRED: message passing across the switch from unordered to ordered
+          # translation (0 forbidden outcomes), as built and hardened; then deliberately
+          # broken switches (test hooks build), which must show forbidden outcomes on a
+          # physical Mac (only a warning where the hardware does not reorder).
+          S="$(find build -name FEXCoreOrderingSwitchTest -type f | head -1)"
+          cp "$S" FEXCoreOrderingSwitchTest-hardened
+          codesign --force --sign - --options runtime --entitlements Data/macOS/jit.entitlements FEXCoreOrderingSwitchTest-hardened
+          ./FEXCoreOrderingSwitchTest-hardened litmus --trials 2000 2>&1 | tee ordering-switch.log
+          ./FEXCoreOrderingSwitchTest-hardened litmus --trials 500 --pattern call 2>&1 | tee -a ordering-switch.log
+          for broken in no-wait no-discard; do
+            "$(find build -name FEXCoreOrderingSwitchTest_hooks -type f | head -1)" litmus --trials 200 --break "$broken" 2>&1 | tee -a ordering-switch.log \
+              || echo "::warning::the broken switch ($broken) showed no forbidden outcome on this machine"
+          done
           for mode in off scalar; do
             set +e
             ./FEXCoreOrderingTest-hardened --tso "$mode" > "ordering-$mode.log" 2>&1

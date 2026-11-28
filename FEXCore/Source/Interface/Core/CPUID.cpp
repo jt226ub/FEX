@@ -696,7 +696,7 @@ FEXCore::CPUID::FunctionResults CPUIDEmu::Function_07h(uint32_t Leaf) const {
     // vcruntime140 memmove will use `rep movsb` in this case which completely destroys perf in Hades(appId 1145360)
     // This is due to LRCPC performance on Cortex being abysmal.
     // Only enable EnhancedREPMOVS if atomic memcpy tso emulation isn't enabled.
-    const uint32_t SupportsEnhancedREPMOVS = CTX->IsMemcpyAtomicTSOEnabled() == false;
+    const uint32_t SupportsEnhancedREPMOVS = CTX->IsMemcpyAtomicTSOEnabledForCPUID() == false;
     const uint32_t SupportsVPCLMULQDQ = CTX->HostFeatures.SupportsPMULL_128Bit && SupportsAVX();
     const uint32_t SupportsWFXT = CTX->HostFeatures.SupportsWFXT;
 

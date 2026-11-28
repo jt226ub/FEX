@@ -168,7 +168,7 @@ The header documents every function. The design decisions:
 
 ## Options
 
-Only these 17 options are accepted; any other name, and any value that does not fit the
+Only these 18 options are accepted; any other name, and any value that does not fit the
 option's rule, gives `FEXMAC_ERROR_BAD_CONFIG`. Names are the core's environment-variable
 name without `FEX_`, or its configuration-file name. Numbers are decimal or `0x`
 hexadecimal; a leading 0 is refused rather than read as octal.
@@ -182,6 +182,7 @@ hexadecimal; a leading 0 is refused rather than read as octal.
 | `TSOBARRIERMERGE` | 0, 1 | default 0: one `dmb ish` instead of a vector load's `dmb ishld` and the next vector store's `dmb ish` when only register-only operations lie between |
 | `MEMCPYSETTSOWIDE` | 0, 1 | default 0. With `TSOENABLED` and `MEMCPYSETTSOENABLED`: `rep movs`/`stos` in 8-byte acquire loads and release stores instead of one pair per element; every access ordered as before (`docs/macOS-port-status.md`, "String instructions in wider ordered units") |
 | `GUESTMEMORYALIASED` | 0, 1 | default 0. Declares that guest memory is reachable through more than one virtual address; every `rep movs` then copies element by element (see "Aliases" under "Self-modifying code") |
+| `TSODEFERRED` | 0, 1 | default 0. 1: no ordering emulation while the context has one guest thread; switched on for good at the second thread or `fexmac_context_mark_memory_shared` (see "Ordering deferred while single-threaded"). Nothing is deferred when `TSOENABLED` is 0 |
 | `SMCCHECKS` | `none`, `mtrack`, `full` (or 0, 1, 2) | default `mtrack`: with no guest memory registered nothing is detected (the embedder calls `fexmac_invalidate`, as before package D); with memory registered, translated pages are write-protected (see "Self-modifying code"). `full`: a check of the guest bytes before every instruction, everywhere. `none`: nothing |
 | `X87REDUCEDPRECISION`, `HIDEHYPERVISORBIT` | 0, 1 | |
 | `HOSTFEATURES` | `off`, or comma-separated `disable*` names the core knows | `enable*` names are refused: they force a feature on whether the host has it or not (`enablesve` dies with SIGILL on an M4) |
@@ -726,8 +727,11 @@ leaves the dispatcher; `fexmac_thread_run` returns `FEXMAC_STOP_REQUESTED`.
   target through its entry, so a chain of linked blocks is checked at every link. A
   `rep lods`/`scas`/`cmps` is checked on every iteration and stops part-way, with rcx,
   rsi and rdi showing its progress, as x86 interrupts one (`stop-rep`: a 256MB
-  `repe cmpsb` stopped about 20 times). A `rep movs` or `rep stos` is one host loop and
-  is not interrupted: the wait is up to its whole length. A system call callback in
+  `repe cmpsb` stopped about 20 times). A `rep movs` or `rep stos` writes the page after
+  every batch and every 64 elements (see "Guest memory faults: what is exact"; this
+  sentence said until round 2 that it was not interrupted, which was no longer true
+  since package D: the round 2 TSODEFERRED tests saw a switch land inside a 256MB
+  `rep movsb`). A system call callback in
   progress finishes first. Measured on the M4 with eight busy host threads on the ten
   cores (`stop-latency`, 2,000 stops per case: a block linked to itself, a loop closed
   by `jmp`, by `jnz`, multiblock on and off): median 4 to 6 us; 99th percentile 30 to
@@ -746,6 +750,172 @@ leaves the dispatcher; `fexmac_thread_run` returns `FEXMAC_STOP_REQUESTED`.
 - **With the host owning the signals**, these faults arrive as SIGBUS on the stopped
   thread and the host passes them to `fexmac_handle_fault` like any other; the host must
   not block SIGBUS/SIGSEGV on guest threads.
+
+## Ordering deferred while single-threaded (`TSODEFERRED`)
+
+An option, default off (then ordering is always as configured, as before). x86 memory
+ordering can only be observed by a second agent touching the same memory at the same
+time. With `TSODEFERRED=1` a context translates **without** ordering emulation while it
+has at most one live guest thread, and switches it on for good when a second
+`fexmac_thread` is created or the embedder calls `fexmac_context_mark_memory_shared`.
+`fexmac_context_ordering_deferred` reports the state. Interface version 2.1.
+
+**What it helps and what it does not.** It helps single-threaded programs and the
+single-threaded phase of any program: tools, tests, loaders, installers, start-up before
+the first thread. They run at ordering-off speed (benchmark configuration
+`tso_on_deferred`, see `macOS-benchmarks.md`). It does nothing for a program that is
+multi-threaded from the start, which is most games (and any program whose runtime starts
+a thread before `main`). It never switches back: after a thread exists, memory may have
+been shared with it, and nothing tells the library that it no longer is.
+
+**The embedder's duty.** The library sees only `fexmac` threads. One `fexmac_thread` run
+on several host threads in turn is one guest thread. But any other agent that reads or
+writes guest memory while a guest thread runs breaks the assumption silently: the
+embedder's own host threads touching guest buffers natively (an audio, GPU or I/O
+thread), a device, another process sharing the memory (`MAP_SHARED`, shared memory
+objects). The embedder must call `fexmac_context_mark_memory_shared` before such an agent
+can touch the memory; it returns once ordering is on and no guest thread can still run
+code made without it. A flag on `fexmac_memory_map` was considered and not chosen:
+sharing is a property of who touches the memory, not of a range, and once anything is
+shared the whole context must switch (the guest's own accesses to other memory are
+ordered against accesses to the shared range). `fexmac_context_mark_memory_shared` may be
+called from a system call callback, not from a signal handler or the log callback
+(`BUSY`). `fexmac_before_fork` returns `BUSY` while a switch is in progress on another
+host thread (the fork contract already excludes concurrent calls; the child would
+otherwise inherit the switch's lock held).
+
+**The switch** (`EnableOrderingLocked` in `Library.cpp`), serialised by a context mutex
+that thread creation also holds while ordering is deferred:
+
+1. With the context's thread lock and the core's invalidation lock held exclusively,
+   the core's effective ordering flags are switched on
+   (`SetTSOEmulationDeferred(false)`) and every translation of every thread and code
+   buffer is discarded (the whole guest address range: links into discarded blocks are
+   severed, every thread's lookup caches and call/return stack are cleared).
+2. Under the registry lock: each thread that is running translated code (`Running` and
+   not inside its system call callback) is counted in `OrderingAcksPending`, marked and
+   asked to resync (the interrupt fault page made read-only, the stop-request
+   mechanism). Every other thread is either not running or in host code that returns to
+   the dispatcher's lookup; its call/return stack is cleared here, where nothing can
+   push to it.
+3. `OrderingDeferred` becomes false.
+
+A marked thread **acknowledges on its own host thread** at its next resync (a block
+entry or loop back-edge, inside a `rep` loop every 64 elements, `Faults.cpp`), its next
+system call (under the registry lock, in the same step that marks it as in its callback,
+so a switch either counted it before and sees the acknowledgement, or sees it in the
+callback and does not count it), the end of its run, or, for a run it was entering at
+the switch, in every round of that run's own wait (it has run nothing yet). Each is a
+point after which the thread looks its code up anew.
+It first clears its own call/return stack, then lowers the count with a sequentially
+consistent (release) decrement. `fexmac_thread_run` does not start guest code while the
+count is non-zero, and `fexmac_context_mark_memory_shared` does not return until it is.
+
+**Why no access without ordering can follow another thread's first instruction.**
+
+- A new guest thread's first instruction runs in `ExecuteThread`, after
+  `fexmac_thread_run` saw the count at zero (acquire). Its handle exists only after
+  `fexmac_thread_create` returned, which is after step 3; a thread created concurrently
+  by another caller waits on the context mutex until the switch is complete.
+- Every thread that could be in code made without ordering at step 2 was counted, and
+  counts only drop at the acknowledgement points. Threads not counted: one not running
+  starts its next run at the dispatcher with every cache emptied in step 1 and its
+  call/return stack cleared in step 2 (its run cannot start in between: the registry lock
+  is held); one inside its system call callback is in host code, and the core's
+  `Syscall` operation ends the block (it spills, resets the stack and jumps to the
+  dispatcher's system call handler, which goes to the loop top after the handler), so
+  it returns to a lookup.
+- After its acknowledgement a thread can reach only code made after step 1: the lookup
+  caches are empty (it sees step 1's writes: its mark was stored after them and it read
+  the mark); blocks made later link only to blocks found by later lookups; and its
+  call/return stack, which can hold return addresses into old blocks pushed after step
+  1's clear (a return lands inside a block, past any check), is cleared by the thread
+  itself. Translation, the code cache lookup and the code cache store all run under the
+  invalidation lock held shared, so a block is either entirely made before step 1 (and
+  discarded) or entirely made with ordering on; the code cache key carries the effective
+  flags (`CodeGenStateFlags`), so an entry stored without ordering cannot be loaded
+  after the switch.
+- Is it enough that thread 1 finishes its current block unordered? Accesses thread 1 made
+  before the second thread existed cannot be observed out of order by it if they are all
+  visible before its first instruction: the acknowledgement's release and the waiter's
+  acquire give that. But accesses thread 1 makes *after* the second thread starts, in
+  the rest of a block made without ordering, can be observed out of order; that is why
+  the second thread waits for the acknowledgement and does not just start. A loop that
+  stays inside one translation would otherwise run without ordering for ever
+  (`FEXCoreOrderingSwitchTest --break no-wait` shows exactly that).
+- A switch while thread 1 is inside a `rep movs` acknowledges at the rep loop's check and
+  finishes the copy with a new, ordered translation from the exact progress, as for a
+  stop. x86 does not order the individual stores of one fast string operation, so the
+  second thread may see the copy incomplete (`deferred-switch-rep-movs` sees that); the
+  ordering against the instructions before and after it holds.
+
+**How long the second thread waits:** until each counted thread reaches a check, at most
+one block, one loop iteration or one 64-element `rep` step, as for a stop request, plus
+the discard. Measured on the M4 under load (other builds running, load average 11 to 18),
+`FEXCoreOrderingSwitchTest cost`, one thread spinning while
+`fexmac_context_mark_memory_shared` runs: with 100 translated blocks 0.04 to 0.08 ms,
+10,000 blocks 1.7 to 2.3 ms, 100,000 blocks 37 to 51 ms (the discard dominates; it walks
+every block). Afterwards every block is translated again on first use: as long as the
+first translation (10,000 blocks 13 to 21 ms, 100,000 blocks 172 to 291 ms against 140 to
+183 ms the first time).
+
+**Other state keyed on ordering.** The code cache key (above). CPUID: the Enhanced REP
+MOVSB bit follows the *configured* string ordering, not the effective one, so it does not
+change at the switch (`deferred-cpuid`). The misaligned-access handler: code made
+without ordering uses plain loads and stores, which do not take alignment faults; the
+handler decodes the faulting instruction and back-patches only code made with ordering,
+and the back-patches go with the discarded code. Locked instructions are atomic in both
+modes, and split locks stay strict (`STRICTINPROCESSSPLITLOCKS`, always on). Code at a
+custom IR handler (only `fexmac_testing_add_thunk_trampoline`) is not in the per-page
+block lists and is not discarded; it makes no guest memory access of its own.
+
+**Tests** (`fexmac_c_test` and `fexmac_hook_test`, which reads the core's effective flags
+and breaks the switch on purpose; `FEXCoreOrderingSwitchTest`):
+
+| Test | Checks |
+|---|---|
+| `deferred-option-off` | without the option: ordering on from the start (core flags 7), a second thread discards nothing, `mark_memory_shared` is a no-op; `TSODEFERRED` with `TSOENABLED=0` defers nothing |
+| `deferred-lifecycle` | deferred at creation (core flags 0); a thread created after the first was destroyed keeps it deferred; the second live thread switches (flags 7, one switch); never back; `mark_memory_shared` with no thread; scalar-only configuration gives flag 1 |
+| `deferred-cpuid` | CPUID leaf 7 the same deferred, after the switch and without the option |
+| `deferred-switch-mid-loop` | thread 1 in a load/add/store loop when thread 2 is created: thread 1 continues its count exactly; at least two blocks compiled after the switch (thread 2's, and thread 1's loop again: the discard); thread 1 acknowledged once |
+| `deferred-switch-rep-movs` | the switch during a 256MB `rep movsb`: the copy completes exactly; thread 1 acknowledged at a check inside the rep loop before thread 2 ran |
+| `deferred-switch-from-callback` | thread 1's system call callback creates thread 2, runs it on another host thread and joins it before returning: no deadlock, thread 1 then reads its value |
+| `deferred-mark-shared` | a host thread reads the guest's message-passing stores with acquire loads: deferred, it sees them out of order (the translation is observably unordered); after `fexmac_context_mark_memory_shared`, 0 of 50M reads; with the option off, 0 before and after |
+| `deferred-cache` | cold deferred run stores unordered entries; a single-threaded warm start loads them; after the switch the same code is compiled, nothing loaded; ordering on loads the entries stored after the switch, and loads nothing where only unordered entries exist |
+| `deferred-switch-races` | 4,000 switches racing a run's start (thread 1 started on a host thread while thread 2 is created) and 4,000 racing a system call whose callback waits for thread 2's store; a hang is caught by the alarm. Both races hung the first version of the switch (found by review: a run marked between setting `Running` and its wait waited for itself; a thread marked between acknowledging at the system call and entering its callback was counted while its callback waited): 4 of 16 runs hung before the fix, 0 of 20 after |
+| `deferred-broken-no-discard-mid-loop` (hooks) | with the discard skipped, only thread 2's block is compiled after the switch: the counter check above can fail |
+| `FEXCoreOrderingSwitchTest litmus` | message passing across the switch: thread 1 writes X then Y in a loop that stays in one translation; thread 2 is created mid-loop and reads Y then X; X < Y is forbidden. `--pattern call` reads the loop's exit flag in a called function. Must be 0; `--mode off` and the `_hooks` build with `--break no-wait`, `no-discard` (and, rarely, `keep-callret`) show forbidden outcomes |
+| `FEXCoreOrderingSwitchTest cost` | the switch cost and the recompilation burst for N = 100, 10,000, 100,000 blocks |
+
+### Not done: memory the embedder declares private to one thread
+
+Recorded for round 2 (experiment 6), not implemented. The stack (`rsp`-based accesses)
+is already exempt from ordering. The idea: a `fexmac_memory_map` flag for regions the
+embedder guarantees only one guest thread ever touches (thread-local heaps, a thread's
+stack reached through other registers), whose accesses would then need no ordering.
+
+- **What the translator would need.** Ordering is decided when an instruction is
+  translated, but the address of an access is known only when it runs. A region flag
+  cannot be consulted at translation time, so it needs either a check per access (range
+  compare or table lookup, then the plain or the ordered form) or speculation per block
+  (translate the block for "private", guard its entry with a check of the base registers,
+  fall back otherwise), with the guard re-validated whenever a base register changes
+  inside the block.
+- **What it could save, against what it costs** (round 2 E1 probe, M4 performance core):
+  a scalar `ldapur` costs about 1.1 cycles of throughput against 0.33 for `ldr`, a
+  `stlur` 1.0 against 0.5; a 16-byte vector load with its `dmb ishld` 1.4 cycles against
+  0.33, a vector store with `dmb ish` 2.0 against 0.5. A per-access range check is at
+  least a compare and a branch (or a dependent table load, about a cycle more, plus a
+  register), so for scalar accesses it costs about what it saves; only vector accesses
+  and string copies could gain, and only with per-block speculation.
+- **The risk.** A wrong declaration silently removes the ordering guarantee for that
+  memory: no test of the embedder's can notice, and the failure is a rare reordering in
+  another thread. The stack exemption is safe because x86 programs essentially never
+  share their stack through `rsp`; a declared region has no such structural guarantee.
+- **Who would use it.** No caller in this project has thread-private guest memory it can
+  name: a game's allocator hands out thread-local memory from inside the guest, which the
+  embedder does not see. Recommendation: do not implement unless a caller appears with
+  such regions and a measurement shows vector or string accesses to them dominating.
 
 ## Self-modifying code
 
@@ -927,7 +1097,7 @@ alarm kills it.
 | `syscall-prefix` | `48 0F 05` resumes at the next instruction |
 | `syscall-restart` | `RESTART` runs the call again with the state the callback set |
 | `state` | defaults, lossless round trip, registers, flags, XMM and `ds` set from the host and read by the guest, `ud2` and `int3` as guest faults, CPUID |
-| `abi` | sizes 0, smaller, larger and garbage are refused for state, stop records, config and translation counters, with nothing written inside or past the structure (the reviewer's `garb.c`); bad cache fields and a set reserved field; version 2.0 |
+| `abi` | sizes 0, smaller, larger and garbage are refused for state, stop records, config and translation counters, with nothing written inside or past the structure (the reviewer's `garb.c`); bad cache fields and a set reserved field; version 2.1 |
 | `invalidate` | changed code runs after `fexmac_invalidate` |
 | `faults-installed`, `faults-chained`, `faults-hosted` | misaligned `lock xadd` across 16 bytes in each handler arrangement; the host's own fault still reaches the host |
 | `callret-recursion`, `callret-deep-recursion`, `callret-overflow`, `callret-underflow` | recursion 100,000 deep; 1,000,000 deep counting every return (`rec.c`); 200,000 calls never returned; 200,000 returns never called |
