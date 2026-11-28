@@ -1078,10 +1078,11 @@ CPUBackend::CompiledCode Arm64JITCore::EmitJITCode(uint64_t Entry, uint64_t Size
 
       BindOrRestart(Target);
       // A block start is a branch target: never merge a barrier across it.
-      LastVectorTSOBarrierEnd = ~size_t(0);
+      PendingVectorTSOBarrier = ~size_t(0);
     }
 
     for (auto [CodeNode, IROp] : IR->GetCode(BlockNode)) {
+      PendingVectorTSOBarrierSetInOp = false;
       switch (IROp->Op) {
 #define REGISTER_OP(op, x) \
   case FEXCore::IR::IROps::OP_##op: Op_##x(IROp, CodeNode); break
@@ -1091,6 +1092,10 @@ CPUBackend::CompiledCode Arm64JITCore::EmitJITCode(uint64_t Entry, uint64_t Size
 #undef REGISTER_OP
 
       default: Op_Unhandled(IROp, CodeNode); break;
+      }
+      // TSOBarrierMerge: only register-only ops may sit between the barriers it merges.
+      if (!PendingVectorTSOBarrierSetInOp && !IsBarrierTransparentOp(IROp->Op)) {
+        PendingVectorTSOBarrier = ~size_t(0);
       }
     }
 

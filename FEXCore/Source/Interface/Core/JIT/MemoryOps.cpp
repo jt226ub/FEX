@@ -764,7 +764,10 @@ DEF_OP(LoadMemPair) {
   }
 }
 
-// Vector memory-ordering emulation without barriers (VectorTSOSplit, off by default).
+// Vector memory-ordering emulation without barriers (VectorTSOSplit, off by default; a bit
+// mask, JITClass.h). Bits 1 and 2 (accesses of 8 bytes or less) keep every access a single
+// access. Bits 4 and 8 (16-byte accesses as two halves) do not, and break the 16-byte
+// atomicity x86 guarantees for aligned accesses: recorded as a measured experiment only.
 //
 // FEAT_LRCPC3 (acquire and release forms for SIMD&FP registers) is absent on Apple's
 // chips so far, so a vector TSO access is normally a plain access plus a barrier: a
@@ -794,9 +797,30 @@ DEF_OP(LoadMemPair) {
 //
 // Only with LRCPC2 (unscaled offsets); otherwise, and for 32-byte SVE accesses, the
 // barrier forms stay.
-bool Arm64JITCore::UseVectorTSOSplit(IR::OpSize AccessSize) const {
-  return CTX->Config.VectorTSOSplit() && CTX->IsVectorAtomicTSOEnabled() && CTX->HostFeatures.SupportsTSOImm9 &&
-         AccessSize <= IR::OpSize::i128Bit;
+bool Arm64JITCore::UseVectorTSOSplit(IR::OpSize AccessSize, IR::OpSize Align, bool IsStore) const {
+  const uint8_t Mode = CTX->Config.VectorTSOSplit();
+  if (!Mode || !CTX->IsVectorAtomicTSOEnabled() || !CTX->HostFeatures.SupportsTSOImm9 || AccessSize > IR::OpSize::i128Bit) {
+    return false;
+  }
+  if (AccessSize <= IR::OpSize::i64Bit) {
+    // One access either way: a single acquire load or release store of the same size, as
+    // atomic as the plain access it replaces. No barrier.
+    return Mode & (IsStore ? VECTOR_TSO_SPLIT_STORES : VECTOR_TSO_SPLIT_LOADS);
+  }
+  // 16 bytes become two 8-byte accesses: another thread can see half of the access.
+  // Intel SDM vol. 3A 11.1.1 guarantees 16-byte atomicity for MOVAPS/MOVAPD/MOVDQA (and
+  // their VEX.128/EVEX.128 forms) on processors that report AVX, and AMD APM vol. 2 7.3.2
+  // for every cacheable naturally aligned 16-byte load or store on such processors; the
+  // guest CPUID reports AVX. Only for experiments: see docs/macOS-port-status.md.
+  if (!(Mode & (IsStore ? VECTOR_TSO_SPLIT_STORES128 : VECTOR_TSO_SPLIT_LOADS128))) {
+    return false;
+  }
+  // Instructions that require their 16-byte operand to be aligned (MOVAPS, MOVAPD, MOVDQA
+  // and the legacy-SSE memory operands the IR gives a 16-byte alignment) keep one access.
+  if ((Mode & VECTOR_TSO_SPLIT_KEEP_ALIGNED) && Align >= IR::OpSize::i128Bit) {
+    return false;
+  }
+  return true;
 }
 
 std::pair<ARMEmitter::Register, int32_t>
@@ -818,23 +842,93 @@ Arm64JITCore::SplitTSOAddress(ARMEmitter::Register Base, IR::OrderedNodeWrapper 
 
 void Arm64JITCore::EmitVectorTSOBarrier(ARMEmitter::BarrierScope Scope) {
   const size_t Here = GetCursorOffset();
-  if (CTX->Config.TSOBarrierMerge() && LastVectorTSOBarrierEnd == Here) {
-    // The instruction just before is this function's previous barrier, with nothing in
-    // between (no access, no label: block starts reset LastVectorTSOBarrierEnd, and no
-    // caller binds a label before its barrier). DMB ISH orders everything DMB ISHLD
-    // orders, so the pair is the stronger one alone.
-    const auto Merged = (Scope == ARMEmitter::BarrierScope::ISH || LastVectorTSOBarrierScope == ARMEmitter::BarrierScope::ISH) ?
-                          ARMEmitter::BarrierScope::ISH :
-                          ARMEmitter::BarrierScope::ISHLD;
-    SetCursorOffset(Here - 4);
-    dmb(Merged);
-    LastVectorTSOBarrierScope = Merged;
-    LastVectorTSOBarrierEnd = GetCursorOffset();
+  if (Scope == ARMEmitter::BarrierScope::ISHLD) {
+    // A load's trailing barrier: the candidate for a later merge. The JIT's block loop
+    // forgets it after any IR op that is not register-only (IsBarrierTransparentOp), and
+    // at every block start.
+    dmb(Scope);
+    if (CTX->Config.TSOBarrierMerge()) {
+      PendingVectorTSOBarrier = Here;
+      PendingVectorTSOBarrierSetInOp = true;
+    }
     return;
   }
+  if (CTX->Config.TSOBarrierMerge() && PendingVectorTSOBarrier != ~size_t(0)) {
+    // A store's leading DMB ISH, and since the load's DMB ISHLD at PendingVectorTSOBarrier
+    // only register-only instructions (no memory access, branch, branch target, call or
+    // instruction that can fault). DMB ISH orders every access before it against every
+    // access after it, which includes all that the DMB ISHLD ordered: the earlier
+    // barrier is redundant. Adjacent: this one takes its place; otherwise it becomes a NOP.
+    const size_t Pending = PendingVectorTSOBarrier;
+    PendingVectorTSOBarrier = ~size_t(0);
+    if (Pending + 4 == Here) {
+      SetCursorOffset(Pending);
+      dmb(Scope);
+      return;
+    }
+    SetCursorOffset(Pending);
+    nop();
+    SetCursorOffset(Here);
+  }
+  PendingVectorTSOBarrier = ~size_t(0);
   dmb(Scope);
-  LastVectorTSOBarrierScope = Scope;
-  LastVectorTSOBarrierEnd = GetCursorOffset();
+}
+
+bool Arm64JITCore::IsBarrierTransparentOp(IR::IROps Op) {
+  // Ops whose code is register-only: no memory access (guest or host), no branch, no
+  // call, nothing that can fault. Everything else ends a pending merge.
+  switch (Op) {
+  case IR::OP_GUESTOPCODE:
+  case IR::OP_CONSTANT:
+  case IR::OP_INLINECONSTANT:
+  case IR::OP_ADD:
+  case IR::OP_SUB:
+  case IR::OP_AND:
+  case IR::OP_ANDN:
+  case IR::OP_OR:
+  case IR::OP_XOR:
+  case IR::OP_NOT:
+  case IR::OP_LSHL:
+  case IR::OP_LSHR:
+  case IR::OP_ASHR:
+  case IR::OP_ADDSHIFT:
+  case IR::OP_MUL:
+  case IR::OP_VMOV:
+  case IR::OP_VECTORIMM:
+  case IR::OP_VXOR:
+  case IR::OP_VOR:
+  case IR::OP_VAND:
+  case IR::OP_VANDN:
+  case IR::OP_VNOT:
+  case IR::OP_VADD:
+  case IR::OP_VSUB:
+  case IR::OP_VMUL:
+  case IR::OP_VFADD:
+  case IR::OP_VFSUB:
+  case IR::OP_VFMUL:
+  case IR::OP_VFDIV:
+  case IR::OP_VFMIN:
+  case IR::OP_VFMAX:
+  case IR::OP_VFMLA:
+  case IR::OP_VFMLS:
+  case IR::OP_VFNEG:
+  case IR::OP_VFSQRT:
+  case IR::OP_VUMIN:
+  case IR::OP_VUMAX:
+  case IR::OP_VSMIN:
+  case IR::OP_VSMAX:
+  case IR::OP_VSHLI:
+  case IR::OP_VUSHRI:
+  case IR::OP_VSSHRI:
+  case IR::OP_VZIP:
+  case IR::OP_VZIP2:
+  case IR::OP_VUNZIP:
+  case IR::OP_VUNZIP2:
+  case IR::OP_VEXTR:
+  case IR::OP_VDUPELEMENT:
+  case IR::OP_VINSELEMENT: return true;
+  default: return false;
+  }
 }
 
 DEF_OP(LoadMemTSO) {
@@ -901,7 +995,7 @@ DEF_OP(LoadMemTSO) {
       // Half-barrier once back-patched.
       nop();
     }
-  } else if (UseVectorTSOSplit(OpSize)) {
+  } else if (UseVectorTSOSplit(OpSize, Op->Align, false)) {
     // See UseVectorTSOSplit. The vector register is written only after the last load.
     const auto Dst = GetVReg(Node);
     const auto [Base, Imm] =
@@ -1949,7 +2043,7 @@ DEF_OP(StoreMemTSO) {
       default: LOGMAN_MSG_A_FMT("Unhandled StoreMemTSO size: {}", OpSize); break;
       }
     }
-  } else if (UseVectorTSOSplit(OpSize)) {
+  } else if (UseVectorTSOSplit(OpSize, Op->Align, true)) {
     // See UseVectorTSOSplit.
     const auto Src = GetVReg(Op->Value);
     const auto [Base, Imm] =

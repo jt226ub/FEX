@@ -38,6 +38,12 @@ MODES = {
     "jit_500_tso": {"FEX_MAXINST": "500", "FEX_MULTIBLOCK": "1", "FEX_TSOENABLED": "1", "FEX_VECTORTSOENABLED": "1",
                     "FEX_MEMCPYSETTSOENABLED": "1"},
 }
+# The four modes run by default. The modes after them are jit_500_tso with one of the round
+# 2 vector-ordering experiments on (VECTORTSOSPLIT, TSOBARRIERMERGE); run them with --modes.
+DEFAULT_MODES = list(MODES)
+for _name, _extra in (("split", {"FEX_VECTORTSOSPLIT": "1"}), ("merge", {"FEX_TSOBARRIERMERGE": "1"}),
+                      ("split_merge", {"FEX_VECTORTSOSPLIT": "1", "FEX_TSOBARRIERMERGE": "1"})):
+    MODES["jit_500_tso_" + _name] = {**MODES["jit_500_tso"], **_extra}
 # The self-modifying-code mode is stated: none for every test but the SelfModifyingCode
 # ones (full, or mtrack with --smc), so results do not follow fexmac's default (which
 # gives registered memory, as the runner's is, full checks).
@@ -388,7 +394,8 @@ def main():
     parser.add_argument("--out", required=True)
     parser.add_argument("--jobs", type=int, default=os.cpu_count() or 2)
     parser.add_argument("--timeout", type=int, default=60)
-    parser.add_argument("--modes", default=",".join(MODES))
+    parser.add_argument("--modes", default=",".join(DEFAULT_MODES), help="default: " + ",".join(DEFAULT_MODES) +
+                        "; also: " + ",".join(m for m in MODES if m not in DEFAULT_MODES))
     parser.add_argument("--filter", default="", help="only run tests whose name contains this text (several: separate with commas)")
     parser.add_argument("--cache-dir", default="", help="switch the on-disk code cache on, kept in this directory")
     parser.add_argument("--cache-passes", type=int, default=1, choices=(1, 2),

@@ -761,7 +761,8 @@ static void TestErrors(void) {
     {"MAXINST", "4294967296", "number out of range"},
     {"MULTIBLOCK", "2", "boolean that is not 0 or 1"},
     {"MULTIBLOCK", "true", "boolean spelt true"},
-    {"VECTORTSOSPLIT", "2", "boolean that is not 0 or 1"},
+    {"VECTORTSOSPLIT", "32", "mask above 31"},
+    {"VECTORTSOSPLIT", "03", "mask with a leading zero"},
     {"TSOBARRIERMERGE", "yes", "boolean spelt yes"},
     {"SMCCHECKS", "sometimes", "unknown named value"},
     {"HOSTFEATURES", "disablesve,nonsense", "unknown host feature name"},
@@ -786,7 +787,7 @@ static void TestErrors(void) {
   /* After all those failures, a good configuration still works. */
   fexmac_option Good[] = {{"SMCCHECKS", "full"}, {"MaxInst", "0x100"}, {"MULTIBLOCK", "0"}, {"HOSTFEATURES", "disablesve,disablefrintts"},
                           {"HostFeatures", "off"},
-                          {"VECTORTSOSPLIT", "1"}, {"TSOBarrierMerge", "0"}};
+                          {"VECTORTSOSPLIT", "31"}, {"TSOBarrierMerge", "0"}};
   fexmac_config_init(&Config);
   Config.options = Good;
   Config.option_count = sizeof(Good) / sizeof(Good[0]);

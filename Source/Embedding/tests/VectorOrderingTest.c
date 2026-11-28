@@ -30,7 +30,8 @@
 /* clang-format off */
 /* Assembled from intel syntax with clang -target x86_64-apple-macos11. In: rdi (input,
  * misaligned by the run), rsi (output, misaligned), r8 = rsi + 0x800, r9 = rsi + 0xA00,
- * r10 = rsi + 0xC00, r11 = rsi + 0xE00, rcx = 3. */
+ * r10 = rsi + 0xC00, r11 = rsi + 0xE00, rcx = 3. The last accesses use rdi and rsi rounded
+ * down to 16 bytes, for the forms that require alignment (movdqa, movaps, movapd, addps). */
 static const uint8_t FormsProgram[] = {
   0xF3, 0x0F, 0x6F, 0x07,                                      /*   0: movdqu	(%rdi), %xmm0 */
   0xF3, 0x0F, 0x6F, 0x4F, 0x08,                                /*   4: movdqu	0x8(%rdi), %xmm1 */
@@ -86,21 +87,31 @@ static const uint8_t FormsProgram[] = {
   0xF3, 0x0F, 0x6F, 0x77, 0x31,                                /* 364: movdqu	0x31(%rdi), %xmm6 */
   0xF3, 0x0F, 0x7F, 0xAE, 0x6C, 0x02, 0x00, 0x00,              /* 369: movdqu	%xmm5, 0x26c(%rsi) */
   0xF3, 0x0F, 0x7F, 0xB6, 0x7C, 0x02, 0x00, 0x00,              /* 377: movdqu	%xmm6, 0x27c(%rsi) */
-  0x0F, 0x77,                                                  /* 385: emms */
-  0xF4,                                                        /* 387: hlt */
+  0x48, 0x89, 0xF8,                                            /* 385: movq	%rdi, %rax */
+  0x48, 0x83, 0xE0, 0xF0,                                      /* 388: andq	$-0x10, %rax */
+  0x48, 0x89, 0xF2,                                            /* 392: movq	%rsi, %rdx */
+  0x48, 0x83, 0xE2, 0xF0,                                      /* 395: andq	$-0x10, %rdx */
+  0x66, 0x0F, 0x6F, 0x48, 0x40,                                /* 399: movdqa	0x40(%rax), %xmm1 */
+  0x0F, 0x29, 0x8A, 0x00, 0x07, 0x00, 0x00,                    /* 404: movaps	%xmm1, 0x700(%rdx) */
+  0x66, 0x0F, 0x28, 0x90, 0x40, 0x12, 0x00, 0x00,              /* 411: movapd	0x1240(%rax), %xmm2 */
+  0x66, 0x0F, 0x7F, 0x92, 0x20, 0x07, 0x00, 0x00,              /* 419: movdqa	%xmm2, 0x720(%rdx) */
+  0x0F, 0x58, 0x58, 0x60,                                      /* 427: addps	0x60(%rax), %xmm3 */
+  0x0F, 0x29, 0x9A, 0x40, 0x07, 0x00, 0x00,                    /* 431: movaps	%xmm3, 0x740(%rdx) */
+  0x0F, 0x77,                                                  /* 438: emms */
+  0xF4,                                                        /* 440: hlt */
 };
 
 /* Single accesses at rdi, each followed by hlt, for the fault cases. */
 enum { STORE16 = 0, STORE8 = 5, STORE32 = 10, LOAD16 = 15 };
 static const uint8_t AccessProgram[] = {
-  0xF3, 0x0F, 0x7F, 0x07,                                      /* 388: movdqu	%xmm0, (%rdi) */
-  0xF4,                                                        /* 392: hlt */
-  0xF2, 0x0F, 0x11, 0x07,                                      /* 393: movsd	%xmm0, (%rdi) */
-  0xF4,                                                        /* 397: hlt */
-  0xC5, 0xFE, 0x7F, 0x07,                                      /* 398: vmovdqu	%ymm0, (%rdi) */
-  0xF4,                                                        /* 402: hlt */
-  0xF3, 0x0F, 0x6F, 0x0F,                                      /* 403: movdqu	(%rdi), %xmm1 */
-  0xF4,                                                        /* 407: hlt */
+  0xF3, 0x0F, 0x7F, 0x07,                                      /*   0: movdqu	%xmm0, (%rdi) */
+  0xF4,                                                        /*   4: hlt */
+  0xF2, 0x0F, 0x11, 0x07,                                      /*   5: movsd	%xmm0, (%rdi) */
+  0xF4,                                                        /*   9: hlt */
+  0xC5, 0xFE, 0x7F, 0x07,                                      /*  10: vmovdqu	%ymm0, (%rdi) */
+  0xF4,                                                        /*  14: hlt */
+  0xF3, 0x0F, 0x6F, 0x0F,                                      /*  15: movdqu	(%rdi), %xmm1 */
+  0xF4,                                                        /*  19: hlt */
 };
 /* clang-format on */
 
@@ -113,9 +124,15 @@ struct OrderingConfig {
 static const struct OrderingConfig Configs[] = {
   {"no ordering", {{"TSOENABLED", "0"}}, 1},
   {"barriers", {{"TSOENABLED", "1"}, {"VECTORTSOENABLED", "1"}}, 2},
-  {"split", {{"TSOENABLED", "1"}, {"VECTORTSOENABLED", "1"}, {"VECTORTSOSPLIT", "1"}}, 3},
+  {"8-byte and smaller loads and stores acquire/release (3)", {{"TSOENABLED", "1"}, {"VECTORTSOENABLED", "1"}, {"VECTORTSOSPLIT", "3"}}, 3},
+  {"small loads only (1)", {{"TSOENABLED", "1"}, {"VECTORTSOENABLED", "1"}, {"VECTORTSOSPLIT", "1"}}, 3},
+  {"small stores only (2)", {{"TSOENABLED", "1"}, {"VECTORTSOENABLED", "1"}, {"VECTORTSOSPLIT", "2"}}, 3},
+  {"everything split, 16 bytes in halves (15)", {{"TSOENABLED", "1"}, {"VECTORTSOENABLED", "1"}, {"VECTORTSOSPLIT", "15"}}, 3},
+  {"16-byte stores in halves only (8)", {{"TSOENABLED", "1"}, {"VECTORTSOENABLED", "1"}, {"VECTORTSOSPLIT", "8"}}, 3},
+  {"everything split, aligned forms kept (31)", {{"TSOENABLED", "1"}, {"VECTORTSOENABLED", "1"}, {"VECTORTSOSPLIT", "31"}}, 3},
   {"merged barriers", {{"TSOENABLED", "1"}, {"VECTORTSOENABLED", "1"}, {"TSOBARRIERMERGE", "1"}}, 3},
-  {"split and merged barriers", {{"TSOENABLED", "1"}, {"VECTORTSOENABLED", "1"}, {"VECTORTSOSPLIT", "1"}, {"TSOBARRIERMERGE", "1"}}, 4},
+  {"small accesses split and merged barriers", {{"TSOENABLED", "1"}, {"VECTORTSOENABLED", "1"}, {"VECTORTSOSPLIT", "3"}, {"TSOBARRIERMERGE", "1"}}, 4},
+  {"everything split and merged barriers", {{"TSOENABLED", "1"}, {"VECTORTSOENABLED", "1"}, {"VECTORTSOSPLIT", "15"}, {"TSOBARRIERMERGE", "1"}}, 4},
 };
 enum { CONFIGS = sizeof(Configs) / sizeof(Configs[0]) };
 

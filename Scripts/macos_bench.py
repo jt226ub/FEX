@@ -117,6 +117,22 @@ CONFIGS = {
         "threads_lock": ANY
     }, "no ordering emulation: not correct for multi-threaded guests; an upper bound for guests known not to need it"),
 }
+# Round 2 experiments (task E2), off by default in the translator and not in the default
+# set: vector ordering as general-register acquire/release accesses (VECTORTSOSPLIT), and a
+# vector load's barrier merged with the next vector store's (TSOBARRIERMERGE).
+CONFIGS["tso_on_fp64"] = ({**BASE, **TSO_ALL, "VECTORTSOSPLIT": "3"}, {},
+                          "as tso_on, vector-register accesses of 8 bytes or less as one acquire load or release store "
+                          "through a general register (VECTORTSOSPLIT=3)")
+CONFIGS["tso_on_merge"] = ({**BASE, **TSO_ALL, "TSOBARRIERMERGE": "1"}, {},
+                           "as tso_on, a vector load's barrier merged into the next vector store's (TSOBARRIERMERGE)")
+CONFIGS["tso_on_fp64_merge"] = ({**BASE, **TSO_ALL, "VECTORTSOSPLIT": "3", "TSOBARRIERMERGE": "1"}, {},
+                                "as tso_on, with VECTORTSOSPLIT=3 and TSOBARRIERMERGE")
+# Recorded, not proposed: 16-byte accesses as two 8-byte halves break x86's aligned
+# 16-byte atomicity (the TEAR tests of FEXCoreOrderingTest see torn values).
+CONFIGS["tso_on_split16"] = ({**BASE, **TSO_ALL, "VECTORTSOSPLIT": "15"}, {},
+                             "as tso_on, every vector access split, 16 bytes as two 8-byte halves (VECTORTSOSPLIT=15; "
+                             "not atomic, dropped)")
+E2_CONFIGS = ["tso_on", "tso_on_fp64", "tso_on_merge", "tso_on_fp64_merge", "tso_on_split16", "tso_scalar"]
 CONFIGS["tso_on_cache_cold"] = (CONFIGS["tso_on"][0], {}, "as tso_on, with the code cache on in a fresh, empty directory "
                                  "for every launch: everything is compiled and written to the cache")
 CONFIGS["tso_on_cache_warm"] = (CONFIGS["tso_on"][0], {}, "as tso_on, with the code cache on in a directory one run "
@@ -458,7 +474,10 @@ def main():
     ap.add_argument("--launches", type=int, default=5)
     ap.add_argument("--reps", type=int, default=3)
     ap.add_argument("--only", default="", help="comma-separated kernel names")
-    ap.add_argument("--configs", default="", help="comma-separated: " + ",".join(CONFIGS))
+    ap.add_argument("--configs", default="", help="comma-separated: " + ",".join(CONFIGS) + "; or e2 for " + ",".join(E2_CONFIGS))
+    ap.add_argument("--qos", choices=["default", "background"], default="default",
+                    help="background runs every build under taskpolicy -b (background QoS, which macOS keeps on the "
+                    "efficiency cores of an M-series chip)")
     ap.add_argument("--hardened", action="store_true", help="run a copy of the loader signed for the hardened runtime")
     ap.add_argument("--no-rosetta", action="store_true")
     ap.add_argument("--timeout", type=int, default=0, help="seconds per launch (default 300, quick 120)")
@@ -484,6 +503,8 @@ def main():
         sys.exit(f"unknown kernel name(s) in --only: {unknown or args.only}; known: {','.join(ALL_KERNELS)}")
     want = [k for k in ALL_KERNELS if not only or k in only]
     configs = [c for c in (args.configs.split(",") if args.configs else (QUICK_CONFIGS if args.quick else DEFAULT_CONFIGS)) if c]
+    if configs == ["e2"]:
+        configs = list(E2_CONFIGS)
     for c in configs:
         if c not in CONFIGS:
             sys.exit(f"unknown configuration {c}")
@@ -525,11 +546,12 @@ def main():
         print("Rosetta 2 is not available: skipping the x86-64 native build", flush=True)
 
     # label: (command builder taking the program arguments, allowances)
-    builds = [("native-arm64", lambda a: [natives["arm64"], *a], {})]
+    qos = ["taskpolicy", "-b"] if args.qos == "background" else []
+    builds = [("native-arm64", lambda a: [*qos, natives["arm64"], *a], {})]
     if have_rosetta:
-        builds.append(("rosetta", lambda a: ["arch", "-x86_64", natives["x86_64"], *a], {}))
+        builds.append(("rosetta", lambda a: [*qos, "arch", "-x86_64", natives["x86_64"], *a], {}))
     for c in configs:
-        builds.append((f"fex:{c}", (lambda c: lambda a: fex_cmd(c, a))(c), CONFIGS[c][1]))
+        builds.append((f"fex:{c}", (lambda c: lambda a: [*qos, *fex_cmd(c, a)])(c), CONFIGS[c][1]))
     labels = [b[0] for b in builds]
 
     sampler = LoadSampler()
@@ -631,6 +653,7 @@ def main():
         "launches": launches,
         "reps": reps,
         "hardened": args.hardened,
+        "qos": args.qos,
         "cflags": CFLAGS,
         "configs": {c: {"options": CONFIGS[c][0], "what": CONFIGS[c][2]} for c in configs},
         "load": load,

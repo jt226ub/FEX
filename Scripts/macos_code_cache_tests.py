@@ -561,6 +561,10 @@ def main():
         ("TSO emulation on", {"FEX_TSOENABLED": "1"}),
         ("TSO on, vector TSO off", {"FEX_TSOENABLED": "1", "FEX_VECTORTSOENABLED": "0"}),
         ("TSO on, memcpy TSO on", {"FEX_TSOENABLED": "1", "FEX_MEMCPYSETTSOENABLED": "1"}),
+        # Round 2 experiments: they change only vector ordering code, but are part of the
+        # key whatever the other switches say (both are marked AffectsCodeGen).
+        ("vector TSO split", {"FEX_VECTORTSOSPLIT": "1"}),
+        ("TSO barrier merge", {"FEX_TSOBARRIERMERGE": "1"}),
         ("max instructions 1", {"FEX_MAXINST": "1"}),
         ("multiblock on", {"FEX_MULTIBLOCK": "1"}),
         # FEXCoreCacheTest states SMCCHECKS none unless told otherwise.

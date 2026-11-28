@@ -335,8 +335,16 @@ private:
   // VectorTSOSplit: a vector TSO access of 1 to 16 bytes as acquire loads or release
   // stores of at most 8 bytes through general registers (FEAT_LRCPC2's LDAPUR/STLUR),
   // instead of a plain access and a barrier.
+  // VectorTSOSplit bits. 1, 2: loads, stores of 1 to 8 bytes (one access each, atomic).
+  // 4, 8: 16-byte loads, stores as two 8-byte halves (NOT atomic). 16: with 4 or 8,
+  // accesses by instructions that require 16-byte alignment keep the barrier form.
+  static constexpr uint8_t VECTOR_TSO_SPLIT_LOADS = 1;
+  static constexpr uint8_t VECTOR_TSO_SPLIT_STORES = 2;
+  static constexpr uint8_t VECTOR_TSO_SPLIT_LOADS128 = 4;
+  static constexpr uint8_t VECTOR_TSO_SPLIT_STORES128 = 8;
+  static constexpr uint8_t VECTOR_TSO_SPLIT_KEEP_ALIGNED = 16;
   [[nodiscard]]
-  bool UseVectorTSOSplit(IR::OpSize AccessSize) const;
+  bool UseVectorTSOSplit(IR::OpSize AccessSize, IR::OpSize Align, bool IsStore) const;
   // The base register and unscaled offset for an access of Span bytes, split into 8-byte
   // parts: [Base + Imm] to [Base + Imm + Span - 8] all encodable as LDAPUR/STLUR (signed
   // 9-bit offsets). Materialises the address into Tmp when they are not.
@@ -344,14 +352,16 @@ private:
   std::pair<ARMEmitter::Register, int32_t> SplitTSOAddress(ARMEmitter::Register Base, IR::OrderedNodeWrapper Offset,
                                                            IR::MemOffsetType OffsetType, uint8_t OffsetScale, uint32_t Span,
                                                            IR::OpSize AccessSize, ARMEmitter::Register Tmp);
-  // TSOBarrierMerge: emits a vector TSO barrier; if the previous instruction emitted is
-  // the barrier this function emitted last (nothing between, same block), the two become
-  // one: the stronger of the two takes the first one's place and nothing new is emitted.
+  // TSOBarrierMerge: emits a vector TSO barrier. A load's DMB ISHLD is remembered; a
+  // store's DMB ISH that follows it with only register-only IR ops between (same block)
+  // replaces it (in its place if adjacent, otherwise the DMB ISHLD becomes a NOP).
   void EmitVectorTSOBarrier(ARMEmitter::BarrierScope Scope);
-  // Cursor offset just past the last barrier EmitVectorTSOBarrier emitted, and its scope.
-  // Reset at every block start: a branch target between two barriers stops a merge.
-  size_t LastVectorTSOBarrierEnd {~size_t(0)};
-  ARMEmitter::BarrierScope LastVectorTSOBarrierScope {ARMEmitter::BarrierScope::ISH};
+  [[nodiscard]]
+  static bool IsBarrierTransparentOp(IR::IROps Op);
+  // Cursor offset of the remembered DMB ISHLD, or ~0. Reset at every block start and
+  // after every IR op that is not barrier-transparent (JIT.cpp).
+  size_t PendingVectorTSOBarrier {~size_t(0)};
+  bool PendingVectorTSOBarrierSetInOp {};
 
   // NOTE: Will use TMP1 as a way to encode immediates that happen to fall outside
   //       the limits of the scalar plus immediate variant of SVE load/stores.

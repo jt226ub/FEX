@@ -57,7 +57,7 @@
 //
 //   FEXCoreOrderingTest [--tso on|off|scalar] [--expect tso|weak|scalar|report]
 //                       [--iterations N] [--runs R] [--groups G] [--soak]
-//                       [--only name[,name...]] [--list]
+//                       [--only name[,name...]] [--list] [--option NAME=VALUE]...
 //
 // --tso on (default) switches on all three emulation settings, off switches all off, and
 // scalar switches on only the general one (vector and string-instruction accesses stay
@@ -72,6 +72,8 @@
 // In every mode a test fails if its threads never overlapped, if a guest thread did not
 // finish, or if a counting test's total is wrong. --only takes exact test names (an
 // unknown one is an error). --soak runs far more iterations (minutes instead of seconds).
+// --option passes a further fexmac option (VECTORTSOSPLIT=1, TSOBARRIERMERGE=1, ...) to the
+// context, after the three ordering switches.
 
 #include <fexmac.h>
 
@@ -353,6 +355,11 @@ constexpr Layout D {};
 
 // What a mode requires of a test's forbidden outcome.
 enum class Expect { Hold, Break, Either };
+
+// From --option VECTORTSOSPLIT=<mask> (with --tso on): 4 and 8 make 16-byte vector loads
+// and stores two 8-byte acquire/release halves, and a misaligned one takes an alignment
+// fault. (16, aligned forms kept, does not apply to the movdqu used here.)
+unsigned VectorSplitMask = 0;
 
 struct LitmusTest {
   const char* Name;
@@ -1211,6 +1218,81 @@ std::vector<LitmusTest> MakeTests() {
     T.push_back(std::move(t));
   }
 
+  // Round 2 (task E2): the cheaper forms of vector ordering (--option VECTORTSOSPLIT=1,
+  // --option TSOBARRIERMERGE=1). Kept apart from the tests above.
+  //
+  // MP-sse-merge: a scalar store, then a vector load and a vector store. With
+  // TSOBARRIERMERGE the load's DMB ISHLD and the store's DMB ISH become one barrier; it
+  // must still order the scalar store before the vector one (a DMB ISHLD would not).
+  {
+    auto t = MP("MP-sse-merge", "message passing, scalar data store, then SSE load and SSE flag store; scalar loads");
+    t.Reset = {D.X, D.Y, D.Y + 8};
+    t.Pre = [](Asm& A, int Role) {
+      WarmData(A, Role, D.X);
+    };
+    t.Body = [](Asm& A, int Role) {
+      if (Role == 0) {
+        A.MovImm(RAX, FULL);
+        A.Store(RBX, D.X, RAX);
+        A.MovdquLoad(0, R8, ConstFull);
+        A.MovdquStore(RBX, D.Y, 0);
+      } else {
+        A.Load(RAX, RBX, D.Y + 8);
+        A.Load(RDX, RBX, D.X);
+        A.Store(R12, 0, RAX);
+        A.Store(R12, 8, RDX);
+      }
+    };
+    // Not measured to break with emulation off or scalar only: reported there.
+    t.Off = Expect::Either;
+    t.Scalar = Expect::Either;
+    t.Classify = [](const uint64_t*, const uint64_t* R1) {
+      return State(R1[0], FULL) * 3 + State(R1[1], FULL);
+    };
+    T.push_back(std::move(t));
+  }
+  // Vector data and flag at misaligned addresses, on both sides. With VECTORTSOSPLIT one
+  // 8-byte half of each access crosses 16 bytes and is rewritten by the misaligned-access
+  // handler (concurrently, on every thread); the barrier forms do not fault.
+  auto UnalignedSSE = [](const char* Name, const char* Desc, Layout L, int32_t DataOff, int32_t FlagOff, int Patched) {
+    auto t = MP(Name, Desc, L);
+    t.Reset = {DataOff & ~7, (DataOff & ~7) + 8, (DataOff & ~7) + 16, FlagOff & ~7, (FlagOff & ~7) + 8, (FlagOff & ~7) + 16};
+    t.Pre = [DataOff](Asm& A, int Role) {
+      WarmData(A, Role, DataOff & ~7);
+      WarmData(A, Role, (DataOff & ~7) + 16);
+    };
+    t.Body = [DataOff, FlagOff](Asm& A, int Role) {
+      if (Role == 0) {
+        A.MovdquLoad(0, R8, ConstFull);
+        A.MovdquStore(RBX, DataOff, 0);
+        A.MovdquStore(RBX, FlagOff, 0);
+      } else {
+        A.MovdquLoad(1, RBX, FlagOff);
+        A.MovdquLoad(2, RBX, DataOff);
+        A.MovdquStore(R12, 0, 1);
+        A.MovdquStore(R12, 16, 2);
+      }
+    };
+    t.Scalar = Expect::Break;
+    t.Classify = [](const uint64_t*, const uint64_t* R1) {
+      return StateAll({R1[0], R1[1]}, FULL) * 3 + StateAll({R1[2], R1[3]}, FULL);
+    };
+    // Patched counts the two stores and the two loads; each side only if it is split.
+    t.PatchedPerRun = Patched * (((VectorSplitMask & 4) ? 1 : 0) + ((VectorSplitMask & 8) ? 1 : 0)) / 2;
+    return t;
+  };
+  // Data at +12: its lower half crosses 16 bytes; flag at +4: its upper half does.
+  T.push_back(UnalignedSSE("MP-sse-split16", "message passing, SSE data and flag misaligned across 16 bytes, both sides", D, D.X + 12,
+                           D.Y + 4, 4));
+  // Data at +8: neither half faults, the halves are in different 16-byte units.
+  T.push_back(UnalignedSSE("MP-sse-split8", "message passing, SSE data and flag 8 bytes off 16, both sides", D, D.X + 8, D.Y + 8, 0));
+  {
+    // The data's 16 bytes cross a 16K host page boundary, 8 on each side: the store keeps
+    // the barrier form there, the load is split.
+    const Layout P {32768, 16, 16376, 20472};
+    T.push_back(UnalignedSSE("MP-sse-split16K", "message passing, SSE data across a 16K host page, both sides", P, P.X, P.Y + 8, 0));
+  }
+
   return T;
 }
 
@@ -1482,12 +1564,15 @@ struct Options {
   bool Soak = false;
   bool List = false;
   std::vector<std::string> Only;
+  // --option NAME=VALUE: further fexmac options, after the three ordering switches.
+  std::vector<std::pair<std::string, std::string>> Extra;
 };
 
 [[noreturn]]
 void Usage() {
   fprintf(stderr, "usage: FEXCoreOrderingTest [--tso on|off|scalar] [--expect tso|weak|scalar|report] [--iterations N] [--runs R]\n"
-                  "                           [--groups G] [--soak] [--only name[,name...]] [--list]\n");
+                  "                           [--groups G] [--soak] [--only name[,name...]] [--list]\n"
+                  "                           [--option NAME=VALUE]...\n");
   _exit(2);
 }
 
@@ -1536,6 +1621,13 @@ Options Parse(int argc, char** argv) {
       O.Soak = true;
     } else if (A == "--list") {
       O.List = true;
+    } else if (A == "--option") {
+      const auto V = Next();
+      const size_t Eq = V.find('=');
+      if (Eq == std::string::npos || Eq == 0) {
+        Usage();
+      }
+      O.Extra.emplace_back(V.substr(0, Eq), V.substr(Eq + 1));
     } else if (A == "--only") {
       std::string V = Next();
       size_t Pos = 0;
@@ -1569,6 +1661,11 @@ int main(int argc, char** argv) {
   pthread_key_create(&ThreadIndexKey, nullptr);
 
   const Options Opt = Parse(argc, argv);
+  for (const auto& [Name, Value] : Opt.Extra) {
+    if (Name == "VECTORTSOSPLIT" && Opt.Mode == Options::TSO::On) {
+      VectorSplitMask = static_cast<unsigned>(strtoul(Value.c_str(), nullptr, 10));
+    }
+  }
   auto Tests = MakeTests();
   if (Opt.List) {
     for (auto& T : Tests) {
@@ -1598,10 +1695,14 @@ int main(int argc, char** argv) {
     {"VECTORTSOENABLED", OtherTSO ? "1" : "0"},
     {"MEMCPYSETTSOENABLED", OtherTSO ? "1" : "0"},
   };
+  std::vector<fexmac_option> AllOptions(std::begin(TSOOptions), std::end(TSOOptions));
+  for (const auto& [Name, Value] : Opt.Extra) {
+    AllOptions.push_back({Name.c_str(), Value.c_str()});
+  }
   fexmac_config Config;
   fexmac_config_init(&Config);
-  Config.options = TSOOptions;
-  Config.option_count = sizeof(TSOOptions) / sizeof(TSOOptions[0]);
+  Config.options = AllOptions.data();
+  Config.option_count = AllOptions.size();
   fexmac_context* Context {};
   if (const auto Result = fexmac_context_create(&Config, &Context); Result != FEXMAC_OK) {
     fprintf(stderr, "FAIL: could not create the context: %s\n", fexmac_result_string(Result));
@@ -1625,6 +1726,9 @@ int main(int argc, char** argv) {
          Opt.Want == Options::Expect::Scalar ? "the vector and string tests to break, the rest to hold" :
                                              "nothing (report only)", Groups, Runs,
          static_cast<unsigned long long>(AllIterations));
+  for (const auto& [Name, Value] : Opt.Extra) {
+    printf("further option: %s=%s\n", Name.c_str(), Value.c_str());
+  }
 
   {
     struct sigaction Action {};

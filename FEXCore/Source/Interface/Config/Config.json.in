@@ -620,13 +620,15 @@
         ]
       },
       "VectorTSOSplit": {
-        "Type": "bool",
-        "Default": "false",
+        "Type": "uint8",
+        "Default": "0",
         "AffectsCodeGen": "true",
         "Desc": [
-          "When vector TSO emulation is enabled, emit vector loads and stores of up to 16 bytes as 64-bit (or smaller)",
-          "acquire loads and release stores through general registers (FEAT_LRCPC2) instead of a plain access and a barrier.",
-          "A 16-byte access then becomes two 8-byte accesses: another thread can see half of it."
+          "When vector TSO emulation is enabled, emit vector-register loads and stores as acquire loads and release",
+          "stores through general registers (FEAT_LRCPC2) instead of a plain access and a barrier. A bit mask:",
+          "1 loads and 2 stores of 8 bytes or less (one access each, as atomic as before);",
+          "4 loads and 8 stores of 16 bytes as two 8-byte halves: NOT atomic, breaks x86's aligned 16-byte atomicity,",
+          "experiment only; 16 with 4 or 8 keeps the barrier form for instructions that require 16-byte alignment."
         ]
       },
       "TSOBarrierMerge": {
@@ -634,8 +636,9 @@
         "Default": "false",
         "AffectsCodeGen": "true",
         "Desc": [
-          "When vector TSO emulation is enabled, merge a vector store's leading barrier into the barrier of a vector load",
-          "emitted immediately before it (no instruction between), so that one full barrier replaces the pair."
+          "When vector TSO emulation is enabled, drop a vector load's trailing barrier when the next vector store's",
+          "leading barrier follows with only register-only operations between (same block), so that one full barrier",
+          "replaces the pair."
         ]
       },
       "MemcpySetTSOEnabled": {

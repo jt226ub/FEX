@@ -18,7 +18,10 @@ Every difference fails the run unless KNOWN lists it (case, check); a listed dif
 that no longer occurs also fails, so the list cannot go stale. Written from the package D
 review's harness.
 
-    python3 Scripts/macos_fault_diff.py --tool build/Bin/fexmac_fault_diff [--filter text]
+    python3 Scripts/macos_fault_diff.py --tool build/Bin/fexmac_fault_diff [--filter text] [--option NAME=VALUE]...
+
+--option passes a further fexmac option to every run (for example VECTORTSOENABLED=1, so
+that the TSO modes also order vector accesses, and VECTORTSOSPLIT=1).
 """
 
 import argparse
@@ -342,7 +345,13 @@ def main():
     parser.add_argument("--filter", default="")
     parser.add_argument("--jobs", type=int, default=4)
     parser.add_argument("--verbose", action="store_true")
+    parser.add_argument("--option", action="append", default=[], metavar="NAME=VALUE",
+                        help="a further fexmac option for every run (EXTRA_OPTIONS), e.g. VECTORTSOENABLED=1")
     args = parser.parse_args()
+    if args.option:
+        # Read by fexmac_fault_diff in every run (run() passes os.environ on).
+        os.environ["EXTRA_OPTIONS"] = ",".join(args.option)
+        print("further options: " + ",".join(args.option))
     known = set()
     if os.path.exists(KNOWN_FILE):
         for line in open(KNOWN_FILE):

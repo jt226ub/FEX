@@ -98,11 +98,29 @@ int main(int argc, char** argv) {
   const int Resume = argc > 5 && !strcmp(argv[5], "resume");
   const char* SMC = getenv("SMC") ? getenv("SMC") : "full";
   const int Warm = getenv("WARM") && !strcmp(getenv("WARM"), "1");
-  fexmac_option Options[] = {{"MULTIBLOCK", argv[2]}, {"TSOENABLED", argv[3]}, {"SMCCHECKS", SMC}};
+  /* EXTRA_OPTIONS: further options as NAME=VALUE,NAME=VALUE (macos_fault_diff.py --option). */
+  enum { MAX_OPTIONS = 16 };
+  fexmac_option Options[MAX_OPTIONS] = {{"MULTIBLOCK", argv[2]}, {"TSOENABLED", argv[3]}, {"SMCCHECKS", SMC}};
+  size_t OptionCount = 3;
+  static char Extra[1024];
+  if (getenv("EXTRA_OPTIONS")) {
+    snprintf(Extra, sizeof(Extra), "%s", getenv("EXTRA_OPTIONS"));
+    for (char* Item = strtok(Extra, ","); Item && OptionCount < MAX_OPTIONS; Item = strtok(NULL, ",")) {
+      char* Eq = strchr(Item, '=');
+      if (!Eq) {
+        fprintf(stderr, "EXTRA_OPTIONS: %s is not NAME=VALUE\n", Item);
+        return 2;
+      }
+      *Eq = 0;
+      Options[OptionCount].name = Item;
+      Options[OptionCount].value = Eq + 1;
+      ++OptionCount;
+    }
+  }
   fexmac_config Config;
   fexmac_config_init(&Config);
   Config.options = Options;
-  Config.option_count = 3;
+  Config.option_count = OptionCount;
   fexmac_context* Context;
   if (fexmac_context_create(&Config, &Context) != FEXMAC_OK) {
     printf("context failed\n");

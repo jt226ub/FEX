@@ -29,6 +29,7 @@ namespace {
     SMCChecks,  // none, mtrack, full (or 0, 1, 2)
     HostFeatures,
     OnlyOne, // "1": IS64BIT_MODE, which may only confirm 64-bit mode
+    Mask5,   // 0 to 31 (a five-bit mask)
   };
 
   struct OptionInfo {
@@ -52,8 +53,11 @@ namespace {
     // Experimental cheaper forms of the vector ordering (off by default; effective only
     // with VECTORTSOENABLED): vector accesses as general-register acquire/release
     // accesses (a 16-byte access becomes two 8-byte ones), and merging of a vector load's
-    // barrier with the next vector store's. See docs/macOS-port-status.md.
-    OPTION(VECTORTSOSPLIT, VectorTSOSplit, Bool),
+    // barrier with the next vector store's. VECTORTSOSPLIT is a mask: 1 loads, 2 stores of
+    // up to 8 bytes; 4 loads, 8 stores of 16 bytes as two halves (not atomic: experiment
+    // only); 16 keeps aligned-form 16-byte accesses whole. See
+    // docs/macOS-port-status.md.
+    OPTION(VECTORTSOSPLIT, VectorTSOSplit, Mask5),
     OPTION(TSOBARRIERMERGE, TSOBarrierMerge, Bool),
     // Self-modifying code. "full" validates every block; "mtrack" needs page-protection
     // tracking, which package D adds; until then it detects nothing and the embedder
@@ -139,6 +143,13 @@ namespace {
     case Rule::Positive64: {
       const auto Number = ParseUnsigned(Value);
       if (!Number || *Number < 1 || *Number > static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
+        return std::nullopt;
+      }
+      return fextl::fmt::format("{}", *Number);
+    }
+    case Rule::Mask5: {
+      const auto Number = ParseUnsigned(Value);
+      if (!Number || *Number > 31) {
         return std::nullopt;
       }
       return fextl::fmt::format("{}", *Number);
