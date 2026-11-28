@@ -174,6 +174,8 @@ jobs:
           cp "$T" FEXCoreOrderingTest-hardened
           codesign --force --sign - --options runtime --entitlements Data/macOS/jit.entitlements FEXCoreOrderingTest-hardened
           time ./FEXCoreOrderingTest-hardened --tso on 2>&1 | tee ordering-on-hardened.log
+          # String instructions in 8-byte ordered units (MEMCPYSETTSOWIDE, off by default).
+          time ./FEXCoreOrderingTest-hardened --tso on --option MEMCPYSETTSOWIDE=1 2>&1 | tee ordering-on-wide-hardened.log
           # Many short runs: eight threads start translating together each time, which is
           # what hung on the lost mutex wake-up.
           time ./FEXCoreOrderingTest-hardened --tso on --only SB --runs 1000 --iterations 200 2>&1 | tail -3
