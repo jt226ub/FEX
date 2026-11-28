@@ -446,6 +446,24 @@ do the same. FEX is faster than Rosetta 2 at full precision, and much faster wit
 
 ### Candidates (recorded, not done in this package)
 
+Round 2 (task E) options, all off by default; each is described once, in
+`docs/macOS-port-status.md` ("x86 memory ordering between threads") and in the options
+table of `docs/macOS-embedding-interface.md`. `python3 Scripts/macos_bench.py --loader
+build/Bin/FEXCoreBench --out bench-e2 --configs e2` measures all of them in one run (and
+`--qos background` on the efficiency cores; the run lists the CPUs FEX's guest threads
+were seen on). The generated block above is still the first release's measurement; round 2 figures
+are provisional and are in the round 2 report. Making any of them the default is the
+owner's decision.
+
+| Option | What it does | Ordering proof | Recommendation |
+|---|---|---|---|
+| `VECTORTSOSPLIT=3` | vector-register accesses of 4 or 8 bytes as one acquire load or release store | litmus, soaks, fault differential, instruction tests, independent review: sound | make default (candidate) |
+| `TSOBARRIERMERGE=1` | a vector load's barrier merged into the next vector store's when only register operations lie between | as above; a too weak merged barrier is not detectable on the M4, the choice rests on the Arm ARM | make default (candidate) |
+| `MEMCPYSETTSOWIDE=1` | `rep movs`/`stos` with string ordering in 8-byte acquire/release units | the string worker's tests (status document) | make default (candidate), as its section argues |
+| `TSODEFERRED=1` | no ordering until the second guest thread | switch litmus and the deliberately broken switches | keep as option (exact, but only single-threaded phases gain) |
+| `GUESTMEMORYALIASED=1` | correctness switch for aliased guest memory, not a speed option | rep string differential | keep as option |
+| `VECTORTSOSPLIT` bits 4, 8, 16 | 16-byte accesses as two halves | breaks x86's 16-byte atomicity (TEAR tests) | drop (testing build only) |
+
 - Use FEAT_LRCPC3 RCpc vector loads and stores for vector ordering where the host has
   them (the core does not support them yet). The M4 measured here does not report the
   feature (`sysctl hw.optional.arm.FEAT_LRCPC3`: unknown oid, macOS 27.0.1); other Apple
