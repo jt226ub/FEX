@@ -461,10 +461,12 @@ do the same. FEX is faster than Rosetta 2 at full precision, and much faster wit
     acquire load or release store, no barrier. Every access stays one access. It lowers
     the headline and clearly helps `matmul_f64`, `nbody` and `fft`; `copy_loop` (16-byte
     `movdqa`) is unchanged.
-  - `TSOBARRIERMERGE=1` (`tso_on_merge`): within noise. In `copy_loop`'s loop (`movdqa`
+  - `TSOBARRIERMERGE=1` (`tso_on_merge`): lowers the headline about as much as
+    `VECTORTSOSPLIT=3`, mostly through `matmul_f32x4`, `nbody` and `fft`; both together
+    (`tso_on_fp64_merge`) a little more. `copy_loop` is unchanged: in its loop (`movdqa`
     load, `pxor`, `movdqa` load, `pxor`, `movdqa` store, `movdqa` store) only the second
-    load's `dmb ishld` is followed by a store's `dmb ish` with only register operations
-    between, so three of the four barriers remain.
+    load's `dmb ishld` is followed by a store's `dmb ish`, so three of the four barriers
+    remain, and the 16-byte accesses keep theirs.
   - For the record, 16-byte accesses as two 8-byte halves (`VECTORTSOSPLIT=15`,
     `tso_on_split16`) gave the largest gain (`copy_loop` most of all) but made
     `matmul_f32x4` slower, and is dropped: it breaks the 16-byte atomicity x86
