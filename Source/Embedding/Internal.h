@@ -8,6 +8,7 @@
 #include <FEXCore/Config/Config.h>
 #include <FEXCore/Core/Context.h>
 #include <FEXCore/Core/CoreState.h>
+#include <FEXCore/Core/HostFeatures.h>
 #include <FEXCore/Core/SignalDelegator.h>
 #include <FEXCore/Debug/InternalThreadState.h>
 #include <FEXCore/HLE/SyscallHandler.h>
@@ -169,6 +170,8 @@ private:
 
 struct fexmac_context {
   fextl::unique_ptr<FEXCore::Context::Context> CTX;
+  // The host features the context was created with, kept for reporting.
+  FEXCore::HostFeatures HostFeatures {};
   fextl::unique_ptr<fexmac::SignalDelegator> Delegator;
   fextl::unique_ptr<fexmac::SyscallHandler> Syscalls;
 

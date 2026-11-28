@@ -198,6 +198,9 @@ public:
     SetIf("hw.optional.arm.FEAT_FCMA", Feature::FCMA);
     SetIf("hw.optional.arm.FEAT_LRCPC", Feature::LRCPC);
     SetIf("hw.optional.arm.FEAT_LRCPC2", Feature::LRCPC2);
+    // Absent (no such sysctl) on the M4 / macOS 27.0.1 this port was measured on; asked
+    // for so that a chip that has it is noticed. Recorded only (HostFeatures::SupportsLRCPC3).
+    SetIf("hw.optional.arm.FEAT_LRCPC3", Feature::LRCPC3);
     SetIf("hw.optional.arm.FEAT_FRINTTS", Feature::FRINTTS);
     SetIf("hw.optional.arm.FEAT_SB", Feature::SB);
     SetIf("hw.optional.arm.FEAT_SPECRES", Feature::SPECRES);
@@ -607,6 +610,8 @@ void FetchHostFeatures(FEX::CPUFeatures& Features, FEXCore::HostFeatures& HostFe
   HostFeatures.SupportsAFP = Features.Supports(CPUFeatures::Feature::AFP);
   HostFeatures.SupportsRCPC = Features.Supports(CPUFeatures::Feature::LRCPC);
   HostFeatures.SupportsTSOImm9 = Features.Supports(CPUFeatures::Feature::LRCPC2);
+  // Recorded only; nothing generates LRCPC3 code (see FEXCore::HostFeatures).
+  HostFeatures.SupportsLRCPC3 = Features.Supports(CPUFeatures::Feature::LRCPC3);
   HostFeatures.SupportsPMULL_128Bit = Features.Supports(CPUFeatures::Feature::PMULL);
   HostFeatures.SupportsCSSC = Features.Supports(CPUFeatures::Feature::CSSC);
   HostFeatures.SupportsFCMA = Features.Supports(CPUFeatures::Feature::FCMA);

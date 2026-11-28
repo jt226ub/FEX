@@ -607,6 +607,7 @@ fexmac_result fexmac_context_create(const fexmac_config* config, fexmac_context*
 
   {
     auto HostFeatures = FEX::FetchHostFeatures(true);
+    Context->HostFeatures = HostFeatures;
     Context->CTX = FEXCore::Context::Context::CreateNewContext(HostFeatures);
   }
   Context->Delegator = fextl::make_unique<fexmac::SignalDelegator>();
@@ -1248,6 +1249,17 @@ fexmac_result fexmac_testing_add_thunk_trampoline(fexmac_context* context, uint6
     return FEXMAC_ERROR_INVALID_HANDLE;
   }
   context->CTX->AddThunkTrampolineIRHandler(entry, target);
+  return FEXMAC_OK;
+}
+
+fexmac_result fexmac_testing_rcpc_features(fexmac_context* context, int* rcpc, int* rcpc2, int* rcpc3) {
+  ContextUse Use {context};
+  if (!Use || !rcpc || !rcpc2 || !rcpc3) {
+    return FEXMAC_ERROR_INVALID_HANDLE;
+  }
+  *rcpc = context->HostFeatures.SupportsRCPC;
+  *rcpc2 = context->HostFeatures.SupportsTSOImm9;
+  *rcpc3 = context->HostFeatures.SupportsLRCPC3;
   return FEXMAC_OK;
 }
 
