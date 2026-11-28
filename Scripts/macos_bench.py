@@ -117,6 +117,13 @@ CONFIGS = {
         "threads_lock": ANY
     }, "no ordering emulation: not correct for multi-threaded guests; an upper bound for guests known not to need it"),
 }
+# fexmac's TSODEFERRED: all ordering configured, none emulated while the guest has one
+# thread. The kernels run in g_kernels' order and the two thread kernels come last, so
+# every single-threaded kernel runs before the second guest thread exists (the switch);
+# the thread kernels then run with ordering on and must be right.
+CONFIGS["tso_on_deferred"] = ({**BASE, **TSO_ALL, "TSODEFERRED": "1"}, {}, "all three ordering switches on, deferred "
+                              "(TSODEFERRED) until the guest creates its second thread: the single-threaded kernels "
+                              "run without ordering, the thread kernels with it")
 CONFIGS["tso_on_cache_cold"] = (CONFIGS["tso_on"][0], {}, "as tso_on, with the code cache on in a fresh, empty directory "
                                  "for every launch: everything is compiled and written to the cache")
 CONFIGS["tso_on_cache_warm"] = (CONFIGS["tso_on"][0], {}, "as tso_on, with the code cache on in a directory one run "
@@ -124,7 +131,7 @@ CONFIGS["tso_on_cache_warm"] = (CONFIGS["tso_on"][0], {}, "as tso_on, with the c
 # The code cache, through FEXCoreBench --code-cache (fexmac's code_cache_* fields), in a
 # private directory under --out; never the user's ~/Library/Caches.
 CACHE_MODE = {"tso_on_cache_cold": "cold", "tso_on_cache_warm": "warm"}
-DEFAULT_CONFIGS = ["tso_on", "tso_scalar", "tso_vector", "tso_memcpy", "tso_on_nomb", "tso_on_x87rp", "tso_off",
+DEFAULT_CONFIGS = ["tso_on", "tso_scalar", "tso_vector", "tso_memcpy", "tso_on_nomb", "tso_on_x87rp", "tso_off", "tso_on_deferred",
                    "tso_on_cache_cold", "tso_on_cache_warm"]
 QUICK_CONFIGS = ["tso_on", "tso_off", "tso_on_nomb", "tso_on_x87rp", "tso_on_cache_cold", "tso_on_cache_warm"]
 STARTUP_CONFIG = "tso_on"
@@ -928,7 +935,9 @@ def summary_markdown(meta, s, labels):
              ("tso_vector", "scalar and vector ordering (`tso_vector`)"),
              ("tso_memcpy", "scalar and string-instruction ordering (`tso_memcpy`)"),
              ("tso_on_nomb", "all on, multiblock off"), ("tso_on_x87rp", "all on, reduced x87 precision"),
-             ("tso_on_cache_cold", "all on, code cache cold"), ("tso_on_cache_warm", "all on, code cache warm")]
+             ("tso_on_cache_cold", "all on, code cache cold"), ("tso_on_cache_warm", "all on, code cache warm"),
+             ("tso_on_deferred", "all on, deferred while single-threaded (`tso_on_deferred`, exact only because these "
+              "kernels run before the program's second thread)")]
     parts = [f"{what} **{fmt_ratio(means.get('fex:' + c, {}).get('headline'))}**" for c, what in names if have(c)]
     if "native-arm64" in means:
         parts.append(f"native arm64 {fmt_ratio(means['native-arm64'].get('headline'))}")

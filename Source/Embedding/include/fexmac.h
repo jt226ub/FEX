@@ -315,12 +315,17 @@ FEXMAC_EXPORT fexmac_result fexmac_after_fork(fexmac_context* context, int child
  * run code made without it; it may be called from a system call callback, but not from
  * a signal handler or the log callback (FEXMAC_ERROR_BUSY). A no-op (FEXMAC_OK) if
  * ordering is already on or was never deferred. While a running guest thread is waited
- * for it must be able to reach its next block entry: one translated block, one loop
- * iteration or one `rep movs`/`rep stos` (which is not interrupted).
+ * for it must reach its next check: within one translated block, one loop iteration or
+ * 64 elements of a `rep` instruction (as for fexmac_thread_request_stop). A thread whose
+ * host thread the embedder has suspended is waited for until it is resumed.
  *
  * What it helps: single-threaded programs, tools, tests, loaders and the single-threaded
  * start of a program, at ordering-off speed until the second thread. What it does not:
- * a program that is multi-threaded from the start (most games) gains nothing. */
+ * a program that is multi-threaded from the start (most games) gains nothing. The switch
+ * discards every translation (about 2 ms for 10,000 translated blocks, 40 to 50 ms for
+ * 100,000, measured under load) and each block is translated again on first use.
+ * Details and the argument: docs/macOS-embedding-interface.md, "Ordering deferred while
+ * single-threaded". */
 FEXMAC_EXPORT fexmac_result fexmac_context_mark_memory_shared(fexmac_context* context);
 
 /* 1 while the context translates without ordering emulation because of TSODEFERRED,
