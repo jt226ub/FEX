@@ -481,6 +481,17 @@ FEXMAC_EXPORT fexmac_result fexmac_thread_request_stop(fexmac_thread* thread);
  *    current block before every instruction, everywhere; correct for aliases too, 2 to 6
  *    times slower on tight loops. SMCCHECKS none: no detection anywhere.
  *
+ * rep movs through aliases. rep movs decides from the addresses in rsi and rdi whether
+ * the copy reads bytes it writes itself (a destination 1 to 64 bytes ahead of the source
+ * in the copy's direction, where x86 copies each element after the one before and so
+ * repeats data) and copies faster otherwise. If the destination reaches the source's
+ * memory through another mapping, the addresses do not show the overlap and the result
+ * differs from x86 (measured on the M4: with string ordering off at distances of 1 to
+ * 31 bytes, with MEMCPYSETTSOWIDE at 1 to 8 bytes; with string ordering on and
+ * without MEMCPYSETTSOWIDE every copy is element by element and right). An embedder whose
+ * guest has such aliases sets the option GUESTMEMORYALIASED=1: every rep movs in the
+ * context then copies element by element, exactly as x86, however the memory is mapped.
+ *
  * Until the first fexmac_memory_map the library knows nothing about guest memory and
  * behaves as before: every address is executable, nothing is write-protected, and an
  * embedder that changes code must call fexmac_invalidate.

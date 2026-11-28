@@ -352,7 +352,9 @@ static int AliasCase(fexmac_thread* T, uint8_t* Code, uint8_t* P, uint8_t* Q, in
   return Stop.reason == FEXMAC_STOP_HALT && St.gpr[RCX] == 0 && memcmp(P, Expect, Len) == 0;
 }
 
-static void AliasRun(const struct Mode* M, uint8_t* P, uint8_t* Q, uint64_t* Cases, uint64_t* Wrong) {
+/* WrongAt[d] counts the wrong cases with the destination d bytes ahead of the source in
+ * the copy's direction (1..80), WrongAt[0] those behind it. */
+static void AliasRun(const struct Mode* M, uint8_t* P, uint8_t* Q, uint64_t* Cases, uint64_t* Wrong, uint64_t* WrongAt) {
   fexmac_context* Ctx = ModeContext(M);
   uint8_t* Code = MapGuestMemory(0x4000);
   WriteSnippets(Code);
@@ -367,7 +369,9 @@ static void AliasRun(const struct Mode* M, uint8_t* P, uint8_t* Q, uint64_t* Cas
           for (int Sign = -1; Sign <= 1; Sign += 2) {
             const int64_t Dist = (Back ? -d : d) * Sign;
             ++*Cases;
-            *Wrong += !AliasCase(T, Code, P, Q, Size, Back, Dist, Bytes[b] / (uint64_t)Size);
+            const int Bad = !AliasCase(T, Code, P, Q, Size, Back, Dist, Bytes[b] / (uint64_t)Size);
+            *Wrong += Bad;
+            WrongAt[Sign > 0 ? d : 0] += Bad;
           }
         }
       }
@@ -393,8 +397,8 @@ static void TestAlias(void) {
     {"MEMCPYSETTSOWIDE, GUESTMEMORYALIASED", "1", "1", "1"},
   };
   for (size_t m = 0; m < 3; ++m) {
-    uint64_t Cases = 0, Wrong = 0;
-    AliasRun(&Declared[m], (uint8_t*)P, (uint8_t*)Q, &Cases, &Wrong);
+    uint64_t Cases = 0, Wrong = 0, WrongAt[81] = {0};
+    AliasRun(&Declared[m], (uint8_t*)P, (uint8_t*)Q, &Cases, &Wrong, WrongAt);
     Check(Wrong == 0, "[%s] destination through an alias 1 to 80 bytes from the source: %llu cases, %llu wrong", Declared[m].Name,
           (unsigned long long)Cases, (unsigned long long)Wrong);
   }
@@ -405,10 +409,16 @@ static void TestAlias(void) {
     {"MEMCPYSETTSOWIDE", "1", "1", "0"},
   };
   for (size_t m = 0; m < 3; ++m) {
-    uint64_t Cases = 0, Wrong = 0;
-    AliasRun(&Undeclared[m], (uint8_t*)P, (uint8_t*)Q, &Cases, &Wrong);
-    printf("  report only, not declared [%s]: %llu cases, %llu not x86's result\n", Undeclared[m].Name, (unsigned long long)Cases,
-           (unsigned long long)Wrong);
+    uint64_t Cases = 0, Wrong = 0, WrongAt[81] = {0};
+    AliasRun(&Undeclared[m], (uint8_t*)P, (uint8_t*)Q, &Cases, &Wrong, WrongAt);
+    printf("  report only, not declared [%s]: %llu cases, %llu not x86's result; destination ahead by (bytes: wrong cases):",
+           Undeclared[m].Name, (unsigned long long)Cases, (unsigned long long)Wrong);
+    for (int d = 1; d <= 80; ++d) {
+      if (WrongAt[d]) {
+        printf(" %d:%llu", d, (unsigned long long)WrongAt[d]);
+      }
+    }
+    printf("; behind: %llu\n", (unsigned long long)WrongAt[0]);
   }
   mach_vm_deallocate(mach_task_self(), P, 0x10000);
   mach_vm_deallocate(mach_task_self(), Q, 0x10000);

@@ -523,16 +523,20 @@ load-store and store-store order; a release store followed by an RCpc load is no
   never split between two units) and the copy does not read what it wrote (destination
   1 to 64 bytes ahead of the source in the copy's direction: element by element, as
   before). The destination is brought to 8-byte alignment element by element. A source
-  at another offset within 8 bytes is read as aligned 8-byte acquire loads, each word
-  once and in the copy's order, and each destination word is assembled with `extr`
-  (one loop per offset); loads run at most one word ahead of the stores, a load passing
-  an earlier store to another address, which TSO allows.
+  at another offset within 8 bytes is read as aligned 8-byte acquire loads in the copy's
+  order, each destination word assembled with `extr` from two of them (one loop per
+  offset). Within a run each word is read once; at the start of the next run the word
+  holding its first byte is read again (the previous read supplied the bytes before it,
+  this one the bytes after: each byte is still read once, in order). Loads run at most two
+  words (16 bytes) ahead of the stores, a load passing an earlier store to another
+  address, which TSO allows.
 - Runs of 32-byte chunks within one 4K page of the destination and of the source, as the
   plain chunk path: a fault can only be the run's first access to a page, before any of
   its stores, and rcx/rsi/rdi count whole chunks, so progress at faults and stops is
-  exact; the interrupt check follows every run. Fewer than 32 bytes, misaligned elements,
-  overlapping copies and `fs:`/`gs:` sources with a base not keeping the alignment use the
-  element loop unchanged. No barrier is added; nothing changes with string ordering off.
+  exact; the interrupt check follows every run. Fewer than 32 bytes, misaligned elements
+  and overlapping copies use the element loop unchanged. With `fs:`/`gs:` the source
+  address that counts is base + rsi: its alignment decides between the aligned loop and
+  the `extr` loops, and an element misaligned there goes element by element. No barrier is added; nothing changes with string ordering off.
   The option acts only on macOS (the in-place loops exist only there; elsewhere it is
   accepted and does nothing), only with `TSOENABLED` and `MEMCPYSETTSOENABLED`, and only
   on hosts with FEAT_LRCPC2 (`ldapur`/`stlur`); it is in the code-cache key (the
@@ -1226,6 +1230,14 @@ Of memory ordering (criterion 5):
   cross-modifying code that the architecture does not guarantee; at most one access per
   thread per patched instruction, once, can miss its barrier. Never observed. Kept as
   upstream's design ("x86 memory ordering between threads", "Known gap").
+- **`rep movs` through aliased mappings.** The copy paths judge overlap from the addresses;
+  a destination that reaches the source's memory through a second mapping 1 to 64 bytes
+  ahead of it in the copy's direction gives a result x86 does not: with string ordering
+  off (the 1.0 default: 32-byte chunks, the one-byte fill) at distances of 1 to 31 bytes,
+  with `MEMCPYSETTSOWIDE` at 1 to 8 bytes (measured: `fexmac_c_test rep-movs-alias`). Undetectable from
+  the addresses; the embedder declares aliased guest memory with `GUESTMEMORYALIASED=1`,
+  and every `rep movs` then copies element by element, exact (`fexmac_c_test
+  rep-movs-alias`; "Aliases and `rep movs`" in `docs/macOS-embedding-interface.md`).
 - `rep movs`/`rep stos` with string ordering on stay ordered element by element (also with
   `MEMCPYSETTSOWIDE`, which only widens the ordered accesses): the Intel-only relaxation
   of a fast string's stores is not used, since AMD documents none ("String instructions in
