@@ -1495,8 +1495,8 @@ std::vector<LitmusTest> MakeTests() {
                          MovsbLong(3, false), 2048, 2040, CopyQ, Expect::Break));
     T.push_back(RepOrder("REP-order-stosb-line", "one 20K rep stosb: qword after a line inside a 4K page before the one before",
                          StosLong(true, false), 2048, 2040, STOS_VALUE, Expect::Break));
-    T.push_back(RepOrder("REP-order-std-stosq-line", "one 20K std; rep stosq: qword below a line inside a 4K page before the one above",
-                         StosLong(false, true), 2040, 2048, STOS_VALUE, Expect::Break));
+    T.push_back(RepOrder("REP-order-std-stosq-line", "one 20K std; rep stosq: qword a line below another in the first 4K run before that one",
+                         StosLong(false, true), 18304, 18432, STOS_VALUE, Expect::Break));
     T.push_back(RepOrder("REP-order-stosb-page", "one 20K rep stosb: qword after the 16K page seen before the one before it",
                          StosLong(true, false), 16384, 16376, STOS_VALUE, Expect::Break));
     T.push_back(RepOrder("REP-order-std-movsb-page", "one 20K std; rep movsb, source 3 bytes off: qword below the 16K page before the one above",
@@ -1561,8 +1561,8 @@ std::vector<LitmusTest> MakeTests() {
                              true, 0, 16376, 16384, Expect::Break));
     T.push_back(RepReadOrder("REP-order-read-movsb-line", "loads within one 20K rep movsb: qword below a line in a 4K page read new, above old",
                              false, 0, 2040, 2048, Expect::Break));
-    T.push_back(RepReadOrder("REP-order-read-std-movsb-line", "loads within one 20K std; rep movsb: qword above a line in a 4K page read new, below old",
-                             true, 0, 2040, 2048));
+    T.push_back(RepReadOrder("REP-order-read-std-movsb-line", "loads within one 20K std; rep movsb: qword a line above another in the first 4K run read new, that one old",
+                             true, 0, 18304, 18432, Expect::Break));
     T.push_back(RepReadOrder("REP-order-read-movsb-skew-line", "as REP-order-read-movsb-line, destination 3 bytes off", false, 3, 2040, 2048, Expect::Break));
     T.push_back(RepReadOrder("REP-order-read-movsb-skew-page", "as REP-order-read-movsb-page, destination 3 bytes off", false, 3, 16376,
                              16384));

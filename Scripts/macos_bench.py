@@ -117,6 +117,11 @@ CONFIGS = {
         "threads_lock": ANY
     }, "no ordering emulation: not correct for multi-threaded guests; an upper bound for guests known not to need it"),
 }
+# Round 2, E2: string instructions in 8-byte acquire/release units (MEMCPYSETTSOWIDE).
+CONFIGS["tso_on_wide"] = ({**BASE, **TSO_ALL, "MEMCPYSETTSOWIDE": "1"}, {},
+                          "as tso_on, with rep movs/stos in 8-byte acquire loads and release stores")
+CONFIGS["tso_memcpy_wide"] = ({**BASE, "TSOENABLED": "1", "VECTORTSOENABLED": "0", "MEMCPYSETTSOENABLED": "1",
+                               "MEMCPYSETTSOWIDE": "1"}, {}, "as tso_memcpy, with rep movs/stos in 8-byte acquire loads and release stores")
 CONFIGS["tso_on_cache_cold"] = (CONFIGS["tso_on"][0], {}, "as tso_on, with the code cache on in a fresh, empty directory "
                                  "for every launch: everything is compiled and written to the cache")
 CONFIGS["tso_on_cache_warm"] = (CONFIGS["tso_on"][0], {}, "as tso_on, with the code cache on in a directory one run "
@@ -126,7 +131,7 @@ CONFIGS["tso_on_cache_warm"] = (CONFIGS["tso_on"][0], {}, "as tso_on, with the c
 CACHE_MODE = {"tso_on_cache_cold": "cold", "tso_on_cache_warm": "warm"}
 DEFAULT_CONFIGS = ["tso_on", "tso_scalar", "tso_vector", "tso_memcpy", "tso_on_nomb", "tso_on_x87rp", "tso_off",
                    "tso_on_cache_cold", "tso_on_cache_warm"]
-QUICK_CONFIGS = ["tso_on", "tso_off", "tso_on_nomb", "tso_on_x87rp", "tso_on_cache_cold", "tso_on_cache_warm"]
+QUICK_CONFIGS = ["tso_on", "tso_off", "tso_on_nomb", "tso_on_x87rp", "tso_on_cache_cold", "tso_on_cache_warm", "tso_on_wide"]
 STARTUP_CONFIG = "tso_on"
 
 
