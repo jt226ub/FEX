@@ -1641,10 +1641,6 @@ std::vector<LitmusTest> MakeTests() {
     T.push_back(RepReadOrder("REP-order-read-movsb-skew-line", "as REP-order-read-movsb-line, destination 3 bytes off", false, 3, 2040, 2048, Expect::Break));
 
     // Pairs inside one 32-byte chunk (the reviewer's tests): units 0 and 1 of one chunk.
-    T.push_back(RepOrder("RV-order-movsb0-chunk", "rep movsb, source aligned like dest: unit 1 of a chunk seen before unit 0",
-                         MovsbLong(0, false), 2056, 2048, CopyQ, Expect::Either, 1528));
-    T.push_back(RepOrder("RV-order-stosb-chunk", "rep stosb: unit 1 of a chunk seen before unit 0",
-                         StosLong(true, false), 2056, 2048, STOS_VALUE, Expect::Either, 1528));
     T.push_back(RepOrder("RV-order-std-stosq-chunk", "std; rep stosq: unit 1 (lower) of a chunk seen before unit 0",
                          StosLong(false, true), 18432, 18440, STOS_VALUE, Expect::Either, 18944));
 
@@ -1843,6 +1839,37 @@ std::vector<LitmusTest> MakeTests() {
         A.JccBack(CC_B, Loop);
       };
       T.push_back(Mono("RV-mono-movsb3-chunk", "rep movsb, source 3 bytes off, again and again: unit 1 never ahead of unit 0", Writer,
+                       [MonoScalarReader](Asm& A) { MonoScalarReader(A, 2056, 2048, 1000); }));
+    }
+    {
+      // The same with the source aligned like the destination (the aligned loop), and
+      // rep stosb of 32 bytes with v (the review's RV-order-movsb0-chunk and
+      // RV-order-stosb-chunk, continuously).
+      auto Writer = [](bool Movs) {
+        return [Movs](Asm& A) {
+          A.MovImm(RDX, 1);
+          const size_t Loop = A.Here();
+          A.Mov(RAX, RDX);
+          A.Mov(RDI, RBX);
+          A.AluImm(ADD, RDI, Movs ? 8192 : 2048);
+          A.MovImm(RCX, Movs ? 40 : 32);
+          A.RepStosb();
+          if (Movs) {
+            A.Mov(RSI, RBX);
+            A.AluImm(ADD, RSI, 8192);
+            A.Mov(RDI, RBX);
+            A.AluImm(ADD, RDI, 2048);
+            A.MovImm(RCX, 32);
+            A.RepMovsb();
+          }
+          A.Inc(RDX);
+          A.AluImm(CMP, RDX, 256);
+          A.JccBack(CC_B, Loop);
+        };
+      };
+      T.push_back(Mono("RV-mono-movsb0-chunk", "rep movsb, source aligned like the destination, again and again: unit 1 never ahead of unit 0",
+                       Writer(true), [MonoScalarReader](Asm& A) { MonoScalarReader(A, 2056, 2048, 1000); }));
+      T.push_back(Mono("RV-mono-stosb-chunk", "rep stosb of 32 bytes again and again: unit 1 never ahead of unit 0", Writer(false),
                        [MonoScalarReader](Asm& A) { MonoScalarReader(A, 2056, 2048, 1000); }));
     }
     T.push_back(Mono("RV-mono-read-movsq-chunk", "as RV-mono-read-movsb-chunk, with rep movsq", MonoScalarWriter(2056, 2048, 3000),
