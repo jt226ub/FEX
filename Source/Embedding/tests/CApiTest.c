@@ -2232,11 +2232,15 @@ static const struct Subtest Subtests[] = {
 /* FaultHandlingTest.c */
 extern const struct Subtest FaultSubtests[];
 extern const size_t FaultSubtestCount;
+/* RepStringTest.c */
+extern const struct Subtest RepSubtests[];
+extern const size_t RepSubtestCount;
 
 int main(int argc, char** argv) {
   enum { Own = sizeof(Subtests) / sizeof(Subtests[0]) };
-  struct Subtest* All = malloc(sizeof(struct Subtest) * (Own + FaultSubtestCount));
+  struct Subtest* All = malloc(sizeof(struct Subtest) * (Own + FaultSubtestCount + RepSubtestCount));
   memcpy(All, Subtests, sizeof(Subtests));
   memcpy(All + Own, FaultSubtests, sizeof(struct Subtest) * FaultSubtestCount);
-  return RunSubtests(argc, argv, All, Own + FaultSubtestCount, 120);
+  memcpy(All + Own + FaultSubtestCount, RepSubtests, sizeof(struct Subtest) * RepSubtestCount);
+  return RunSubtests(argc, argv, All, Own + FaultSubtestCount + RepSubtestCount, 120);
 }

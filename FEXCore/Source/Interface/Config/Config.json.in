@@ -628,6 +628,16 @@
           "Only affects REP MOVS and REP STOS instructions"
         ]
       },
+      "GuestMemoryAliased": {
+        "Type": "bool",
+        "Default": "false",
+        "AffectsCodeGen": "true",
+        "Desc": [
+          "The guest's memory has aliases (two virtual addresses of the same memory). REP MOVS then",
+          "always copies element by element, in x86's order: the faster paths decide from the",
+          "addresses whether source and destination overlap, which an alias hides. Off by default."
+        ]
+      },
       "MemcpySetTSOWide": {
         "Type": "bool",
         "Default": "false",
