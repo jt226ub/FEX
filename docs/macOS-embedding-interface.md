@@ -589,6 +589,44 @@ Without registered memory the library goes by the host fault: macOS raises SIGSE
 unmapped address (reported as `SEGV_MAPERR`, not present) and SIGBUS for a protected page
 (`SEGV_ACCERR`, present for a permission fault, not present for PROT_NONE).
 
+**Control transfers to an address with no code** (round 2 review). A jump, call or return
+(direct, through a register or memory, `ret imm16`, `iretq`, or rip set by the embedder
+before a run or in a system call callback) to address 0, to unmapped memory or to a
+non-executable registered page ends the run with `FEXMAC_STOP_GUEST_FAULT`, trap 14, a
+fetch (`FEXMAC_ACCESS_EXECUTE`) at the target, rip the target and the stack as x86
+leaves it (a call's return address pushed). Until round 2 a transfer to 0 killed the host
+process, and one to unmapped memory with nothing registered did too. Three causes, each
+fixed on macOS only (other platforms' tables and code are upstream's):
+
+- The inline lookups (`ExitFunction`, the dispatcher's L1 probe) compare only the guest
+  address, and an empty L1 entry is all zeros, so rip 0 matched slot 0. Slot 0 now holds
+  guest address 1 after every clear (rip 1 indexes slot 1, so nothing can match it); an
+  invalidated entry gets its old address with the lowest bit flipped instead of 0 (which
+  also indexes another slot), so the stale host code it keeps (for concurrent readers) can
+  never be reached, also not by a jump to 0 after invalidating a block in slot 0, the
+  reviewer's stale variant. The C++ probe also requires host code. No instruction is
+  added to the inline lookups.
+- A return through the call/return stack popped an empty or cleared entry (0, 0), matched
+  a return to rip 0 and returned to host address 0. A hit now needs non-zero host code:
+  one `cbnz` more on the return path.
+- With nothing registered every address counted as executable, and the translator read
+  unmapped memory. It now asks the host's map (`mach_vm_region`) for the region holding
+  the address; an unreadable one is a fetch fault. The answer is cached by the frontend
+  until it leaves the range or code is invalidated. Writable stays true (the code cache
+  key uses it).
+
+Tests: `transfer-to-zero` and `transfer-to-zero-registered` (13 transfers, each fresh,
+after other code and after invalidating slot 0, multiblock on and off, ordering on,
+deferred and after the switch: 234 each); each half of the lookup fix alone still
+crashes or runs stale code (`rip 0 set before running` ran the old translation, the
+others crashed); fault differential `xfer-*` (60 cases with their flag preludes: before
+the fix the `ret`-to-0 forms died). Cost of the `cbnz`: not resolved yet. Measured on a
+saturated machine (load average 64 to 69, two runs of 5 launches each way, `tso_on`),
+`calls` 57.9 and 54.3 ms with it against 68.6 and 47.8 without, `interp` 412 and 464
+against 398 and 380, `deep_recursion` 113 and 106 against 87 and 93: the spread between
+runs of the same binary is as large as any difference. To be measured on an idle
+machine (the round 2 report gives the command).
+
 ### Guest memory faults: what is exact
 
 Checked by `Scripts/macos_fault_diff.py` (the package D review's differential harness,
@@ -696,6 +734,9 @@ x86's result in every case):**
 
 - A 32-byte store whose *lower* page is the inaccessible one has already written its
   upper 16 bytes.
+- An 80-bit x87 store (`fstp m80`) whose *upper* page is the inaccessible one has
+  already written its lower 8 bytes (round 2 review: `rvw-fstp-tbyte-cross8-ro` and
+  `-cross9-ro`; the same on 1.0).
 - `fxsave` across a page may be partly written (x86 may leave it partly written too).
 
 The embedder may then fix the cause (map or unprotect the page) and run again, which runs
@@ -779,8 +820,18 @@ code made without it. A flag on `fexmac_memory_map` was considered and not chose
 sharing is a property of who touches the memory, not of a range, and once anything is
 shared the whole context must switch (the guest's own accesses to other memory are
 ordered against accesses to the shared range). `fexmac_context_mark_memory_shared` may be
-called from a system call callback, not from a signal handler or the log callback
-(`BUSY`). `fexmac_before_fork` returns `BUSY` while a switch is in progress on another
+called from a system call callback. From the log callback, and from a signal handler on
+a host thread that is running a guest thread outside its callback, it returns `BUSY`
+(before the round 2 review's fix the second hung: the thread was counted and waited for
+itself; `deferred-mark-shared-signal`). A signal handler on any other host thread must
+not call it (it takes locks); that is not detected. A write window
+(`fexmac_memory_write_begin`/`_begin_ex` to `_end`) opened by a host thread that is not
+running a guest thread of the context is the embedder writing guest memory: if a guest
+thread is running then, the full switch (with the wait) is made before the begin
+returns, and a run that starts while such a window is open makes the switch first. A
+window opened and closed while no guest code runs keeps the deferral
+(`deferred-host-write-window`; before the fix a host reader saw 603,386 reordered stores
+in 50 million reads inside such a window). `fexmac_before_fork` returns `BUSY` while a switch is in progress on another
 host thread (the fork contract already excludes concurrent calls; the child would
 otherwise inherit the switch's lock held).
 
@@ -882,6 +933,8 @@ and breaks the switch on purpose; `FEXCoreOrderingSwitchTest`):
 | `deferred-switch-from-callback` | thread 1's system call callback creates thread 2, runs it on another host thread and joins it before returning: no deadlock, thread 1 then reads its value |
 | `deferred-mark-shared` | a host thread reads the guest's message-passing stores with acquire loads: deferred, it sees them out of order (the translation is observably unordered); after `fexmac_context_mark_memory_shared`, 0 of 50M reads; with the option off, 0 before and after |
 | `deferred-cache` | cold deferred run stores unordered entries; a single-threaded warm start loads them; after the switch the same code is compiled, nothing loaded; ordering on loads the entries stored after the switch, and loads nothing where only unordered entries exist |
+| `deferred-mark-shared-signal` | `fexmac_context_mark_memory_shared` from a SIGUSR1 handler on the running guest thread's host thread: `BUSY`, still deferred; then from the main thread it switches. Hung before the fix |
+| `deferred-host-write-window` | a write window from the main thread with nothing running keeps the deferral; opened while the guest runs it ends it before `write_begin` returns, and a host reader sees 0 reordered stores in 50 million reads; a run started inside an open window switches. Before the fix: still deferred, 603,386 and 343,163 reordered |
 | `deferred-switch-races` | 4,000 switches racing a run's start (thread 1 started on a host thread while thread 2 is created) and 4,000 racing a system call whose callback waits for thread 2's store; a hang is caught by the alarm. Both races hung the first version of the switch (found by review: a run marked between setting `Running` and its wait waited for itself; a thread marked between acknowledging at the system call and entering its callback was counted while its callback waited): 4 of 16 runs hung before the fix, 0 of 20 after |
 | `deferred-broken-no-discard-mid-loop` (hooks) | with the discard skipped, only thread 2's block is compiled after the switch: the counter check above can fail |
 | `FEXCoreOrderingSwitchTest litmus` | message passing across the switch: thread 1 writes X then Y in a loop that stays in one translation; thread 2 is created mid-loop and reads Y then X; X < Y is forbidden. `--pattern call` reads the loop's exit flag in a called function. Must be 0; `--mode off` and the `_hooks` build with `--break no-wait`, `no-discard` (and, rarely, `keep-callret`) show forbidden outcomes |
@@ -1195,7 +1248,7 @@ mapped as a code range, flushes before exiting and prints the translation counte
 
 - Exact memory at the fault (running again is right) for the two entries left in
   `fault_diff_known.txt` (see "Guest memory faults: what is exact"): a 32-byte store whose
-  lower page faults, `fxsave` across a page.
+  lower page faults, an 80-bit x87 store whose upper page faults, `fxsave` across a page.
 - A cheaper stop check (future option, not done): today every block entry, back-edge and
   `rep` loop writes the interrupt fault page; on a loop of two linked blocks without
   multiblock that costs +50% (+18% with multiblock, where the loop's own back-edge check

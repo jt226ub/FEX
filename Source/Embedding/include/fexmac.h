@@ -694,7 +694,8 @@ FEXMAC_EXPORT uint64_t fexmac_memory_code_write_count(fexmac_context* context);
  * handler that reads EFLAGS, or writes the state back (a guest signal frame and its
  * sigreturn), sees x86's value. Not exact, the memory at the fault only (running again
  * is right): a 32-byte store whose LOWER page faults has already written its upper half,
- * and fxsave/xsave across a page may be partly written (as on x86). See
+ * an 80-bit x87 store (fstp m80) whose UPPER page faults has already written its lower 8
+ * bytes, and fxsave/xsave across a page may be partly written (as on x86). See
  * docs/macOS-embedding-interface.md, "Guest memory faults: what is exact".
  *
  * One fault outside these is always a core bug: an access past the end of a code buffer,

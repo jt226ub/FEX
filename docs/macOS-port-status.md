@@ -293,7 +293,7 @@ again still gives x86's result, and the 4K-within-16K rule in its last row.
 | Scratch-buffer restart | `scratch-guard-disarmed-after-translation`, `scratch-overflow-*`; `CodeBufferOverflow` | pass |
 | Self-modifying code by page protection | `smc-*`, `split-lock-on-code-page`, `SelfModifyingCode/*` with `--smc mtrack`, the harness's write-protection path | pass; **the default once memory is registered** (no memory registered: nothing detected, as before package D); writes through aliases and to non-writable guest pages sharing a host page with writable ones are not seen |
 | Stopping a thread from another thread | `stop-*`, `stop-rep-movs`, `stop-rep-movs-string-tso`, `stop-rep-movs-string-tso-wide` | pass; median 4 to 6 us request to return; also inside a long `rep movs`/`stos` (32 MB, thousands of stops, registers exact at each, final memory x86's), with string ordering off, on, and on with `MEMCPYSETTSOWIDE` (25 shapes each: forward and backward, skewed sources, every element size, overlaps either side of the wide path's limit) |
-| Guest fault with correct guest state | `fault-*`, `guest-*`, `Scripts/macos_fault_diff.py` (368 programs, each also with three flag preludes, x 4 modes x 4 ways including the get/set-state round trip) | **exact, and running again gives x86's result, for loads, stores, push/pop/call/ret, `pop [m]`, `leave`, `enter`, every read-modify-write form on memory (also locked and misaligned), `xadd`/`cmpxchg`, vector and x87 accesses, 16- and 32-byte stores across a page, and every `rep` string form part-way (also with fs:/gs:), with x86's fault address**; RFLAGS at the fault is the pre-instruction value, every flag; 2 memory-at-the-fault differences remain in `fault_diff_known.txt`: a 32-byte store whose lower page faults, `fxsave` across a page |
+| Guest fault with correct guest state | `fault-*`, `guest-*`, `Scripts/macos_fault_diff.py` (368 programs, each also with three flag preludes, x 4 modes x 4 ways including the get/set-state round trip) | **exact, and running again gives x86's result, for loads, stores, push/pop/call/ret, `pop [m]`, `leave`, `enter`, every read-modify-write form on memory (also locked and misaligned), `xadd`/`cmpxchg`, vector and x87 accesses, 16- and 32-byte stores across a page, and every `rep` string form part-way (also with fs:/gs:), with x86's fault address**; RFLAGS at the fault is the pre-instruction value, every flag; 3 memory-at-the-fault differences remain in `fault_diff_known.txt`: a 32-byte store whose lower page faults, an 80-bit x87 store whose upper page faults (round 2 review), `fxsave` across a page |
 | 4K protections within a 16K host page | `memory-arguments` | refused unless `FEXMAC_PROT_ALLOW_UNENFORCED`; accepted ones are counted and NOT enforced (guard pages, read-only next to writable, SMC protection of the non-writable page): the 1.0 limit, stated in `fexmac.h` and the embedding document with the sound scheme as future work |
 
 How (all macOS-only, `__APPLE__`): a full register-cache flush and x87 stack sync before
@@ -581,11 +581,18 @@ with `X87REDUCEDPRECISION=1` and with `VECTORTSOSPLIT=3`) and still break with `
 off` and `--tso scalar` (MP-x87 is reported there). `fist`/`fistp`/`fisttp` (general-register stores) and `fnstcw`/
 `fnstsw` were already ordered stores; `fld`/`fild`/`fbld` and `fldcw` ordered loads (the
 80-bit load's first part is plain, the barrier after its second part orders both).
-Still plain, not changed: the state save and restore instructions `fnstenv`, `fnsave`,
-`fxsave` (and `fldenv`, `frstor`, `fxrstor`), which write or read their 14 to 512 bytes
-with plain accesses (`OpcodeDispatcher/X87.cpp`, `Vector.cpp` `SaveX87State`); a release
-store after them orders them, but their stores are not ordered against each other or
-against a later plain store.
+The state save and restore instructions `fnstenv`, `fnsave`, `fxsave`, `xsave` (and
+`fldenv`, `frstor`, `fxrstor`, `xrstor`) write or read their 14 to 512 bytes with plain
+accesses (`OpcodeDispatcher/X87.cpp`, `Vector.cpp`). Since the round 2 review, with vector
+ordering (effective state), a barrier comes before a save's stores (`dmb sy`: earlier
+stores stay before the area's) and after a restore's loads (`dmb ishld`: the area's loads
+stay before later accesses); their own accesses are still not ordered against each other
+(x86 does not define that order either). `FEXCoreOrderingSwitchTest litmus --mode on
+--stores fxrstor` (Y read by `fxrstor`) showed 37,363 forbidden outcomes in 50 million
+reads before, 0 in 200 million after (and 47,057 in 50 million with
+`VECTORTSOENABLED=0`, which drops the barrier); `--stores fxsave` showed 0 before and
+after on the M4, so that half rests on the architecture (a plain store may pass an earlier
+release store).
 
 **String instructions in wider ordered units (`MEMCPYSETTSOWIDE`, round 2 task E2; off by
 default).** What one `rep movs`/`rep stos` must guarantee with string ordering on is what
@@ -1390,6 +1397,32 @@ the round 2 integration branch `macos/wp-r2-ordering-speed`, **not on `macos/v1`
   round 2 adds an opt-in (`GUESTMEMORYALIASED=1`, every `rep movs` then copies element by
   element), not a fix of the chunk path.
 
+Found by the independent review of the integrated round 2 branch, fixed on
+`macos/wp-r2-review-fixes` (28 November 2026):
+
+- **A guest jump, call or return to address 0 killed the host process (since 1.0).**
+  The inline lookups compare only the guest address, and an empty lookup entry or
+  call/return stack entry is all zeros, so rip 0 "hit" and translated code branched to
+  host address 0 (`xor eax, eax; jmp rax`, a null function-pointer call, `push 0; ret`).
+  An invalidated lookup entry kept its host code with guest address 0, so a jump to 0
+  after invalidating a block in lookup slot 0 ran the old translation (with
+  `TSODEFERRED`, possibly one made without ordering). And with no guest memory
+  registered every address counted as executable, so a transfer to any unmapped address
+  died in the translator. Now each is a guest fetch fault at the target with x86's state
+  (`fexmac_c_test transfer-to-zero`, `transfer-to-zero-registered`: 13 transfer kinds in
+  18 combinations each; fault differential `xfer-*`). How, and its cost: the
+  embedding document, "Guest memory faults".
+- **`fexmac_context_mark_memory_shared` from a signal handler on a running guest thread
+  hung** (the thread waited for itself); it returns `FEXMAC_ERROR_BUSY` now. A
+  `fexmac_memory_write_begin` window opened by another host thread while ordering is
+  deferred now ends the deferral when a guest thread runs during it.
+- **The state save and restore instructions were unordered** (above).
+- **Instruction tests depended on the output directory.** From an absolute directory
+  whose path has a space, nasm wrote no symbol map (its `[map]` directive stops at the
+  space) and two tests (`FEX_bugs/cmpxchg8b`, `cmpxchg16b`) failed in every mode;
+  `Scripts/macos_asm_tests.py` now runs nasm in the map's directory and fails if no map
+  is written.
+
 ## Known limits
 
 Every limit of the port at 1.0, in one place, with where it is explained. None of them is
@@ -1416,9 +1449,11 @@ Of the platform (macOS on Apple silicon):
 
 Of fault handling (criterion 4, met with documented limits):
 
-- At a guest fault, memory differs from x86 in two cases: a 32-byte store whose lower
-  page faults has already written its upper half, and `fxsave` across a page
-  (`fault_diff_known.txt`). Running again gives x86's result.
+- At a guest fault, memory differs from x86 in three cases: a 32-byte store whose lower
+  page faults has already written its upper half, an 80-bit x87 store (`fstp m80`) whose
+  upper page faults has already written its lower 8 bytes (found by the round 2 review,
+  the same on 1.0), and `fxsave` across a page (`fault_diff_known.txt`). Running again
+  gives x86's result.
 - Self-modifying code is not detected for writes through aliased mappings, for writes to
   a non-writable guest page that shares a host page with a writable one, or at all when
   no guest memory is registered (the embedder then calls `fexmac_invalidate`).
